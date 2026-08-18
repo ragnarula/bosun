@@ -22,6 +22,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::instrument;
 
+use crate::proxy::ProxyManager;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
 use crate::registry::SessionHealth;
@@ -66,6 +67,7 @@ pub struct AppState {
     pub registry: Arc<NodeRegistry>,
     pub client: reqwest::Client,
     pub template_path: PathBuf,
+    pub proxies: Arc<ProxyManager>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -82,6 +84,18 @@ async fn heartbeat(
     Json(heartbeat): Json<Heartbeat>,
 ) -> StatusCode {
     state.registry.upsert(&heartbeat, SystemTime::now());
+    for session in &heartbeat.sessions {
+        let Some(forwarder_addr) = &session.forwarder_addr else {
+            continue;
+        };
+        if let Err(error) = state.proxies.ensure(&session.id, forwarder_addr).await {
+            debug!(
+                session_id = %session.id,
+                error = %error.display_chain(),
+                "failed to start proxy for session"
+            );
+        }
+    }
     info!(
         node = %heartbeat.node_name,
         session_count = heartbeat.sessions.len(),
@@ -95,7 +109,11 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
 }
 
 async fn sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionHealth>> {
-    Json(state.registry.sessions(SystemTime::now()))
+    let mut sessions = state.registry.sessions(SystemTime::now());
+    for session in &mut sessions {
+        session.proxy_port = state.proxies.port(&session.id);
+    }
+    Json(sessions)
 }
 
 #[instrument(skip(state))]
@@ -164,6 +182,13 @@ async fn spawn(
         .json()
         .await
         .with_context(|| format!("failed to parse spawn response from node {}", req.node))?;
+    let Some(forwarder_addr) = session.forwarder_addr.clone() else {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "session {} reported no forwarder address",
+            session.id
+        )));
+    };
+    let proxy_port = state.proxies.ensure(&session.id, &forwarder_addr).await?;
     state.registry.add_session(&req.node, session.clone());
     info!(session_id = %session.id, node = %req.node, "session spawned");
 
@@ -173,5 +198,6 @@ async fn spawn(
         repo_url: session.repo_url,
         git_ref: session.git_ref,
         status: session.status,
+        proxy_port: Some(proxy_port),
     }))
 }

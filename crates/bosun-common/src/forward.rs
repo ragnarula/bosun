@@ -7,6 +7,20 @@ use tokio::net::TcpStream;
 use tracing::debug;
 use tracing::instrument;
 
+pub async fn start(
+    listen_on: &str,
+    target: SocketAddr,
+) -> Result<(SocketAddr, tokio::task::AbortHandle), anyhow::Error> {
+    let listener = TcpListener::bind(listen_on)
+        .await
+        .with_context(|| format!("failed to bind forwarder on {listen_on}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read the bound forwarder address")?;
+    let handle = tokio::spawn(accept_loop(listener, target)).abort_handle();
+    Ok((local_addr, handle))
+}
+
 pub async fn accept_loop(listener: TcpListener, target: SocketAddr) {
     loop {
         let (inbound, _peer) = match listener.accept().await {
@@ -47,7 +61,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_loop_forwards_bytes_both_ways() {
-        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let (mut stream, _) = echo.accept().await.unwrap();
@@ -56,13 +70,11 @@ mod tests {
             stream.write_all(&buf[..n]).await.unwrap();
         });
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let forwarder_addr = listener.local_addr().unwrap();
         let accept_task = tokio::spawn(accept_loop(listener, echo_addr));
 
-        let mut client = tokio::net::TcpStream::connect(forwarder_addr)
-            .await
-            .unwrap();
+        let mut client = TcpStream::connect(forwarder_addr).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.unwrap();

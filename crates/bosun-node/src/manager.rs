@@ -13,8 +13,6 @@ use thiserror::Error;
 use tokio::process::Child;
 use tracing::debug;
 
-use crate::forwarder::accept_loop;
-
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -203,16 +201,10 @@ async fn start_forwarder(
     advertise_addr: &str,
     opencode_port: u16,
 ) -> Result<(String, tokio::task::AbortHandle), anyhow::Error> {
-    let listener = tokio::net::TcpListener::bind(format!("{advertise_addr}:0"))
-        .await
-        .with_context(|| format!("failed to bind forwarder on {advertise_addr}"))?;
-    let forwarder_port = listener
-        .local_addr()
-        .context("failed to read the bound forwarder port")?
-        .port();
-    let forwarder_addr = format!("{advertise_addr}:{forwarder_port}");
     let target = SocketAddr::from(([127, 0, 0, 1], opencode_port));
-    let handle = tokio::spawn(accept_loop(listener, target)).abort_handle();
+    let (addr, handle) =
+        bosun_common::forward::start(&format!("{advertise_addr}:0"), target).await?;
+    let forwarder_addr = format!("{advertise_addr}:{}", addr.port());
     Ok((forwarder_addr, handle))
 }
 

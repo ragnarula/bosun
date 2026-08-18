@@ -31,3 +31,18 @@ RUST_LOG=info,bosun=trace cargo run -p bosun -- node --config cmd/bosun/settings
 ```
 
 The `--log-filter` flag overrides `RUST_LOG`.
+
+## Driving a session
+
+Spawn a session, then connect the opencode client through the control-plane proxy:
+
+```bash
+cargo run -p bosun -- spawn --node node-1 file:///path/to/repo
+# spawned session <id> on node node-1 (status running)
+# opencode --hostname 127.0.0.1 --port <proxy-port>
+
+cargo run -p bosun -- open <id>
+# opencode --hostname 127.0.0.1 --port <proxy-port>
+```
+
+Run the printed `opencode` command to drive the session. The client reaches the session through the control-plane proxy port, the node forwarder, and the opencode server on the node's loopback.
