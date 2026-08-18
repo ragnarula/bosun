@@ -1,0 +1,6 @@
+# Node configuration. Every field is optional.
+cp_url = "http://127.0.0.1:8090"
+node_name = "node-1"
+# work_dir = "work"
+# advertise_addr = "127.0.0.1"
+# heartbeat_interval_secs = 5
