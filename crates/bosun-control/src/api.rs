@@ -17,6 +17,7 @@ use bosun_common::types::Heartbeat;
 use bosun_common::types::NodeSpawnRequest;
 use bosun_common::types::SessionInfo;
 use bosun_common::types::SpawnRequest;
+use bosun_common::types::StopRequest;
 use thiserror::Error;
 use tracing::debug;
 use tracing::info;
@@ -34,7 +35,7 @@ pub enum ApiError {
     #[error("node {node} is not up")]
     NodeNotUp { node: String },
 
-    #[error("node {node} rejected the spawn request: {detail}")]
+    #[error("node {node} rejected the request: {detail}")]
     NodeRejected { node: String, detail: String },
 
     #[error("node {node} is unreachable")]
@@ -76,6 +77,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/nodes", get(nodes))
         .route("/sessions", get(sessions))
         .route("/spawn", post(spawn))
+        .route("/stop", post(stop))
         .with_state(state)
 }
 
@@ -121,12 +123,7 @@ async fn spawn(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SpawnRequest>,
 ) -> Result<Json<SessionHealth>, ApiError> {
-    let found = state
-        .registry
-        .list(SystemTime::now())
-        .into_iter()
-        .find(|health| health.name == req.node);
-    let Some(health) = found.filter(|health| health.up) else {
+    let Some(health) = state.registry.node(&req.node, SystemTime::now()) else {
         return Err(ApiError::NodeNotUp {
             node: req.node.clone(),
         });
@@ -200,4 +197,46 @@ async fn spawn(
         status: session.status,
         proxy_port: Some(proxy_port),
     }))
+}
+
+#[instrument(skip(state))]
+async fn stop(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<StopRequest>,
+) -> Result<StatusCode, ApiError> {
+    let now = SystemTime::now();
+    let Some((node, _)) = state.registry.session(&req.session_id, now) else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let Some(node_health) = state.registry.node(&node, now) else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let url = format!("http://{}/stop", node_health.control_addr);
+    let response = match state.client.post(&url).json(&req).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            debug!(
+                error = %error,
+                url = %url,
+                node = %node,
+                session_id = %req.session_id,
+                "stop request to node failed"
+            );
+            return Err(ApiError::NodeUnreachable { node });
+        }
+    };
+
+    if !response.status().is_success() {
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("node returned no readable error"));
+        return Err(ApiError::NodeRejected { node, detail });
+    }
+
+    state.proxies.remove(&req.session_id);
+    state.registry.remove_session(&node, &req.session_id);
+    info!(session_id = %req.session_id, node = %node, "session stopped");
+    Ok(StatusCode::NO_CONTENT)
 }

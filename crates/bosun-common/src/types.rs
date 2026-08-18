@@ -42,3 +42,8 @@ pub struct NodeSpawnRequest {
     pub git_ref: Option<String>,
     pub opencode_config: String,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StopRequest {
+    pub session_id: String,
+}

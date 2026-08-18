@@ -107,6 +107,30 @@ impl NodeRegistry {
         None
     }
 
+    pub fn node(&self, name: &str, now: SystemTime) -> Option<NodeHealth> {
+        let nodes = self.nodes.read().unwrap();
+        let record = nodes.get(name)?;
+        if !is_up(record.last_seen, now, self.timeout) {
+            return None;
+        }
+        Some(NodeHealth {
+            name: name.to_string(),
+            up: true,
+            last_seen_secs: record
+                .last_seen
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            control_addr: record.control_addr.clone(),
+        })
+    }
+
+    pub fn remove_session(&self, node: &str, session_id: &str) {
+        if let Some(record) = self.nodes.write().unwrap().get_mut(node) {
+            record.sessions.remove(session_id);
+        }
+    }
+
     pub fn sessions(&self, now: SystemTime) -> Vec<SessionHealth> {
         let mut sessions: Vec<SessionHealth> = self
             .nodes
@@ -268,5 +292,54 @@ mod tests {
             .expect("session should be found");
         assert_eq!(node, "node-1");
         assert_eq!(found.id, "s1");
+    }
+
+    #[test]
+    fn remove_session_drops_one_of_two() {
+        let registry = NodeRegistry::new(Duration::from_secs(30));
+        registry.upsert(
+            &heartbeat(
+                "node-1",
+                "127.0.0.1:8091",
+                vec![session("s1"), session("s2")],
+            ),
+            epoch(100),
+        );
+
+        registry.remove_session("node-1", "s1");
+
+        let sessions = registry.sessions(epoch(110));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "s2");
+    }
+
+    #[test]
+    fn remove_session_for_unknown_node_is_a_noop() {
+        let registry = NodeRegistry::new(Duration::from_secs(30));
+        registry.upsert(
+            &heartbeat("node-1", "127.0.0.1:8091", vec![session("s1")]),
+            epoch(100),
+        );
+
+        registry.remove_session("node-unknown", "s1");
+        registry.remove_session("node-1", "s-unknown");
+
+        assert_eq!(registry.sessions(epoch(110)).len(), 1);
+    }
+
+    #[test]
+    fn node_is_none_for_unknown_or_down_nodes() {
+        let registry = NodeRegistry::new(Duration::from_secs(30));
+        assert!(registry.node("node-1", epoch(100)).is_none());
+
+        registry.upsert(&heartbeat("node-1", "127.0.0.1:8091", vec![]), epoch(100));
+
+        assert!(registry.node("node-1", epoch(200)).is_none());
+        let node = registry
+            .node("node-1", epoch(110))
+            .expect("node should be up");
+        assert_eq!(node.name, "node-1");
+        assert!(node.up);
+        assert_eq!(node.control_addr, "127.0.0.1:8091");
     }
 }

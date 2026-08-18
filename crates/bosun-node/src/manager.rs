@@ -12,6 +12,7 @@ use bosun_common::types::SessionInfo;
 use thiserror::Error;
 use tokio::process::Child;
 use tracing::debug;
+use tracing::info;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -43,9 +44,7 @@ pub struct NodeManager {
     work_dir: PathBuf,
     advertise_addr: String,
     sessions: RwLock<HashMap<String, SessionRecord>>,
-    #[allow(dead_code)]
     processes: RwLock<HashMap<String, Child>>,
-    #[allow(dead_code)]
     forwarders: RwLock<HashMap<String, tokio::task::AbortHandle>>,
 }
 
@@ -175,6 +174,34 @@ impl NodeManager {
             .unwrap()
             .insert(record.id.clone(), child);
         Ok(record)
+    }
+
+    pub async fn stop(&self, session_id: &str) -> Result<(), NodeError> {
+        let record = match self.sessions.read().unwrap().get(session_id) {
+            Some(record) => record.clone(),
+            None => {
+                info!(session_id = %session_id, "stop requested for unknown session");
+                return Ok(());
+            }
+        };
+
+        let child = self.processes.write().unwrap().remove(session_id);
+        if let Some(mut child) = child {
+            child.kill().await.with_context(|| {
+                format!("failed to kill opencode serve for session {session_id}")
+            })?;
+        }
+
+        let forwarder = self.forwarders.write().unwrap().remove(session_id);
+        if let Some(handle) = forwarder {
+            handle.abort();
+        }
+
+        self.sessions.write().unwrap().remove(session_id);
+        cleanup(&record.dir).await;
+
+        info!(session_id = %session_id, "session stopped");
+        Ok(())
     }
 
     pub fn sessions(&self) -> Vec<SessionInfo> {
@@ -319,6 +346,18 @@ mod tests {
         assert!(matches!(err, NodeError::CloneFailed { .. }));
         assert!(manager.sessions().is_empty());
         assert!(!work.path().join("s2").exists());
+    }
+
+    #[tokio::test]
+    async fn stop_of_unknown_session_is_idempotent() {
+        let work = tempdir().unwrap();
+        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into());
+
+        manager
+            .stop("s1")
+            .await
+            .expect("stopping an unknown session should succeed");
+        assert!(manager.sessions().is_empty());
     }
 
     #[tokio::test]

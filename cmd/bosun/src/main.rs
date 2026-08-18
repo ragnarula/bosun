@@ -15,6 +15,7 @@ use bosun_common::telemetry::setup_logging;
 use bosun_common::types::Heartbeat;
 use bosun_common::types::NodeStatus;
 use bosun_common::types::SpawnRequest;
+use bosun_common::types::StopRequest;
 use bosun_control::api::AppState;
 use bosun_control::proxy::ProxyManager;
 use bosun_control::registry::NodeHealth;
@@ -51,6 +52,8 @@ enum Command {
     List(ListArgs),
     /// Print the connect command for a session.
     Open(OpenArgs),
+    /// Stop a session and remove it from the node.
+    Stop(StopArgs),
 }
 
 #[derive(Args)]
@@ -110,6 +113,15 @@ struct OpenArgs {
     cp_url: Option<String>,
 }
 
+#[derive(Args)]
+struct StopArgs {
+    /// Session id to stop.
+    session_id: String,
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    #[arg(long)]
+    cp_url: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -121,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Spawn(args) => run_spawn(args).await,
         Command::List(args) => run_list(args).await,
         Command::Open(args) => run_open(args).await,
+        Command::Stop(args) => run_stop(args).await,
     }
 }
 
@@ -361,6 +374,31 @@ async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("session {} has no proxy port", session.id));
         }
     }
+    Ok(())
+}
+
+async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
+    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+
+    let client = reqwest::Client::new();
+    let request = StopRequest {
+        session_id: args.session_id.clone(),
+    };
+    let response = client
+        .post(format!("{cp_url}/stop"))
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .with_context(|| format!("failed to read response from {cp_url}"))?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("stop failed: {text}"));
+    }
+    println!("stopped session {}", args.session_id);
     Ok(())
 }
 
