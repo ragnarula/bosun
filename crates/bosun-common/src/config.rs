@@ -33,6 +33,7 @@ pub struct NodeConfig {
     pub work_dir: PathBuf,
     pub advertise_addr: String,
     pub heartbeat_interval_secs: u64,
+    pub listen_port: u16,
 }
 
 impl Default for NodeConfig {
@@ -43,6 +44,7 @@ impl Default for NodeConfig {
             work_dir: "work".into(),
             advertise_addr: "127.0.0.1".into(),
             heartbeat_interval_secs: 5,
+            listen_port: 8091,
         }
     }
 }
@@ -95,5 +97,11 @@ mod tests {
     #[test]
     fn load_missing_file_is_err() {
         assert!(load_config::<ControlConfig>(Path::new("/nonexistent/bosun.toml")).is_err());
+    }
+
+    #[test]
+    fn node_config_defaults_listen_port() {
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.listen_port, 8091);
     }
 }

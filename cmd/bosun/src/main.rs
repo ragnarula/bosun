@@ -14,12 +14,19 @@ use bosun_common::error::ErrorExt;
 use bosun_common::telemetry::setup_logging;
 use bosun_common::types::Heartbeat;
 use bosun_common::types::NodeStatus;
+use bosun_common::types::SpawnRequest;
+use bosun_control::api::AppState;
+use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
+use bosun_control::registry::SessionHealth;
+use bosun_node::manager::NodeManager;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
+use tracing::instrument;
 use tracing::warn;
 
 #[derive(Parser)]
@@ -37,6 +44,10 @@ enum Command {
     Node(NodeArgs),
     /// List nodes registered with the control plane.
     Nodes(NodesArgs),
+    /// Clone a repository on a node and start a session.
+    Spawn(SpawnArgs),
+    /// List sessions on the control plane.
+    List(ListArgs),
 }
 
 #[derive(Args)]
@@ -66,6 +77,27 @@ struct NodesArgs {
     cp_url: Option<String>,
 }
 
+#[derive(Args)]
+struct SpawnArgs {
+    /// Node to clone the repository on.
+    #[arg(long)]
+    node: String,
+    /// Git repository URL.
+    repo_url: String,
+    /// Git ref to check out. Defaults to the remote default branch.
+    git_ref: Option<String>,
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    #[arg(long)]
+    cp_url: Option<String>,
+}
+
+#[derive(Args)]
+struct ListArgs {
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    #[arg(long)]
+    cp_url: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -74,7 +106,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => run_serve(args).await,
         Command::Node(args) => run_node(args).await,
         Command::Nodes(args) => run_nodes(args).await,
+        Command::Spawn(args) => run_spawn(args).await,
+        Command::List(args) => run_list(args).await,
     }
+}
+
+fn resolve_cp_url(flag: Option<&str>) -> String {
+    flag.map(ToString::to_string)
+        .or_else(|| env::var("BOSUN_CP_URL").ok())
+        .unwrap_or_else(|| CliConfig::default().cp_url)
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -87,10 +127,14 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         "control plane configured"
     );
 
-    let registry = Arc::new(NodeRegistry::new(Duration::from_secs(
-        config.node_timeout_secs,
-    )));
-    let app = bosun_control::api::router(registry);
+    let state = Arc::new(AppState {
+        registry: Arc::new(NodeRegistry::new(Duration::from_secs(
+            config.node_timeout_secs,
+        ))),
+        client: reqwest::Client::new(),
+        template_path: config.template_path.clone(),
+    });
+    let app = bosun_control::api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await
@@ -114,28 +158,54 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     info!(
         cp_url = %config.cp_url,
         node_name = %config.node_name,
+        listen_port = config.listen_port,
         "node configured"
     );
 
+    let manager = Arc::new(NodeManager::new(config.work_dir.clone()));
+    let app = bosun_node::api::router(manager.clone());
+    let listen_addr = format!("{}:{}", config.advertise_addr, config.listen_port);
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .with_context(|| format!("failed to bind node HTTP server on {listen_addr}"))?;
+    info!(listen_addr = %listen_addr, "node server listening");
+
+    let _server_task = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        {
+            error!("node server failed: {}", e.display_chain());
+        }
+    });
+
     let client = reqwest::Client::new();
+    let control_addr = format!("{}:{}", config.advertise_addr, config.listen_port);
     let mut interval = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
     loop {
         interval.tick().await;
-        if let Err(e) = send_heartbeat(&client, &config).await {
+        let heartbeat = Heartbeat {
+            node_name: config.node_name.clone(),
+            status: NodeStatus::Up,
+            control_addr: control_addr.clone(),
+            sessions: manager.sessions(),
+        };
+        if let Err(e) = send_heartbeat(&client, &config, &heartbeat).await {
             warn!("heartbeat failed: {}", e.display_chain());
         }
     }
 }
 
-async fn send_heartbeat(client: &reqwest::Client, config: &NodeConfig) -> anyhow::Result<()> {
+#[instrument(skip(client, heartbeat))]
+async fn send_heartbeat(
+    client: &reqwest::Client,
+    config: &NodeConfig,
+    heartbeat: &Heartbeat,
+) -> anyhow::Result<()> {
     let url = format!("{}/heartbeat", config.cp_url.trim_end_matches('/'));
-    let body = Heartbeat {
-        node_name: config.node_name.clone(),
-        status: NodeStatus::Up,
-    };
     client
         .post(&url)
-        .json(&body)
+        .json(&heartbeat)
         .send()
         .await
         .context("failed to send heartbeat")?
@@ -146,13 +216,10 @@ async fn send_heartbeat(client: &reqwest::Client, config: &NodeConfig) -> anyhow
 }
 
 async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
-    let cp_url = args
-        .cp_url
-        .or_else(|| env::var("BOSUN_CP_URL").ok())
-        .unwrap_or_else(|| CliConfig::default().cp_url);
+    let cp_url = resolve_cp_url(args.cp_url.as_deref());
 
     let client = reqwest::Client::new();
-    let health: Vec<bosun_control::registry::NodeHealth> = client
+    let health: Vec<NodeHealth> = client
         .get(format!("{cp_url}/nodes"))
         .send()
         .await
@@ -175,6 +242,71 @@ async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
             node.name,
             status,
             format_ago(now, node.last_seen_secs)
+        );
+    }
+    Ok(())
+}
+
+async fn run_spawn(args: SpawnArgs) -> anyhow::Result<()> {
+    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+
+    let client = reqwest::Client::new();
+    let request = SpawnRequest {
+        node: args.node.clone(),
+        repo_url: args.repo_url,
+        git_ref: args.git_ref,
+    };
+    let response = client
+        .post(format!("{cp_url}/spawn"))
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .with_context(|| format!("failed to read response from {cp_url}"))?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("spawn failed: {text}"));
+    }
+    let health: SessionHealth =
+        serde_json::from_str(&text).context("failed to parse spawn response")?;
+    println!(
+        "spawned session {} on node {} (status {})",
+        health.id, health.node, health.status
+    );
+    Ok(())
+}
+
+async fn run_list(args: ListArgs) -> anyhow::Result<()> {
+    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+
+    let client = reqwest::Client::new();
+    let sessions: Vec<SessionHealth> = client
+        .get(format!("{cp_url}/sessions"))
+        .send()
+        .await
+        .with_context(|| format!("failed to reach control plane at {cp_url}"))?
+        .error_for_status()
+        .with_context(|| format!("control plane at {cp_url} returned an error"))?
+        .json()
+        .await
+        .context("failed to parse session list")?;
+
+    if sessions.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}",
+        "id", "node", "repo", "ref", "status"
+    );
+    for session in &sessions {
+        let git_ref = session.git_ref.as_deref().unwrap_or("-");
+        println!(
+            "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}",
+            session.id, session.node, session.repo_url, git_ref, session.status
         );
     }
     Ok(())

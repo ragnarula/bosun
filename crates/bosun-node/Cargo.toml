@@ -1,20 +1,16 @@
 [package]
-name = "bosun"
+name = "bosun-node"
 version.workspace = true
 edition.workspace = true
-
-[[bin]]
-name = "bosun"
-path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 bosun-common.workspace = true
-bosun-control.workspace = true
-bosun-node.workspace = true
-clap.workspace = true
-reqwest.workspace = true
-serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

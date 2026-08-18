@@ -1,33 +1,177 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 
+use anyhow::Context;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
+use bosun_common::error::ErrorExt;
 use bosun_common::types::Heartbeat;
+use bosun_common::types::NodeSpawnRequest;
+use bosun_common::types::SessionInfo;
+use bosun_common::types::SpawnRequest;
+use thiserror::Error;
+use tracing::debug;
 use tracing::info;
+use tracing::instrument;
 
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
+use crate::registry::SessionHealth;
 
-pub fn router(registry: Arc<NodeRegistry>) -> Router {
+const SPAWN_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("node {node} is not up")]
+    NodeNotUp { node: String },
+
+    #[error("node {node} rejected the spawn request: {detail}")]
+    NodeRejected { node: String, detail: String },
+
+    #[error("node {node} is unreachable")]
+    NodeUnreachable { node: String },
+
+    #[error("internal error")]
+    Internal(#[from] anyhow::Error),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, text) = match &self {
+            ApiError::NodeNotUp { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
+            ApiError::NodeRejected { .. } | ApiError::NodeUnreachable { .. } => {
+                (StatusCode::BAD_GATEWAY, Some(self.to_string()))
+            }
+            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+        };
+
+        tracing::error!("error: {}", self.display_chain());
+
+        match text {
+            Some(text) => (status, text).into_response(),
+            None => status.into_response(),
+        }
+    }
+}
+
+pub struct AppState {
+    pub registry: Arc<NodeRegistry>,
+    pub client: reqwest::Client,
+    pub template_path: PathBuf,
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/heartbeat", post(heartbeat))
         .route("/nodes", get(nodes))
-        .with_state(registry)
+        .route("/sessions", get(sessions))
+        .route("/spawn", post(spawn))
+        .with_state(state)
 }
 
 async fn heartbeat(
-    State(registry): State<Arc<NodeRegistry>>,
+    State(state): State<Arc<AppState>>,
     Json(heartbeat): Json<Heartbeat>,
-) -> axum::http::StatusCode {
-    registry.upsert(&heartbeat.node_name, SystemTime::now());
-    info!(node = %heartbeat.node_name, "node heartbeated");
-    axum::http::StatusCode::NO_CONTENT
+) -> StatusCode {
+    state.registry.upsert(&heartbeat, SystemTime::now());
+    info!(
+        node = %heartbeat.node_name,
+        session_count = heartbeat.sessions.len(),
+        "node heartbeated"
+    );
+    StatusCode::NO_CONTENT
 }
 
-async fn nodes(State(registry): State<Arc<NodeRegistry>>) -> Json<Vec<NodeHealth>> {
-    Json(registry.list(SystemTime::now()))
+async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
+    Json(state.registry.list(SystemTime::now()))
+}
+
+async fn sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionHealth>> {
+    Json(state.registry.sessions(SystemTime::now()))
+}
+
+#[instrument(skip(state))]
+async fn spawn(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SpawnRequest>,
+) -> Result<Json<SessionHealth>, ApiError> {
+    let found = state
+        .registry
+        .list(SystemTime::now())
+        .into_iter()
+        .find(|health| health.name == req.node);
+    let Some(health) = found.filter(|health| health.up) else {
+        return Err(ApiError::NodeNotUp {
+            node: req.node.clone(),
+        });
+    };
+
+    let template = tokio::fs::read_to_string(&state.template_path)
+        .await
+        .with_context(|| format!("failed to read template {}", state.template_path.display()))?;
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let request = NodeSpawnRequest {
+        session_id: session_id.clone(),
+        repo_url: req.repo_url.clone(),
+        git_ref: req.git_ref.clone(),
+        opencode_config: template,
+    };
+
+    let url = format!("http://{}/spawn", health.control_addr);
+    let response = match state
+        .client
+        .post(&url)
+        .json(&request)
+        .timeout(Duration::from_secs(SPAWN_TIMEOUT_SECS))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            debug!(
+                error = %error,
+                url = %url,
+                node = %req.node,
+                "spawn request to node failed"
+            );
+            return Err(ApiError::NodeUnreachable {
+                node: req.node.clone(),
+            });
+        }
+    };
+
+    if !response.status().is_success() {
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("node returned no readable error"));
+        return Err(ApiError::NodeRejected {
+            node: req.node.clone(),
+            detail,
+        });
+    }
+
+    let session: SessionInfo = response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse spawn response from node {}", req.node))?;
+    state.registry.add_session(&req.node, session.clone());
+    info!(session_id = %session.id, node = %req.node, "session spawned");
+
+    Ok(Json(SessionHealth {
+        id: session.id,
+        node: req.node,
+        repo_url: session.repo_url,
+        git_ref: session.git_ref,
+        status: session.status,
+    }))
 }

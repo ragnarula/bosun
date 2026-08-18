@@ -1,5 +1,5 @@
 [workspace]
-members = ["cmd/bosun", "crates/bosun-common", "crates/bosun-control"]
+members = ["cmd/bosun", "crates/bosun-common", "crates/bosun-control", "crates/bosun-node"]
 resolver = "2"
 
 [workspace.package]
@@ -11,12 +11,15 @@ anyhow = "1"
 axum = "0.8"
 bosun-common = { path = "crates/bosun-common" }
 bosun-control = { path = "crates/bosun-control" }
+bosun-node = { path = "crates/bosun-node" }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal", "fs", "process"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

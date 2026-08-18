@@ -28,6 +28,7 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `work_dir` | `work` | Directory session clones are created in |
 | `advertise_addr` | `127.0.0.1` | Address the control plane reaches this node at |
 | `heartbeat_interval_secs` | `5` | Seconds between heartbeats |
+| `listen_port` | `8091` | Port the node's HTTP server binds on |
 
 ## CLI
 
