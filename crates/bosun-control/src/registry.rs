@@ -152,6 +152,7 @@ mod tests {
             repo_url: "https://example.com/repo".into(),
             git_ref: None,
             status: "ready".into(),
+            opencode_port: None,
         }
     }
 

@@ -23,6 +23,7 @@ pub struct SessionInfo {
     #[serde(rename = "ref")]
     pub git_ref: Option<String>,
     pub status: String,
+    pub opencode_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

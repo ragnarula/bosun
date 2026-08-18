@@ -187,6 +187,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bosun-common",
+ "reqwest",
  "serde",
  "tempfile",
  "thiserror",

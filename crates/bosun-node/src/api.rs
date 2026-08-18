@@ -32,6 +32,9 @@ impl IntoResponse for ApiError {
             ApiError::Spawn(NodeError::CloneFailed { .. }) => {
                 (StatusCode::BAD_REQUEST, Some(self.to_string()))
             }
+            ApiError::Spawn(NodeError::HealthTimeout { .. }) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Some(self.to_string()))
+            }
             ApiError::Spawn(_) | ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
 
@@ -56,11 +59,12 @@ async fn spawn(
     Json(req): Json<NodeSpawnRequest>,
 ) -> Result<Json<SessionInfo>, ApiError> {
     let record = manager.spawn(&req).await.map_err(ApiError::Spawn)?;
-    info!(session_id = %record.id, "session cloned");
+    info!(session_id = %record.id, "session spawned");
     Ok(Json(SessionInfo {
         id: record.id,
         repo_url: record.repo_url,
         git_ref: record.git_ref,
         status: record.status,
+        opencode_port: record.opencode_port,
     }))
 }
