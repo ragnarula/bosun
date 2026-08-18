@@ -153,6 +153,7 @@ mod tests {
             git_ref: None,
             status: "ready".into(),
             opencode_port: None,
+            forwarder_addr: None,
         }
     }
 

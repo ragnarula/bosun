@@ -66,5 +66,6 @@ async fn spawn(
         git_ref: record.git_ref,
         status: record.status,
         opencode_port: record.opencode_port,
+        forwarder_addr: record.forwarder_addr,
     }))
 }

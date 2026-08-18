@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -12,6 +13,8 @@ use thiserror::Error;
 use tokio::process::Child;
 use tracing::debug;
 
+use crate::forwarder::accept_loop;
+
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -23,6 +26,7 @@ pub struct SessionRecord {
     pub status: String,
     pub dir: PathBuf,
     pub opencode_port: Option<u16>,
+    pub forwarder_addr: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -39,17 +43,22 @@ pub enum NodeError {
 
 pub struct NodeManager {
     work_dir: PathBuf,
+    advertise_addr: String,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     #[allow(dead_code)]
     processes: RwLock<HashMap<String, Child>>,
+    #[allow(dead_code)]
+    forwarders: RwLock<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 impl NodeManager {
-    pub fn new(work_dir: PathBuf) -> Self {
+    pub fn new(work_dir: PathBuf, advertise_addr: String) -> Self {
         Self {
             work_dir,
+            advertise_addr,
             sessions: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
+            forwarders: RwLock::new(HashMap::new()),
         }
     }
 
@@ -136,6 +145,20 @@ impl NodeManager {
             return Err(e);
         }
 
+        let (forwarder_addr, forwarder_handle) =
+            match start_forwarder(&self.advertise_addr, port).await {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = child.kill().await;
+                    cleanup(&dir).await;
+                    return Err(NodeError::Internal(e));
+                }
+            };
+        self.forwarders
+            .write()
+            .unwrap()
+            .insert(req.session_id.clone(), forwarder_handle);
+
         let record = SessionRecord {
             id: req.session_id.clone(),
             repo_url: req.repo_url.clone(),
@@ -143,6 +166,7 @@ impl NodeManager {
             status: "running".into(),
             dir,
             opencode_port: Some(port),
+            forwarder_addr: Some(forwarder_addr),
         };
         self.sessions
             .write()
@@ -167,11 +191,29 @@ impl NodeManager {
                 git_ref: record.git_ref.clone(),
                 status: record.status.clone(),
                 opencode_port: record.opencode_port,
+                forwarder_addr: record.forwarder_addr.clone(),
             })
             .collect();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         sessions
     }
+}
+
+async fn start_forwarder(
+    advertise_addr: &str,
+    opencode_port: u16,
+) -> Result<(String, tokio::task::AbortHandle), anyhow::Error> {
+    let listener = tokio::net::TcpListener::bind(format!("{advertise_addr}:0"))
+        .await
+        .with_context(|| format!("failed to bind forwarder on {advertise_addr}"))?;
+    let forwarder_port = listener
+        .local_addr()
+        .context("failed to read the bound forwarder port")?
+        .port();
+    let forwarder_addr = format!("{advertise_addr}:{forwarder_port}");
+    let target = SocketAddr::from(([127, 0, 0, 1], opencode_port));
+    let handle = tokio::spawn(accept_loop(listener, target)).abort_handle();
+    Ok((forwarder_addr, handle))
 }
 
 async fn pick_free_port() -> Result<u16, anyhow::Error> {
@@ -275,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_of_bogus_repo_returns_clone_failure() {
         let work = tempdir().unwrap();
-        let manager = NodeManager::new(work.path().to_path_buf());
+        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into());
 
         let err = manager
             .spawn(&request("s2", "file:///nonexistent/bogus-repo"))

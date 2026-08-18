@@ -24,6 +24,7 @@ pub struct SessionInfo {
     pub git_ref: Option<String>,
     pub status: String,
     pub opencode_port: Option<u16>,
+    pub forwarder_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

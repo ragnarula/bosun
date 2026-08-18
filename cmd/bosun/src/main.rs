@@ -162,7 +162,10 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         "node configured"
     );
 
-    let manager = Arc::new(NodeManager::new(config.work_dir.clone()));
+    let manager = Arc::new(NodeManager::new(
+        config.work_dir.clone(),
+        config.advertise_addr.clone(),
+    ));
     let app = bosun_node::api::router(manager.clone());
     let listen_addr = format!("{}:{}", config.advertise_addr, config.listen_port);
     let listener = tokio::net::TcpListener::bind(&listen_addr)
