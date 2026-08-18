@@ -190,6 +190,7 @@ dependencies = [
  "bosun-common",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

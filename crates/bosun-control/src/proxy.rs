@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::RwLock;
 
 use anyhow::Context;
+use bosun_common::forward::accept_loop;
+use tokio::net::TcpListener;
 use tracing::info;
 
 pub struct ProxyManager {
@@ -12,7 +14,9 @@ pub struct ProxyManager {
 
 struct ProxyRecord {
     port: u16,
+    listener: std::net::TcpListener,
     handle: tokio::task::AbortHandle,
+    target: String,
 }
 
 impl ProxyManager {
@@ -28,19 +32,57 @@ impl ProxyManager {
         session_id: &str,
         forwarder_addr: &str,
     ) -> Result<u16, anyhow::Error> {
-        if let Some(record) = self.proxies.read().unwrap().get(session_id) {
-            return Ok(record.port);
+        {
+            let proxies = self.proxies.read().unwrap();
+            if let Some(record) = proxies.get(session_id)
+                && record.target == forwarder_addr
+            {
+                return Ok(record.port);
+            }
         }
+
         let target: SocketAddr = forwarder_addr
             .parse()
             .with_context(|| format!("failed to parse forwarder address {forwarder_addr}"))?;
-        let (addr, handle) =
-            bosun_common::forward::start(&format!("{}:0", self.bind_addr), target).await?;
-        let port = addr.port();
-        self.proxies
-            .write()
-            .unwrap()
-            .insert(session_id.to_string(), ProxyRecord { port, handle });
+
+        let mut proxies = self.proxies.write().unwrap();
+        if let Some(record) = proxies.get_mut(session_id) {
+            record.handle.abort();
+            let accept = record
+                .listener
+                .try_clone()
+                .context("failed to clone proxy listener")?;
+            record.handle =
+                tokio::spawn(accept_loop(to_tokio_listener(accept)?, target)).abort_handle();
+            record.target = forwarder_addr.to_string();
+            info!(
+                session_id = %session_id,
+                port = record.port,
+                "proxy re-pointed to the new forwarder"
+            );
+            return Ok(record.port);
+        }
+        drop(proxies);
+
+        let listener = std::net::TcpListener::bind(format!("{}:0", self.bind_addr))
+            .with_context(|| format!("failed to bind proxy on {}", self.bind_addr))?;
+        let port = listener
+            .local_addr()
+            .context("failed to read the bound proxy port")?
+            .port();
+        let accept = listener
+            .try_clone()
+            .context("failed to clone proxy listener")?;
+        let handle = tokio::spawn(accept_loop(to_tokio_listener(accept)?, target)).abort_handle();
+        self.proxies.write().unwrap().insert(
+            session_id.to_string(),
+            ProxyRecord {
+                port,
+                listener,
+                handle,
+                target: forwarder_addr.to_string(),
+            },
+        );
         info!(session_id = %session_id, port = port, "proxy started");
         Ok(port)
     }
@@ -58,6 +100,13 @@ impl ProxyManager {
             record.handle.abort();
         }
     }
+}
+
+fn to_tokio_listener(listener: std::net::TcpListener) -> Result<TcpListener, anyhow::Error> {
+    listener
+        .set_nonblocking(true)
+        .context("failed to set proxy listener nonblocking")?;
+    TcpListener::from_std(listener).context("failed to move proxy listener to tokio")
 }
 
 #[cfg(test)]
@@ -145,5 +194,44 @@ mod tests {
             .await
             .expect_err("invalid address should fail");
         assert!(err.chain().any(|e| e.is::<std::net::AddrParseError>()));
+    }
+
+    #[tokio::test]
+    async fn ensure_repoints_an_existing_proxy_to_a_new_target_on_the_same_port() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let manager = ProxyManager::new("127.0.0.1".into());
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let echo_a = tokio::spawn(async move {
+            let (mut stream, _) = listener_a.accept().await.unwrap();
+            stream.write_all(b"A").await.unwrap();
+        });
+        let echo_b = tokio::spawn(async move {
+            let (mut stream, _) = listener_b.accept().await.unwrap();
+            stream.write_all(b"B").await.unwrap();
+        });
+
+        let port = manager.ensure("s1", &addr_a.to_string()).await.unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut reply = [0u8; 1];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"A");
+
+        let repointed = manager.ensure("s1", &addr_b.to_string()).await.unwrap();
+        assert_eq!(repointed, port);
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut reply = [0u8; 1];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"B");
+
+        echo_a.await.unwrap();
+        echo_b.await.unwrap();
     }
 }

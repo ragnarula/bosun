@@ -7,12 +7,18 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::Context;
+use bosun_common::error::ErrorExt;
 use bosun_common::types::NodeSpawnRequest;
 use bosun_common::types::SessionInfo;
 use thiserror::Error;
 use tokio::process::Child;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
+use tracing::warn;
+
+use crate::state::PersistedSession;
+use crate::state::state_path;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -109,52 +115,22 @@ impl NodeManager {
             }
         };
 
-        let mut child = match tokio::process::Command::new("opencode")
-            .args([
-                "serve",
-                "--hostname",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-            ])
-            .current_dir(&dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start opencode serve for session {}",
-                    req.session_id
-                )
-            }) {
+        let mut child = match self.start_server(&req.session_id, &dir, port).await {
             Ok(child) => child,
             Err(e) => {
                 cleanup(&dir).await;
-                return Err(NodeError::Internal(e));
+                return Err(e);
             }
         };
 
-        let client = reqwest::Client::new();
-        if let Err(e) = wait_for_health(&client, port, HEALTH_TIMEOUT).await {
-            let _ = child.kill().await;
-            cleanup(&dir).await;
-            return Err(e);
-        }
-
-        let (forwarder_addr, forwarder_handle) =
-            match start_forwarder(&self.advertise_addr, port).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let _ = child.kill().await;
-                    cleanup(&dir).await;
-                    return Err(NodeError::Internal(e));
-                }
-            };
-        self.forwarders
-            .write()
-            .unwrap()
-            .insert(req.session_id.clone(), forwarder_handle);
+        let forwarder_addr = match self.open_forwarder(&req.session_id, port).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                let _ = child.kill().await;
+                cleanup(&dir).await;
+                return Err(e);
+            }
+        };
 
         let record = SessionRecord {
             id: req.session_id.clone(),
@@ -173,6 +149,14 @@ impl NodeManager {
             .write()
             .unwrap()
             .insert(record.id.clone(), child);
+
+        if let Err(e) = self.persist().await {
+            warn!(
+                session_id = %record.id,
+                error = %e.display_chain(),
+                "failed to persist session state"
+            );
+        }
         Ok(record)
     }
 
@@ -200,6 +184,14 @@ impl NodeManager {
         self.sessions.write().unwrap().remove(session_id);
         cleanup(&record.dir).await;
 
+        if let Err(e) = self.persist().await {
+            warn!(
+                session_id = %session_id,
+                error = %e.display_chain(),
+                "failed to persist session state after stop"
+            );
+        }
+
         info!(session_id = %session_id, "session stopped");
         Ok(())
     }
@@ -222,17 +214,207 @@ impl NodeManager {
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         sessions
     }
+
+    async fn start_server(&self, id: &str, dir: &Path, port: u16) -> Result<Child, NodeError> {
+        let child = tokio::process::Command::new("opencode")
+            .args([
+                "serve",
+                "--hostname",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to start opencode serve for session {id}"))?;
+
+        let client = reqwest::Client::new();
+        wait_for_health(&client, port, HEALTH_TIMEOUT).await?;
+        Ok(child)
+    }
+
+    async fn open_forwarder(&self, id: &str, opencode_port: u16) -> Result<String, NodeError> {
+        let target = SocketAddr::from(([127, 0, 0, 1], opencode_port));
+        let (addr, handle) =
+            bosun_common::forward::start(&format!("{}:0", self.advertise_addr), target).await?;
+        self.forwarders
+            .write()
+            .unwrap()
+            .insert(id.to_string(), handle);
+        Ok(format!("{}:{}", self.advertise_addr, addr.port()))
+    }
+
+    fn persisted_sessions(&self) -> Vec<PersistedSession> {
+        let sessions = self.sessions.read().unwrap();
+        let processes = self.processes.read().unwrap();
+        let mut persisted: Vec<PersistedSession> = sessions
+            .values()
+            .filter_map(|record| {
+                let port = record.opencode_port?;
+                let pid = processes
+                    .get(&record.id)
+                    .and_then(|child| child.id())
+                    .unwrap_or(0);
+                Some(PersistedSession {
+                    id: record.id.clone(),
+                    repo_url: record.repo_url.clone(),
+                    git_ref: record.git_ref.clone(),
+                    opencode_port: port,
+                    pid,
+                })
+            })
+            .collect();
+        persisted.sort_by(|a, b| a.id.cmp(&b.id));
+        persisted
+    }
+
+    async fn write_state(&self, persisted: &[PersistedSession]) -> Result<(), anyhow::Error> {
+        let json = serde_json::to_string_pretty(persisted).context("failed to serialize state")?;
+        let path = state_path(&self.work_dir);
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, &json)
+            .await
+            .with_context(|| format!("failed to write state to {}", tmp.display()))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .with_context(|| format!("failed to move state into {}", path.display()))?;
+        Ok(())
+    }
+
+    async fn persist(&self) -> Result<(), anyhow::Error> {
+        let persisted = self.persisted_sessions();
+        self.write_state(&persisted).await
+    }
+
+    pub async fn restore(&self) {
+        let path = state_path(&self.work_dir);
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                error!(
+                    error = %e.display_chain(),
+                    path = %path.display(),
+                    "failed to read session state; starting empty"
+                );
+                return;
+            }
+        };
+        let persisted: Vec<PersistedSession> = match serde_json::from_str(&text) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                error!(
+                    error = %e.display_chain(),
+                    path = %path.display(),
+                    "failed to parse session state; starting empty"
+                );
+                return;
+            }
+        };
+
+        let mut failed_to_restore = Vec::new();
+        for session in persisted {
+            let dir = self.work_dir.join(&session.id);
+            if !dir.is_dir() {
+                warn!(session_id = %session.id, "skipping restore: session directory is missing");
+                continue;
+            }
+
+            kill_pid_if_alive(session.pid).await;
+
+            let mut child = match self
+                .start_server(&session.id, &dir, session.opencode_port)
+                .await
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    error!(
+                        session_id = %session.id,
+                        error = %e.display_chain(),
+                        "failed to restart opencode serve"
+                    );
+                    failed_to_restore.push(session);
+                    continue;
+                }
+            };
+
+            let forwarder_addr = match self
+                .open_forwarder(&session.id, session.opencode_port)
+                .await
+            {
+                Ok(addr) => addr,
+                Err(e) => {
+                    let _ = child.kill().await;
+                    error!(
+                        session_id = %session.id,
+                        error = %e.display_chain(),
+                        "failed to restart forwarder"
+                    );
+                    failed_to_restore.push(session);
+                    continue;
+                }
+            };
+
+            let record = SessionRecord {
+                id: session.id.clone(),
+                repo_url: session.repo_url,
+                git_ref: session.git_ref,
+                status: "running".into(),
+                dir,
+                opencode_port: Some(session.opencode_port),
+                forwarder_addr: Some(forwarder_addr),
+            };
+            self.sessions
+                .write()
+                .unwrap()
+                .insert(record.id.clone(), record.clone());
+            self.processes
+                .write()
+                .unwrap()
+                .insert(record.id.clone(), child);
+            info!(session_id = %session.id, "session restored");
+        }
+
+        if let Err(e) = self.persist().await {
+            warn!(error = %e.display_chain(), "failed to rewrite session state after restore");
+        }
+
+        if !failed_to_restore.is_empty() {
+            let mut merged = self.persisted_sessions();
+            merged.extend(failed_to_restore);
+            merged.sort_by(|a, b| a.id.cmp(&b.id));
+            if let Err(e) = self.write_state(&merged).await {
+                warn!(error = %e.display_chain(), "failed to keep un-restored sessions in state");
+            }
+        }
+    }
 }
 
-async fn start_forwarder(
-    advertise_addr: &str,
-    opencode_port: u16,
-) -> Result<(String, tokio::task::AbortHandle), anyhow::Error> {
-    let target = SocketAddr::from(([127, 0, 0, 1], opencode_port));
-    let (addr, handle) =
-        bosun_common::forward::start(&format!("{advertise_addr}:0"), target).await?;
-    let forwarder_addr = format!("{advertise_addr}:{}", addr.port());
-    Ok((forwarder_addr, handle))
+async fn kill_pid_if_alive(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let alive = tokio::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !alive {
+        debug!(pid = pid, "no stale opencode process to kill");
+        return;
+    }
+    info!(pid = pid, "killing stale opencode process");
+    if let Err(e) = tokio::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await
+    {
+        debug!(pid = pid, error = %e, "failed to terminate stale opencode process");
+    }
 }
 
 async fn pick_free_port() -> Result<u16, anyhow::Error> {
@@ -380,5 +562,37 @@ mod tests {
             .await
             .expect_err("health check should time out");
         assert!(matches!(err, NodeError::HealthTimeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn restore_skips_sessions_whose_dir_is_missing() {
+        let work = tempdir().unwrap();
+        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into());
+        tokio::fs::write(
+            state_path(work.path()),
+            r#"[
+                {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"opencode_port":43210,"pid":4242}
+            ]"#,
+        )
+        .await
+        .unwrap();
+
+        manager.restore().await;
+
+        assert!(manager.sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn kill_pid_if_alive_terminates_a_process() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+
+        kill_pid_if_alive(pid).await;
+
+        let output = child.wait().await.unwrap();
+        assert!(!output.success());
     }
 }
