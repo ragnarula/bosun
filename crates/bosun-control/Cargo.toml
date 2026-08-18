@@ -1,0 +1,11 @@
+[package]
+name = "bosun-control"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+bosun-common.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
