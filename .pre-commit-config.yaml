@@ -4,7 +4,8 @@
 #   pre-commit install
 # Run manually: pre-commit run --all-files
 #
-# Runs fast lints/formatters and clippy on commit.
+# Runs fast lints/formatters, clippy, and supply-chain checks on commit.
+# cargo deny needs network access on first run to fetch the advisory database.
 
 repos:
   # Stage 1: Fast lints and formatters
@@ -35,4 +36,10 @@ repos:
         entry: cargo clippy --locked --all-targets --all-features -- -D warnings
         language: system
         types: [rust]
+        pass_filenames: false
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check
+        language: system
         pass_filenames: false

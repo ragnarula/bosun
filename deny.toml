@@ -1,0 +1,72 @@
+# cargo-deny configuration for Bosun
+#
+# Run: cargo deny check
+#
+# Sections:
+#   advisories - checks the rustsec advisory database for known vulnerabilities
+#   licenses   - allows only permissive licenses
+#   bans       - bans the OpenSSL/system-TLS family and duplicate versions
+#   sources    - requires all dependencies to come from crates.io
+
+[advisories]
+# Uses the rustsec advisory-db by default.
+
+[licenses]
+# Permissive licenses only. The allowlist is exhaustive: any license not listed
+# here, including GPL/LGPL/AGPL/MPL and other copyleft licenses, is rejected.
+# A crate tri-licensed MIT OR LGPL still passes, because the author allows use
+# under MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# No duplicate versions of any crate, except the baselines listed under
+# skip below.
+multiple-versions = "deny"
+
+# Ban the OpenSSL and native-TLS family. These crates bind system TLS libraries
+# (libssl, LibreSSL, BoringSSL) or Apple's Security framework, so they need a
+# system install. Bosun uses rustls, which is pure Rust and needs no system lib.
+# Add any future dependency that requires a system library here, with a comment.
+deny = [
+    "openssl",
+    "openssl-sys",
+    "openssl-src",
+    "openssl-probe",
+    "native-tls",
+    "libressl-sys",
+    "boringssl-sys",
+    "boring",
+    "security-framework",
+    "security-framework-sys",
+]
+
+# Duplicate baselines as of 2026-08-19. Each is a major-version split forced by
+# upstream crates and cannot be merged:
+#   getrandom 0.2 - pinned by ring 0.17 (semver-incompatible with getrandom 0.3+)
+#   syn 2         - used by tracing-attributes and the ICU stack (via
+#                   url -> idna -> idna_adapter); not yet migrated to syn 3
+#   windows-sys 0.52 - pinned by ring 0.17 for old-Windows support; the rest of
+#                   the tree uses windows-sys 0.61 (Windows-only dependency)
+# Any new duplicate version fails the check.
+skip = [
+    { name = "getrandom", version = "0.2.17" },
+    { name = "syn", version = "2.0.119" },
+    { name = "windows-sys", version = "0.52.0" },
+]
+
+[sources]
+# Only crates.io. No git dependencies and no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
