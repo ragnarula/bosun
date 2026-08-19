@@ -2,6 +2,8 @@
 
 Single-user Bosun in Rust. No security, no scalability. Trusted network only.
 
+Status: **complete**. All nine stories are implemented, tested, and committed.
+
 ## Confirmed decisions
 
 - Multi-machine from day one. One Rust codebase: `bosun serve` (control plane), `bosun node` (daemon), and CLI subcommands.
@@ -18,7 +20,7 @@ Connection path: `client -> CP proxy port -> node forwarder -> opencode serve on
 
 ## User stories in implementation order
 
-### S1 — Project scaffolding
+- [x] **S1 — Project scaffolding**
 
 As a developer, I want a Rust workspace that builds and tests cleanly, so I can add features incrementally.
 
@@ -27,7 +29,7 @@ As a developer, I want a Rust workspace that builds and tests cleanly, so I can 
 - Structured logging wired up; `bosun --help` and `--version` work on every subcommand.
 - `cargo test`, `cargo clippy`, and `cargo fmt --check` pass with no warnings.
 
-### S2 — Node self-registration
+- [x] **S2 — Node self-registration**
 
 As a user, I want nodes to appear on the control plane without manual entry, so I can add a machine by just starting Bosun on it.
 
@@ -36,7 +38,7 @@ As a user, I want nodes to appear on the control plane without manual entry, so 
 - `bosun nodes` lists nodes with status (up/down) and last-seen.
 - Spawning onto a down node fails with a clear error.
 
-### S3 — Spawn clones the repo
+- [x] **S3 — Spawn clones the repo**
 
 As a user, I want `bosun spawn --node <name> <git-url> [ref]` to fetch the repo on that node, so a session has a fresh checkout to work in.
 
@@ -44,7 +46,7 @@ As a user, I want `bosun spawn --node <name> <git-url> [ref]` to fetch the repo 
 - Node clones `repo_url` into `work_dir/<session_id>` using its own git credentials; `ref` defaults to the remote default branch; clone failure reports the git error.
 - On success the session appears in `bosun list` with id, repo, ref, node, and status; the CLI prints the session id.
 
-### S4 — Inject config and start the agent server
+- [x] **S4 — Inject config and start the agent server**
 
 As a user, I want the spawned session to run a working opencode server with my provider config, so the agent can actually think and act.
 
@@ -52,14 +54,14 @@ As a user, I want the spawned session to run a working opencode server with my p
 - Node starts `opencode serve --hostname 127.0.0.1 --port <n>` in the clone dir with a free local port, and polls `/global/health` until healthy or a timeout; a failure to start reports an error and leaves the session failed.
 - A failed spawn cleans up: kill the process, delete the clone dir, remove the session from node state.
 
-### S5 — Node-side forwarder
+- [x] **S5 — Node-side forwarder**
 
 As a user, I want the node to expose the loopback server to the control plane, so the CP can reach it without opencode listening on the network.
 
 - Node opens a forwarder listener on `advertise_addr:<port>` per session, forwarding bytes to `127.0.0.1:<opencode_port>`.
 - The node's heartbeat includes each running session's forwarder address; `bosun list` reflects the session as ready.
 
-### S6 — Control-plane proxy and end-to-end drive
+- [x] **S6 — Control-plane proxy and end-to-end drive**
 
 As a user, I want one URL per session on the control plane, so I can drive the agent with the opencode client from anywhere on the network.
 
@@ -67,7 +69,7 @@ As a user, I want one URL per session on the control plane, so I can drive the a
 - `bosun spawn` (and `bosun open <session>`) print the connect command: `opencode --hostname <cp> --port <proxy_port>`.
 - End-to-end check: connect the opencode client, create a session, give it a task, watch it edit files in the cloned repo.
 
-### S7 — Explicit stop
+- [x] **S7 — Explicit stop**
 
 As a user, I want `bosun stop <session>` to end a session completely, so nothing runs or costs money when I'm done.
 
@@ -75,14 +77,14 @@ As a user, I want `bosun stop <session>` to end a session completely, so nothing
 - CP closes the proxy port and removes the session; `bosun list` no longer shows it.
 - Stopping an already-gone session reports success (idempotent).
 
-### S8 — Node restart recovery
+- [x] **S8 — Node restart recovery**
 
 As a user, I want sessions to survive a node reboot, so I don't lose running work when a machine restarts.
 
 - Node persists its session list to a local state file; on startup it restarts opencode serve and the forwarder for each session, then resumes heartbeating.
 - The CP registry is repopulated from heartbeats; `bosun list` shows the sessions again and `bosun open` yields a working URL.
 
-### S9 — Control-plane restart resilience
+- [x] **S9 — Control-plane restart resilience**
 
 As a user, I want sessions to stay reachable after the control plane restarts, so a CP reboot doesn't orphan my running agents.
 
