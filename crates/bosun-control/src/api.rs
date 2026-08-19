@@ -81,6 +81,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[instrument(skip(state))]
 async fn heartbeat(
     State(state): State<Arc<AppState>>,
     Json(heartbeat): Json<Heartbeat>,
@@ -106,10 +107,12 @@ async fn heartbeat(
     StatusCode::NO_CONTENT
 }
 
+#[instrument(skip(state))]
 async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
     Json(state.registry.list(SystemTime::now()))
 }
 
+#[instrument(skip(state))]
 async fn sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionHealth>> {
     let mut sessions = state.registry.sessions(SystemTime::now());
     for session in &mut sessions {
@@ -151,13 +154,7 @@ async fn spawn(
         .await
     {
         Ok(response) => response,
-        Err(error) => {
-            debug!(
-                error = %error,
-                url = %url,
-                node = %req.node,
-                "spawn request to node failed"
-            );
+        Err(_) => {
             return Err(ApiError::NodeUnreachable {
                 node: req.node.clone(),
             });
@@ -215,14 +212,7 @@ async fn stop(
     let url = format!("http://{}/stop", node_health.control_addr);
     let response = match state.client.post(&url).json(&req).send().await {
         Ok(response) => response,
-        Err(error) => {
-            debug!(
-                error = %error,
-                url = %url,
-                node = %node,
-                session_id = %req.session_id,
-                "stop request to node failed"
-            );
+        Err(_) => {
             return Err(ApiError::NodeUnreachable { node });
         }
     };

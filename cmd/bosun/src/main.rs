@@ -314,11 +314,9 @@ async fn run_spawn(args: SpawnArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_list(args: ListArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
-
+async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<SessionHealth>> {
     let client = reqwest::Client::new();
-    let sessions: Vec<SessionHealth> = client
+    client
         .get(format!("{cp_url}/sessions"))
         .send()
         .await
@@ -327,7 +325,12 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         .with_context(|| format!("control plane at {cp_url} returned an error"))?
         .json()
         .await
-        .context("failed to parse session list")?;
+        .context("failed to parse session list")
+}
+
+async fn run_list(args: ListArgs) -> anyhow::Result<()> {
+    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let sessions = fetch_sessions(&cp_url).await?;
 
     if sessions.is_empty() {
         println!("no sessions");
@@ -353,18 +356,7 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
 
 async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref());
-
-    let client = reqwest::Client::new();
-    let sessions: Vec<SessionHealth> = client
-        .get(format!("{cp_url}/sessions"))
-        .send()
-        .await
-        .with_context(|| format!("failed to reach control plane at {cp_url}"))?
-        .error_for_status()
-        .with_context(|| format!("control plane at {cp_url} returned an error"))?
-        .json()
-        .await
-        .context("failed to parse session list")?;
+    let sessions = fetch_sessions(&cp_url).await?;
 
     let Some(session) = sessions.into_iter().find(|s| s.id == args.session_id) else {
         return Err(anyhow::anyhow!("session {} not found", args.session_id));

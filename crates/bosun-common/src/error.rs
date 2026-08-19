@@ -1,23 +1,5 @@
 use std::error::Error;
 
-use tracing::error;
-
-pub trait ResultExt<T, E> {
-    fn log_map_err(self, err: E, msg: &str) -> Result<T, E>;
-}
-
-impl<T, FromErr, ToErr> ResultExt<T, ToErr> for Result<T, FromErr>
-where
-    FromErr: Error,
-{
-    fn log_map_err(self, err: ToErr, msg: &str) -> Result<T, ToErr> {
-        self.map_err(|e| {
-            error!("{msg}: {e:?}");
-            err
-        })
-    }
-}
-
 pub trait ErrorExt {
     fn display_chain(self) -> String;
 }
