@@ -19,6 +19,19 @@ cargo +nightly fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
+## E2E Test
+
+One end-to-end test boots the control plane and a node, spawns a session on a
+local repo, drives it through the proxy, and stops it. It needs `git` and the
+`opencode` binary on PATH, so it is `#[ignore]`d and run on demand:
+
+```bash
+cargo test -p bosun --test e2e -- --ignored --nocapture
+```
+
+The test uses temp directories and cleans up after itself; it does not touch a
+real deployment.
+
 ## Debugging a Failing Test
 
 ```bash

@@ -18,10 +18,9 @@ Cheapest first. Cost tracks how much must be standing before the test can run.
 | Tier | Answers | Location | Needs |
 |---|---|---|---|
 | Unit | Is this logic correct across all its cases? | Inline `#[cfg(test)]` | Nothing |
-| Integration | Does this Rust API work against a real external dependency (git, opencode)? | `crates/bosun-integration-tests` | One dependency |
-| Smoke | Is this API present in the binary and responding as expected? | `tests/smoke` | Built binaries, running services |
+| E2E | Does a real user flow work across the binaries? | `cmd/bosun/tests/e2e.rs`, `#[ignore]` | `git` and `opencode` on PATH |
 
-Edge cases belong in unit tests. Integration and smoke cover happy and common paths only.
+Edge cases belong in unit tests. The e2e test covers the happy path only.
 
 ## Polling for Async State
 

@@ -149,6 +149,7 @@ dependencies = [
  "clap",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
