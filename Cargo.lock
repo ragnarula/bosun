@@ -184,7 +184,6 @@ dependencies = [
  "axum",
  "bosun-common",
  "futures-util",
- "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",

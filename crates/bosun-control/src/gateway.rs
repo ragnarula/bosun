@@ -102,9 +102,9 @@ async fn forward(gateway: &Gateway, req: Request<Body>) -> Result<Response, anyh
 
     let mut upstream = Request::builder()
         .method(parts.method.clone())
-        .uri(upstream_uri(rest, parts.uri.query()))
+        .uri(upstream_uri(rest, parts.uri.query())?)
         .body(body)
-        .expect("request parts always build a valid request");
+        .context("failed to build the upstream request")?;
     for (name, value) in parts.headers.iter() {
         if is_hop_by_hop(name) {
             continue;
@@ -175,9 +175,9 @@ async fn forward(gateway: &Gateway, req: Request<Body>) -> Result<Response, anyh
         if let Some(headers_map) = builder.headers_mut() {
             *headers_map = headers;
         }
-        return Ok(builder
+        return builder
             .body(Body::empty())
-            .expect("status 101 response always builds"));
+            .context("failed to build the 101 response");
     }
     if upgrade {
         debug!(
@@ -222,7 +222,7 @@ fn split_session_path(path: &str) -> Option<(&str, &str)> {
     Some((id, rest))
 }
 
-fn upstream_uri(rest: &str, query: Option<&str>) -> Uri {
+fn upstream_uri(rest: &str, query: Option<&str>) -> Result<Uri, anyhow::Error> {
     let path = if rest.is_empty() {
         "/".to_string()
     } else {
@@ -234,7 +234,7 @@ fn upstream_uri(rest: &str, query: Option<&str>) -> Uri {
         uri.push_str(query);
     }
     uri.parse()
-        .expect("origin-form uri is built from a validated path")
+        .context("failed to build the upstream request target")
 }
 
 fn wants_upgrade(parts: &Parts) -> bool {
@@ -301,13 +301,15 @@ mod tests {
 
     #[test]
     fn upstream_uri_builds_an_origin_form_path_with_query() {
-        assert_eq!(upstream_uri("", None).to_string(), "/");
+        assert_eq!(upstream_uri("", None).unwrap().to_string(), "/");
         assert_eq!(
-            upstream_uri("global/health", None).to_string(),
+            upstream_uri("global/health", None).unwrap().to_string(),
             "/global/health"
         );
         assert_eq!(
-            upstream_uri("file/content", Some("path=src/main.rs")).to_string(),
+            upstream_uri("file/content", Some("path=src/main.rs"))
+                .unwrap()
+                .to_string(),
             "/file/content?path=src/main.rs"
         );
     }

@@ -334,14 +334,19 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}",
-        "id", "node", "repo", "ref", "status"
+        "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}  {:<80}",
+        "id", "node", "repo", "ref", "status", "connect"
     );
     for session in &sessions {
         let git_ref = session.git_ref.as_deref().unwrap_or("-");
         println!(
-            "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}",
-            session.id, session.node, session.repo_url, git_ref, session.status
+            "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}  {:<80}",
+            session.id,
+            session.node,
+            session.repo_url,
+            git_ref,
+            session.status,
+            connect_command(&cp_url, &session.id)
         );
     }
     Ok(())
