@@ -17,7 +17,7 @@ use bosun_common::types::NodeStatus;
 use bosun_common::types::SpawnRequest;
 use bosun_common::types::StopRequest;
 use bosun_control::api::AppState;
-use bosun_control::proxy::ProxyManager;
+use bosun_control::gateway::Gateway;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::registry::SessionHealth;
@@ -159,7 +159,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         ))),
         client: reqwest::Client::new(),
         template_path: config.template_path.clone(),
-        proxies: Arc::new(ProxyManager::new(config.proxy_bind.clone())),
+        gateway: Arc::new(Gateway::new()),
     });
     let app = bosun_control::api::router(state);
 
@@ -307,10 +307,7 @@ async fn run_spawn(args: SpawnArgs) -> anyhow::Result<()> {
         "spawned session {} on node {} (status {})",
         health.id, health.node, health.status
     );
-    match health.proxy_port {
-        Some(port) => println!("{}", connect_command(&cp_url, port)),
-        None => println!("session has no proxy port"),
-    }
+    println!("{}", connect_command(&cp_url, &health.id));
     Ok(())
 }
 
@@ -337,18 +334,14 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}  {:<6}",
-        "id", "node", "repo", "ref", "status", "port"
+        "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}",
+        "id", "node", "repo", "ref", "status"
     );
     for session in &sessions {
         let git_ref = session.git_ref.as_deref().unwrap_or("-");
-        let port = session
-            .proxy_port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
         println!(
-            "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}  {:<6}",
-            session.id, session.node, session.repo_url, git_ref, session.status, port
+            "{:<36}  {:<10}  {:<24}  {:<12}  {:<6}",
+            session.id, session.node, session.repo_url, git_ref, session.status
         );
     }
     Ok(())
@@ -361,12 +354,7 @@ async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
     let Some(session) = sessions.into_iter().find(|s| s.id == args.session_id) else {
         return Err(anyhow::anyhow!("session {} not found", args.session_id));
     };
-    match session.proxy_port {
-        Some(port) => println!("{}", connect_command(&cp_url, port)),
-        None => {
-            return Err(anyhow::anyhow!("session {} has no proxy port", session.id));
-        }
-    }
+    println!("{}", connect_command(&cp_url, &session.id));
     Ok(())
 }
 
@@ -395,12 +383,11 @@ async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn connect_command(cp_url: &str, proxy_port: u16) -> String {
-    let host = reqwest::Url::parse(cp_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| "127.0.0.1".into());
-    format!("opencode --hostname {host} --port {proxy_port}")
+fn connect_command(cp_url: &str, session_id: &str) -> String {
+    format!(
+        "opencode attach {}/session/{session_id}",
+        cp_url.trim_end_matches('/')
+    )
 }
 
 fn format_ago(now: SystemTime, unix_secs: u64) -> String {
@@ -431,18 +418,18 @@ mod tests {
     }
 
     #[test]
-    fn connect_command_uses_url_host_and_port() {
+    fn connect_command_uses_url_and_session_id() {
         assert_eq!(
-            connect_command("http://192.168.1.10:8090", 43210),
-            "opencode --hostname 192.168.1.10 --port 43210"
+            connect_command("http://192.168.1.10:8090", "abc-123"),
+            "opencode attach http://192.168.1.10:8090/session/abc-123"
         );
     }
 
     #[test]
-    fn connect_command_defaults_host_when_url_is_invalid() {
+    fn connect_command_trims_a_trailing_slash() {
         assert_eq!(
-            connect_command("not a url", 43210),
-            "opencode --hostname 127.0.0.1 --port 43210"
+            connect_command("http://127.0.0.1:8090/", "abc-123"),
+            "opencode attach http://127.0.0.1:8090/session/abc-123"
         );
     }
 }

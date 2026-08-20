@@ -11,7 +11,6 @@ pub struct ControlConfig {
     pub listen_addr: String,
     pub template_path: PathBuf,
     pub node_timeout_secs: u64,
-    pub proxy_bind: String,
 }
 
 impl Default for ControlConfig {
@@ -20,7 +19,6 @@ impl Default for ControlConfig {
             listen_addr: "127.0.0.1:8090".into(),
             template_path: "opencode.json".into(),
             node_timeout_secs: 30,
-            proxy_bind: "127.0.0.1".into(),
         }
     }
 }

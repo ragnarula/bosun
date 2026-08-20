@@ -19,11 +19,10 @@ use bosun_common::types::SessionInfo;
 use bosun_common::types::SpawnRequest;
 use bosun_common::types::StopRequest;
 use thiserror::Error;
-use tracing::debug;
 use tracing::info;
 use tracing::instrument;
 
-use crate::proxy::ProxyManager;
+use crate::gateway::Gateway;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
 use crate::registry::SessionHealth;
@@ -68,7 +67,7 @@ pub struct AppState {
     pub registry: Arc<NodeRegistry>,
     pub client: reqwest::Client,
     pub template_path: PathBuf,
-    pub proxies: Arc<ProxyManager>,
+    pub gateway: Arc<Gateway>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -78,6 +77,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions", get(sessions))
         .route("/spawn", post(spawn))
         .route("/stop", post(stop))
+        .fallback(crate::gateway::route)
         .with_state(state)
 }
 
@@ -88,15 +88,8 @@ async fn heartbeat(
 ) -> StatusCode {
     state.registry.upsert(&heartbeat, SystemTime::now());
     for session in &heartbeat.sessions {
-        let Some(forwarder_addr) = &session.forwarder_addr else {
-            continue;
-        };
-        if let Err(error) = state.proxies.ensure(&session.id, forwarder_addr).await {
-            debug!(
-                session_id = %session.id,
-                error = %error.display_chain(),
-                "failed to start proxy for session"
-            );
+        if let Some(forwarder_addr) = &session.forwarder_addr {
+            state.gateway.ensure(&session.id, forwarder_addr);
         }
     }
     info!(
@@ -114,11 +107,7 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
 
 #[instrument(skip(state))]
 async fn sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionHealth>> {
-    let mut sessions = state.registry.sessions(SystemTime::now());
-    for session in &mut sessions {
-        session.proxy_port = state.proxies.port(&session.id);
-    }
-    Json(sessions)
+    Json(state.registry.sessions(SystemTime::now()))
 }
 
 #[instrument(skip(state))]
@@ -182,7 +171,7 @@ async fn spawn(
             session.id
         )));
     };
-    let proxy_port = state.proxies.ensure(&session.id, &forwarder_addr).await?;
+    state.gateway.ensure(&session.id, &forwarder_addr);
     state.registry.add_session(&req.node, session.clone());
     info!(session_id = %session.id, node = %req.node, "session spawned");
 
@@ -192,7 +181,6 @@ async fn spawn(
         repo_url: session.repo_url,
         git_ref: session.git_ref,
         status: session.status,
-        proxy_port: Some(proxy_port),
     }))
 }
 
@@ -225,7 +213,7 @@ async fn stop(
         return Err(ApiError::NodeRejected { node, detail });
     }
 
-    state.proxies.remove(&req.session_id);
+    state.gateway.remove(&req.session_id);
     state.registry.remove_session(&node, &req.session_id);
     info!(session_id = %req.session_id, node = %node, "session stopped");
     Ok(StatusCode::NO_CONTENT)

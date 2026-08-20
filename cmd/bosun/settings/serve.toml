@@ -2,4 +2,3 @@
 # listen_addr = "127.0.0.1:8090"
 template_path = "cmd/bosun/settings/opencode.json"
 # node_timeout_secs = 30
-# proxy_bind = "127.0.0.1"

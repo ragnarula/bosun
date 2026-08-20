@@ -53,8 +53,7 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
              template_path = \"{}\"\n\
-             node_timeout_secs = 10\n\
-             proxy_bind = \"127.0.0.1\"\n",
+             node_timeout_secs = 10\n",
             template.display()
         ),
     )
@@ -122,7 +121,7 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         String::from_utf8_lossy(&spawn_out.stderr)
     );
 
-    // The session appears as running with a proxy port.
+    // The session appears as running.
     let session = wait_for_value(
         || async {
             let Ok(response) = reqwest::get(format!("{cp_url}/sessions")).await else {
@@ -137,13 +136,12 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
     )
     .await;
     let session_id = session["id"].as_str().unwrap().to_string();
-    let proxy_port = session["proxy_port"].as_u64().unwrap() as u16;
 
     // The injected config landed in the clone.
     assert!(work_dir.join(&session_id).join("opencode.json").is_file());
 
-    // The opencode server answers through the proxy chain.
-    let health: Value = reqwest::get(format!("http://127.0.0.1:{proxy_port}/global/health"))
+    // The opencode server answers through the control-plane path route.
+    let health: Value = reqwest::get(format!("{cp_url}/session/{session_id}/global/health"))
         .await
         .unwrap()
         .json()
@@ -151,9 +149,9 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         .unwrap();
     assert_eq!(health["healthy"], true);
 
-    // The client can create a session through the chain, rooted in the clone.
+    // The client can create a session through the route, rooted in the clone.
     let created: Value = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{proxy_port}/session"))
+        .post(format!("{cp_url}/session/{session_id}/session"))
         .send()
         .await
         .unwrap()
@@ -174,7 +172,7 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         String::from_utf8_lossy(&stop_out.stderr)
     );
 
-    // The session disappears and the proxy port closes.
+    // The session disappears and its route closes.
     wait_for_value(
         || async {
             let Ok(response) = reqwest::get(format!("{cp_url}/sessions")).await else {
@@ -190,12 +188,12 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
     .await;
     wait_for_value(
         || async {
-            reqwest::get(format!("http://127.0.0.1:{proxy_port}/global/health"))
-                .await
-                .is_err()
-                .then_some(())
+            match reqwest::get(format!("{cp_url}/session/{session_id}/global/health")).await {
+                Ok(response) => (response.status() == reqwest::StatusCode::NOT_FOUND).then_some(()),
+                Err(_) => None,
+            }
         },
-        "proxy port to close",
+        "session route to close",
     )
     .await;
     assert!(!work_dir.join(&session_id).exists());

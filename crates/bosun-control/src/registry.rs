@@ -24,7 +24,6 @@ pub struct SessionHealth {
     pub repo_url: String,
     pub git_ref: Option<String>,
     pub status: String,
-    pub proxy_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +144,6 @@ impl NodeRegistry {
                     repo_url: session.repo_url.clone(),
                     git_ref: session.git_ref.clone(),
                     status: session.status.clone(),
-                    proxy_port: None,
                 })
             })
             .collect();
