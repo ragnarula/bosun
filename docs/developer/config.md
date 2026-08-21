@@ -6,7 +6,7 @@ Each role reads one TOML file passed with `--config`:
 |---|---|---|
 | Control plane | `bosun serve --config serve.toml` | `ControlConfig` |
 | Node | `bosun node --config node.toml` | `NodeConfig` |
-| CLI | reads `BOSUN_CP_URL`, else a default | `CliConfig` |
+| CLI | stored config file, then `BOSUN_CP_URL`, then a default | `CliConfig` |
 
 Every field has a default, so a config file can be sparse or empty. Deserialization fills missing fields from the struct's `Default` implementation. See `crates/bosun-common/src/config.rs` for the current fields and defaults.
 
@@ -32,4 +32,14 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 
 ## CLI
 
-The CLI reads `BOSUN_CP_URL`, defaulting to `http://127.0.0.1:8090`.
+The CLI reads its control-plane URL from `~/.config/bosun/config.toml` (or
+`$XDG_CONFIG_HOME/bosun/config.toml` when set). Store it once with:
+
+```bash
+bosun config set cp-url http://10.0.0.5:8090
+bosun config get      # shows the stored URL and the file path
+bosun config unset    # resets the stored URL to the default
+```
+
+Every CLI command resolves the URL from, in order: `--cp-url`, `BOSUN_CP_URL`,
+the stored config file, then the default `http://127.0.0.1:8090`.

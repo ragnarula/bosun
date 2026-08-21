@@ -11,7 +11,10 @@ use anyhow::Context;
 use bosun_common::config::CliConfig;
 use bosun_common::config::ControlConfig;
 use bosun_common::config::NodeConfig;
+use bosun_common::config::cli_config_path;
+use bosun_common::config::load_cli_config;
 use bosun_common::config::load_config;
+use bosun_common::config::save_cli_config;
 use bosun_common::error::ErrorExt;
 use bosun_common::telemetry::setup_logging;
 use bosun_common::types::CloneRequest;
@@ -57,8 +60,10 @@ enum Command {
     Dev(DevArgs),
     /// List sessions on the control plane.
     List(ListArgs),
-    /// Print the connect command for a session.
+    /// Open a session's connect command.
     Open(OpenArgs),
+    /// Manage the CLI config file.
+    Config(ConfigArgs),
     /// Stop a session and remove it from the node.
     Stop(StopArgs),
 }
@@ -85,7 +90,7 @@ struct NodeArgs {
 
 #[derive(Args)]
 struct NodesArgs {
-    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
 }
@@ -99,7 +104,7 @@ struct CloneArgs {
     repo_url: String,
     /// Git ref to check out. Defaults to the remote default branch.
     git_ref: Option<String>,
-    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
 }
@@ -109,14 +114,14 @@ struct DevArgs {
     /// Node whose directories to browse.
     #[arg(long)]
     node: String,
-    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
 }
 
 #[derive(Args)]
 struct ListArgs {
-    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
 }
@@ -125,16 +130,40 @@ struct ListArgs {
 struct OpenArgs {
     /// Session id to connect to.
     session_id: String,
-    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Store the control-plane base URL in the CLI config file.
+    Set(ConfigSetArgs),
+    /// Print the stored control-plane base URL and the config file path.
+    Get,
+    /// Reset the stored control-plane base URL to the default.
+    Unset,
+}
+
+#[derive(Args)]
+struct ConfigSetArgs {
+    /// Config key. Only cp-url is supported.
+    key: String,
+    /// Value to store.
+    value: String,
 }
 
 #[derive(Args)]
 struct StopArgs {
     /// Session id to stop.
     session_id: String,
-    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then http://127.0.0.1:8090.
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
 }
@@ -151,14 +180,22 @@ async fn main() -> anyhow::Result<()> {
         Command::Dev(args) => run_dev(args).await,
         Command::List(args) => run_list(args).await,
         Command::Open(args) => run_open(args).await,
+        Command::Config(args) => run_config(args),
         Command::Stop(args) => run_stop(args).await,
     }
 }
 
-fn resolve_cp_url(flag: Option<&str>) -> String {
-    flag.map(ToString::to_string)
-        .or_else(|| env::var("BOSUN_CP_URL").ok())
-        .unwrap_or_else(|| CliConfig::default().cp_url)
+fn resolve_cp_url(flag: Option<&str>) -> anyhow::Result<String> {
+    let stored = load_cli_config()?.cp_url;
+    Ok(resolve_cp_url_from(
+        flag,
+        env::var("BOSUN_CP_URL").ok(),
+        stored,
+    ))
+}
+
+fn resolve_cp_url_from(flag: Option<&str>, env_url: Option<String>, stored: String) -> String {
+    flag.map(ToString::to_string).or(env_url).unwrap_or(stored)
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -266,7 +303,7 @@ async fn send_heartbeat(
 }
 
 async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
 
     let client = reqwest::Client::new();
     let health: Vec<NodeHealth> = client
@@ -298,7 +335,7 @@ async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
 }
 
 async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
 
     let client = reqwest::Client::new();
     let request = CloneRequest {
@@ -351,7 +388,7 @@ impl fmt::Display for Choice {
 }
 
 async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
     let client = reqwest::Client::new();
     let mut current: Option<PathBuf> = None;
 
@@ -471,7 +508,7 @@ async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<SessionHealth>> {
 }
 
 async fn run_list(args: ListArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
     let sessions = fetch_sessions(&cp_url).await?;
 
     if sessions.is_empty() {
@@ -498,7 +535,7 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
 }
 
 async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
     let sessions = fetch_sessions(&cp_url).await?;
 
     let Some(session) = sessions.into_iter().find(|s| s.id == args.session_id) else {
@@ -507,8 +544,43 @@ async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
     println!("{}", connect_command(&cp_url, &session.id));
     Ok(())
 }
+fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
+    match args.command {
+        ConfigCommand::Set(args) => {
+            if args.key != "cp-url" {
+                return Err(anyhow::anyhow!("unknown config key: {}", args.key));
+            }
+            let mut config = load_cli_config()?;
+            config.cp_url = args.value;
+            save_cli_config(&config)?;
+            println!(
+                "stored cp-url {} in {}",
+                config.cp_url,
+                cli_config_path().display()
+            );
+            Ok(())
+        }
+        ConfigCommand::Get => {
+            let config = load_cli_config()?;
+            println!(
+                "cp-url {} (in {})",
+                config.cp_url,
+                cli_config_path().display()
+            );
+            Ok(())
+        }
+        ConfigCommand::Unset => {
+            let mut config = load_cli_config()?;
+            config.cp_url = CliConfig::default().cp_url;
+            save_cli_config(&config)?;
+            println!("reset cp-url to {}", config.cp_url);
+            Ok(())
+        }
+    }
+}
+
 async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref());
+    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
 
     let client = reqwest::Client::new();
     let request = StopRequest {
@@ -579,6 +651,25 @@ mod tests {
         assert_eq!(
             connect_command("http://127.0.0.1:8090/", "abc-123"),
             "opencode attach http://127.0.0.1:8090/session/abc-123"
+        );
+    }
+
+    #[test]
+    fn resolve_cp_url_prefers_flag_over_env_over_stored() {
+        let flag = Some("http://flag:8090");
+        let env = Some("http://env:8090".to_string());
+        let stored = "http://stored:8090".to_string();
+        assert_eq!(
+            resolve_cp_url_from(flag, env.clone(), stored.clone()),
+            "http://flag:8090"
+        );
+        assert_eq!(
+            resolve_cp_url_from(None, env, stored.clone()),
+            "http://env:8090"
+        );
+        assert_eq!(
+            resolve_cp_url_from(None, None, stored),
+            "http://stored:8090"
         );
     }
 }
