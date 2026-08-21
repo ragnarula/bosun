@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "bosun"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-common"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-control"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-node"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
