@@ -6,6 +6,8 @@ use std::time::SystemTime;
 use anyhow::Context;
 use axum::Json;
 use axum::Router;
+use axum::extract::Path as AxumPath;
+use axum::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -13,11 +15,15 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use bosun_common::error::ErrorExt;
+use bosun_common::types::CloneRequest;
+use bosun_common::types::DevRequest;
+use bosun_common::types::DirListing;
 use bosun_common::types::Heartbeat;
-use bosun_common::types::NodeSpawnRequest;
+use bosun_common::types::NodeCloneRequest;
+use bosun_common::types::NodeDevRequest;
 use bosun_common::types::SessionInfo;
-use bosun_common::types::SpawnRequest;
 use bosun_common::types::StopRequest;
+use serde::Deserialize;
 use thiserror::Error;
 use tracing::info;
 use tracing::instrument;
@@ -66,7 +72,6 @@ impl IntoResponse for ApiError {
 pub struct AppState {
     pub registry: Arc<NodeRegistry>,
     pub client: reqwest::Client,
-    pub template_path: PathBuf,
     pub gateway: Arc<Gateway>,
 }
 
@@ -75,7 +80,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/heartbeat", post(heartbeat))
         .route("/nodes", get(nodes))
         .route("/sessions", get(sessions))
-        .route("/spawn", post(spawn))
+        .route("/clone", post(clone))
+        .route("/dev", post(dev))
+        .route("/nodes/{name}/dirs", get(dirs))
         .route("/stop", post(stop))
         .fallback(crate::gateway::route)
         .with_state(state)
@@ -111,9 +118,9 @@ async fn sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionHealth>
 }
 
 #[instrument(skip(state))]
-async fn spawn(
+async fn clone(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SpawnRequest>,
+    Json(req): Json<CloneRequest>,
 ) -> Result<Json<SessionHealth>, ApiError> {
     let Some(health) = state.registry.node(&req.node, SystemTime::now()) else {
         return Err(ApiError::NodeNotUp {
@@ -121,19 +128,14 @@ async fn spawn(
         });
     };
 
-    let template = tokio::fs::read_to_string(&state.template_path)
-        .await
-        .with_context(|| format!("failed to read template {}", state.template_path.display()))?;
-
     let session_id = uuid::Uuid::new_v4().to_string();
-    let request = NodeSpawnRequest {
+    let request = NodeCloneRequest {
         session_id: session_id.clone(),
         repo_url: req.repo_url.clone(),
         git_ref: req.git_ref.clone(),
-        opencode_config: template,
     };
 
-    let url = format!("http://{}/spawn", health.control_addr);
+    let url = format!("http://{}/clone", health.control_addr);
     let response = match state
         .client
         .post(&url)
@@ -164,24 +166,109 @@ async fn spawn(
     let session: SessionInfo = response
         .json()
         .await
-        .with_context(|| format!("failed to parse spawn response from node {}", req.node))?;
-    let Some(forwarder_addr) = session.forwarder_addr.clone() else {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "session {} reported no forwarder address",
-            session.id
-        )));
-    };
-    state.gateway.ensure(&session.id, &forwarder_addr);
-    state.registry.add_session(&req.node, session.clone());
-    info!(session_id = %session.id, node = %req.node, "session spawned");
+        .with_context(|| format!("failed to parse clone response from node {}", req.node))?;
+    register_session(&state, &req.node, session.clone())?;
+    info!(session_id = %session.id, node = %req.node, "session cloned");
 
-    Ok(Json(SessionHealth {
-        id: session.id,
-        node: req.node,
-        repo_url: session.repo_url,
-        git_ref: session.git_ref,
-        status: session.status,
-    }))
+    Ok(Json(to_health(req.node, session)))
+}
+
+#[instrument(skip(state))]
+async fn dev(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DevRequest>,
+) -> Result<Json<SessionHealth>, ApiError> {
+    let Some(health) = state.registry.node(&req.node, SystemTime::now()) else {
+        return Err(ApiError::NodeNotUp {
+            node: req.node.clone(),
+        });
+    };
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let request = NodeDevRequest {
+        session_id: session_id.clone(),
+        dir: req.dir.clone(),
+    };
+
+    let url = format!("http://{}/dev", health.control_addr);
+    let response = match state
+        .client
+        .post(&url)
+        .json(&request)
+        .timeout(Duration::from_secs(SPAWN_TIMEOUT_SECS))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return Err(ApiError::NodeUnreachable {
+                node: req.node.clone(),
+            });
+        }
+    };
+
+    if !response.status().is_success() {
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("node returned no readable error"));
+        return Err(ApiError::NodeRejected {
+            node: req.node.clone(),
+            detail,
+        });
+    }
+
+    let session: SessionInfo = response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse dev response from node {}", req.node))?;
+    register_session(&state, &req.node, session.clone())?;
+    info!(session_id = %session.id, node = %req.node, dir = %req.dir.display(), "dev session started");
+
+    Ok(Json(to_health(req.node, session)))
+}
+
+#[derive(Debug, Deserialize)]
+struct DirsQuery {
+    path: Option<PathBuf>,
+}
+
+#[instrument(skip(state))]
+async fn dirs(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node): AxumPath<String>,
+    Query(query): Query<DirsQuery>,
+) -> Result<Json<DirListing>, ApiError> {
+    let Some(health) = state.registry.node(&node, SystemTime::now()) else {
+        return Err(ApiError::NodeNotUp { node });
+    };
+
+    let mut request = state
+        .client
+        .get(format!("http://{}/dirs", health.control_addr));
+    if let Some(path) = &query.path {
+        request = request.query(&[("path", path.to_string_lossy().to_string())]);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(_) => {
+            return Err(ApiError::NodeUnreachable { node });
+        }
+    };
+
+    if !response.status().is_success() {
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("node returned no readable error"));
+        return Err(ApiError::NodeRejected { node, detail });
+    }
+
+    let listing: DirListing = response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse dirs response from node {node}"))?;
+    Ok(Json(listing))
 }
 
 #[instrument(skip(state))]
@@ -217,4 +304,27 @@ async fn stop(
     state.registry.remove_session(&node, &req.session_id);
     info!(session_id = %req.session_id, node = %node, "session stopped");
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn register_session(state: &AppState, node: &str, session: SessionInfo) -> Result<(), ApiError> {
+    let Some(forwarder_addr) = session.forwarder_addr.clone() else {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "session {} reported no forwarder address",
+            session.id
+        )));
+    };
+    state.gateway.ensure(&session.id, &forwarder_addr);
+    state.registry.add_session(node, session);
+    Ok(())
+}
+
+fn to_health(node: String, session: SessionInfo) -> SessionHealth {
+    SessionHealth {
+        id: session.id,
+        node,
+        repo_url: session.repo_url,
+        git_ref: session.git_ref,
+        dir: session.dir,
+        status: session.status,
+    }
 }

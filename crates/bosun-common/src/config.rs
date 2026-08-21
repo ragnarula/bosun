@@ -9,7 +9,6 @@ use serde::de::DeserializeOwned;
 #[serde(default)]
 pub struct ControlConfig {
     pub listen_addr: String,
-    pub template_path: PathBuf,
     pub node_timeout_secs: u64,
 }
 
@@ -17,7 +16,6 @@ impl Default for ControlConfig {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:8090".into(),
-            template_path: "opencode.json".into(),
             node_timeout_secs: 30,
         }
     }
@@ -32,6 +30,7 @@ pub struct NodeConfig {
     pub advertise_addr: String,
     pub heartbeat_interval_secs: u64,
     pub listen_port: u16,
+    pub browse_roots: Vec<PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -43,6 +42,7 @@ impl Default for NodeConfig {
             advertise_addr: "127.0.0.1".into(),
             heartbeat_interval_secs: 5,
             listen_port: 8091,
+            browse_roots: Vec::new(),
         }
     }
 }
@@ -101,5 +101,11 @@ mod tests {
     fn node_config_defaults_listen_port() {
         let config: NodeConfig = toml::from_str("").unwrap();
         assert_eq!(config.listen_port, 8091);
+    }
+
+    #[test]
+    fn node_config_defaults_to_no_browse_roots() {
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert!(config.browse_roots.is_empty());
     }
 }

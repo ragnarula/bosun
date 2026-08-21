@@ -55,13 +55,20 @@ deny = [
 #   getrandom 0.2 - pinned by ring 0.17 (semver-incompatible with getrandom 0.3+)
 #   syn 2         - used by tracing-attributes and the ICU stack (via
 #                   url -> idna -> idna_adapter); not yet migrated to syn 3
+#   thiserror 1   - pinned by dialoguer 0.11 (interactive select); the tree uses
+#                   thiserror 2
 #   windows-sys 0.52 - pinned by ring 0.17 for old-Windows support; the rest of
 #                   the tree uses windows-sys 0.61 (Windows-only dependency)
+#   windows-sys 0.59 - pinned by console/crossterm for the interactive select;
+#                   newer than 0.52, older than the rest of the tree's 0.61
 # Any new duplicate version fails the check.
 skip = [
     { name = "getrandom", version = "0.2.17" },
     { name = "syn", version = "2.0.119" },
+    { name = "thiserror", version = "1.0.69" },
+    { name = "thiserror-impl", version = "1.0.69" },
     { name = "windows-sys", version = "0.52.0" },
+    { name = "windows-sys", version = "0.59.0" },
 ]
 
 [sources]

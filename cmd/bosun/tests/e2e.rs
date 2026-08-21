@@ -1,5 +1,7 @@
-//! End-to-end test: boots the control plane and a node, spawns a session on a
-//! local repo, drives it through the control-plane proxy, then stops it.
+//! End-to-end tests: boot the control plane and a node, clone a session on a
+//! local repo, drive it through the control-plane proxy, and stop it. A second
+//! test spawns a dev session in an existing directory and checks the
+//! directory survives a stop.
 //!
 //! Needs `git` and the `opencode` binary on PATH.
 //!
@@ -20,7 +22,7 @@ const BOSUN: &str = env!("CARGO_BIN_EXE_bosun");
 
 #[tokio::test]
 #[ignore]
-async fn spawn_drive_and_stop_a_session_end_to_end() {
+async fn clone_drive_and_stop_a_session_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
@@ -45,16 +47,12 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
     let node_port = free_port().await;
     let cp_url = format!("http://127.0.0.1:{serve_port}");
 
-    let template = root.join("opencode.json");
-    std::fs::write(&template, "{}").unwrap();
     let serve_config = root.join("serve.toml");
     std::fs::write(
         &serve_config,
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
-             template_path = \"{}\"\n\
-             node_timeout_secs = 10\n",
-            template.display()
+             node_timeout_secs = 10\n"
         ),
     )
     .unwrap();
@@ -69,8 +67,10 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
              work_dir = \"{}\"\n\
              advertise_addr = \"127.0.0.1\"\n\
              heartbeat_interval_secs = 1\n\
-             listen_port = {node_port}\n",
-            work_dir.display()
+             listen_port = {node_port}\n\
+             browse_roots = [\"{}\"]\n",
+            work_dir.display(),
+            root.display()
         ),
     )
     .unwrap();
@@ -84,7 +84,6 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         &root.join("node.log"),
     );
 
-    // The node registers with the control plane.
     wait_for_value(
         || async {
             let Ok(response) = reqwest::get(format!("{cp_url}/nodes")).await else {
@@ -102,10 +101,10 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
     )
     .await;
 
-    // Spawn a session via the CLI.
-    let spawn_out = Command::new(BOSUN)
+    // Clone a session via the CLI.
+    let clone_out = Command::new(BOSUN)
         .args([
-            "spawn",
+            "clone",
             "--node",
             "e2e-node",
             "--cp-url",
@@ -116,9 +115,9 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         .await
         .unwrap();
     assert!(
-        spawn_out.status.success(),
-        "spawn failed: {}",
-        String::from_utf8_lossy(&spawn_out.stderr)
+        clone_out.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone_out.stderr)
     );
 
     // The session appears as running.
@@ -136,9 +135,11 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
     )
     .await;
     let session_id = session["id"].as_str().unwrap().to_string();
-
-    // The injected config landed in the clone.
-    assert!(work_dir.join(&session_id).join("opencode.json").is_file());
+    assert_eq!(
+        session["repo_url"].as_str(),
+        repo.to_str(),
+        "clone session must report its repository"
+    );
 
     // The opencode server answers through the control-plane path route.
     let health: Value = reqwest::get(format!("{cp_url}/session/{session_id}/global/health"))
@@ -172,7 +173,7 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
         String::from_utf8_lossy(&stop_out.stderr)
     );
 
-    // The session disappears and its route closes.
+    // The session disappears, its route closes, and the clone is removed.
     wait_for_value(
         || async {
             let Ok(response) = reqwest::get(format!("{cp_url}/sessions")).await else {
@@ -197,6 +198,138 @@ async fn spawn_drive_and_stop_a_session_end_to_end() {
     )
     .await;
     assert!(!work_dir.join(&session_id).exists());
+
+    shutdown(&mut serve, &mut node).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn dev_session_in_existing_directory_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let repo = root.join("existing");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+
+    let serve_port = free_port().await;
+    let node_port = free_port().await;
+    let cp_url = format!("http://127.0.0.1:{serve_port}");
+
+    let serve_config = root.join("serve.toml");
+    std::fs::write(
+        &serve_config,
+        format!(
+            "listen_addr = \"127.0.0.1:{serve_port}\"\n\
+             node_timeout_secs = 10\n"
+        ),
+    )
+    .unwrap();
+
+    let node_config = root.join("node.toml");
+    std::fs::write(
+        &node_config,
+        format!(
+            "cp_url = \"{cp_url}\"\n\
+             node_name = \"e2e-node\"\n\
+             work_dir = \"{}\"\n\
+             advertise_addr = \"127.0.0.1\"\n\
+             heartbeat_interval_secs = 1\n\
+             listen_port = {node_port}\n\
+             browse_roots = [\"{}\"]\n",
+            root.join("work").display(),
+            root.display()
+        ),
+    )
+    .unwrap();
+
+    let mut serve = spawn_bosun(
+        &["serve", "--config", serve_config.to_str().unwrap()],
+        &root.join("serve.log"),
+    );
+    let mut node = spawn_bosun(
+        &["node", "--config", node_config.to_str().unwrap()],
+        &root.join("node.log"),
+    );
+
+    wait_for_value(
+        || async {
+            let Ok(response) = reqwest::get(format!("{cp_url}/nodes")).await else {
+                return None;
+            };
+            let Ok(nodes) = response.json::<Vec<Value>>().await else {
+                return None;
+            };
+            nodes
+                .iter()
+                .any(|n| n["name"] == "e2e-node" && n["up"] == true)
+                .then_some(())
+        },
+        "node to register",
+    )
+    .await;
+
+    // The node lists the existing repository as a browsable directory.
+    let canonical_root = root.canonicalize().unwrap();
+    let listing: Value = reqwest::get(format!("{cp_url}/nodes/e2e-node/dirs"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listing["entries"][0]["name"],
+        canonical_root.display().to_string()
+    );
+    assert_eq!(listing["entries"][0]["is_repo"], false);
+
+    let child_listing: Value = reqwest::get(format!(
+        "{cp_url}/nodes/e2e-node/dirs?path={}",
+        root.display()
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let entries = child_listing["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["name"] == "existing" && e["is_repo"] == true)
+    );
+
+    // Spawn a dev session in the existing directory.
+    let request = serde_json::json!({ "node": "e2e-node", "dir": repo.display().to_string() });
+    let dev_response: Value = reqwest::Client::new()
+        .post(format!("{cp_url}/dev"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = dev_response["id"].as_str().unwrap().to_string();
+
+    let health: Value = reqwest::get(format!("{cp_url}/session/{session_id}/global/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["healthy"], true);
+
+    // Stop the session; the existing directory stays.
+    let stop_out = Command::new(BOSUN)
+        .args(["stop", &session_id, "--cp-url", &cp_url])
+        .output()
+        .await
+        .unwrap();
+    assert!(stop_out.status.success());
+    assert!(repo.is_dir(), "dev session must not delete the directory");
 
     shutdown(&mut serve, &mut node).await;
 }

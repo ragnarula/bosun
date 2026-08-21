@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -21,8 +22,9 @@ pub struct NodeHealth {
 pub struct SessionHealth {
     pub id: String,
     pub node: String,
-    pub repo_url: String,
+    pub repo_url: Option<String>,
     pub git_ref: Option<String>,
+    pub dir: Option<PathBuf>,
     pub status: String,
 }
 
@@ -143,6 +145,7 @@ impl NodeRegistry {
                     node: name.clone(),
                     repo_url: session.repo_url.clone(),
                     git_ref: session.git_ref.clone(),
+                    dir: session.dir.clone(),
                     status: session.status.clone(),
                 })
             })
@@ -173,8 +176,9 @@ mod tests {
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
             id: id.into(),
-            repo_url: "https://example.com/repo".into(),
+            repo_url: Some("https://example.com/repo".into()),
             git_ref: None,
+            dir: None,
             status: "ready".into(),
             opencode_port: None,
             forwarder_addr: None,

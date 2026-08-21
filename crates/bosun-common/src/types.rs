@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -19,16 +21,17 @@ pub enum NodeStatus {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub id: String,
-    pub repo_url: String,
+    pub repo_url: Option<String>,
     #[serde(rename = "ref")]
     pub git_ref: Option<String>,
+    pub dir: Option<PathBuf>,
     pub status: String,
     pub opencode_port: Option<u16>,
     pub forwarder_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SpawnRequest {
+pub struct CloneRequest {
     pub node: String,
     pub repo_url: String,
     #[serde(rename = "ref")]
@@ -36,14 +39,40 @@ pub struct SpawnRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct NodeSpawnRequest {
+pub struct NodeCloneRequest {
     pub session_id: String,
     pub repo_url: String,
+    #[serde(rename = "ref")]
     pub git_ref: Option<String>,
-    pub opencode_config: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DevRequest {
+    pub node: String,
+    pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeDevRequest {
+    pub session_id: String,
+    pub dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StopRequest {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_repo: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DirListing {
+    pub path: Option<PathBuf>,
+    pub parent: Option<PathBuf>,
+    pub entries: Vec<DirEntry>,
 }

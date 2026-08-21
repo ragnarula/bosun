@@ -15,7 +15,6 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | Field | Default | Meaning |
 |---|---|---|
 | `listen_addr` | `127.0.0.1:8090` | Address the control-plane HTTP server listens on |
-| `template_path` | `opencode.json` | Path to the opencode config template injected into each spawned session |
 | `node_timeout_secs` | `30` | Heartbeats older than this mark a node down |
 | `proxy_bind` | `127.0.0.1` | Address the per-session proxy ports bind on |
 
@@ -29,6 +28,7 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `advertise_addr` | `127.0.0.1` | Address the control plane reaches this node at |
 | `heartbeat_interval_secs` | `5` | Seconds between heartbeats |
 | `listen_port` | `8091` | Port the node's HTTP server binds on |
+| `browse_roots` | none | Directories `bosun dev` may browse and spawn into. Empty disables `bosun dev` on this node |
 
 ## CLI
 

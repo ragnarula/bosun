@@ -16,6 +16,7 @@ bosun-common.workspace = true
 bosun-control.workspace = true
 bosun-node.workspace = true
 clap.workspace = true
+dialoguer.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

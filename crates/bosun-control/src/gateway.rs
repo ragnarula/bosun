@@ -270,7 +270,6 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use axum::routing::get;
@@ -339,7 +338,6 @@ mod tests {
         let state = Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             client: reqwest::Client::new(),
-            template_path: PathBuf::new(),
             gateway: Arc::new(gateway),
         });
         let app = crate::api::router(state);

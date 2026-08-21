@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bosun_common::error::ErrorExt;
-use bosun_common::types::NodeSpawnRequest;
+use bosun_common::types::DirEntry;
+use bosun_common::types::DirListing;
+use bosun_common::types::NodeCloneRequest;
+use bosun_common::types::NodeDevRequest;
 use bosun_common::types::SessionInfo;
 use thiserror::Error;
 use tokio::process::Child;
@@ -26,10 +29,11 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub id: String,
-    pub repo_url: String,
+    pub repo_url: Option<String>,
     pub git_ref: Option<String>,
-    pub status: String,
     pub dir: PathBuf,
+    pub reapable: bool,
+    pub status: String,
     pub opencode_port: Option<u16>,
     pub forwarder_addr: Option<String>,
 }
@@ -42,6 +46,18 @@ pub enum NodeError {
     #[error("opencode server on port {port} did not become healthy")]
     HealthTimeout { port: u16 },
 
+    #[error("no browse roots configured on this node")]
+    NoBrowseRoots,
+
+    #[error("directory {dir} does not exist")]
+    DirNotFound { dir: String },
+
+    #[error("path {path} is not a directory")]
+    NotADirectory { path: String },
+
+    #[error("directory {dir} is outside the configured browse roots")]
+    OutsideRoot { dir: String },
+
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -49,23 +65,39 @@ pub enum NodeError {
 pub struct NodeManager {
     work_dir: PathBuf,
     advertise_addr: String,
+    browse_roots: Vec<PathBuf>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     processes: RwLock<HashMap<String, Child>>,
     forwarders: RwLock<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 impl NodeManager {
-    pub fn new(work_dir: PathBuf, advertise_addr: String) -> Self {
+    pub fn new(work_dir: PathBuf, advertise_addr: String, browse_roots: Vec<PathBuf>) -> Self {
+        let browse_roots: Vec<PathBuf> = browse_roots
+            .into_iter()
+            .filter_map(|root| match root.canonicalize() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    warn!(
+                        root = %root.display(),
+                        error = %e,
+                        "browse root does not exist; ignoring it"
+                    );
+                    None
+                }
+            })
+            .collect();
         Self {
             work_dir,
             advertise_addr,
+            browse_roots,
             sessions: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             forwarders: RwLock::new(HashMap::new()),
         }
     }
 
-    pub async fn spawn(&self, req: &NodeSpawnRequest) -> Result<SessionRecord, NodeError> {
+    pub async fn run_clone(&self, req: &NodeCloneRequest) -> Result<SessionRecord, NodeError> {
         tokio::fs::create_dir_all(&self.work_dir)
             .await
             .with_context(|| format!("failed to create work dir {}", self.work_dir.display()))?;
@@ -93,51 +125,66 @@ impl NodeManager {
             });
         }
 
-        let config_path = dir.join("opencode.json");
-        if let Err(e) = tokio::fs::write(&config_path, &req.opencode_config)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to write opencode config to {}",
-                    config_path.display()
-                )
-            })
-        {
-            cleanup(&dir).await;
-            return Err(NodeError::Internal(e));
-        }
+        let record = self
+            .start_in_dir(
+                &req.session_id,
+                &dir,
+                true,
+                Some(req.repo_url.clone()),
+                req.git_ref.clone(),
+            )
+            .await?;
+        info!(session_id = %req.session_id, "clone session started");
+        Ok(record)
+    }
 
-        let port = match pick_free_port().await {
-            Ok(port) => port,
-            Err(e) => {
-                cleanup(&dir).await;
-                return Err(NodeError::Internal(e));
-            }
-        };
+    pub async fn dev(&self, req: &NodeDevRequest) -> Result<SessionRecord, NodeError> {
+        let dir = self.resolve_within_roots(&req.dir)?;
+        let record = self
+            .start_in_dir(&req.session_id, &dir, false, None, None)
+            .await?;
+        info!(session_id = %req.session_id, dir = %record.dir.display(), "dev session started");
+        Ok(record)
+    }
 
-        let mut child = match self.start_server(&req.session_id, &dir, port).await {
+    async fn start_in_dir(
+        &self,
+        session_id: &str,
+        dir: &Path,
+        reapable: bool,
+        repo_url: Option<String>,
+        git_ref: Option<String>,
+    ) -> Result<SessionRecord, NodeError> {
+        let port = pick_free_port().await?;
+
+        let mut child = match self.start_server(session_id, dir, port).await {
             Ok(child) => child,
             Err(e) => {
-                cleanup(&dir).await;
+                if reapable {
+                    cleanup(dir).await;
+                }
                 return Err(e);
             }
         };
 
-        let forwarder_addr = match self.open_forwarder(&req.session_id, port).await {
+        let forwarder_addr = match self.open_forwarder(session_id, port).await {
             Ok(addr) => addr,
             Err(e) => {
                 let _ = child.kill().await;
-                cleanup(&dir).await;
+                if reapable {
+                    cleanup(dir).await;
+                }
                 return Err(e);
             }
         };
 
         let record = SessionRecord {
-            id: req.session_id.clone(),
-            repo_url: req.repo_url.clone(),
-            git_ref: req.git_ref.clone(),
+            id: session_id.to_string(),
+            repo_url,
+            git_ref,
+            dir: dir.to_path_buf(),
+            reapable,
             status: "running".into(),
-            dir,
             opencode_port: Some(port),
             forwarder_addr: Some(forwarder_addr),
         };
@@ -158,6 +205,94 @@ impl NodeManager {
             );
         }
         Ok(record)
+    }
+
+    pub fn list_dir(&self, requested: Option<&Path>) -> Result<DirListing, NodeError> {
+        let Some(requested) = requested else {
+            return self.list_roots();
+        };
+        let canonical = self.resolve_within_roots(requested)?;
+
+        let read = std::fs::read_dir(&canonical)
+            .with_context(|| format!("failed to read directory {}", canonical.display()))?;
+
+        let mut entries: Vec<DirEntry> = read
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || !path.is_dir() {
+                    return None;
+                }
+                let is_repo = path.join(".git").exists();
+                Some(DirEntry {
+                    name,
+                    path: path.clone(),
+                    is_repo,
+                })
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let parent = canonical
+            .parent()
+            .filter(|parent| self.within_roots(parent))
+            .map(PathBuf::from);
+
+        Ok(DirListing {
+            path: Some(canonical),
+            parent,
+            entries,
+        })
+    }
+
+    fn list_roots(&self) -> Result<DirListing, NodeError> {
+        if self.browse_roots.is_empty() {
+            return Err(NodeError::NoBrowseRoots);
+        }
+        let entries = self
+            .browse_roots
+            .iter()
+            .map(|root| DirEntry {
+                name: root.display().to_string(),
+                path: root.clone(),
+                is_repo: root.join(".git").exists(),
+            })
+            .collect();
+        Ok(DirListing {
+            path: None,
+            parent: None,
+            entries,
+        })
+    }
+
+    fn resolve_within_roots(&self, requested: &Path) -> Result<PathBuf, NodeError> {
+        if self.browse_roots.is_empty() {
+            return Err(NodeError::NoBrowseRoots);
+        }
+        if !requested.exists() {
+            return Err(NodeError::DirNotFound {
+                dir: requested.display().to_string(),
+            });
+        }
+        let canonical = requested
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", requested.display()))?;
+        if !canonical.is_dir() {
+            return Err(NodeError::NotADirectory {
+                path: requested.display().to_string(),
+            });
+        }
+        if !self.within_roots(&canonical) {
+            return Err(NodeError::OutsideRoot {
+                dir: requested.display().to_string(),
+            });
+        }
+        Ok(canonical)
+    }
+
+    fn within_roots(&self, path: &Path) -> bool {
+        self.browse_roots.iter().any(|root| path.starts_with(root))
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<(), NodeError> {
@@ -182,7 +317,9 @@ impl NodeManager {
         }
 
         self.sessions.write().unwrap().remove(session_id);
-        cleanup(&record.dir).await;
+        if record.reapable {
+            cleanup(&record.dir).await;
+        }
 
         if let Err(e) = self.persist().await {
             warn!(
@@ -206,6 +343,11 @@ impl NodeManager {
                 id: record.id.clone(),
                 repo_url: record.repo_url.clone(),
                 git_ref: record.git_ref.clone(),
+                dir: if record.reapable {
+                    None
+                } else {
+                    Some(record.dir.clone())
+                },
                 status: record.status.clone(),
                 opencode_port: record.opencode_port,
                 forwarder_addr: record.forwarder_addr.clone(),
@@ -262,6 +404,12 @@ impl NodeManager {
                     id: record.id.clone(),
                     repo_url: record.repo_url.clone(),
                     git_ref: record.git_ref.clone(),
+                    dir: if record.reapable {
+                        None
+                    } else {
+                        Some(record.dir.clone())
+                    },
+                    reapable: record.reapable,
                     opencode_port: port,
                     pid,
                 })
@@ -317,7 +465,10 @@ impl NodeManager {
 
         let mut failed_to_restore = Vec::new();
         for session in persisted {
-            let dir = self.work_dir.join(&session.id);
+            let dir = match session.dir.clone() {
+                Some(dir) => dir,
+                None => self.work_dir.join(&session.id),
+            };
             if !dir.is_dir() {
                 warn!(session_id = %session.id, "skipping restore: session directory is missing");
                 continue;
@@ -362,8 +513,9 @@ impl NodeManager {
                 id: session.id.clone(),
                 repo_url: session.repo_url,
                 git_ref: session.git_ref,
-                status: "running".into(),
                 dir,
+                reapable: session.reapable,
+                status: "running".into(),
                 opencode_port: Some(session.opencode_port),
                 forwarder_addr: Some(forwarder_addr),
             };
@@ -474,13 +626,20 @@ mod tests {
 
     use super::*;
 
-    fn request(session_id: &str, repo_url: &str) -> NodeSpawnRequest {
-        NodeSpawnRequest {
+    fn request(session_id: &str, repo_url: &str) -> NodeCloneRequest {
+        NodeCloneRequest {
             session_id: session_id.into(),
             repo_url: repo_url.into(),
             git_ref: None,
-            opencode_config: String::new(),
         }
+    }
+
+    fn manager(work: &tempfile::TempDir) -> NodeManager {
+        NodeManager::new(
+            work.path().to_path_buf(),
+            "127.0.0.1".into(),
+            vec![work.path().to_path_buf()],
+        )
     }
 
     async fn stub_server() -> u16 {
@@ -516,12 +675,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_of_bogus_repo_returns_clone_failure() {
+    async fn clone_of_bogus_repo_returns_clone_failure() {
         let work = tempdir().unwrap();
-        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into());
+        let manager = manager(&work);
 
         let err = manager
-            .spawn(&request("s2", "file:///nonexistent/bogus-repo"))
+            .run_clone(&request("s2", "file:///nonexistent/bogus-repo"))
             .await
             .expect_err("clone should fail");
 
@@ -533,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn stop_of_unknown_session_is_idempotent() {
         let work = tempdir().unwrap();
-        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into());
+        let manager = manager(&work);
 
         manager
             .stop("s1")
@@ -567,7 +726,7 @@ mod tests {
     #[tokio::test]
     async fn restore_skips_sessions_whose_dir_is_missing() {
         let work = tempdir().unwrap();
-        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into());
+        let manager = manager(&work);
         tokio::fs::write(
             state_path(work.path()),
             r#"[
@@ -594,5 +753,129 @@ mod tests {
 
         let output = child.wait().await.unwrap();
         assert!(!output.success());
+    }
+
+    #[test]
+    fn list_dir_without_roots_reports_no_browse_roots() {
+        let work = tempdir().unwrap();
+        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into(), Vec::new());
+
+        let err = manager.list_dir(None).unwrap_err();
+        assert!(matches!(err, NodeError::NoBrowseRoots));
+    }
+
+    #[test]
+    fn list_dir_without_path_lists_the_roots() {
+        let work = tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join(".git")).unwrap();
+        let manager = NodeManager::new(
+            work.path().to_path_buf(),
+            "127.0.0.1".into(),
+            vec![work.path().to_path_buf()],
+        );
+
+        let listing = manager.list_dir(None).unwrap();
+        assert_eq!(listing.path, None);
+        assert_eq!(listing.parent, None);
+        assert_eq!(listing.entries.len(), 1);
+        assert!(listing.entries[0].is_repo);
+        let canonical = work.path().canonicalize().unwrap();
+        assert_eq!(listing.entries[0].name, canonical.display().to_string());
+    }
+
+    #[test]
+    fn list_dir_lists_directories_sorted_within_a_root() {
+        let work = tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("zebra")).unwrap();
+        std::fs::create_dir_all(work.path().join("alpha")).unwrap();
+        std::fs::create_dir_all(work.path().join("alpha/.git")).unwrap();
+        std::fs::create_dir_all(work.path().join(".hidden")).unwrap();
+        std::fs::write(work.path().join("file.txt"), "x").unwrap();
+        let manager = manager(&work);
+
+        let listing = manager.list_dir(Some(work.path())).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zebra"]);
+        assert!(listing.entries[0].is_repo);
+        assert!(!listing.entries[1].is_repo);
+        let canonical = work.path().canonicalize().unwrap();
+        assert_eq!(listing.path.as_deref(), Some(canonical.as_path()));
+    }
+
+    #[test]
+    fn list_dir_rejects_missing_and_out_of_root_paths() {
+        let work = tempdir().unwrap();
+        let manager = manager(&work);
+
+        let err = manager
+            .list_dir(Some(&work.path().join("missing")))
+            .unwrap_err();
+        assert!(matches!(err, NodeError::DirNotFound { .. }));
+
+        let outside = tempdir().unwrap();
+        let err = manager.list_dir(Some(outside.path())).unwrap_err();
+        assert!(matches!(err, NodeError::OutsideRoot { .. }));
+    }
+
+    #[test]
+    fn list_dir_rejects_a_file_path() {
+        let work = tempdir().unwrap();
+        let file = work.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let manager = manager(&work);
+
+        let err = manager.list_dir(Some(&file)).unwrap_err();
+        assert!(matches!(err, NodeError::NotADirectory { .. }));
+    }
+
+    #[tokio::test]
+    async fn dev_rejects_missing_out_of_root_and_file_paths() {
+        let work = tempdir().unwrap();
+        let manager = manager(&work);
+
+        let missing = manager
+            .dev(&NodeDevRequest {
+                session_id: "s1".into(),
+                dir: work.path().join("missing"),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, NodeError::DirNotFound { .. }));
+
+        let outside = tempdir().unwrap();
+        let err = manager
+            .dev(&NodeDevRequest {
+                session_id: "s2".into(),
+                dir: outside.path().to_path_buf(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::OutsideRoot { .. }));
+
+        let file = work.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let err = manager
+            .dev(&NodeDevRequest {
+                session_id: "s3".into(),
+                dir: file,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::NotADirectory { .. }));
+    }
+
+    #[tokio::test]
+    async fn dev_without_roots_reports_no_browse_roots() {
+        let work = tempdir().unwrap();
+        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into(), Vec::new());
+
+        let err = manager
+            .dev(&NodeDevRequest {
+                session_id: "s1".into(),
+                dir: work.path().to_path_buf(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::NoBrowseRoots));
     }
 }
