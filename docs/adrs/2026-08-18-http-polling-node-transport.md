@@ -3,6 +3,8 @@
 **Date:** 2026-08-18
 **Author:** Raghav
 
+> Superseded by `2026-08-21-nodes-dial-out-only.md`: the node's control listener is gone, and commands flow node to control plane by long polling.
+
 ## Context
 
 The architecture brief names NATS JetStream as the transport: a task queue for nodes to pull from and ordered event streams with sequence numbers for replay. The MVP has one control plane and one or two nodes.

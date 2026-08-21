@@ -3,35 +3,45 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use anyhow::Context;
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::http::Request;
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use bosun_common::error::ErrorExt;
+use bosun_common::tunnel::Tunnel;
 use bosun_common::types::CloneRequest;
+use bosun_common::types::CommandResult;
 use bosun_common::types::DevRequest;
 use bosun_common::types::DirListing;
-use bosun_common::types::Heartbeat;
-use bosun_common::types::NodeCloneRequest;
-use bosun_common::types::NodeDevRequest;
+use bosun_common::types::NodeCommand;
+use bosun_common::types::PollRequest;
+use bosun_common::types::PollResponse;
 use bosun_common::types::SessionInfo;
 use bosun_common::types::StopRequest;
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tracing::info;
 use tracing::instrument;
+use tracing::warn;
 
-use crate::gateway::Gateway;
+use crate::commands::CommandQueue;
+use crate::gateway::route as gateway_route;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
 use crate::registry::SessionHealth;
+use crate::tunnel::TunnelRegistry;
 
 const SPAWN_TIMEOUT_SECS: u64 = 300;
 
@@ -71,40 +81,39 @@ impl IntoResponse for ApiError {
 
 pub struct AppState {
     pub registry: Arc<NodeRegistry>,
-    pub client: reqwest::Client,
-    pub gateway: Arc<Gateway>,
+    pub commands: Arc<CommandQueue>,
+    pub tunnels: Arc<TunnelRegistry>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/heartbeat", post(heartbeat))
+        .route("/poll", post(poll))
         .route("/nodes", get(nodes))
         .route("/sessions", get(sessions))
         .route("/clone", post(clone))
         .route("/dev", post(dev))
         .route("/nodes/{name}/dirs", get(dirs))
         .route("/stop", post(stop))
-        .fallback(crate::gateway::route)
+        .route("/tunnel/session/{id}", get(tunnel))
+        .fallback(gateway_route)
         .with_state(state)
 }
 
+/// The node's one outbound control request: it reports its heartbeat payload,
+/// delivers the previous command's result, and takes the next command.
 #[instrument(skip(state))]
-async fn heartbeat(
+async fn poll(
     State(state): State<Arc<AppState>>,
-    Json(heartbeat): Json<Heartbeat>,
-) -> StatusCode {
-    state.registry.upsert(&heartbeat, SystemTime::now());
-    for session in &heartbeat.sessions {
-        if let Some(forwarder_addr) = &session.forwarder_addr {
-            state.gateway.ensure(&session.id, forwarder_addr);
-        }
+    Json(poll): Json<PollRequest>,
+) -> Json<PollResponse> {
+    state
+        .registry
+        .upsert(&poll.node_name, &poll.sessions, SystemTime::now());
+    if let Some(result) = poll.result {
+        state.commands.report(&poll.node_name, result);
     }
-    info!(
-        node = %heartbeat.node_name,
-        session_count = heartbeat.sessions.len(),
-        "node heartbeated"
-    );
-    StatusCode::NO_CONTENT
+    let command = state.commands.next(&poll.node_name).await;
+    Json(PollResponse { command })
 }
 
 #[instrument(skip(state))]
@@ -122,54 +131,34 @@ async fn clone(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CloneRequest>,
 ) -> Result<Json<SessionHealth>, ApiError> {
-    let Some(health) = state.registry.node(&req.node, SystemTime::now()) else {
+    if state.registry.node(&req.node, SystemTime::now()).is_none() {
         return Err(ApiError::NodeNotUp {
             node: req.node.clone(),
         });
-    };
+    }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let request = NodeCloneRequest {
+    let command = NodeCommand::Clone {
+        id: state.commands.next_id(),
         session_id: session_id.clone(),
         repo_url: req.repo_url.clone(),
         git_ref: req.git_ref.clone(),
     };
-
-    let url = format!("http://{}/clone", health.control_addr);
-    let response = match state
-        .client
-        .post(&url)
-        .json(&request)
-        .timeout(Duration::from_secs(SPAWN_TIMEOUT_SECS))
-        .send()
+    let session = enqueue_and_await(&state, &req.node, command)
         .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            return Err(ApiError::NodeUnreachable {
+        .and_then(|result| match result {
+            CommandResult::Session { session, .. } => Ok(session),
+            CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
                 node: req.node.clone(),
-            });
-        }
-    };
+                detail: message,
+            }),
+            _ => Err(ApiError::Internal(anyhow::anyhow!(
+                "node answered clone with a non-session result"
+            ))),
+        })?;
 
-    if !response.status().is_success() {
-        let detail = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("node returned no readable error"));
-        return Err(ApiError::NodeRejected {
-            node: req.node.clone(),
-            detail,
-        });
-    }
-
-    let session: SessionInfo = response
-        .json()
-        .await
-        .with_context(|| format!("failed to parse clone response from node {}", req.node))?;
-    register_session(&state, &req.node, session.clone())?;
+    state.registry.add_session(&req.node, session.clone());
     info!(session_id = %session.id, node = %req.node, "session cloned");
-
     Ok(Json(to_health(req.node, session)))
 }
 
@@ -178,53 +167,33 @@ async fn dev(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DevRequest>,
 ) -> Result<Json<SessionHealth>, ApiError> {
-    let Some(health) = state.registry.node(&req.node, SystemTime::now()) else {
+    if state.registry.node(&req.node, SystemTime::now()).is_none() {
         return Err(ApiError::NodeNotUp {
             node: req.node.clone(),
         });
-    };
+    }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let request = NodeDevRequest {
+    let command = NodeCommand::Dev {
+        id: state.commands.next_id(),
         session_id: session_id.clone(),
         dir: req.dir.clone(),
     };
-
-    let url = format!("http://{}/dev", health.control_addr);
-    let response = match state
-        .client
-        .post(&url)
-        .json(&request)
-        .timeout(Duration::from_secs(SPAWN_TIMEOUT_SECS))
-        .send()
+    let session = enqueue_and_await(&state, &req.node, command)
         .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            return Err(ApiError::NodeUnreachable {
+        .and_then(|result| match result {
+            CommandResult::Session { session, .. } => Ok(session),
+            CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
                 node: req.node.clone(),
-            });
-        }
-    };
+                detail: message,
+            }),
+            _ => Err(ApiError::Internal(anyhow::anyhow!(
+                "node answered dev with a non-session result"
+            ))),
+        })?;
 
-    if !response.status().is_success() {
-        let detail = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("node returned no readable error"));
-        return Err(ApiError::NodeRejected {
-            node: req.node.clone(),
-            detail,
-        });
-    }
-
-    let session: SessionInfo = response
-        .json()
-        .await
-        .with_context(|| format!("failed to parse dev response from node {}", req.node))?;
-    register_session(&state, &req.node, session.clone())?;
+    state.registry.add_session(&req.node, session.clone());
     info!(session_id = %session.id, node = %req.node, dir = %req.dir.display(), "dev session started");
-
     Ok(Json(to_health(req.node, session)))
 }
 
@@ -239,35 +208,27 @@ async fn dirs(
     AxumPath(node): AxumPath<String>,
     Query(query): Query<DirsQuery>,
 ) -> Result<Json<DirListing>, ApiError> {
-    let Some(health) = state.registry.node(&node, SystemTime::now()) else {
+    if state.registry.node(&node, SystemTime::now()).is_none() {
         return Err(ApiError::NodeNotUp { node });
-    };
-
-    let mut request = state
-        .client
-        .get(format!("http://{}/dirs", health.control_addr));
-    if let Some(path) = &query.path {
-        request = request.query(&[("path", path.to_string_lossy().to_string())]);
     }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(_) => {
-            return Err(ApiError::NodeUnreachable { node });
-        }
-    };
 
-    if !response.status().is_success() {
-        let detail = response
-            .text()
+    let command = NodeCommand::Dirs {
+        id: state.commands.next_id(),
+        path: query.path,
+    };
+    let listing =
+        enqueue_and_await(&state, &node, command)
             .await
-            .unwrap_or_else(|_| String::from("node returned no readable error"));
-        return Err(ApiError::NodeRejected { node, detail });
-    }
-
-    let listing: DirListing = response
-        .json()
-        .await
-        .with_context(|| format!("failed to parse dirs response from node {node}"))?;
+            .and_then(|result| match result {
+                CommandResult::Dirs { listing, .. } => Ok(listing),
+                CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
+                    node,
+                    detail: message,
+                }),
+                _ => Err(ApiError::Internal(anyhow::anyhow!(
+                    "node answered dirs with a non-listing result"
+                ))),
+            })?;
     Ok(Json(listing))
 }
 
@@ -280,42 +241,109 @@ async fn stop(
     let Some((node, _)) = state.registry.session(&req.session_id, now) else {
         return Ok(StatusCode::NO_CONTENT);
     };
-    let Some(node_health) = state.registry.node(&node, now) else {
+    if state.registry.node(&node, now).is_none() {
         return Ok(StatusCode::NO_CONTENT);
-    };
-
-    let url = format!("http://{}/stop", node_health.control_addr);
-    let response = match state.client.post(&url).json(&req).send().await {
-        Ok(response) => response,
-        Err(_) => {
-            return Err(ApiError::NodeUnreachable { node });
-        }
-    };
-
-    if !response.status().is_success() {
-        let detail = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("node returned no readable error"));
-        return Err(ApiError::NodeRejected { node, detail });
     }
 
-    state.gateway.remove(&req.session_id);
+    let command = NodeCommand::Stop {
+        id: state.commands.next_id(),
+        session_id: req.session_id.clone(),
+    };
+    let node_for_result = node.clone();
+    enqueue_and_await(&state, &node, command)
+        .await
+        .and_then(|result| match result {
+            CommandResult::Stop { .. } => Ok(()),
+            CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
+                node: node_for_result,
+                detail: message,
+            }),
+            _ => Err(ApiError::Internal(anyhow::anyhow!(
+                "node answered stop with a non-stop result"
+            ))),
+        })?;
+
+    state.tunnels.unregister(&req.session_id);
     state.registry.remove_session(&node, &req.session_id);
     info!(session_id = %req.session_id, node = %node, "session stopped");
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn register_session(state: &AppState, node: &str, session: SessionInfo) -> Result<(), ApiError> {
-    let Some(forwarder_addr) = session.forwarder_addr.clone() else {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "session {} reported no forwarder address",
-            session.id
-        )));
+/// Enqueues a command for the node and waits for its result, delivered in the
+/// node's next poll.
+async fn enqueue_and_await(
+    state: &Arc<AppState>,
+    node: &str,
+    command: NodeCommand,
+) -> Result<CommandResult, ApiError> {
+    let (reply, reply_rx) = oneshot::channel();
+    state.commands.enqueue(node, command, reply);
+    match tokio::time::timeout(Duration::from_secs(SPAWN_TIMEOUT_SECS), reply_rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(ApiError::Internal(anyhow::anyhow!(
+            "node {node} dropped the command reply"
+        ))),
+        Err(_) => Err(ApiError::NodeUnreachable {
+            node: node.to_string(),
+        }),
+    }
+}
+
+/// Accepts a node's outbound tunnel for a session. The node keeps the
+/// connection; the gateway opens logical connections on it per client.
+async fn tunnel(
+    State(state): State<Arc<AppState>>,
+    AxumPath(session_id): AxumPath<String>,
+    mut req: Request<Body>,
+) -> Response {
+    if !wants_tunnel_upgrade(&req) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(upgrade) = req.extensions_mut().remove::<OnUpgrade>() else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    state.gateway.ensure(&session.id, &forwarder_addr);
-    state.registry.add_session(node, session);
-    Ok(())
+
+    let tunnels = state.tunnels.clone();
+    tokio::spawn(async move {
+        let stream = match upgrade.await {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(session_id = %session_id, error = %error, "session tunnel upgrade failed");
+                return;
+            }
+        };
+        let (tunnel, _opens) = Tunnel::new(TokioIo::new(stream));
+        tunnels.register(&session_id, tunnel.clone());
+        tunnel.closed().await;
+        tunnels.unregister(&session_id);
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "bosun-tunnel")
+        .body(Body::empty())
+        .unwrap_or_else(|error| {
+            warn!(error = %error, "failed to build the 101 response");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })
+}
+
+fn wants_tunnel_upgrade(req: &Request<Body>) -> bool {
+    let connection = req
+        .headers()
+        .get(header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    connection
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        && upgrade.eq_ignore_ascii_case("bosun-tunnel")
 }
 
 fn to_health(node: String, session: SessionInfo) -> SessionHealth {
@@ -326,5 +354,312 @@ fn to_health(node: String, session: SessionInfo) -> SessionHealth {
         git_ref: session.git_ref,
         dir: session.dir,
         status: session.status,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    #[test]
+    fn wants_tunnel_upgrade_accepts_the_bosun_tunnel_protocol() {
+        let req = HttpRequest::builder()
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "bosun-tunnel")
+            .body(Body::empty())
+            .unwrap();
+        assert!(wants_tunnel_upgrade(&req));
+
+        let plain = HttpRequest::builder().body(Body::empty()).unwrap();
+        assert!(!wants_tunnel_upgrade(&plain));
+
+        let ws = HttpRequest::builder()
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!wants_tunnel_upgrade(&ws));
+    }
+
+    /// Boots the full API with a fake node: one side of an in-memory tunnel
+    /// registered for `session_id`, whose relay dials `backend`.
+    async fn test_server(backend: SocketAddr) -> (SocketAddr, String) {
+        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
+        let (cp_tunnel, _) = Tunnel::new(cp_side);
+        let (node_tunnel, mut opens) = Tunnel::new(node_side);
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let tunnels = TunnelRegistry::new();
+        tunnels.register(&session_id, cp_tunnel);
+
+        tokio::spawn(async move {
+            while let Some(event) = opens.recv().await {
+                let tunnel = node_tunnel.clone();
+                tokio::spawn(async move {
+                    let mut backend = TcpStream::connect(backend).await.unwrap();
+                    let mut logical = tunnel.attach(event.conn_id, event.rx).unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut backend, &mut logical).await;
+                });
+            }
+        });
+
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(tunnels),
+        });
+        let app = router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, session_id)
+    }
+
+    async fn stub_backend() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    use tokio::io::AsyncWriteExt;
+                    let mut buf = [0u8; 4096];
+                    let mut read = 0;
+                    while let Ok(n) = stream.read(&mut buf[read..]).await {
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tunnel_route_carries_the_upgrade() {
+        let backend_addr = stub_backend().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(TunnelRegistry::new()),
+        });
+        let app = router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) =
+            http1::handshake::<_, http_body_util::Empty<bytes::Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri(format!("/tunnel/session/{session_id}"))
+            .header(header::HOST, addr.to_string())
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "bosun-tunnel")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        // The test owns the node side of the upgraded connection: relay every
+        // opened logical connection to the stub backend.
+        let upgraded = hyper::upgrade::on(response).await.unwrap();
+        let (node_tunnel, mut opens) = Tunnel::new(TokioIo::new(upgraded));
+        tokio::spawn(async move {
+            while let Some(event) = opens.recv().await {
+                let tunnel = node_tunnel.clone();
+                tokio::spawn(async move {
+                    let mut backend = TcpStream::connect(backend_addr).await.unwrap();
+                    let mut logical = tunnel.attach(event.conn_id, event.rx).unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut backend, &mut logical).await;
+                });
+            }
+        });
+
+        // The control plane registers the tunnel after the 101; retry until the
+        // session is reachable through the gateway.
+        let client = reqwest::Client::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match client
+                .get(format!("http://{addr}/session/{session_id}/global/health"))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => break,
+                _ => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("session never became reachable through the tunnel");
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_route_serves_through_the_tunnel() {
+        let backend = stub_backend().await;
+        let (addr, session_id) = test_server(backend).await;
+        let client = reqwest::Client::new();
+        let text = client
+            .get(format!("http://{addr}/session/{session_id}/global/health"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(text, "ok");
+    }
+
+    #[tokio::test]
+    async fn session_route_returns_not_found_without_a_tunnel() {
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(TunnelRegistry::new()),
+        });
+        let app = router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/session/ghost/global/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn non_session_path_returns_not_found() {
+        let (addr, _) = test_server(stub_backend().await).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn streams_the_response_body_through() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+                      data: one\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream.write_all(b"data: two\n\n").await.unwrap();
+        });
+
+        let (addr, session_id) = test_server(backend_addr).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!("GET /session/{session_id}/global/health HTTP/1.1\r\nHost: test\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = client.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&tmp[..n]);
+            let text = String::from_utf8_lossy(&seen);
+            if text.contains("data: one") && text.contains("data: two") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.contains("data: one"), "first event missing");
+        assert!(text.contains("data: two"), "second event missing");
+    }
+
+    #[tokio::test]
+    async fn tunnels_websocket_upgrades() {
+        use futures_util::SinkExt;
+        use futures_util::StreamExt;
+
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = backend.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                ws.send(message).await.unwrap();
+            }
+        });
+
+        let (addr, session_id) = test_server(backend_addr).await;
+
+        let url = format!("ws://{addr}/session/{session_id}/pty/1/connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
+            .await
+            .unwrap();
+        let message = ws.next().await.unwrap().unwrap();
+        assert_eq!(
+            message,
+            tokio_tungstenite::tungstenite::Message::Text("ping".into())
+        );
     }
 }

@@ -15,8 +15,7 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | Field | Default | Meaning |
 |---|---|---|
 | `listen_addr` | `127.0.0.1:8090` | Address the control-plane HTTP server listens on |
-| `node_timeout_secs` | `30` | Heartbeats older than this mark a node down |
-| `proxy_bind` | `127.0.0.1` | Address the per-session proxy ports bind on |
+| `node_timeout_secs` | `30` | Polls older than this mark a node down |
 
 ## Node
 
@@ -25,10 +24,10 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `cp_url` | `http://127.0.0.1:8090` | Control-plane base URL |
 | `node_name` | `node` | Name this node registers under |
 | `work_dir` | `work` | Directory session clones are created in |
-| `advertise_addr` | `127.0.0.1` | Address the control plane reaches this node at |
-| `heartbeat_interval_secs` | `5` | Seconds between heartbeats |
-| `listen_port` | `8091` | Port the node's HTTP server binds on |
 | `browse_roots` | none | Directories `bosun dev` may browse and spawn into. Empty disables `bosun dev` on this node |
+
+The node opens no inbound ports. It polls the control plane and holds one
+outbound tunnel per session, per `docs/adrs/2026-08-21-nodes-dial-out-only.md`.
 
 ## CLI
 

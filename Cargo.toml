@@ -15,7 +15,9 @@ bosun-common = { path = "crates/bosun-common" }
 bosun-control = { path = "crates/bosun-control" }
 bosun-node = { path = "crates/bosun-node" }
 clap = { version = "4", features = ["derive"] }
+bytes = "1"
 futures-util = "0.3"
+http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select"] }

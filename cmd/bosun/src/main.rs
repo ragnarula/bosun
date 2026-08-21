@@ -15,29 +15,24 @@ use bosun_common::config::cli_config_path;
 use bosun_common::config::load_cli_config;
 use bosun_common::config::load_config;
 use bosun_common::config::save_cli_config;
-use bosun_common::error::ErrorExt;
 use bosun_common::telemetry::setup_logging;
 use bosun_common::types::CloneRequest;
 use bosun_common::types::DevRequest;
 use bosun_common::types::DirEntry;
 use bosun_common::types::DirListing;
-use bosun_common::types::Heartbeat;
-use bosun_common::types::NodeStatus;
 use bosun_common::types::StopRequest;
 use bosun_control::api::AppState;
-use bosun_control::gateway::Gateway;
+use bosun_control::commands::CommandQueue;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::registry::SessionHealth;
+use bosun_control::tunnel::TunnelRegistry;
 use bosun_node::manager::NodeManager;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use dialoguer::FuzzySelect;
-use tracing::debug;
 use tracing::info;
-use tracing::instrument;
-use tracing::warn;
 
 #[derive(Parser)]
 #[command(name = "bosun", version, about = "Control panel for coding agents")]
@@ -212,8 +207,10 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(
             config.node_timeout_secs,
         ))),
-        client: reqwest::Client::new(),
-        gateway: Arc::new(Gateway::new()),
+        commands: Arc::new(CommandQueue::new(Duration::from_secs(
+            config.node_timeout_secs,
+        ))),
+        tunnels: Arc::new(TunnelRegistry::new()),
     });
     let app = bosun_control::api::router(state);
 
@@ -239,67 +236,20 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     info!(
         cp_url = %config.cp_url,
         node_name = %config.node_name,
-        listen_port = config.listen_port,
         "node configured"
     );
 
     let manager = Arc::new(NodeManager::new(
         config.work_dir.clone(),
-        config.advertise_addr.clone(),
         config.browse_roots.clone(),
+        config.cp_url.clone(),
     ));
     manager.restore().await;
-    let app = bosun_node::api::router(manager.clone());
-    let listen_addr = format!("{}:{}", config.advertise_addr, config.listen_port);
-    let listener = tokio::net::TcpListener::bind(&listen_addr)
-        .await
-        .with_context(|| format!("failed to bind node HTTP server on {listen_addr}"))?;
-    info!(listen_addr = %listen_addr, "node server listening");
 
-    let client = reqwest::Client::new();
-    let control_addr = format!("{}:{}", config.advertise_addr, config.listen_port);
-    let heartbeat_task = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
-        loop {
-            interval.tick().await;
-            let heartbeat = Heartbeat {
-                node_name: config.node_name.clone(),
-                status: NodeStatus::Up,
-                control_addr: control_addr.clone(),
-                sessions: manager.sessions(),
-            };
-            if let Err(e) = send_heartbeat(&client, &config, &heartbeat).await {
-                warn!("heartbeat failed: {}", e.display_chain());
-            }
-        }
-    });
-
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
-    heartbeat_task.abort();
-    result.context("node server failed")?;
-    Ok(())
-}
-
-#[instrument(skip(client, heartbeat))]
-async fn send_heartbeat(
-    client: &reqwest::Client,
-    config: &NodeConfig,
-    heartbeat: &Heartbeat,
-) -> anyhow::Result<()> {
-    let url = format!("{}/heartbeat", config.cp_url.trim_end_matches('/'));
-    client
-        .post(&url)
-        .json(&heartbeat)
-        .send()
-        .await
-        .context("failed to send heartbeat")?
-        .error_for_status()
-        .context("control plane rejected heartbeat")?;
-    debug!(node = %config.node_name, "heartbeat sent");
-    Ok(())
+    tokio::select! {
+        _ = bosun_node::poll::run_poll_loop(config.cp_url.clone(), config.node_name.clone(), manager) => Ok(()),
+        _ = shutdown_signal() => Ok(()),
+    }
 }
 
 async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {

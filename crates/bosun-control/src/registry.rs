@@ -5,7 +5,6 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use bosun_common::types::Heartbeat;
 use bosun_common::types::SessionInfo;
 use serde::Deserialize;
 use serde::Serialize;
@@ -15,7 +14,6 @@ pub struct NodeHealth {
     pub name: String,
     pub up: bool,
     pub last_seen_secs: u64,
-    pub control_addr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +29,6 @@ pub struct SessionHealth {
 #[derive(Debug, Clone)]
 pub struct NodeRecord {
     pub last_seen: SystemTime,
-    pub control_addr: String,
     pub sessions: HashMap<String, SessionInfo>,
 }
 
@@ -48,12 +45,12 @@ impl NodeRegistry {
         }
     }
 
-    pub fn upsert(&self, heartbeat: &Heartbeat, now: SystemTime) {
+    /// Replaces the control plane's whole view of a node with what the node
+    /// itself reported.
+    pub fn upsert(&self, node_name: &str, sessions: &[SessionInfo], now: SystemTime) {
         let record = NodeRecord {
             last_seen: now,
-            control_addr: heartbeat.control_addr.clone(),
-            sessions: heartbeat
-                .sessions
+            sessions: sessions
                 .iter()
                 .map(|session| (session.id.clone(), session.clone()))
                 .collect(),
@@ -61,7 +58,7 @@ impl NodeRegistry {
         self.nodes
             .write()
             .unwrap()
-            .insert(heartbeat.node_name.clone(), record);
+            .insert(node_name.to_string(), record);
     }
 
     pub fn add_session(&self, node: &str, session: SessionInfo) {
@@ -90,7 +87,6 @@ impl NodeRegistry {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
-                control_addr: record.control_addr,
             })
             .collect()
     }
@@ -122,7 +118,6 @@ impl NodeRegistry {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            control_addr: record.control_addr.clone(),
         })
     }
 
@@ -165,8 +160,6 @@ fn is_up(last_seen: SystemTime, now: SystemTime, timeout: Duration) -> bool {
 mod tests {
     use std::time::Duration;
 
-    use bosun_common::types::NodeStatus;
-
     use super::*;
 
     fn epoch(secs: u64) -> SystemTime {
@@ -180,17 +173,6 @@ mod tests {
             git_ref: None,
             dir: None,
             status: "ready".into(),
-            opencode_port: None,
-            forwarder_addr: None,
-        }
-    }
-
-    fn heartbeat(node_name: &str, control_addr: &str, sessions: Vec<SessionInfo>) -> Heartbeat {
-        Heartbeat {
-            node_name: node_name.into(),
-            status: NodeStatus::Up,
-            control_addr: control_addr.into(),
-            sessions,
         }
     }
 
@@ -201,21 +183,20 @@ mod tests {
     }
 
     #[test]
-    fn recent_heartbeat_is_up() {
+    fn recent_upsert_is_up() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(&heartbeat("node-1", "127.0.0.1:8091", vec![]), epoch(100));
+        registry.upsert("node-1", &[], epoch(100));
         let health = registry.list(epoch(110));
         assert_eq!(health.len(), 1);
         assert!(health[0].up);
         assert_eq!(health[0].name, "node-1");
         assert_eq!(health[0].last_seen_secs, 100);
-        assert_eq!(health[0].control_addr, "127.0.0.1:8091");
     }
 
     #[test]
     fn stale_node_is_down() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(&heartbeat("node-1", "127.0.0.1:8091", vec![]), epoch(100));
+        registry.upsert("node-1", &[], epoch(100));
         let health = registry.list(epoch(200));
         assert!(!health[0].up);
     }
@@ -223,8 +204,8 @@ mod tests {
     #[test]
     fn upsert_updates_last_seen_instead_of_duplicating() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(&heartbeat("node-1", "127.0.0.1:8091", vec![]), epoch(100));
-        registry.upsert(&heartbeat("node-1", "127.0.0.1:8091", vec![]), epoch(110));
+        registry.upsert("node-1", &[], epoch(100));
+        registry.upsert("node-1", &[], epoch(110));
         let health = registry.list(epoch(120));
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].last_seen_secs, 110);
@@ -233,39 +214,29 @@ mod tests {
     #[test]
     fn list_is_sorted_by_name() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(&heartbeat("node-b", "b:8091", vec![]), epoch(100));
-        registry.upsert(&heartbeat("node-a", "a:8091", vec![]), epoch(100));
+        registry.upsert("node-b", &[], epoch(100));
+        registry.upsert("node-a", &[], epoch(100));
         let health = registry.list(epoch(110));
         assert_eq!(health[0].name, "node-a");
         assert_eq!(health[1].name, "node-b");
     }
 
     #[test]
-    fn heartbeat_replaces_whole_record() {
+    fn upsert_replaces_whole_record() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(
-            &heartbeat("node-1", "127.0.0.1:8091", vec![session("s1")]),
-            epoch(100),
-        );
-        registry.upsert(&heartbeat("node-1", "127.0.0.1:9091", vec![]), epoch(110));
+        registry.upsert("node-1", &[session("s1")], epoch(100));
+        registry.upsert("node-1", &[], epoch(110));
 
         let health = registry.list(epoch(120));
         assert_eq!(health.len(), 1);
-        assert_eq!(health[0].control_addr, "127.0.0.1:9091");
         assert!(registry.sessions(epoch(120)).is_empty());
     }
 
     #[test]
     fn sessions_flatten_across_nodes_sorted_by_id() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(
-            &heartbeat("node-b", "b:8091", vec![session("s2"), session("s3")]),
-            epoch(100),
-        );
-        registry.upsert(
-            &heartbeat("node-a", "a:8091", vec![session("s1")]),
-            epoch(100),
-        );
+        registry.upsert("node-b", &[session("s2"), session("s3")], epoch(100));
+        registry.upsert("node-a", &[session("s1")], epoch(100));
 
         let sessions = registry.sessions(epoch(110));
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
@@ -277,18 +248,12 @@ mod tests {
     #[test]
     fn down_node_sessions_are_not_listed() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(
-            &heartbeat("node-1", "127.0.0.1:8091", vec![session("s1")]),
-            epoch(100),
-        );
+        registry.upsert("node-1", &[session("s1")], epoch(100));
 
         assert!(registry.sessions(epoch(200)).is_empty());
         assert!(registry.session("s1", epoch(200)).is_none());
 
-        registry.upsert(
-            &heartbeat("node-1", "127.0.0.1:8091", vec![session("s1")]),
-            epoch(199),
-        );
+        registry.upsert("node-1", &[session("s1")], epoch(199));
         let (node, found) = registry
             .session("s1", epoch(200))
             .expect("session should be found");
@@ -299,14 +264,7 @@ mod tests {
     #[test]
     fn remove_session_drops_one_of_two() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(
-            &heartbeat(
-                "node-1",
-                "127.0.0.1:8091",
-                vec![session("s1"), session("s2")],
-            ),
-            epoch(100),
-        );
+        registry.upsert("node-1", &[session("s1"), session("s2")], epoch(100));
 
         registry.remove_session("node-1", "s1");
 
@@ -318,10 +276,7 @@ mod tests {
     #[test]
     fn remove_session_for_unknown_node_is_a_noop() {
         let registry = NodeRegistry::new(Duration::from_secs(30));
-        registry.upsert(
-            &heartbeat("node-1", "127.0.0.1:8091", vec![session("s1")]),
-            epoch(100),
-        );
+        registry.upsert("node-1", &[session("s1")], epoch(100));
 
         registry.remove_session("node-unknown", "s1");
         registry.remove_session("node-1", "s-unknown");
@@ -334,7 +289,7 @@ mod tests {
         let registry = NodeRegistry::new(Duration::from_secs(30));
         assert!(registry.node("node-1", epoch(100)).is_none());
 
-        registry.upsert(&heartbeat("node-1", "127.0.0.1:8091", vec![]), epoch(100));
+        registry.upsert("node-1", &[], epoch(100));
 
         assert!(registry.node("node-1", epoch(200)).is_none());
         let node = registry
@@ -342,6 +297,5 @@ mod tests {
             .expect("node should be up");
         assert_eq!(node.name, "node-1");
         assert!(node.up);
-        assert_eq!(node.control_addr, "127.0.0.1:8091");
     }
 }

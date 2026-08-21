@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,7 +34,22 @@ pub struct SessionRecord {
     pub reapable: bool,
     pub status: String,
     pub opencode_port: Option<u16>,
-    pub forwarder_addr: Option<String>,
+}
+
+impl SessionRecord {
+    pub fn to_info(&self) -> SessionInfo {
+        SessionInfo {
+            id: self.id.clone(),
+            repo_url: self.repo_url.clone(),
+            git_ref: self.git_ref.clone(),
+            dir: if self.reapable {
+                None
+            } else {
+                Some(self.dir.clone())
+            },
+            status: self.status.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -64,15 +78,15 @@ pub enum NodeError {
 
 pub struct NodeManager {
     work_dir: PathBuf,
-    advertise_addr: String,
+    cp_url: String,
     browse_roots: Vec<PathBuf>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     processes: RwLock<HashMap<String, Child>>,
-    forwarders: RwLock<HashMap<String, tokio::task::AbortHandle>>,
+    tunnels: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl NodeManager {
-    pub fn new(work_dir: PathBuf, advertise_addr: String, browse_roots: Vec<PathBuf>) -> Self {
+    pub fn new(work_dir: PathBuf, browse_roots: Vec<PathBuf>, cp_url: String) -> Self {
         let browse_roots: Vec<PathBuf> = browse_roots
             .into_iter()
             .filter_map(|root| match root.canonicalize() {
@@ -89,11 +103,11 @@ impl NodeManager {
             .collect();
         Self {
             work_dir,
-            advertise_addr,
+            cp_url,
             browse_roots,
             sessions: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
-            forwarders: RwLock::new(HashMap::new()),
+            tunnels: RwLock::new(HashMap::new()),
         }
     }
 
@@ -157,7 +171,7 @@ impl NodeManager {
     ) -> Result<SessionRecord, NodeError> {
         let port = pick_free_port().await?;
 
-        let mut child = match self.start_server(session_id, dir, port).await {
+        let child = match self.start_server(session_id, dir, port).await {
             Ok(child) => child,
             Err(e) => {
                 if reapable {
@@ -167,16 +181,7 @@ impl NodeManager {
             }
         };
 
-        let forwarder_addr = match self.open_forwarder(session_id, port).await {
-            Ok(addr) => addr,
-            Err(e) => {
-                let _ = child.kill().await;
-                if reapable {
-                    cleanup(dir).await;
-                }
-                return Err(e);
-            }
-        };
+        self.open_tunnel(session_id, port);
 
         let record = SessionRecord {
             id: session_id.to_string(),
@@ -186,7 +191,6 @@ impl NodeManager {
             reapable,
             status: "running".into(),
             opencode_port: Some(port),
-            forwarder_addr: Some(forwarder_addr),
         };
         self.sessions
             .write()
@@ -311,8 +315,8 @@ impl NodeManager {
             })?;
         }
 
-        let forwarder = self.forwarders.write().unwrap().remove(session_id);
-        if let Some(handle) = forwarder {
+        let tunnel = self.tunnels.write().unwrap().remove(session_id);
+        if let Some(handle) = tunnel {
             handle.abort();
         }
 
@@ -339,19 +343,7 @@ impl NodeManager {
             .read()
             .unwrap()
             .values()
-            .map(|record| SessionInfo {
-                id: record.id.clone(),
-                repo_url: record.repo_url.clone(),
-                git_ref: record.git_ref.clone(),
-                dir: if record.reapable {
-                    None
-                } else {
-                    Some(record.dir.clone())
-                },
-                status: record.status.clone(),
-                opencode_port: record.opencode_port,
-                forwarder_addr: record.forwarder_addr.clone(),
-            })
+            .map(|record| record.to_info())
             .collect();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         sessions
@@ -378,15 +370,18 @@ impl NodeManager {
         Ok(child)
     }
 
-    async fn open_forwarder(&self, id: &str, opencode_port: u16) -> Result<String, NodeError> {
-        let target = SocketAddr::from(([127, 0, 0, 1], opencode_port));
-        let (addr, handle) =
-            bosun_common::forward::start(&format!("{}:0", self.advertise_addr), target).await?;
-        self.forwarders
-            .write()
-            .unwrap()
-            .insert(id.to_string(), handle);
-        Ok(format!("{}:{}", self.advertise_addr, addr.port()))
+    /// Opens the session's outbound tunnel to the control plane. The tunnel
+    /// reconnects on its own until the session stops, so a refused connection
+    /// does not fail the session.
+    fn open_tunnel(&self, session_id: &str, opencode_port: u16) {
+        let cp_url = self.cp_url.clone();
+        let session_id = session_id.to_string();
+        let handle = tokio::spawn(crate::tunnel::run_session_tunnel(
+            cp_url,
+            session_id.clone(),
+            opencode_port,
+        ));
+        let _ = self.tunnels.write().unwrap().insert(session_id, handle);
     }
 
     fn persisted_sessions(&self) -> Vec<PersistedSession> {
@@ -476,7 +471,7 @@ impl NodeManager {
 
             kill_pid_if_alive(session.pid).await;
 
-            let mut child = match self
+            let child = match self
                 .start_server(&session.id, &dir, session.opencode_port)
                 .await
             {
@@ -492,22 +487,7 @@ impl NodeManager {
                 }
             };
 
-            let forwarder_addr = match self
-                .open_forwarder(&session.id, session.opencode_port)
-                .await
-            {
-                Ok(addr) => addr,
-                Err(e) => {
-                    let _ = child.kill().await;
-                    error!(
-                        session_id = %session.id,
-                        error = %e.display_chain(),
-                        "failed to restart forwarder"
-                    );
-                    failed_to_restore.push(session);
-                    continue;
-                }
-            };
+            self.open_tunnel(&session.id, session.opencode_port);
 
             let record = SessionRecord {
                 id: session.id.clone(),
@@ -517,7 +497,6 @@ impl NodeManager {
                 reapable: session.reapable,
                 status: "running".into(),
                 opencode_port: Some(session.opencode_port),
-                forwarder_addr: Some(forwarder_addr),
             };
             self.sessions
                 .write()
@@ -637,8 +616,8 @@ mod tests {
     fn manager(work: &tempfile::TempDir) -> NodeManager {
         NodeManager::new(
             work.path().to_path_buf(),
-            "127.0.0.1".into(),
             vec![work.path().to_path_buf()],
+            "http://127.0.0.1:8090".into(),
         )
     }
 
@@ -758,7 +737,11 @@ mod tests {
     #[test]
     fn list_dir_without_roots_reports_no_browse_roots() {
         let work = tempdir().unwrap();
-        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into(), Vec::new());
+        let manager = NodeManager::new(
+            work.path().to_path_buf(),
+            Vec::new(),
+            "http://127.0.0.1:8090".into(),
+        );
 
         let err = manager.list_dir(None).unwrap_err();
         assert!(matches!(err, NodeError::NoBrowseRoots));
@@ -770,8 +753,8 @@ mod tests {
         std::fs::create_dir_all(work.path().join(".git")).unwrap();
         let manager = NodeManager::new(
             work.path().to_path_buf(),
-            "127.0.0.1".into(),
             vec![work.path().to_path_buf()],
+            "http://127.0.0.1:8090".into(),
         );
 
         let listing = manager.list_dir(None).unwrap();
@@ -867,7 +850,11 @@ mod tests {
     #[tokio::test]
     async fn dev_without_roots_reports_no_browse_roots() {
         let work = tempdir().unwrap();
-        let manager = NodeManager::new(work.path().to_path_buf(), "127.0.0.1".into(), Vec::new());
+        let manager = NodeManager::new(
+            work.path().to_path_buf(),
+            Vec::new(),
+            "http://127.0.0.1:8090".into(),
+        );
 
         let err = manager
             .dev(&NodeDevRequest {

@@ -3,6 +3,8 @@
 **Date:** 2026-08-18
 **Author:** Raghav
 
+> Superseded by `2026-08-20-single-port-path-routing.md` for the control-plane ports, and by `2026-08-21-nodes-dial-out-only.md` for the node forwarder. The byte-level chain through the control plane remains: the gateway copies opaque bytes.
+
 ## Context
 
 `opencode serve` listens on `127.0.0.1` by default and the architecture keeps it there. The person's opencode client must reach a session on a node across the network, through the control plane, without ever addressing the node directly.

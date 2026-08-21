@@ -3,6 +3,8 @@
 **Date:** 2026-08-20
 **Author:** Raghav
 
+> Updated by `2026-08-21-nodes-dial-out-only.md`: the gateway's map points at each session's outbound tunnel instead of the node's forwarder address. The single-port, path-prefix routing decision itself stands.
+
 ## Context
 
 `2026-08-18-byte-level-proxy-chain.md` decided the control plane opens one proxy port per session (`proxy_bind:<ephemeral>`), and the client connects with `opencode attach http://<cp>:<proxy_port>`. This makes hosting the control plane in Docker impossible: the person must publish one host port per session, and Docker exposes one container port per `-p` flag.

@@ -44,7 +44,6 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     );
 
     let serve_port = free_port().await;
-    let node_port = free_port().await;
     let cp_url = format!("http://127.0.0.1:{serve_port}");
 
     let serve_config = root.join("serve.toml");
@@ -65,9 +64,6 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
             "cp_url = \"{cp_url}\"\n\
              node_name = \"e2e-node\"\n\
              work_dir = \"{}\"\n\
-             advertise_addr = \"127.0.0.1\"\n\
-             heartbeat_interval_secs = 1\n\
-             listen_port = {node_port}\n\
              browse_roots = [\"{}\"]\n",
             work_dir.display(),
             root.display()
@@ -141,24 +137,44 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         "clone session must report its repository"
     );
 
-    // The opencode server answers through the control-plane path route.
-    let health: Value = reqwest::get(format!("{cp_url}/session/{session_id}/global/health"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // The opencode server answers through the control-plane path route. The
+    // tunnel registers just after the session appears, so retry until the
+    // route is live.
+    let health = wait_for_value(
+        || async {
+            let Ok(response) =
+                reqwest::get(format!("{cp_url}/session/{session_id}/global/health")).await
+            else {
+                return None;
+            };
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        },
+        "session route to become live",
+    )
+    .await;
     assert_eq!(health["healthy"], true);
 
     // The client can create a session through the route, rooted in the clone.
-    let created: Value = reqwest::Client::new()
-        .post(format!("{cp_url}/session/{session_id}/session"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let created = wait_for_value(
+        || async {
+            let Ok(response) = reqwest::Client::new()
+                .post(format!("{cp_url}/session/{session_id}/session"))
+                .send()
+                .await
+            else {
+                return None;
+            };
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        },
+        "session creation through the route",
+    )
+    .await;
     assert!(created["id"].as_str().is_some());
 
     // Stop the session.
@@ -213,7 +229,6 @@ async fn dev_session_in_existing_directory_end_to_end() {
     git(&repo, &["init", "-q"]);
 
     let serve_port = free_port().await;
-    let node_port = free_port().await;
     let cp_url = format!("http://127.0.0.1:{serve_port}");
 
     let serve_config = root.join("serve.toml");
@@ -233,9 +248,6 @@ async fn dev_session_in_existing_directory_end_to_end() {
             "cp_url = \"{cp_url}\"\n\
              node_name = \"e2e-node\"\n\
              work_dir = \"{}\"\n\
-             advertise_addr = \"127.0.0.1\"\n\
-             heartbeat_interval_secs = 1\n\
-             listen_port = {node_port}\n\
              browse_roots = [\"{}\"]\n",
             root.join("work").display(),
             root.display()
@@ -314,12 +326,21 @@ async fn dev_session_in_existing_directory_end_to_end() {
         .unwrap();
     let session_id = dev_response["id"].as_str().unwrap().to_string();
 
-    let health: Value = reqwest::get(format!("{cp_url}/session/{session_id}/global/health"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let health = wait_for_value(
+        || async {
+            let Ok(response) =
+                reqwest::get(format!("{cp_url}/session/{session_id}/global/health")).await
+            else {
+                return None;
+            };
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        },
+        "session route to become live",
+    )
+    .await;
     assert_eq!(health["healthy"], true);
 
     // Stop the session; the existing directory stays.
