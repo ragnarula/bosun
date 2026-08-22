@@ -358,13 +358,7 @@ impl NodeManager {
 
     async fn start_server(&self, id: &str, dir: &Path, port: u16) -> Result<Child, NodeError> {
         let child = tokio::process::Command::new("opencode")
-            .args([
-                "serve",
-                "--hostname",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-            ])
+            .args(serve_args(id, port, &self.cp_url))
             .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -531,6 +525,25 @@ impl NodeManager {
             }
         }
     }
+}
+
+/// Builds the `opencode serve` arguments for a session. The session's web UI
+/// is served at `<session-id>.<control-plane-host>`, so the node passes that
+/// origin to `--cors`; without it the browser's cross-origin requests to the
+/// subdomain would be rejected.
+fn serve_args(id: &str, port: u16, cp_url: &str) -> Vec<String> {
+    let mut args = vec![
+        "serve".into(),
+        "--hostname".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+    ];
+    if let Some(origin) = bosun_common::origin::session_origin(cp_url, id) {
+        args.push("--cors".into());
+        args.push(origin);
+    }
+    args
 }
 
 async fn kill_pid_if_alive(pid: u32) {
@@ -742,6 +755,16 @@ mod tests {
 
         let output = child.wait().await.unwrap();
         assert!(!output.success());
+    }
+
+    #[test]
+    fn serve_args_include_the_session_cors_origin() {
+        let args = serve_args("s1", 4321, "https://bosun.on.21cs.biz");
+        assert!(args.contains(&"--cors".to_string()));
+        assert!(args.contains(&"https://s1.bosun.on.21cs.biz".to_string()));
+
+        let local = serve_args("s1", 4321, "http://127.0.0.1:8090");
+        assert!(local.contains(&"http://s1.localhost:8090".to_string()));
     }
 
     #[test]

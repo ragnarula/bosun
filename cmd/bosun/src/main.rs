@@ -614,28 +614,17 @@ async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
 }
 
 /// Prints the command to attach to a session. The session is addressed at its
-/// subdomain so the web UI sits at the origin root. Loopback hosts use the
-/// `.localhost` domain, which every browser and operating system resolves to
-/// 127.0.0.1 without DNS or a hosts file; other IP addresses keep the path
-/// form, since they have no wildcard DNS.
+/// subdomain so the web UI sits at the origin root; the path form is kept for
+/// control planes with no wildcard DNS, where the session cannot have a
+/// subdomain.
 fn connect_command(cp_url: &str, session_id: &str) -> String {
-    let url = cp_url.trim_end_matches('/');
-    let Some((scheme, authority)) = url.split_once("://") else {
-        return format!("opencode attach {url}/session/{session_id}");
-    };
-    let (host, port) = match authority.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (authority, None),
-    };
-    let port_suffix = port.map(|port| format!(":{port}")).unwrap_or_default();
-    let base = match host {
-        "localhost" | "127.0.0.1" | "[::1]" => "localhost".to_string(),
-        _ if host.parse::<std::net::IpAddr>().is_ok() => {
-            return format!("opencode attach {url}/session/{session_id}");
-        }
-        _ => host.to_string(),
-    };
-    format!("opencode attach {scheme}://{session_id}.{base}{port_suffix}")
+    match bosun_common::origin::session_origin(cp_url, session_id) {
+        Some(origin) => format!("opencode attach {origin}"),
+        None => format!(
+            "opencode attach {}/session/{session_id}",
+            cp_url.trim_end_matches('/')
+        ),
+    }
 }
 
 fn format_ago(now: SystemTime, unix_secs: u64) -> String {

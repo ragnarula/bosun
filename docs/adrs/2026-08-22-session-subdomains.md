@@ -31,6 +31,8 @@ The control-plane gateway routes a request by host first and by path prefix seco
 ## Consequences
 
 - The web UI works without rewriting opencode's assets or API calls.
+- The node launches `opencode serve` with `--cors <session-origin>`, so the
+  browser's cross-origin requests to the session subdomain are allowed.
 - The terminal client and the web UI share the same session subdomain.
 - The deployment needs wildcard DNS and a wildcard certificate for the control-plane host, and the certificate must also cover the apex host, because the node's tunnel and polls connect to the control-plane host itself.
 - A hostname that begins with a session id routes to that session, so guessing or knowing a session id is enough to reach the session — the same trust as the path form.
