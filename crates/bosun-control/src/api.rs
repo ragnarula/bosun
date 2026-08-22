@@ -549,6 +549,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subdomain_host_routes_to_the_session() {
+        let backend = stub_backend().await;
+        let (addr, session_id) = test_server(backend).await;
+        let client = reqwest::Client::new();
+        let text = client
+            .get(format!("http://{addr}/assets/index-abc.js"))
+            .header("host", format!("{session_id}.bosun.on.21cs.biz"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(text, "ok");
+    }
+
+    #[tokio::test]
+    async fn apex_host_does_not_route_root_paths() {
+        let (addr, _) = test_server(stub_backend().await).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/assets/index-abc.js"))
+            .header("host", "bosun.on.21cs.biz")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn session_route_returns_not_found_without_a_tunnel() {
         let state = Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),

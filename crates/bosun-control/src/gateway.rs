@@ -24,11 +24,22 @@ use crate::api::AppState;
 use crate::tunnel::TunnelError;
 use crate::tunnel::TunnelRegistry;
 
-/// Routes opencode client requests to session tunnels on one control-plane
-/// port. The path prefix `/session/<id>` selects the target; the prefix is
-/// stripped before the request is forwarded, so the node's opencode server
-/// sees plain opencode paths. Requests and responses are streamed as bytes
-/// after the routing decision; WebSocket upgrades are bridged as raw streams.
+/// How a request is rewritten before it enters the session tunnel.
+struct Upstream {
+    /// Path portion after the leading slash; empty means `/`.
+    rest: String,
+    /// `Host` header to send to the node.
+    host: String,
+}
+
+/// Routes opencode client traffic to session tunnels on one control-plane
+/// port. A request whose `Host` starts with `<session-id>.` routes to that
+/// session's tunnel with the path passed through unchanged, so each session's
+/// web UI lives at its own subdomain root. The path prefix `/session/<id>`
+/// also routes to the same tunnel, with the prefix stripped, for clients that
+/// attach to the control plane by path. Requests and responses are streamed
+/// as bytes after the routing decision; WebSocket upgrades are bridged as raw
+/// streams.
 #[instrument(skip(state, req), fields(path = %req.uri().path()))]
 pub async fn route(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     match forward(&state.tunnels, req).await {
@@ -41,10 +52,44 @@ pub async fn route(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
 }
 
 async fn forward(tunnels: &TunnelRegistry, req: Request<Body>) -> Result<Response, anyhow::Error> {
-    let (mut parts, body) = req.into_parts();
-    let Some((session_id, rest)) = split_session_path(parts.uri.path()) else {
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path().to_string();
+    let query = parts.uri.query().map(ToString::to_string);
+
+    if let Some((session_id, rest)) = split_session_path(&path) {
+        let route = Upstream {
+            rest: rest.to_string(),
+            host: session_id.to_string(),
+        };
+        return forward_stream(tunnels, session_id, route, query, parts, body).await;
+    }
+
+    let Some(session_id) = session_from_host(parts.headers.get(header::HOST)) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    let client_host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(&session_id)
+        .to_string();
+    let route = Upstream {
+        rest: path.trim_start_matches('/').to_string(),
+        host: client_host,
+    };
+    forward_stream(tunnels, &session_id, route, query, parts, body).await
+}
+
+/// Opens a logical connection on the session's tunnel and streams one request
+/// through it. The upstream path and `Host` header come from `route`.
+async fn forward_stream(
+    tunnels: &TunnelRegistry,
+    session_id: &str,
+    route: Upstream,
+    query: Option<String>,
+    mut parts: Parts,
+    body: Body,
+) -> Result<Response, anyhow::Error> {
     let stream = match tunnels.open(session_id).await {
         Ok(stream) => stream,
         Err(TunnelError::NoTunnel { .. }) => {
@@ -63,9 +108,9 @@ async fn forward(tunnels: &TunnelRegistry, req: Request<Body>) -> Result<Respons
         None
     };
 
-    let mut upstream = Request::builder()
+    let mut request = Request::builder()
         .method(parts.method.clone())
-        .uri(upstream_uri(rest, parts.uri.query())?)
+        .uri(upstream_uri(&route.rest, query.as_deref())?)
         .body(body)
         .context("failed to build the upstream request")?;
     for (name, value) in parts.headers.iter() {
@@ -75,19 +120,18 @@ async fn forward(tunnels: &TunnelRegistry, req: Request<Body>) -> Result<Respons
         if name == header::HOST {
             continue;
         }
-        upstream.headers_mut().append(name.clone(), value.clone());
+        request.headers_mut().append(name.clone(), value.clone());
     }
-    upstream.headers_mut().insert(
+    request.headers_mut().insert(
         header::HOST,
-        header::HeaderValue::from_str(session_id)
-            .context("session id is not a valid host header")?,
+        header::HeaderValue::from_str(&route.host).context("host header is not a valid value")?,
     );
     if upgrade {
-        upstream.headers_mut().insert(
+        request.headers_mut().insert(
             header::CONNECTION,
             header::HeaderValue::from_static("upgrade"),
         );
-        upstream.headers_mut().insert(
+        request.headers_mut().insert(
             header::UPGRADE,
             header::HeaderValue::from_static("websocket"),
         );
@@ -103,7 +147,7 @@ async fn forward(tunnels: &TunnelRegistry, req: Request<Body>) -> Result<Respons
     });
 
     let response = sender
-        .send_request(upstream)
+        .send_request(request)
         .await
         .context("failed to send request to the session tunnel")?;
 
@@ -182,6 +226,18 @@ fn split_session_path(path: &str) -> Option<(&str, &str)> {
     Some((id, rest))
 }
 
+/// Extracts the session id from the first DNS label of the `Host` header, for
+/// requests addressed to `<session-id>.<control-plane-host>`.
+fn session_from_host(host: Option<&header::HeaderValue>) -> Option<String> {
+    let host = host?.to_str().ok()?;
+    let host = host.split(':').next()?;
+    let label = host.split('.').next()?;
+    if label.is_empty() {
+        return None;
+    }
+    Some(label.to_string())
+}
+
 fn upstream_uri(rest: &str, query: Option<&str>) -> Result<Uri, anyhow::Error> {
     let path = if rest.is_empty() {
         "/".to_string()
@@ -247,6 +303,19 @@ mod tests {
         assert_eq!(split_session_path("/session/"), None);
         assert_eq!(split_session_path("/poll"), None);
         assert_eq!(split_session_path("/session"), None);
+    }
+
+    #[test]
+    fn session_from_host_takes_the_first_dns_label() {
+        let host = header::HeaderValue::from_static("s1.bosun.on.21cs.biz");
+        assert_eq!(session_from_host(Some(&host)).as_deref(), Some("s1"));
+
+        let with_port = header::HeaderValue::from_static("s1.bosun.biz:443");
+        assert_eq!(session_from_host(Some(&with_port)).as_deref(), Some("s1"));
+
+        assert_eq!(session_from_host(None), None);
+        let apex = header::HeaderValue::from_static("bosun.on.21cs.biz");
+        assert_eq!(session_from_host(Some(&apex)).as_deref(), Some("bosun"));
     }
 
     #[test]

@@ -4,6 +4,8 @@
 **Author:** Raghav
 
 > Updated by `2026-08-21-nodes-dial-out-only.md`: the gateway's map points at each session's outbound tunnel instead of the node's forwarder address. The single-port, path-prefix routing decision itself stands.
+>
+> Updated by `2026-08-22-session-subdomains.md`: the gateway also routes by the `Host` header, addressing each session at `<session-id>.<control-plane-host>`. The path-prefix route remains for IP and localhost setups.
 
 ## Context
 

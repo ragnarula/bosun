@@ -227,6 +227,69 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     .await;
     assert!(created["id"].as_str().is_some());
 
+    // The same session is reachable at its subdomain host without a reverse
+    // proxy: the gateway routes purely on the Host header. The terminal API
+    // and the web UI root both answer at the subdomain origin.
+    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
+    let host_health = wait_for_value(
+        || async {
+            let Ok(response) = client
+                .get(format!("{cp_url}/global/health"))
+                .header("host", &subdomain)
+                .send()
+                .await
+            else {
+                return None;
+            };
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        },
+        "host-routed health check",
+    )
+    .await;
+    assert_eq!(host_health["healthy"], true);
+
+    let host_created = wait_for_value(
+        || async {
+            let Ok(response) = client
+                .post(format!("{cp_url}/session"))
+                .header("host", &subdomain)
+                .send()
+                .await
+            else {
+                return None;
+            };
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        },
+        "host-routed session creation",
+    )
+    .await;
+    assert!(host_created["id"].as_str().is_some());
+
+    let web_ui = client
+        .get(format!("{cp_url}/"))
+        .header("host", &subdomain)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(
+        web_ui
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/html"),
+        "the web UI must be served at the subdomain root"
+    );
+
     // Stop the session.
     let stop_out = Command::new(BOSUN)
         .env("BOSUN_CA_CERT", &ca_path)

@@ -19,6 +19,11 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `tls_cert` | none | PEM certificate chain. When set with `tls_key`, the control plane serves HTTPS |
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
 
+For session subdomains to work over HTTPS, the certificate must cover both the
+control-plane host and its wildcard (`bosun.on.21cs.biz` and
+`*.bosun.on.21cs.biz`), and DNS must resolve every session subdomain to the
+control plane. See `docs/adrs/2026-08-22-session-subdomains.md`.
+
 ## Node
 
 | Field | Default | Meaning |
