@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -19,8 +21,16 @@ use tokio::sync::mpsc;
 use tracing::debug;
 use tracing::warn;
 
-/// Bounded per-connection queue of incoming data frames.
-const CHANNEL_CAPACITY: usize = 32;
+/// Bytes of unacknowledged data a peer may send on one logical connection
+/// before the receiver grants more credit. The receiver sends a
+/// `WindowUpdate` as its application consumes data, so a slow consumer backs
+/// the sender up instead of overflowing a queue.
+const INITIAL_WINDOW: u32 = 512 * 1024;
+/// Bytes a connection must consume before the receiver grants more credit.
+const WINDOW_UPDATE_THRESHOLD: usize = (INITIAL_WINDOW / 2) as usize;
+/// Per-connection inbound queue. Sized so a full window of frames always fits
+/// no matter how small the frames are.
+const RECEIVE_CAPACITY: usize = INITIAL_WINDOW as usize;
 /// Bounded queue of frames waiting to be written to the socket.
 const WRITER_CAPACITY: usize = 64;
 /// Largest allowed frame payload, in bytes. Any larger frame is a protocol
@@ -35,18 +45,21 @@ enum FrameType {
     Open = 0x01,
     Data = 0x02,
     Close = 0x03,
+    WindowUpdate = 0x04,
 }
 
 enum Frame {
     Open { conn_id: u64 },
     Data { conn_id: u64, bytes: Vec<u8> },
     Close { conn_id: u64 },
+    WindowUpdate { conn_id: u64, bytes: u32 },
 }
 
 enum TunnelWrite {
     Open { conn_id: u64 },
     Data { conn_id: u64, bytes: Vec<u8> },
     Close { conn_id: u64 },
+    WindowUpdate { conn_id: u64, bytes: u32 },
 }
 
 /// An inbound event for one logical connection.
@@ -62,9 +75,28 @@ pub struct OpenEvent {
     pub rx: mpsc::Receiver<Incoming>,
 }
 
+/// Send-side state of one logical connection: the peer's remaining credit and
+/// the waker of a writer that ran out of it.
+struct SendWindow {
+    remaining: u64,
+    waker: Option<Waker>,
+}
+
+impl SendWindow {
+    fn new() -> Self {
+        Self {
+            remaining: INITIAL_WINDOW as u64,
+            waker: None,
+        }
+    }
+}
+
 struct TunnelInner {
     writer: mpsc::Sender<TunnelWrite>,
     conns: RwLock<HashMap<u64, mpsc::Sender<Incoming>>>,
+    send_windows: RwLock<HashMap<u64, SendWindow>>,
+    /// Writers parked on a full shared writer queue, woken as it drains.
+    writer_space: Mutex<Vec<Waker>>,
     next_id: AtomicU64,
     dead: AtomicBool,
     death: Notify,
@@ -75,6 +107,11 @@ struct TunnelInner {
 /// the other side receives them as [`OpenEvent`]s and relays each with
 /// [`Tunnel::attach`]. Logical connections are independent full-duplex
 /// streams; closing one does not affect the others.
+///
+/// Each logical connection is flow-controlled in both directions. A sender
+/// may put at most [`INITIAL_WINDOW`] bytes in flight before the receiver
+/// grants more credit, so no connection can overrun its queues: a slow
+/// consumer pauses the producer rather than losing data.
 #[derive(Clone)]
 pub struct Tunnel {
     inner: Arc<TunnelInner>,
@@ -83,6 +120,7 @@ pub struct Tunnel {
 impl TunnelInner {
     fn release(&self, conn_id: u64) {
         self.conns.write().unwrap().remove(&conn_id);
+        self.send_windows.write().unwrap().remove(&conn_id);
     }
 }
 
@@ -99,6 +137,8 @@ impl Tunnel {
         let inner = Arc::new(TunnelInner {
             writer: writer_tx,
             conns: RwLock::new(HashMap::new()),
+            send_windows: RwLock::new(HashMap::new()),
+            writer_space: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             dead: AtomicBool::new(false),
             death: Notify::new(),
@@ -115,8 +155,13 @@ impl Tunnel {
             return None;
         }
         let conn_id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(RECEIVE_CAPACITY);
         self.inner.conns.write().unwrap().insert(conn_id, tx);
+        self.inner
+            .send_windows
+            .write()
+            .unwrap()
+            .insert(conn_id, SendWindow::new());
         if self
             .inner
             .writer
@@ -136,6 +181,11 @@ impl Tunnel {
         if self.inner.dead.load(Ordering::SeqCst) {
             return None;
         }
+        self.inner
+            .send_windows
+            .write()
+            .unwrap()
+            .insert(conn_id, SendWindow::new());
         Some(self.stream_for(conn_id, rx))
     }
 
@@ -152,6 +202,8 @@ impl Tunnel {
             inner: self.inner.clone(),
             rx,
             closed: false,
+            consumed: 0,
+            pending_read: None,
         }
     }
 }
@@ -165,6 +217,21 @@ pub struct LogicalStream {
     inner: Arc<TunnelInner>,
     rx: mpsc::Receiver<Incoming>,
     closed: bool,
+    /// Bytes delivered to the application since the last `WindowUpdate`.
+    consumed: usize,
+    /// Remainder of a data frame too large for the read buffer.
+    pending_read: Option<Vec<u8>>,
+}
+
+impl LogicalStream {
+    fn consume(&mut self, n: usize) {
+        self.consumed += n;
+        if self.consumed >= WINDOW_UPDATE_THRESHOLD {
+            let bytes = self.consumed as u32;
+            self.consumed = 0;
+            send_window_update(&self.inner, self.conn_id, bytes);
+        }
+    }
 }
 
 impl AsyncRead for LogicalStream {
@@ -174,10 +241,29 @@ impl AsyncRead for LogicalStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
+            if let Some(mut pending) = self.pending_read.take() {
+                let n = pending.len().min(buf.remaining());
+                buf.put_slice(&pending[..n]);
+                self.consume(n);
+                if n < pending.len() {
+                    pending.drain(..n);
+                    self.pending_read = Some(pending);
+                }
+                return Poll::Ready(Ok(()));
+            }
             match self.rx.poll_recv(cx) {
                 Poll::Ready(Some(Incoming::Data(bytes))) if bytes.is_empty() => continue,
                 Poll::Ready(Some(Incoming::Data(bytes))) => {
-                    buf.put_slice(&bytes);
+                    if bytes.len() > buf.remaining() {
+                        let n = buf.remaining();
+                        buf.put_slice(&bytes[..n]);
+                        self.consume(n);
+                        self.pending_read = Some(bytes[n..].to_vec());
+                    } else {
+                        let n = bytes.len();
+                        buf.put_slice(&bytes);
+                        self.consume(n);
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Incoming::Close)) | Poll::Ready(None) => {
@@ -193,13 +279,19 @@ impl AsyncRead for LogicalStream {
 impl AsyncWrite for LogicalStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "logical connection is closed",
+            )));
+        }
+        if self.inner.dead.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tunnel is closed",
             )));
         }
         if buf.is_empty() {
@@ -211,17 +303,55 @@ impl AsyncWrite for LogicalStream {
                 "write exceeds the maximum frame size",
             )));
         }
-        // Bounded by the writer channel capacity. A full queue means the peer
-        // is not reading; the connection is failing anyway.
-        let bytes = buf.to_vec();
+
+        // Take credit before queuing the frame. The peer replenishes it with
+        // WindowUpdate frames as it consumes, so a slow peer parks this write
+        // instead of overflowing the tunnel.
+        let n = {
+            let mut windows = self.inner.send_windows.write().unwrap();
+            let Some(window) = windows.get_mut(&self.conn_id) else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "logical connection is closed",
+                )));
+            };
+            if window.remaining == 0 {
+                window.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let n = buf.len().min(window.remaining as usize);
+            window.remaining -= n as u64;
+            n
+        };
+
+        let bytes = buf[..n].to_vec();
         match self.writer.try_send(TunnelWrite::Data {
             conn_id: self.conn_id,
             bytes,
         }) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(io::Error::new(
+            Ok(()) => Poll::Ready(Ok(n)),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // The frame was not queued; give the credit back and wait for
+                // the writer loop to drain the shared queue.
+                if let Some(window) = self
+                    .inner
+                    .send_windows
+                    .write()
+                    .unwrap()
+                    .get_mut(&self.conn_id)
+                {
+                    window.remaining += n as u64;
+                }
+                self.inner
+                    .writer_space
+                    .lock()
+                    .unwrap()
+                    .push(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "tunnel write queue is full or closed",
+                "tunnel write queue is closed",
             ))),
         }
     }
@@ -232,9 +362,7 @@ impl AsyncWrite for LogicalStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed = true;
-        let _ = self.writer.try_send(TunnelWrite::Close {
-            conn_id: self.conn_id,
-        });
+        send_close(&self.inner, self.conn_id);
         self.inner.release(self.conn_id);
         Poll::Ready(Ok(()))
     }
@@ -243,12 +371,44 @@ impl AsyncWrite for LogicalStream {
 impl Drop for LogicalStream {
     fn drop(&mut self) {
         if !self.closed {
-            let _ = self.writer.try_send(TunnelWrite::Close {
-                conn_id: self.conn_id,
-            });
+            send_close(&self.inner, self.conn_id);
         }
         self.inner.release(self.conn_id);
     }
+}
+
+/// Queues a close frame, delivering it asynchronously when the writer queue
+/// is full so the peer never waits forever on a connection that is gone.
+fn send_close(inner: &Arc<TunnelInner>, conn_id: u64) {
+    let frame = TunnelWrite::Close { conn_id };
+    if inner.writer.try_send(frame).is_ok() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let _ = inner.writer.send(TunnelWrite::Close { conn_id }).await;
+    });
+}
+
+/// Grants the peer more credit for one connection.
+fn send_window_update(inner: &Arc<TunnelInner>, conn_id: u64, bytes: u32) {
+    let frame = TunnelWrite::WindowUpdate { conn_id, bytes };
+    if inner.writer.try_send(frame).is_ok() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let _ = inner
+            .writer
+            .send(TunnelWrite::WindowUpdate { conn_id, bytes })
+            .await;
+    });
 }
 
 async fn writer_loop<W>(mut write: W, mut rx: mpsc::Receiver<TunnelWrite>, inner: Arc<TunnelInner>)
@@ -260,14 +420,25 @@ where
             TunnelWrite::Open { conn_id } => Frame::Open { conn_id },
             TunnelWrite::Data { conn_id, bytes } => Frame::Data { conn_id, bytes },
             TunnelWrite::Close { conn_id } => Frame::Close { conn_id },
+            TunnelWrite::WindowUpdate { conn_id, bytes } => Frame::WindowUpdate { conn_id, bytes },
         };
         if let Err(error) = write_frame(&mut write, &frame).await {
             warn!(error = %error, "tunnel writer failed; closing tunnel");
             mark_dead(&inner);
             return;
         }
+        wake_blocked_writers(&inner);
     }
     mark_dead(&inner);
+}
+
+/// Wakes writers parked on a full shared writer queue. Called whenever the
+/// writer loop drains a frame and frees a slot.
+fn wake_blocked_writers(inner: &Arc<TunnelInner>) {
+    let wakers = std::mem::take(&mut *inner.writer_space.lock().unwrap());
+    for waker in wakers {
+        waker.wake();
+    }
 }
 
 async fn reader_loop<R>(
@@ -288,7 +459,7 @@ async fn reader_loop<R>(
         };
         match frame {
             Frame::Open { conn_id } => {
-                let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+                let (tx, rx) = mpsc::channel(RECEIVE_CAPACITY);
                 inner.conns.write().unwrap().insert(conn_id, tx);
                 let _ = open_tx.send(OpenEvent { conn_id, rx });
             }
@@ -297,19 +468,37 @@ async fn reader_loop<R>(
                 let Some(tx) = conns.get(&conn_id) else {
                     continue;
                 };
-                if tx.try_send(Incoming::Data(bytes)).is_err() {
-                    drop(conns);
-                    debug!(
-                        conn_id,
-                        "logical connection overflowed its buffer; closing it"
-                    );
-                    let _ = inner.writer.try_send(TunnelWrite::Close { conn_id });
-                    inner.conns.write().unwrap().remove(&conn_id);
+                match tx.try_send(Incoming::Data(bytes)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => continue,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        drop(conns);
+                        warn!(
+                            conn_id,
+                            "logical connection receive queue overflowed despite flow control; closing tunnel"
+                        );
+                        mark_dead(&inner);
+                        return;
+                    }
                 }
             }
             Frame::Close { conn_id } => {
                 if let Some(tx) = inner.conns.write().unwrap().remove(&conn_id) {
                     let _ = tx.try_send(Incoming::Close);
+                }
+                if let Some(window) = inner.send_windows.write().unwrap().remove(&conn_id)
+                    && let Some(waker) = window.waker
+                {
+                    waker.wake();
+                }
+            }
+            Frame::WindowUpdate { conn_id, bytes } => {
+                let mut windows = inner.send_windows.write().unwrap();
+                if let Some(window) = windows.get_mut(&conn_id) {
+                    window.remaining += bytes as u64;
+                    if let Some(waker) = window.waker.take() {
+                        waker.wake();
+                    }
                 }
             }
         }
@@ -325,6 +514,16 @@ fn mark_dead(inner: &Arc<TunnelInner>) {
     for tx in conns.values() {
         let _ = tx.try_send(Incoming::Close);
     }
+    drop(conns);
+    let writer_wakers = std::mem::take(&mut *inner.writer_space.lock().unwrap());
+    for waker in writer_wakers {
+        waker.wake();
+    }
+    for window in inner.send_windows.write().unwrap().values_mut() {
+        if let Some(waker) = window.waker.take() {
+            waker.wake();
+        }
+    }
     inner.death.notify_waiters();
 }
 
@@ -332,20 +531,36 @@ async fn write_frame<W>(write: &mut W, frame: &Frame) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let (frame_type, conn_id, payload) = match frame {
-        Frame::Open { conn_id } => (FrameType::Open as u8, *conn_id, &[][..]),
-        Frame::Data { conn_id, bytes } => (FrameType::Data as u8, *conn_id, bytes.as_slice()),
-        Frame::Close { conn_id } => (FrameType::Close as u8, *conn_id, &[][..]),
-    };
-    let mut header = [0u8; HEADER_LEN];
-    header[0] = frame_type;
-    header[1..9].copy_from_slice(&conn_id.to_le_bytes());
-    header[9..HEADER_LEN].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    write.write_all(&header).await?;
-    if !payload.is_empty() {
-        write.write_all(payload).await?;
+    match frame {
+        Frame::WindowUpdate { conn_id, bytes } => {
+            let mut header = [0u8; HEADER_LEN];
+            header[0] = FrameType::WindowUpdate as u8;
+            header[1..9].copy_from_slice(&conn_id.to_le_bytes());
+            header[9..HEADER_LEN].copy_from_slice(&4u32.to_le_bytes());
+            write.write_all(&header).await?;
+            write.write_all(&bytes.to_le_bytes()).await
+        }
+        Frame::Open { conn_id } => {
+            let mut header = [0u8; HEADER_LEN];
+            header[0] = FrameType::Open as u8;
+            header[1..9].copy_from_slice(&conn_id.to_le_bytes());
+            write.write_all(&header).await
+        }
+        Frame::Data { conn_id, bytes } => {
+            let mut header = [0u8; HEADER_LEN];
+            header[0] = FrameType::Data as u8;
+            header[1..9].copy_from_slice(&conn_id.to_le_bytes());
+            header[9..HEADER_LEN].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            write.write_all(&header).await?;
+            write.write_all(bytes).await
+        }
+        Frame::Close { conn_id } => {
+            let mut header = [0u8; HEADER_LEN];
+            header[0] = FrameType::Close as u8;
+            header[1..9].copy_from_slice(&conn_id.to_le_bytes());
+            write.write_all(&header).await
+        }
     }
-    Ok(())
 }
 
 async fn read_frame<R>(read: &mut R) -> io::Result<Option<Frame>>
@@ -384,6 +599,12 @@ where
             "frame exceeds the maximum size",
         ));
     }
+    if frame_type == FrameType::WindowUpdate as u8 && len != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "window update frame must carry a 4-byte credit",
+        ));
+    }
     let mut payload = vec![0u8; len as usize];
     read.read_exact(&mut payload).await?;
     let frame = match frame_type {
@@ -393,6 +614,10 @@ where
             bytes: payload,
         },
         _ if frame_type == FrameType::Close as u8 => Frame::Close { conn_id },
+        _ if frame_type == FrameType::WindowUpdate as u8 => Frame::WindowUpdate {
+            conn_id,
+            bytes: u32::from_le_bytes(payload[..4].try_into().expect("fixed credit slice")),
+        },
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -498,5 +723,41 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(cp.open().await.is_none());
+    }
+
+    /// A producer that outruns its consumer must pause, never lose data, and
+    /// finish once the consumer catches up. Exercises the flow-control window
+    /// across the whole tunnel.
+    #[tokio::test]
+    async fn a_slow_consumer_never_loses_data() {
+        let (a, b) = duplex(64 * 1024);
+        let (cp, _opens) = Tunnel::new(a);
+        let (node, mut opens) = Tunnel::new(b);
+        let mut client = cp.open().await.expect("open");
+        let event = opens.recv().await.expect("open event");
+        let mut server = node.attach(event.conn_id, event.rx).expect("attach");
+
+        let total = INITIAL_WINDOW as usize * 4;
+        let chunk = vec![b'x'; 8192];
+        let writer = tokio::spawn(async move {
+            let mut written = 0;
+            while written < total {
+                let n = client.write(&chunk).await.unwrap();
+                assert_ne!(n, 0, "writer made no progress while blocked");
+                written += n;
+            }
+            client.shutdown().await.unwrap();
+        });
+
+        let mut received = 0;
+        let mut buf = vec![0u8; 8192];
+        while received < total {
+            let n = server.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "connection closed before all data arrived");
+            received += n;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(received, total);
+        writer.await.unwrap();
     }
 }
