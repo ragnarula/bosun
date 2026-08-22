@@ -613,16 +613,15 @@ async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the command to attach to a session. The session is addressed at its
-/// subdomain so the web UI sits at the origin root; the path form is kept for
-/// control planes with no wildcard DNS, where the session cannot have a
-/// subdomain.
+/// Prints the command to attach to a session. A session is addressed at its
+/// subdomain host, so the web UI sits at the origin root and opencode's own
+/// `/session` API paths reach it unchanged. A control plane reachable only at
+/// a non-loopback IP has no wildcard DNS, so its sessions have no address.
 fn connect_command(cp_url: &str, session_id: &str) -> String {
     match bosun_common::origin::session_origin(cp_url, session_id) {
         Some(origin) => format!("opencode attach {origin}"),
         None => format!(
-            "opencode attach {}/session/{session_id}",
-            cp_url.trim_end_matches('/')
+            "session {session_id} is not reachable from {cp_url}: an IP-addressed control plane has no session subdomains"
         ),
     }
 }
@@ -655,10 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn connect_command_uses_url_and_session_id() {
+    fn connect_command_explains_when_an_ip_control_plane_has_no_subdomains() {
         assert_eq!(
             connect_command("http://192.168.1.10:8090", "abc-123"),
-            "opencode attach http://192.168.1.10:8090/session/abc-123"
+            "session abc-123 is not reachable from http://192.168.1.10:8090: \
+             an IP-addressed control plane has no session subdomains"
         );
     }
 
@@ -695,14 +695,6 @@ mod tests {
         assert_eq!(
             connect_command("http://127.0.0.1:8090", "abc-123"),
             "opencode attach http://abc-123.localhost:8090"
-        );
-    }
-
-    #[test]
-    fn connect_command_keeps_the_path_form_for_other_ips() {
-        assert_eq!(
-            connect_command("http://192.168.1.10:8090", "abc-123"),
-            "opencode attach http://192.168.1.10:8090/session/abc-123"
         );
     }
 

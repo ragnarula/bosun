@@ -16,7 +16,7 @@ pub enum TunnelError {
 }
 
 /// Maps each session to the node's outbound tunnel. The gateway opens a
-/// logical connection on it for every `/session/<id>` request.
+/// logical connection on it for every host-routed client request.
 #[derive(Clone)]
 pub struct TunnelRegistry {
     tunnels: Arc<RwLock<HashMap<String, Tunnel>>>,

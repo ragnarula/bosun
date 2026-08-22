@@ -35,11 +35,9 @@ struct Upstream {
 /// Routes opencode client traffic to session tunnels on one control-plane
 /// port. A request whose `Host` starts with `<session-id>.` routes to that
 /// session's tunnel with the path passed through unchanged, so each session's
-/// web UI lives at its own subdomain root. The path prefix `/session/<id>`
-/// also routes to the same tunnel, with the prefix stripped, for clients that
-/// attach to the control plane by path. Requests and responses are streamed
-/// as bytes after the routing decision; WebSocket upgrades are bridged as raw
-/// streams.
+/// web UI and API live at their own subdomain root. Requests and responses are
+/// streamed as bytes after the routing decision; WebSocket upgrades are
+/// bridged as raw streams.
 #[instrument(skip(state, req), fields(path = %req.uri().path()))]
 pub async fn route(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     match forward(&state.tunnels, req).await {
@@ -55,14 +53,6 @@ async fn forward(tunnels: &TunnelRegistry, req: Request<Body>) -> Result<Respons
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().map(ToString::to_string);
-
-    if let Some((session_id, rest)) = split_session_path(&path) {
-        let route = Upstream {
-            rest: rest.to_string(),
-            host: session_id.to_string(),
-        };
-        return forward_stream(tunnels, session_id, route, query, parts, body).await;
-    }
 
     let Some(session_id) = session_from_host(parts.headers.get(header::HOST)) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
@@ -217,15 +207,6 @@ async fn bridge(incoming: OnUpgrade, upstream: Upgraded) {
     }
 }
 
-fn split_session_path(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("/session/")?;
-    let (id, rest) = rest.split_once('/').unwrap_or((rest, ""));
-    if id.is_empty() {
-        return None;
-    }
-    Some((id, rest))
-}
-
 /// Extracts the session id from the first DNS label of the `Host` header, for
 /// requests addressed to `<session-id>.<control-plane-host>`.
 fn session_from_host(host: Option<&header::HeaderValue>) -> Option<String> {
@@ -287,23 +268,6 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_session_path_handles_bare_and_nested_paths() {
-        assert_eq!(split_session_path("/session/s1"), Some(("s1", "")));
-        assert_eq!(
-            split_session_path("/session/s1/global/health"),
-            Some(("s1", "global/health"))
-        );
-        assert_eq!(
-            split_session_path("/session/s1/pty/1/connect"),
-            Some(("s1", "pty/1/connect"))
-        );
-        assert_eq!(split_session_path("/session/s1/"), Some(("s1", "")));
-        assert_eq!(split_session_path("/session/"), None);
-        assert_eq!(split_session_path("/poll"), None);
-        assert_eq!(split_session_path("/session"), None);
-    }
 
     #[test]
     fn session_from_host_takes_the_first_dns_label() {

@@ -142,10 +142,12 @@ async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
     node_tunnel(cp_addr, &session_id, backend_addr).await;
 
     let client = reqwest::Client::new();
+    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match client
-            .get(format!("http://{cp_addr}/session/{session_id}/"))
+            .get(format!("http://{cp_addr}/"))
+            .header("host", &subdomain)
             .send()
             .await
         {
@@ -161,12 +163,12 @@ async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
     }
 
     let root = client
-        .get(format!("http://{cp_addr}/session/{session_id}/"))
+        .get(format!("http://{cp_addr}/"))
+        .header("host", &subdomain)
         .send();
     let asset = client
-        .get(format!(
-            "http://{cp_addr}/session/{session_id}/assets/index.js"
-        ))
+        .get(format!("http://{cp_addr}/assets/index.js"))
+        .header("host", &subdomain)
         .send();
 
     let (root, asset) = tokio::join!(root, asset);
@@ -209,15 +211,16 @@ async fn concurrent_http2_streams_over_one_tunnel_deliver_both_bodies() {
             .build_http();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
+    let host_request = |path: &str| {
+        HttpRequest::builder()
+            .uri(format!("http://{cp_addr}{path}"))
+            .header("host", &subdomain)
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap()
+    };
     loop {
-        match client
-            .get(
-                format!("http://{cp_addr}/session/{session_id}/")
-                    .parse()
-                    .unwrap(),
-            )
-            .await
-        {
+        match client.request(host_request("/")).await {
             Ok(response) if response.status().is_success() => break,
             _ => {
                 assert!(
@@ -229,16 +232,8 @@ async fn concurrent_http2_streams_over_one_tunnel_deliver_both_bodies() {
         }
     }
 
-    let root = client.get(
-        format!("http://{cp_addr}/session/{session_id}/")
-            .parse()
-            .unwrap(),
-    );
-    let asset = client.get(
-        format!("http://{cp_addr}/session/{session_id}/assets/index.js")
-            .parse()
-            .unwrap(),
-    );
+    let root = client.request(host_request("/"));
+    let asset = client.request(host_request("/assets/index.js"));
 
     let (root, asset) = tokio::join!(root, asset);
     let root = root.expect("root request failed");

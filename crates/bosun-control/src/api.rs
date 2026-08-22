@@ -515,7 +515,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match client
-                .get(format!("http://{addr}/session/{session_id}/global/health"))
+                .get(format!("http://{addr}/global/health"))
+                .header("host", format!("{session_id}.bosun.on.21cs.biz"))
                 .send()
                 .await
             {
@@ -530,13 +531,54 @@ mod tests {
         }
     }
 
+    /// Answers with the request line so a test can see exactly what the
+    /// gateway forwarded to the backend.
+    async fn request_line_backend() -> SocketAddr {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut read = 0;
+                    while read < buf.len() {
+                        match stream.read(&mut buf[read..]).await {
+                            Ok(0) => return,
+                            Ok(n) => read += n,
+                            Err(_) => return,
+                        }
+                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf[..read]);
+                    let request_line = head.lines().next().unwrap_or("");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                        request_line.len(),
+                        request_line
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn session_route_serves_through_the_tunnel() {
         let backend = stub_backend().await;
         let (addr, session_id) = test_server(backend).await;
         let client = reqwest::Client::new();
         let text = client
-            .get(format!("http://{addr}/session/{session_id}/global/health"))
+            .get(format!("http://{addr}/global/health"))
+            .header("host", format!("{session_id}.bosun.on.21cs.biz"))
             .send()
             .await
             .unwrap()
@@ -546,6 +588,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(text, "ok");
+    }
+
+    /// opencode's own API uses `/session` and `/session/<id>` paths. The
+    /// gateway must forward them unchanged rather than treating the path as a
+    /// route prefix.
+    #[tokio::test]
+    async fn session_api_paths_are_forwarded_unchanged() {
+        let backend_addr = request_line_backend().await;
+        let (addr, session_id) = test_server(backend_addr).await;
+        let client = reqwest::Client::new();
+        let text = client
+            .get(format!("http://{addr}/session/other-session/global/health"))
+            .header("host", format!("{session_id}.bosun.on.21cs.biz"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(text, "GET /session/other-session/global/health HTTP/1.1");
     }
 
     #[tokio::test]
@@ -581,7 +645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_route_returns_not_found_without_a_tunnel() {
+    async fn session_host_without_a_tunnel_returns_not_found() {
         let state = Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
@@ -596,7 +660,8 @@ mod tests {
 
         let client = reqwest::Client::new();
         let response = client
-            .get(format!("http://{addr}/session/ghost/global/health"))
+            .get(format!("http://{addr}/global/health"))
+            .header("host", "ghost.bosun.on.21cs.biz")
             .send()
             .await
             .unwrap();
@@ -604,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_session_path_returns_not_found() {
+    async fn non_session_host_returns_not_found() {
         let (addr, _) = test_server(stub_backend().await).await;
         let client = reqwest::Client::new();
         let response = client
@@ -642,8 +707,10 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
             .write_all(
-                format!("GET /session/{session_id}/global/health HTTP/1.1\r\nHost: test\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET /global/health HTTP/1.1\r\nHost: {session_id}.bosun.on.21cs.biz\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -683,8 +750,18 @@ mod tests {
 
         let (addr, session_id) = test_server(backend_addr).await;
 
-        let url = format!("ws://{addr}/session/{session_id}/pty/1/connect");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}/pty/1/connect")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            header::HOST,
+            format!("{session_id}.bosun.on.21cs.biz").parse().unwrap(),
+        );
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
         ws.send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
             .await
             .unwrap();

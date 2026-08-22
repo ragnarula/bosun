@@ -185,13 +185,15 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         "clone session must report its repository"
     );
 
-    // The opencode server answers through the control-plane path route. The
-    // tunnel registers just after the session appears, so retry until the
-    // route is live.
+    // The opencode server answers through the control-plane gateway at the
+    // session subdomain. The tunnel registers just after the session appears,
+    // so retry until the route is live.
+    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
     let health = wait_for_value(
         || async {
             let Ok(response) = client
-                .get(format!("{cp_url}/session/{session_id}/global/health"))
+                .get(format!("{cp_url}/global/health"))
+                .header("host", &subdomain)
                 .send()
                 .await
             else {
@@ -207,11 +209,13 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     .await;
     assert_eq!(health["healthy"], true);
 
-    // The client can create a session through the route, rooted in the clone.
+    // The client can create a session through the gateway, rooted in the
+    // clone, using opencode's own `/session` API path.
     let created = wait_for_value(
         || async {
             let Ok(response) = client
-                .post(format!("{cp_url}/session/{session_id}/session"))
+                .post(format!("{cp_url}/session"))
+                .header("host", &subdomain)
                 .send()
                 .await
             else {
@@ -227,50 +231,8 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     .await;
     assert!(created["id"].as_str().is_some());
 
-    // The same session is reachable at its subdomain host without a reverse
-    // proxy: the gateway routes purely on the Host header. The terminal API
-    // and the web UI root both answer at the subdomain origin.
-    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
-    let host_health = wait_for_value(
-        || async {
-            let Ok(response) = client
-                .get(format!("{cp_url}/global/health"))
-                .header("host", &subdomain)
-                .send()
-                .await
-            else {
-                return None;
-            };
-            if !response.status().is_success() {
-                return None;
-            }
-            response.json::<Value>().await.ok()
-        },
-        "host-routed health check",
-    )
-    .await;
-    assert_eq!(host_health["healthy"], true);
-
-    let host_created = wait_for_value(
-        || async {
-            let Ok(response) = client
-                .post(format!("{cp_url}/session"))
-                .header("host", &subdomain)
-                .send()
-                .await
-            else {
-                return None;
-            };
-            if !response.status().is_success() {
-                return None;
-            }
-            response.json::<Value>().await.ok()
-        },
-        "host-routed session creation",
-    )
-    .await;
-    assert!(host_created["id"].as_str().is_some());
-
+    // The web UI is served at the subdomain root: the gateway routes purely
+    // on the Host header and passes the path through unchanged.
     let web_ui = client
         .get(format!("{cp_url}/"))
         .header("host", &subdomain)
@@ -320,7 +282,8 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     wait_for_value(
         || async {
             match client
-                .get(format!("{cp_url}/session/{session_id}/global/health"))
+                .get(format!("{cp_url}/global/health"))
+                .header("host", &subdomain)
                 .send()
                 .await
             {
@@ -459,10 +422,12 @@ async fn dev_session_in_existing_directory_end_to_end() {
         .unwrap();
     let session_id = dev_response["id"].as_str().unwrap().to_string();
 
+    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
     let health = wait_for_value(
         || async {
             let Ok(response) = client
-                .get(format!("{cp_url}/session/{session_id}/global/health"))
+                .get(format!("{cp_url}/global/health"))
+                .header("host", &subdomain)
                 .send()
                 .await
             else {
