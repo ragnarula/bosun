@@ -6,6 +6,7 @@ use bosun_common::types::NodeStatus;
 use bosun_common::types::PollRequest;
 use bosun_common::types::PollResponse;
 use reqwest::Client;
+use rustls::ClientConfig;
 use tracing::warn;
 
 use crate::command::execute;
@@ -19,8 +20,19 @@ const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// The node's one outbound control loop: heartbeats, command delivery, and
 /// command results all ride this request.
-pub async fn run_poll_loop(cp_url: String, node_name: String, manager: Arc<NodeManager>) {
-    let client = Client::new();
+pub async fn run_poll_loop(
+    cp_url: String,
+    node_name: String,
+    manager: Arc<NodeManager>,
+    tls_config: Option<Arc<ClientConfig>>,
+) {
+    let client = match &tls_config {
+        Some(config) => Client::builder()
+            .use_preconfigured_tls((**config).clone())
+            .build()
+            .expect("failed to build the polling HTTP client"),
+        None => Client::new(),
+    };
     let url = format!("{}/poll", cp_url.trim_end_matches('/'));
     let mut pending: Option<bosun_common::types::CommandResult> = None;
 

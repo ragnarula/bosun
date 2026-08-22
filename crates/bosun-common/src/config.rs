@@ -11,6 +11,8 @@ use serde::de::DeserializeOwned;
 pub struct ControlConfig {
     pub listen_addr: String,
     pub node_timeout_secs: u64,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for ControlConfig {
@@ -18,6 +20,8 @@ impl Default for ControlConfig {
         Self {
             listen_addr: "127.0.0.1:8090".into(),
             node_timeout_secs: 30,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -29,6 +33,7 @@ pub struct NodeConfig {
     pub node_name: String,
     pub work_dir: PathBuf,
     pub browse_roots: Vec<PathBuf>,
+    pub ca_cert: Option<PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -38,6 +43,7 @@ impl Default for NodeConfig {
             node_name: "node".into(),
             work_dir: "work".into(),
             browse_roots: Vec::new(),
+            ca_cert: None,
         }
     }
 }

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -11,9 +12,12 @@ use hyper::header;
 use hyper::http::StatusCode;
 use hyper::http::Uri;
 use hyper::upgrade::Upgraded;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::rt::TokioIo;
+use rustls::ClientConfig;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
+use tower_service::Service as _;
 use tracing::debug;
 use tracing::warn;
 
@@ -22,9 +26,14 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 /// Keeps one outbound tunnel to the control plane open for a session. On any
 /// failure the connection is re-established after a short delay; the session
 /// itself keeps running on the node.
-pub async fn run_session_tunnel(cp_url: String, session_id: String, opencode_port: u16) {
+pub async fn run_session_tunnel(
+    cp_url: String,
+    session_id: String,
+    opencode_port: u16,
+    tls_config: Option<Arc<ClientConfig>>,
+) {
     loop {
-        match connect_tunnel(&cp_url, &session_id).await {
+        match connect_tunnel(&cp_url, &session_id, tls_config.clone()).await {
             Ok(stream) => {
                 let (tunnel, mut opens) = Tunnel::new(stream);
                 loop {
@@ -71,20 +80,39 @@ async fn relay_connection(event: OpenEvent, opencode_port: u16, tunnel: Tunnel) 
     }
 }
 
-async fn connect_tunnel(cp_url: &str, session_id: &str) -> anyhow::Result<TokioIo<Upgraded>> {
-    let base = cp_url.trim_end_matches('/');
-    let uri: Uri = format!("{base}/tunnel/session/{session_id}")
-        .parse()
-        .context("cp_url is not a valid URL")?;
+async fn connect_tunnel(
+    cp_url: &str,
+    session_id: &str,
+    tls_config: Option<Arc<ClientConfig>>,
+) -> anyhow::Result<TokioIo<Upgraded>> {
+    let mut connector = match tls_config {
+        Some(config) => HttpsConnectorBuilder::new()
+            .with_tls_config((*config).clone())
+            .https_or_http()
+            .enable_http1()
+            .build(),
+        None => HttpsConnectorBuilder::new()
+            .with_platform_verifier()
+            .https_or_http()
+            .enable_http1()
+            .build(),
+    };
+
+    let uri: Uri = format!(
+        "{}/tunnel/session/{session_id}",
+        cp_url.trim_end_matches('/')
+    )
+    .parse()
+    .context("cp_url is not a valid URL")?;
     let authority = uri
         .authority()
         .context("cp_url must include a host and port")?
         .to_string();
+    let stream = connector.call(uri).await.map_err(|error| {
+        anyhow::anyhow!("failed to connect to the control plane at {authority}: {error}")
+    })?;
 
-    let stream = TcpStream::connect(authority.as_str())
-        .await
-        .with_context(|| format!("failed to connect to the control plane at {authority}"))?;
-    let (mut sender, conn) = http1::handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
+    let (mut sender, conn) = http1::handshake::<_, Empty<Bytes>>(stream)
         .await
         .context("failed to handshake with the control plane")?;
     tokio::spawn(async move {

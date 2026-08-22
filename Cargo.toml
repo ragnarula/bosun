@@ -19,16 +19,22 @@ bytes = "1"
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "tls12", "http1", "rustls-platform-verifier"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
+rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal", "fs", "process"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-tungstenite = "0.30"
 toml = "0.8"
+tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

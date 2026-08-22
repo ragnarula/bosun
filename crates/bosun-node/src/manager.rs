@@ -80,13 +80,19 @@ pub struct NodeManager {
     work_dir: PathBuf,
     cp_url: String,
     browse_roots: Vec<PathBuf>,
+    tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     processes: RwLock<HashMap<String, Child>>,
     tunnels: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl NodeManager {
-    pub fn new(work_dir: PathBuf, browse_roots: Vec<PathBuf>, cp_url: String) -> Self {
+    pub fn new(
+        work_dir: PathBuf,
+        browse_roots: Vec<PathBuf>,
+        cp_url: String,
+        tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+    ) -> Self {
         let browse_roots: Vec<PathBuf> = browse_roots
             .into_iter()
             .filter_map(|root| match root.canonicalize() {
@@ -105,6 +111,7 @@ impl NodeManager {
             work_dir,
             cp_url,
             browse_roots,
+            tls_config,
             sessions: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             tunnels: RwLock::new(HashMap::new()),
@@ -376,10 +383,12 @@ impl NodeManager {
     fn open_tunnel(&self, session_id: &str, opencode_port: u16) {
         let cp_url = self.cp_url.clone();
         let session_id = session_id.to_string();
+        let tls_config = self.tls_config.clone();
         let handle = tokio::spawn(crate::tunnel::run_session_tunnel(
             cp_url,
             session_id.clone(),
             opencode_port,
+            tls_config,
         ));
         let _ = self.tunnels.write().unwrap().insert(session_id, handle);
     }
@@ -618,6 +627,7 @@ mod tests {
             work.path().to_path_buf(),
             vec![work.path().to_path_buf()],
             "http://127.0.0.1:8090".into(),
+            None,
         )
     }
 
@@ -741,6 +751,7 @@ mod tests {
             work.path().to_path_buf(),
             Vec::new(),
             "http://127.0.0.1:8090".into(),
+            None,
         );
 
         let err = manager.list_dir(None).unwrap_err();
@@ -755,6 +766,7 @@ mod tests {
             work.path().to_path_buf(),
             vec![work.path().to_path_buf()],
             "http://127.0.0.1:8090".into(),
+            None,
         );
 
         let listing = manager.list_dir(None).unwrap();
@@ -854,6 +866,7 @@ mod tests {
             work.path().to_path_buf(),
             Vec::new(),
             "http://127.0.0.1:8090".into(),
+            None,
         );
 
         let err = manager

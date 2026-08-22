@@ -1,7 +1,7 @@
-//! End-to-end tests: boot the control plane and a node, clone a session on a
-//! local repo, drive it through the control-plane proxy, and stop it. A second
-//! test spawns a dev session in an existing directory and checks the
-//! directory survives a stop.
+//! End-to-end tests: boot the control plane and a node over HTTPS with a
+//! self-signed certificate, clone a session on a local repo, drive it through
+//! the control-plane proxy, and stop it. A second test spawns a dev session in
+//! an existing directory and checks the directory survives a stop.
 //!
 //! Needs `git` and the `opencode` binary on PATH.
 //!
@@ -13,12 +13,48 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use rcgen::BasicConstraints;
+use rcgen::CertificateParams;
+use rcgen::IsCa;
+use rcgen::KeyPair;
 use serde_json::Value;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::sleep;
 
 const BOSUN: &str = env!("CARGO_BIN_EXE_bosun");
+
+/// Writes a self-signed CA and a leaf certificate for `127.0.0.1`. Returns
+/// the CA, leaf certificate, and leaf key paths.
+fn write_tls_files(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let leaf_key = KeyPair::generate().unwrap();
+    let mut leaf_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    leaf_params.is_ca = IsCa::NoCa;
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+    let ca_path = root.join("ca.pem");
+    let cert_path = root.join("cert.pem");
+    let key_path = root.join("key.pem");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&cert_path, leaf_cert.pem()).unwrap();
+    std::fs::write(&key_path, leaf_key.serialize_pem()).unwrap();
+    (ca_path, cert_path, key_path)
+}
+
+/// An HTTP client that trusts the test CA, so it can reach the HTTPS control
+/// plane.
+fn test_client(ca_path: &Path) -> reqwest::Client {
+    let ca = std::fs::read(ca_path).unwrap();
+    reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .build()
+        .unwrap()
+}
 
 #[tokio::test]
 #[ignore]
@@ -43,15 +79,22 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         ],
     );
 
+    let (ca_path, cert_path, key_path) = write_tls_files(root);
+    let client = test_client(&ca_path);
+
     let serve_port = free_port().await;
-    let cp_url = format!("http://127.0.0.1:{serve_port}");
+    let cp_url = format!("https://127.0.0.1:{serve_port}");
 
     let serve_config = root.join("serve.toml");
     std::fs::write(
         &serve_config,
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
-             node_timeout_secs = 10\n"
+             node_timeout_secs = 10\n\
+             tls_cert = \"{}\"\n\
+             tls_key = \"{}\"\n",
+            cert_path.display(),
+            key_path.display()
         ),
     )
     .unwrap();
@@ -64,9 +107,11 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
             "cp_url = \"{cp_url}\"\n\
              node_name = \"e2e-node\"\n\
              work_dir = \"{}\"\n\
-             browse_roots = [\"{}\"]\n",
+             browse_roots = [\"{}\"]\n\
+             ca_cert = \"{}\"\n",
             work_dir.display(),
-            root.display()
+            root.display(),
+            ca_path.display()
         ),
     )
     .unwrap();
@@ -74,15 +119,17 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     let mut serve = spawn_bosun(
         &["serve", "--config", serve_config.to_str().unwrap()],
         &root.join("serve.log"),
+        &ca_path,
     );
     let mut node = spawn_bosun(
         &["node", "--config", node_config.to_str().unwrap()],
         &root.join("node.log"),
+        &ca_path,
     );
 
     wait_for_value(
         || async {
-            let Ok(response) = reqwest::get(format!("{cp_url}/nodes")).await else {
+            let Ok(response) = client.get(format!("{cp_url}/nodes")).send().await else {
                 return None;
             };
             let Ok(nodes) = response.json::<Vec<Value>>().await else {
@@ -99,6 +146,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
 
     // Clone a session via the CLI.
     let clone_out = Command::new(BOSUN)
+        .env("BOSUN_CA_CERT", &ca_path)
         .args([
             "clone",
             "--node",
@@ -119,7 +167,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     // The session appears as running.
     let session = wait_for_value(
         || async {
-            let Ok(response) = reqwest::get(format!("{cp_url}/sessions")).await else {
+            let Ok(response) = client.get(format!("{cp_url}/sessions")).send().await else {
                 return None;
             };
             let Ok(sessions) = response.json::<Vec<Value>>().await else {
@@ -142,8 +190,10 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     // route is live.
     let health = wait_for_value(
         || async {
-            let Ok(response) =
-                reqwest::get(format!("{cp_url}/session/{session_id}/global/health")).await
+            let Ok(response) = client
+                .get(format!("{cp_url}/session/{session_id}/global/health"))
+                .send()
+                .await
             else {
                 return None;
             };
@@ -160,7 +210,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     // The client can create a session through the route, rooted in the clone.
     let created = wait_for_value(
         || async {
-            let Ok(response) = reqwest::Client::new()
+            let Ok(response) = client
                 .post(format!("{cp_url}/session/{session_id}/session"))
                 .send()
                 .await
@@ -179,6 +229,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
 
     // Stop the session.
     let stop_out = Command::new(BOSUN)
+        .env("BOSUN_CA_CERT", &ca_path)
         .args(["stop", &session_id, "--cp-url", &cp_url])
         .output()
         .await
@@ -192,7 +243,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     // The session disappears, its route closes, and the clone is removed.
     wait_for_value(
         || async {
-            let Ok(response) = reqwest::get(format!("{cp_url}/sessions")).await else {
+            let Ok(response) = client.get(format!("{cp_url}/sessions")).send().await else {
                 return None;
             };
             let Ok(sessions) = response.json::<Vec<Value>>().await else {
@@ -205,7 +256,11 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     .await;
     wait_for_value(
         || async {
-            match reqwest::get(format!("{cp_url}/session/{session_id}/global/health")).await {
+            match client
+                .get(format!("{cp_url}/session/{session_id}/global/health"))
+                .send()
+                .await
+            {
                 Ok(response) => (response.status() == reqwest::StatusCode::NOT_FOUND).then_some(()),
                 Err(_) => None,
             }
@@ -228,15 +283,22 @@ async fn dev_session_in_existing_directory_end_to_end() {
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
 
+    let (ca_path, cert_path, key_path) = write_tls_files(root);
+    let client = test_client(&ca_path);
+
     let serve_port = free_port().await;
-    let cp_url = format!("http://127.0.0.1:{serve_port}");
+    let cp_url = format!("https://127.0.0.1:{serve_port}");
 
     let serve_config = root.join("serve.toml");
     std::fs::write(
         &serve_config,
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
-             node_timeout_secs = 10\n"
+             node_timeout_secs = 10\n\
+             tls_cert = \"{}\"\n\
+             tls_key = \"{}\"\n",
+            cert_path.display(),
+            key_path.display()
         ),
     )
     .unwrap();
@@ -248,9 +310,11 @@ async fn dev_session_in_existing_directory_end_to_end() {
             "cp_url = \"{cp_url}\"\n\
              node_name = \"e2e-node\"\n\
              work_dir = \"{}\"\n\
-             browse_roots = [\"{}\"]\n",
+             browse_roots = [\"{}\"]\n\
+             ca_cert = \"{}\"\n",
             root.join("work").display(),
-            root.display()
+            root.display(),
+            ca_path.display()
         ),
     )
     .unwrap();
@@ -258,15 +322,17 @@ async fn dev_session_in_existing_directory_end_to_end() {
     let mut serve = spawn_bosun(
         &["serve", "--config", serve_config.to_str().unwrap()],
         &root.join("serve.log"),
+        &ca_path,
     );
     let mut node = spawn_bosun(
         &["node", "--config", node_config.to_str().unwrap()],
         &root.join("node.log"),
+        &ca_path,
     );
 
     wait_for_value(
         || async {
-            let Ok(response) = reqwest::get(format!("{cp_url}/nodes")).await else {
+            let Ok(response) = client.get(format!("{cp_url}/nodes")).send().await else {
                 return None;
             };
             let Ok(nodes) = response.json::<Vec<Value>>().await else {
@@ -283,7 +349,9 @@ async fn dev_session_in_existing_directory_end_to_end() {
 
     // The node lists the existing repository as a browsable directory.
     let canonical_root = root.canonicalize().unwrap();
-    let listing: Value = reqwest::get(format!("{cp_url}/nodes/e2e-node/dirs"))
+    let listing: Value = client
+        .get(format!("{cp_url}/nodes/e2e-node/dirs"))
+        .send()
         .await
         .unwrap()
         .json()
@@ -295,15 +363,17 @@ async fn dev_session_in_existing_directory_end_to_end() {
     );
     assert_eq!(listing["entries"][0]["is_repo"], false);
 
-    let child_listing: Value = reqwest::get(format!(
-        "{cp_url}/nodes/e2e-node/dirs?path={}",
-        root.display()
-    ))
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
+    let child_listing: Value = client
+        .get(format!(
+            "{cp_url}/nodes/e2e-node/dirs?path={}",
+            root.display()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let entries = child_listing["entries"].as_array().unwrap();
     assert!(
         entries
@@ -313,7 +383,7 @@ async fn dev_session_in_existing_directory_end_to_end() {
 
     // Spawn a dev session in the existing directory.
     let request = serde_json::json!({ "node": "e2e-node", "dir": repo.display().to_string() });
-    let dev_response: Value = reqwest::Client::new()
+    let dev_response: Value = client
         .post(format!("{cp_url}/dev"))
         .json(&request)
         .send()
@@ -328,8 +398,10 @@ async fn dev_session_in_existing_directory_end_to_end() {
 
     let health = wait_for_value(
         || async {
-            let Ok(response) =
-                reqwest::get(format!("{cp_url}/session/{session_id}/global/health")).await
+            let Ok(response) = client
+                .get(format!("{cp_url}/session/{session_id}/global/health"))
+                .send()
+                .await
             else {
                 return None;
             };
@@ -345,6 +417,7 @@ async fn dev_session_in_existing_directory_end_to_end() {
 
     // Stop the session; the existing directory stays.
     let stop_out = Command::new(BOSUN)
+        .env("BOSUN_CA_CERT", &ca_path)
         .args(["stop", &session_id, "--cp-url", &cp_url])
         .output()
         .await
@@ -377,10 +450,11 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn spawn_bosun(args: &[&str], log_path: &Path) -> Child {
+fn spawn_bosun(args: &[&str], log_path: &Path, ca_path: &Path) -> Child {
     let log = std::fs::File::create(log_path).unwrap();
     Command::new(BOSUN)
         .args(args)
+        .env("BOSUN_CA_CERT", ca_path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .kill_on_drop(true)

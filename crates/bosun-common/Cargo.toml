@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -15,4 +17,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true

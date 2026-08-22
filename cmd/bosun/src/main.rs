@@ -193,6 +193,21 @@ fn resolve_cp_url_from(flag: Option<&str>, env_url: Option<String>, stored: Stri
     flag.map(ToString::to_string).or(env_url).unwrap_or(stored)
 }
 
+/// Builds the HTTP client the CLI uses to reach the control plane. When
+/// `BOSUN_CA_CERT` names a PEM file, the client trusts it, so a control plane
+/// behind a private CA (or self-signed certificate) can be reached.
+fn cp_client() -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Ok(ca_cert) = std::env::var("BOSUN_CA_CERT")
+        && !ca_cert.is_empty()
+    {
+        let config = bosun_common::tls::load_client_config(Some(Path::new(&ca_cert)))?
+            .expect("a CA cert was configured");
+        builder = builder.use_preconfigured_tls(config);
+    }
+    builder.build().context("failed to build the HTTP client")
+}
+
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     setup_logging(args.log_filter.as_deref())?;
     let config: ControlConfig =
@@ -217,12 +232,53 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_addr))?;
-    info!(listen_addr = %config.listen_addr, "control plane listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("control plane server failed")?;
+    match (config.tls_cert.as_deref(), config.tls_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            let server_config = bosun_common::tls::load_server_config(cert, key)
+                .context("failed to load the control-plane TLS certificate")?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+            serve_tls(listener, app, acceptor, &config.listen_addr).await
+        }
+        (None, None) => {
+            info!(listen_addr = %config.listen_addr, "control plane listening");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .context("control plane server failed")?;
+            Ok(())
+        }
+        _ => Err(anyhow::anyhow!("tls_cert and tls_key must be set together")),
+    }
+}
+
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    acceptor: tokio_rustls::TlsAcceptor,
+    listen_addr: &str,
+) -> anyhow::Result<()> {
+    info!(listen_addr = %listen_addr, "control plane listening (TLS)");
+    loop {
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted.context("control plane accept failed")?,
+            _ = shutdown_signal() => break,
+        };
+        let acceptor = acceptor.clone();
+        let service = hyper_util::service::TowerToHyperService::new(app.clone().into_service());
+        tokio::spawn(async move {
+            let stream = acceptor
+                .accept(stream)
+                .await
+                .context("TLS handshake failed")?;
+            let io = hyper_util::rt::TokioIo::new(stream);
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .map_err(|error| anyhow::anyhow!("TLS connection failed: {error}"))?;
+            Ok::<(), anyhow::Error>(())
+        });
+    }
     Ok(())
 }
 
@@ -239,15 +295,18 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         "node configured"
     );
 
+    let tls_config =
+        bosun_common::tls::load_client_config(config.ca_cert.as_deref())?.map(Arc::new);
     let manager = Arc::new(NodeManager::new(
         config.work_dir.clone(),
         config.browse_roots.clone(),
         config.cp_url.clone(),
+        tls_config.clone(),
     ));
     manager.restore().await;
 
     tokio::select! {
-        _ = bosun_node::poll::run_poll_loop(config.cp_url.clone(), config.node_name.clone(), manager) => Ok(()),
+        _ = bosun_node::poll::run_poll_loop(config.cp_url.clone(), config.node_name.clone(), manager, tls_config) => Ok(()),
         _ = shutdown_signal() => Ok(()),
     }
 }
@@ -255,7 +314,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
 
-    let client = reqwest::Client::new();
+    let client = cp_client()?;
     let health: Vec<NodeHealth> = client
         .get(format!("{cp_url}/nodes"))
         .send()
@@ -287,7 +346,7 @@ async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
 async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
 
-    let client = reqwest::Client::new();
+    let client = cp_client()?;
     let request = CloneRequest {
         node: args.node.clone(),
         repo_url: args.repo_url,
@@ -339,7 +398,7 @@ impl fmt::Display for Choice {
 
 async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
-    let client = reqwest::Client::new();
+    let client = cp_client()?;
     let mut current: Option<PathBuf> = None;
 
     loop {
@@ -444,7 +503,7 @@ async fn spawn_dev(
 }
 
 async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<SessionHealth>> {
-    let client = reqwest::Client::new();
+    let client = cp_client()?;
     client
         .get(format!("{cp_url}/sessions"))
         .send()
@@ -532,7 +591,7 @@ fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
 async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
 
-    let client = reqwest::Client::new();
+    let client = cp_client()?;
     let request = StopRequest {
         session_id: args.session_id.clone(),
     };
