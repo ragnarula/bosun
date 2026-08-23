@@ -331,6 +331,9 @@ impl NodeManager {
         if record.reapable {
             cleanup(&record.dir).await;
         }
+        // The data dir always lives under the work dir, even for a dev session
+        // whose repo is elsewhere. Remove it so stopping leaves no state.
+        cleanup(&self.work_dir.join(session_id)).await;
 
         if let Err(e) = self.persist().await {
             warn!(
@@ -357,8 +360,13 @@ impl NodeManager {
     }
 
     async fn start_server(&self, id: &str, dir: &Path, port: u16) -> Result<Child, NodeError> {
+        let data_dir = session_data_dir(&self.work_dir, id);
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .with_context(|| format!("failed to create data dir for session {id}"))?;
         let child = tokio::process::Command::new("opencode")
             .args(serve_args(id, port, &self.cp_url))
+            .env("XDG_DATA_HOME", &data_dir)
             .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -525,6 +533,17 @@ impl NodeManager {
             }
         }
     }
+}
+
+/// The isolated opencode data directory for a session, passed as
+/// `XDG_DATA_HOME`. Lives under the work dir so a clone's cleanup removes it
+/// with the clone, and so stopping a dev session can remove it separately
+/// from the repo the session runs in. Each session gets its own opencode
+/// database and project state; without this, two sessions on one node share a
+/// database and its single `project/current` points at whichever clone was
+/// created first.
+fn session_data_dir(work_dir: &Path, id: &str) -> PathBuf {
+    work_dir.join(id).join(".opencode-data")
 }
 
 /// Builds the `opencode serve` arguments for a session. The session's web UI
@@ -755,6 +774,16 @@ mod tests {
 
         let output = child.wait().await.unwrap();
         assert!(!output.success());
+    }
+
+    #[test]
+    fn session_data_dir_is_per_session_under_the_work_dir() {
+        let work = tempdir().unwrap();
+        let first = session_data_dir(work.path(), "s1");
+        let second = session_data_dir(work.path(), "s2");
+        assert_eq!(first, work.path().join("s1").join(".opencode-data"));
+        assert_ne!(first, second, "sessions must not share a data dir");
+        assert!(first.starts_with(work.path()));
     }
 
     #[test]

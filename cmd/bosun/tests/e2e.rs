@@ -252,6 +252,117 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         "the web UI must be served at the subdomain root"
     );
 
+    // Cloning the same repo a second time must not share opencode state with
+    // the first session: each session gets its own data directory, so its
+    // database and `project/current` belong to it alone.
+    let second_clone: Value = client
+        .post(format!("{cp_url}/clone"))
+        .json(&serde_json::json!({
+            "node": "e2e-node",
+            "repo_url": repo.to_str().unwrap(),
+            "ref": null,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_id = second_clone["id"].as_str().unwrap().to_string();
+    let second_subdomain = format!("{second_id}.bosun.on.21cs.biz");
+    wait_for_value(
+        || async {
+            let Ok(response) = client
+                .get(format!("{cp_url}/global/health"))
+                .header("host", &second_subdomain)
+                .send()
+                .await
+            else {
+                return None;
+            };
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        },
+        "second session route to become live",
+    )
+    .await;
+
+    // Create a session in each clone so opencode records its current project.
+    client
+        .post(format!("{cp_url}/session"))
+        .header("host", &subdomain)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!("{cp_url}/session"))
+        .header("host", &second_subdomain)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let first_project: Value = client
+        .get(format!("{cp_url}/project/current"))
+        .header("host", &subdomain)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_project: Value = client
+        .get(format!("{cp_url}/project/current"))
+        .header("host", &second_subdomain)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_worktree = first_project["worktree"].as_str().unwrap();
+    let second_worktree = second_project["worktree"].as_str().unwrap();
+    assert_ne!(
+        first_worktree, second_worktree,
+        "two sessions must not share one project/current"
+    );
+    assert!(
+        Path::new(first_worktree).exists(),
+        "first session's project points at a missing directory"
+    );
+    assert!(
+        Path::new(second_worktree).exists(),
+        "second session's project points at a missing directory"
+    );
+
+    // Stop the second session; its state must go with it.
+    let second_stop = Command::new(BOSUN)
+        .env("BOSUN_CA_CERT", &ca_path)
+        .args(["stop", &second_id, "--cp-url", &cp_url])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        second_stop.status.success(),
+        "second stop failed: {}",
+        String::from_utf8_lossy(&second_stop.stderr)
+    );
+    assert!(
+        !work_dir.join(&second_id).exists(),
+        "stopping a session must remove its data directory"
+    );
+
     // Stop the session.
     let stop_out = Command::new(BOSUN)
         .env("BOSUN_CA_CERT", &ca_path)
@@ -452,6 +563,10 @@ async fn dev_session_in_existing_directory_end_to_end() {
         .unwrap();
     assert!(stop_out.status.success());
     assert!(repo.is_dir(), "dev session must not delete the directory");
+    assert!(
+        !root.join("work").join(&session_id).exists(),
+        "stopping a dev session must remove its data directory"
+    );
 
     shutdown(&mut serve, &mut node).await;
 }
