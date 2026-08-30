@@ -1,0 +1,25 @@
+[package]
+name = "bosun-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bosun-common.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+glob.workspace = true
+http-body-util.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

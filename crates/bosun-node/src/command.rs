@@ -15,11 +15,13 @@ pub async fn execute(manager: &Arc<NodeManager>, command: NodeCommand) -> Comman
             session_id,
             repo_url,
             git_ref,
+            permission,
         } => {
             let request = NodeCloneRequest {
                 session_id,
                 repo_url,
                 git_ref,
+                permission,
             };
             match manager.run_clone(&request).await {
                 Ok(record) => CommandResult::Session {
@@ -36,8 +38,13 @@ pub async fn execute(manager: &Arc<NodeManager>, command: NodeCommand) -> Comman
             id,
             session_id,
             dir,
+            permission,
         } => {
-            let request = NodeDevRequest { session_id, dir };
+            let request = NodeDevRequest {
+                session_id,
+                dir,
+                permission,
+            };
             match manager.dev(&request).await {
                 Ok(record) => CommandResult::Session {
                     id,

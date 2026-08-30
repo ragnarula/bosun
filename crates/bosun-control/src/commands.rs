@@ -106,6 +106,15 @@ impl CommandQueue {
         }
     }
 
+    /// True when the node has a command queued or awaiting a result. Lets
+    /// tests assert that a rejected request never reached the node.
+    pub fn pending(&self, node: &str) -> bool {
+        let nodes = self.nodes.read().unwrap();
+        nodes
+            .get(node)
+            .is_some_and(|entry| !entry.queue.is_empty() || !entry.results.is_empty())
+    }
+
     fn pop(&self, node: &str) -> Option<NodeCommand> {
         self.nodes
             .write()

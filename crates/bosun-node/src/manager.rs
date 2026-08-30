@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bosun_common::error::ErrorExt;
+use bosun_common::session::Permission;
 use bosun_common::types::DirEntry;
 use bosun_common::types::DirListing;
 use bosun_common::types::NodeCloneRequest;
@@ -33,7 +34,8 @@ pub struct SessionRecord {
     pub dir: PathBuf,
     pub reapable: bool,
     pub status: String,
-    pub opencode_port: Option<u16>,
+    pub executor_port: Option<u16>,
+    pub permission: Permission,
 }
 
 impl SessionRecord {
@@ -42,11 +44,7 @@ impl SessionRecord {
             id: self.id.clone(),
             repo_url: self.repo_url.clone(),
             git_ref: self.git_ref.clone(),
-            dir: if self.reapable {
-                None
-            } else {
-                Some(self.dir.clone())
-            },
+            dir: Some(self.dir.clone()),
             status: self.status.clone(),
         }
     }
@@ -57,7 +55,7 @@ pub enum NodeError {
     #[error("failed to clone {repo_url}: {stderr}")]
     CloneFailed { repo_url: String, stderr: String },
 
-    #[error("opencode server on port {port} did not become healthy")]
+    #[error("executor on port {port} did not become healthy")]
     HealthTimeout { port: u16 },
 
     #[error("no browse roots configured on this node")]
@@ -153,6 +151,7 @@ impl NodeManager {
                 true,
                 Some(req.repo_url.clone()),
                 req.git_ref.clone(),
+                req.permission,
             )
             .await?;
         info!(session_id = %req.session_id, "clone session started");
@@ -162,7 +161,7 @@ impl NodeManager {
     pub async fn dev(&self, req: &NodeDevRequest) -> Result<SessionRecord, NodeError> {
         let dir = self.resolve_within_roots(&req.dir)?;
         let record = self
-            .start_in_dir(&req.session_id, &dir, false, None, None)
+            .start_in_dir(&req.session_id, &dir, false, None, None, req.permission)
             .await?;
         info!(session_id = %req.session_id, dir = %record.dir.display(), "dev session started");
         Ok(record)
@@ -175,10 +174,11 @@ impl NodeManager {
         reapable: bool,
         repo_url: Option<String>,
         git_ref: Option<String>,
+        permission: Permission,
     ) -> Result<SessionRecord, NodeError> {
         let port = pick_free_port().await?;
 
-        let child = match self.start_server(session_id, dir, port).await {
+        let child = match self.start_executor(session_id, dir, port, permission).await {
             Ok(child) => child,
             Err(e) => {
                 if reapable {
@@ -197,7 +197,8 @@ impl NodeManager {
             dir: dir.to_path_buf(),
             reapable,
             status: "running".into(),
-            opencode_port: Some(port),
+            executor_port: Some(port),
+            permission,
         };
         self.sessions
             .write()
@@ -317,9 +318,10 @@ impl NodeManager {
 
         let child = self.processes.write().unwrap().remove(session_id);
         if let Some(mut child) = child {
-            child.kill().await.with_context(|| {
-                format!("failed to kill opencode serve for session {session_id}")
-            })?;
+            child
+                .kill()
+                .await
+                .with_context(|| format!("failed to kill executor for session {session_id}"))?;
         }
 
         let tunnel = self.tunnels.write().unwrap().remove(session_id);
@@ -331,9 +333,6 @@ impl NodeManager {
         if record.reapable {
             cleanup(&record.dir).await;
         }
-        // The data dir always lives under the work dir, even for a dev session
-        // whose repo is elsewhere. Remove it so stopping leaves no state.
-        cleanup(&self.work_dir.join(session_id)).await;
 
         if let Err(e) = self.persist().await {
             warn!(
@@ -359,20 +358,34 @@ impl NodeManager {
         sessions
     }
 
-    async fn start_server(&self, id: &str, dir: &Path, port: u16) -> Result<Child, NodeError> {
-        let data_dir = session_data_dir(&self.work_dir, id);
-        tokio::fs::create_dir_all(&data_dir)
-            .await
-            .with_context(|| format!("failed to create data dir for session {id}"))?;
-        let child = tokio::process::Command::new("opencode")
-            .args(serve_args(id, port, &self.cp_url))
-            .env("XDG_DATA_HOME", &data_dir)
+    async fn start_executor(
+        &self,
+        id: &str,
+        dir: &Path,
+        port: u16,
+        permission: Permission,
+    ) -> Result<Child, NodeError> {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("bosun"));
+        let mut command = tokio::process::Command::new(exe);
+        let permission_arg = match permission {
+            Permission::ReadOnly => "read_only",
+            Permission::ReadWrite => "read_write",
+        };
+        command
+            .arg("executor")
+            .arg("--session-dir")
+            .arg(dir)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--permission")
+            .arg(permission_arg)
             .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        let child = command
             .spawn()
-            .with_context(|| format!("failed to start opencode serve for session {id}"))?;
+            .with_context(|| format!("failed to start executor for session {id}"))?;
 
         let client = reqwest::Client::new();
         wait_for_health(&client, port, HEALTH_TIMEOUT).await?;
@@ -382,14 +395,14 @@ impl NodeManager {
     /// Opens the session's outbound tunnel to the control plane. The tunnel
     /// reconnects on its own until the session stops, so a refused connection
     /// does not fail the session.
-    fn open_tunnel(&self, session_id: &str, opencode_port: u16) {
+    fn open_tunnel(&self, session_id: &str, executor_port: u16) {
         let cp_url = self.cp_url.clone();
         let session_id = session_id.to_string();
         let tls_config = self.tls_config.clone();
         let handle = tokio::spawn(crate::tunnel::run_session_tunnel(
             cp_url,
             session_id.clone(),
-            opencode_port,
+            executor_port,
             tls_config,
         ));
         let _ = self.tunnels.write().unwrap().insert(session_id, handle);
@@ -401,7 +414,7 @@ impl NodeManager {
         let mut persisted: Vec<PersistedSession> = sessions
             .values()
             .filter_map(|record| {
-                let port = record.opencode_port?;
+                let port = record.executor_port?;
                 let pid = processes
                     .get(&record.id)
                     .and_then(|child| child.id())
@@ -416,7 +429,8 @@ impl NodeManager {
                         Some(record.dir.clone())
                     },
                     reapable: record.reapable,
-                    opencode_port: port,
+                    executor_port: port,
+                    permission: record.permission,
                     pid,
                 })
             })
@@ -483,7 +497,7 @@ impl NodeManager {
             kill_pid_if_alive(session.pid).await;
 
             let child = match self
-                .start_server(&session.id, &dir, session.opencode_port)
+                .start_executor(&session.id, &dir, session.executor_port, session.permission)
                 .await
             {
                 Ok(child) => child,
@@ -491,14 +505,14 @@ impl NodeManager {
                     error!(
                         session_id = %session.id,
                         error = %e.display_chain(),
-                        "failed to restart opencode serve"
+                        "failed to restart executor"
                     );
                     failed_to_restore.push(session);
                     continue;
                 }
             };
 
-            self.open_tunnel(&session.id, session.opencode_port);
+            self.open_tunnel(&session.id, session.executor_port);
 
             let record = SessionRecord {
                 id: session.id.clone(),
@@ -507,7 +521,8 @@ impl NodeManager {
                 dir,
                 reapable: session.reapable,
                 status: "running".into(),
-                opencode_port: Some(session.opencode_port),
+                executor_port: Some(session.executor_port),
+                permission: session.permission,
             };
             self.sessions
                 .write()
@@ -535,36 +550,6 @@ impl NodeManager {
     }
 }
 
-/// The isolated opencode data directory for a session, passed as
-/// `XDG_DATA_HOME`. Lives under the work dir so a clone's cleanup removes it
-/// with the clone, and so stopping a dev session can remove it separately
-/// from the repo the session runs in. Each session gets its own opencode
-/// database and project state; without this, two sessions on one node share a
-/// database and its single `project/current` points at whichever clone was
-/// created first.
-fn session_data_dir(work_dir: &Path, id: &str) -> PathBuf {
-    work_dir.join(id).join(".opencode-data")
-}
-
-/// Builds the `opencode serve` arguments for a session. The session's web UI
-/// is served at `<session-id>.<control-plane-host>`, so the node passes that
-/// origin to `--cors`; without it the browser's cross-origin requests to the
-/// subdomain would be rejected.
-fn serve_args(id: &str, port: u16, cp_url: &str) -> Vec<String> {
-    let mut args = vec![
-        "serve".into(),
-        "--hostname".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
-        port.to_string(),
-    ];
-    if let Some(origin) = bosun_common::origin::session_origin(cp_url, id) {
-        args.push("--cors".into());
-        args.push(origin);
-    }
-    args
-}
-
 async fn kill_pid_if_alive(pid: u32) {
     if pid == 0 {
         return;
@@ -576,16 +561,16 @@ async fn kill_pid_if_alive(pid: u32) {
         .map(|status| status.success())
         .unwrap_or(false);
     if !alive {
-        debug!(pid = pid, "no stale opencode process to kill");
+        debug!(pid = pid, "no stale executor process to kill");
         return;
     }
-    info!(pid = pid, "killing stale opencode process");
+    info!(pid = pid, "killing stale executor process");
     if let Err(e) = tokio::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
         .await
     {
-        debug!(pid = pid, error = %e, "failed to terminate stale opencode process");
+        debug!(pid = pid, error = %e, "failed to terminate stale executor process");
     }
 }
 
@@ -606,7 +591,7 @@ async fn wait_for_health(
     timeout: Duration,
 ) -> Result<(), NodeError> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let url = format!("http://127.0.0.1:{port}/global/health");
+    let url = format!("http://127.0.0.1:{port}/health");
     loop {
         let healthy = matches!(
             client
@@ -642,6 +627,7 @@ async fn cleanup(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use bosun_common::session::Permission;
     use tempfile::tempdir;
 
     use super::*;
@@ -651,6 +637,7 @@ mod tests {
             session_id: session_id.into(),
             repo_url: repo_url.into(),
             git_ref: None,
+            permission: Permission::ReadWrite,
         }
     }
 
@@ -722,6 +709,27 @@ mod tests {
         assert!(manager.sessions().is_empty());
     }
 
+    #[test]
+    fn to_info_reports_the_dir_for_reapable_and_dev_sessions() {
+        let clone = SessionRecord {
+            id: "s1".into(),
+            repo_url: Some("https://example.com/repo".into()),
+            git_ref: None,
+            dir: PathBuf::from("/work/s1"),
+            reapable: true,
+            status: "running".into(),
+            executor_port: Some(43210),
+            permission: Permission::ReadWrite,
+        };
+        let dev = SessionRecord {
+            reapable: false,
+            ..clone.clone()
+        };
+
+        assert_eq!(clone.to_info().dir, Some(PathBuf::from("/work/s1")));
+        assert_eq!(dev.to_info().dir, Some(PathBuf::from("/work/s1")));
+    }
+
     #[tokio::test]
     async fn wait_for_health_succeeds_against_stub() {
         let port = stub_server().await;
@@ -751,7 +759,7 @@ mod tests {
         tokio::fs::write(
             state_path(work.path()),
             r#"[
-                {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"opencode_port":43210,"pid":4242}
+                {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"executor_port":43210,"pid":4242}
             ]"#,
         )
         .await
@@ -774,26 +782,6 @@ mod tests {
 
         let output = child.wait().await.unwrap();
         assert!(!output.success());
-    }
-
-    #[test]
-    fn session_data_dir_is_per_session_under_the_work_dir() {
-        let work = tempdir().unwrap();
-        let first = session_data_dir(work.path(), "s1");
-        let second = session_data_dir(work.path(), "s2");
-        assert_eq!(first, work.path().join("s1").join(".opencode-data"));
-        assert_ne!(first, second, "sessions must not share a data dir");
-        assert!(first.starts_with(work.path()));
-    }
-
-    #[test]
-    fn serve_args_include_the_session_cors_origin() {
-        let args = serve_args("s1", 4321, "https://bosun.on.21cs.biz");
-        assert!(args.contains(&"--cors".to_string()));
-        assert!(args.contains(&"https://s1.bosun.on.21cs.biz".to_string()));
-
-        let local = serve_args("s1", 4321, "http://127.0.0.1:8090");
-        assert!(local.contains(&"http://s1.localhost:8090".to_string()));
     }
 
     #[test]
@@ -884,6 +872,7 @@ mod tests {
             .dev(&NodeDevRequest {
                 session_id: "s1".into(),
                 dir: work.path().join("missing"),
+                permission: Permission::ReadWrite,
             })
             .await
             .unwrap_err();
@@ -894,6 +883,7 @@ mod tests {
             .dev(&NodeDevRequest {
                 session_id: "s2".into(),
                 dir: outside.path().to_path_buf(),
+                permission: Permission::ReadWrite,
             })
             .await
             .unwrap_err();
@@ -905,6 +895,7 @@ mod tests {
             .dev(&NodeDevRequest {
                 session_id: "s3".into(),
                 dir: file,
+                permission: Permission::ReadWrite,
             })
             .await
             .unwrap_err();
@@ -925,6 +916,7 @@ mod tests {
             .dev(&NodeDevRequest {
                 session_id: "s1".into(),
                 dir: work.path().to_path_buf(),
+                permission: Permission::ReadWrite,
             })
             .await
             .unwrap_err();

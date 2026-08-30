@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::path::Path;
@@ -8,6 +9,9 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
+use bosun_agent::adapters::provider_for;
+use bosun_agent::config::resolve_model;
+use bosun_agent::provider::Provider;
 use bosun_common::config::CliConfig;
 use bosun_common::config::ControlConfig;
 use bosun_common::config::NodeConfig;
@@ -15,6 +19,9 @@ use bosun_common::config::cli_config_path;
 use bosun_common::config::load_cli_config;
 use bosun_common::config::load_config;
 use bosun_common::config::save_cli_config;
+use bosun_common::session::Permission;
+use bosun_common::session::Session;
+use bosun_common::session::SessionState;
 use bosun_common::telemetry::setup_logging;
 use bosun_common::types::CloneRequest;
 use bosun_common::types::DevRequest;
@@ -23,16 +30,21 @@ use bosun_common::types::DirListing;
 use bosun_common::types::StopRequest;
 use bosun_control::api::AppState;
 use bosun_control::commands::CommandQueue;
+use bosun_control::loops::AgentRegistry;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
-use bosun_control::registry::SessionHealth;
 use bosun_control::tunnel::TunnelRegistry;
+use bosun_executor::tools;
 use bosun_node::manager::NodeManager;
+use bosun_store::store::Store;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use dialoguer::FuzzySelect;
 use tracing::info;
+use tracing::warn;
+
+mod attach;
 
 #[derive(Parser)]
 #[command(name = "bosun", version, about = "Control panel for coding agents")]
@@ -55,12 +67,14 @@ enum Command {
     Dev(DevArgs),
     /// List sessions on the control plane.
     List(ListArgs),
-    /// Open a session's connect command.
+    /// Attach to a session interactively.
     Open(OpenArgs),
     /// Manage the CLI config file.
     Config(ConfigArgs),
     /// Stop a session and remove it from the node.
     Stop(StopArgs),
+    /// Run an executor server for one session.
+    Executor(ExecutorArgs),
 }
 
 #[derive(Args)]
@@ -99,6 +113,15 @@ struct CloneArgs {
     repo_url: String,
     /// Git ref to check out. Defaults to the remote default branch.
     git_ref: Option<String>,
+    /// Model to run the session with. Defaults to the control plane's default.
+    #[arg(long)]
+    model: Option<String>,
+    /// Tool permission: read-only or read-write. Defaults to read-write.
+    #[arg(long)]
+    permission: Option<String>,
+    /// First instruction for the session.
+    #[arg(long)]
+    message: Option<String>,
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
@@ -109,6 +132,15 @@ struct DevArgs {
     /// Node whose directories to browse.
     #[arg(long)]
     node: String,
+    /// Model to run the session with. Defaults to the control plane's default.
+    #[arg(long)]
+    model: Option<String>,
+    /// Tool permission: read-only or read-write. Defaults to read-write.
+    #[arg(long)]
+    permission: Option<String>,
+    /// First instruction for the session.
+    #[arg(long)]
+    message: Option<String>,
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
@@ -123,8 +155,8 @@ struct ListArgs {
 
 #[derive(Args)]
 struct OpenArgs {
-    /// Session id to connect to.
-    session_id: String,
+    /// Session id to connect to. Picked from a list when omitted.
+    session_id: Option<String>,
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
@@ -163,6 +195,22 @@ struct StopArgs {
     cp_url: Option<String>,
 }
 
+#[derive(Args)]
+struct ExecutorArgs {
+    /// Directory the session works in.
+    #[arg(long)]
+    session_dir: PathBuf,
+    /// Port the executor listens on.
+    #[arg(long)]
+    port: u16,
+    /// Tool permission: read_only or read_write.
+    #[arg(long, default_value = "read_write")]
+    permission: String,
+    /// Override the log filter. Defaults to RUST_LOG, then info.
+    #[arg(long)]
+    log_filter: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -177,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Open(args) => run_open(args).await,
         Command::Config(args) => run_config(args),
         Command::Stop(args) => run_stop(args).await,
+        Command::Executor(args) => run_executor(args).await,
     }
 }
 
@@ -218,6 +267,45 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         "control plane configured"
     );
 
+    tokio::fs::create_dir_all(&config.data_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create data directory {}",
+                config.data_dir.display()
+            )
+        })?;
+    let skills_dir = config.data_dir.join("skills");
+    tokio::fs::create_dir_all(&skills_dir)
+        .await
+        .with_context(|| format!("failed to create skills directory {}", skills_dir.display()))?;
+    let store = Store::open(&config.data_dir.join("store.db")).with_context(|| {
+        format!(
+            "failed to open the session store at {}",
+            config.data_dir.display()
+        )
+    })?;
+
+    let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+    let mut prices: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut model_names: Vec<&String> = config.models.keys().collect();
+    model_names.sort();
+    for name in model_names {
+        let resolved = resolve_model(&config.models, Some(name))?;
+        let provider = provider_for(&resolved)?;
+        providers.insert(name.clone(), Arc::from(provider));
+        prices.insert(
+            name.clone(),
+            (
+                resolved.config.price_input_per_mtok,
+                resolved.config.price_output_per_mtok,
+            ),
+        );
+    }
+    if providers.is_empty() {
+        warn!("no models configured; sessions cannot run");
+    }
+
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(
             config.node_timeout_secs,
@@ -226,7 +314,19 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             config.node_timeout_secs,
         ))),
         tunnels: Arc::new(TunnelRegistry::new()),
+        store,
+        loops: Arc::new(AgentRegistry::new(
+            Some(skills_dir.clone()),
+            providers.clone(),
+            config.subagents.clone(),
+            prices,
+        )),
+        providers,
+        subagents: config.subagents,
+        default_model: config.default_model,
+        skills_dir: Some(skills_dir),
     });
+    bosun_control::api::recover(&state).await;
     let app = bosun_control::api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
@@ -345,12 +445,20 @@ async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
 
 async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let permission = args
+        .permission
+        .as_deref()
+        .map(parse_permission)
+        .transpose()?;
 
     let client = cp_client()?;
     let request = CloneRequest {
         node: args.node.clone(),
         repo_url: args.repo_url,
         git_ref: args.git_ref,
+        model: args.model,
+        permission,
+        prompt: args.message,
     };
     let response = client
         .post(format!("{cp_url}/clone"))
@@ -366,13 +474,14 @@ async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
     if !status.is_success() {
         return Err(anyhow::anyhow!("clone failed: {text}"));
     }
-    let health: SessionHealth =
-        serde_json::from_str(&text).context("failed to parse clone response")?;
+    let session: Session = serde_json::from_str(&text).context("failed to parse clone response")?;
     println!(
         "cloned session {} on node {} (status {})",
-        health.id, health.node, health.status
+        session.id,
+        session.node,
+        state_name(session.state)
     );
-    println!("{}", connect_command(&cp_url, &health.id));
+    println!("open with: bosun open {}", session.id);
     Ok(())
 }
 
@@ -398,6 +507,11 @@ impl fmt::Display for Choice {
 
 async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let permission = args
+        .permission
+        .as_deref()
+        .map(parse_permission)
+        .transpose()?;
     let client = cp_client()?;
     let mut current: Option<PathBuf> = None;
 
@@ -430,7 +544,16 @@ async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
         match choice {
             Choice::SpawnHere => {
                 let dir = current.expect("spawn here is only offered below the roots screen");
-                spawn_dev(&client, &cp_url, &args.node, &dir).await?;
+                spawn_dev(
+                    &client,
+                    &cp_url,
+                    &args.node,
+                    &dir,
+                    args.model.clone(),
+                    permission,
+                    args.message.clone(),
+                )
+                .await?;
                 return Ok(());
             }
             Choice::Up => current = listing.parent.clone(),
@@ -473,10 +596,16 @@ async fn spawn_dev(
     cp_url: &str,
     node: &str,
     dir: &Path,
+    model: Option<String>,
+    permission: Option<Permission>,
+    prompt: Option<String>,
 ) -> anyhow::Result<()> {
     let request = DevRequest {
         node: node.to_string(),
         dir: dir.to_path_buf(),
+        model,
+        permission,
+        prompt,
     };
     let response = client
         .post(format!("{cp_url}/dev"))
@@ -492,17 +621,18 @@ async fn spawn_dev(
     if !status.is_success() {
         return Err(anyhow::anyhow!("dev failed: {text}"));
     }
-    let health: SessionHealth =
-        serde_json::from_str(&text).context("failed to parse dev response")?;
+    let session: Session = serde_json::from_str(&text).context("failed to parse dev response")?;
     println!(
         "started dev session {} on node {} (status {})",
-        health.id, health.node, health.status
+        session.id,
+        session.node,
+        state_name(session.state)
     );
-    println!("{}", connect_command(cp_url, &health.id));
+    println!("open with: bosun open {}", session.id);
     Ok(())
 }
 
-async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<SessionHealth>> {
+async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<Session>> {
     let client = cp_client()?;
     client
         .get(format!("{cp_url}/sessions"))
@@ -532,26 +662,70 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         let source = session
             .repo_url
             .clone()
-            .or_else(|| session.dir.as_ref().map(|d| d.display().to_string()))
-            .unwrap_or_else(|| "-".to_string());
+            .unwrap_or_else(|| session.dir.clone());
         let git_ref = session.git_ref.as_deref().unwrap_or("-");
         println!(
             "{:<36}  {:<10}  {:<28}  {:<12}  {:<6}",
-            session.id, session.node, source, git_ref, session.status
+            session.id,
+            session.node,
+            source,
+            git_ref,
+            state_name(session.state)
         );
     }
     Ok(())
 }
 
+fn state_name(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Creating => "creating",
+        SessionState::Running => "running",
+        SessionState::WaitingForInput => "waiting_for_input",
+        SessionState::Interrupted => "interrupted",
+        SessionState::Stopped => "stopped",
+    }
+}
+
 async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
-    let sessions = fetch_sessions(&cp_url).await?;
-
-    let Some(session) = sessions.into_iter().find(|s| s.id == args.session_id) else {
-        return Err(anyhow::anyhow!("session {} not found", args.session_id));
+    let session_id = match args.session_id {
+        Some(id) => {
+            let sessions = fetch_sessions(&cp_url).await?;
+            if !sessions.iter().any(|s| s.id == id) {
+                return Err(anyhow::anyhow!("session {id} not found"));
+            }
+            id
+        }
+        None => {
+            let Some(id) = pick_session(&cp_url).await? else {
+                return Ok(());
+            };
+            id
+        }
     };
-    println!("{}", connect_command(&cp_url, &session.id));
-    Ok(())
+    attach::attach(&cp_url, &session_id).await
+}
+
+async fn pick_session(cp_url: &str) -> anyhow::Result<Option<String>> {
+    let sessions = fetch_sessions(cp_url).await?;
+    if sessions.is_empty() {
+        return Err(anyhow::anyhow!("no sessions to open"));
+    }
+    let items: Vec<String> = sessions
+        .iter()
+        .map(|s| format!("{}  {}  {}", s.id, s.node, state_name(s.state)))
+        .collect();
+    let selected = match FuzzySelect::new()
+        .with_prompt("session")
+        .items(&items)
+        .default(0)
+        .interact_opt()
+    {
+        Ok(Some(index)) => index,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(Some(sessions[selected].id.clone()))
 }
 fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
     match args.command {
@@ -613,17 +787,17 @@ async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the command to attach to a session. A session is addressed at its
-/// subdomain host, so the web UI sits at the origin root and opencode's own
-/// `/session` API paths reach it unchanged. A control plane reachable only at
-/// a non-loopback IP has no wildcard DNS, so its sessions have no address.
-fn connect_command(cp_url: &str, session_id: &str) -> String {
-    match bosun_common::origin::session_origin(cp_url, session_id) {
-        Some(origin) => format!("opencode attach {origin}"),
-        None => format!(
-            "session {session_id} is not reachable from {cp_url}: an IP-addressed control plane has no session subdomains"
-        ),
-    }
+fn parse_permission(value: &str) -> anyhow::Result<Permission> {
+    tools::permission_from_str(value).ok_or_else(|| {
+        anyhow::anyhow!("invalid permission: {value}; expected read-only or read-write")
+    })
+}
+
+async fn run_executor(args: ExecutorArgs) -> anyhow::Result<()> {
+    let permission = parse_permission(&args.permission)?;
+    setup_logging(args.log_filter.as_deref())?;
+    bosun_executor::server::serve(args.session_dir, args.port, permission).await?;
+    Ok(())
 }
 
 fn format_ago(now: SystemTime, unix_secs: u64) -> String {
@@ -654,51 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn connect_command_explains_when_an_ip_control_plane_has_no_subdomains() {
-        assert_eq!(
-            connect_command("http://192.168.1.10:8090", "abc-123"),
-            "session abc-123 is not reachable from http://192.168.1.10:8090: \
-             an IP-addressed control plane has no session subdomains"
-        );
-    }
-
-    #[test]
-    fn connect_command_trims_a_trailing_slash() {
-        assert_eq!(
-            connect_command("http://127.0.0.1:8090/", "abc-123"),
-            "opencode attach http://abc-123.localhost:8090"
-        );
-    }
-
-    #[test]
-    fn connect_command_uses_the_session_subdomain_for_dns_hosts() {
-        assert_eq!(
-            connect_command("https://bosun.on.21cs.biz", "abc-123"),
-            "opencode attach https://abc-123.bosun.on.21cs.biz"
-        );
-    }
-
-    #[test]
-    fn connect_command_keeps_the_port_on_the_subdomain() {
-        assert_eq!(
-            connect_command("http://bosun.example.com:8090", "abc-123"),
-            "opencode attach http://abc-123.bosun.example.com:8090"
-        );
-    }
-
-    #[test]
-    fn connect_command_uses_the_localhost_subdomain_for_loopback() {
-        assert_eq!(
-            connect_command("http://localhost:8090", "abc-123"),
-            "opencode attach http://abc-123.localhost:8090"
-        );
-        assert_eq!(
-            connect_command("http://127.0.0.1:8090", "abc-123"),
-            "opencode attach http://abc-123.localhost:8090"
-        );
-    }
-
-    #[test]
     fn resolve_cp_url_prefers_flag_over_env_over_stored() {
         let flag = Some("http://flag:8090");
         let env = Some("http://env:8090".to_string());
@@ -715,5 +844,21 @@ mod tests {
             resolve_cp_url_from(None, None, stored),
             "http://stored:8090"
         );
+    }
+
+    #[test]
+    fn parse_permission_accepts_dashes_and_underscores() {
+        assert_eq!(parse_permission("read-only").unwrap(), Permission::ReadOnly);
+        assert_eq!(parse_permission("read_only").unwrap(), Permission::ReadOnly);
+        assert_eq!(
+            parse_permission("read-write").unwrap(),
+            Permission::ReadWrite
+        );
+        assert_eq!(
+            parse_permission("read_write").unwrap(),
+            Permission::ReadWrite
+        );
+        assert!(parse_permission("admin").is_err());
+        assert!(parse_permission("").is_err());
     }
 }

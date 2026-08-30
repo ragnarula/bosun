@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bosun</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #10131a;
+    --panel: #161a22;
+    --panel-2: #1d2230;
+    --border: #2b3242;
+    --text: #d8dde6;
+    --muted: #8a93a3;
+    --accent: #5b8cff;
+    --user: #d3b072;
+    --mono: #9fb7cc;
+    --error: #ff7070;
+    --ok: #4ed48e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  }
+  header.top {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 10px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header.top h1 { margin: 0; font-size: 18px; }
+  header.top .origin { color: var(--muted); font-size: 13px; }
+  #status { min-height: 20px; padding: 3px 20px 7px; color: var(--muted); font-size: 12px; }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 0 20px 20px;
+    align-items: start;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .panel h2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 7px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: var(--panel-2); }
+  .empty { color: var(--muted); }
+  button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.up { background: var(--ok); }
+  .dot.down { background: var(--error); }
+  #new-session-form {
+    display: grid;
+    gap: 10px;
+    padding: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  #new-session-form[hidden] { display: none; }
+  #new-session-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  #new-session-form input, #new-session-form select, #new-session-form textarea {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font: inherit;
+  }
+  #new-session-form .actions { display: flex; gap: 8px; }
+  #session-view {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #session-view[hidden] { display: none; }
+  .view-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .view-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .view-meta .muted { color: var(--muted); }
+  .view-meta .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .badge {
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .badge.state { color: var(--accent); border-color: var(--accent); }
+  .view-actions { display: flex; gap: 8px; }
+  #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  #transcript .msg { margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #transcript .msg.user { color: var(--user); }
+  #transcript .msg.assistant { color: var(--text); }
+  #transcript .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #transcript .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
+  #transcript .error { color: var(--error); }
+  #transcript .state { color: var(--muted); font-size: 12px; }
+  #transcript .summary { color: var(--muted); font-style: italic; }
+  #transcript .subagent { color: var(--muted); padding-left: 18px; }
+  #transcript .model-call {
+    color: var(--muted);
+    opacity: 0.65;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #transcript .unknown { color: var(--muted); font-size: 12px; }
+  #transcript .ask {
+    margin: 6px 0;
+    padding: 10px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: rgba(91, 140, 255, 0.08);
+  }
+  #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
+  #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
+  .input-row {
+    display: flex;
+    gap: 10px;
+    padding: 14px 20px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+  .input-row textarea {
+    flex: 1;
+    resize: vertical;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font: inherit;
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>Bosun</h1>
+  <span class="origin" id="origin"></span>
+</header>
+<div id="status"></div>
+<main>
+  <section class="panel">
+    <h2>Nodes</h2>
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Status</th><th>Last seen</th></tr>
+      </thead>
+      <tbody id="nodes-body"></tbody>
+    </table>
+  </section>
+  <section class="panel">
+    <h2>Sessions <button id="btn-new-session" type="button">New session</button></h2>
+    <form id="new-session-form" hidden>
+      <label>Node
+        <select id="form-node" required></select>
+      </label>
+      <label>Dir
+        <input id="form-dir" type="text" required placeholder="/path/to/work">
+      </label>
+      <label>Model
+        <input id="form-model" type="text" placeholder="default model">
+      </label>
+      <label>Permission
+        <select id="form-permission">
+          <option value="read_write">read-write</option>
+          <option value="read_only">read-only</option>
+        </select>
+      </label>
+      <label>Prompt
+        <textarea id="form-prompt" rows="3" placeholder="optional first instruction"></textarea>
+      </label>
+      <div class="actions">
+        <button type="submit">Start</button>
+        <button type="button" id="btn-cancel-new-session">Cancel</button>
+      </div>
+    </form>
+    <table>
+      <thead>
+        <tr><th>Id</th><th>Node</th><th>Model</th><th>State</th><th>Permission</th></tr>
+      </thead>
+      <tbody id="sessions-body"></tbody>
+    </table>
+  </section>
+</main>
+
+<div id="session-view" hidden>
+  <header class="view-header">
+    <div class="view-meta">
+      <span class="id" id="view-id"></span>
+      <span class="muted" id="view-node"></span>
+      <span class="muted" id="view-model"></span>
+      <span class="badge" id="view-permission"></span>
+      <span class="badge state" id="view-state"></span>
+    </div>
+    <div class="view-actions">
+      <button id="btn-interrupt" type="button">Interrupt</button>
+      <button id="btn-permission" type="button">Switch to read-only</button>
+      <button id="btn-stop" type="button">Stop</button>
+      <button id="btn-close" type="button">Close</button>
+    </div>
+  </header>
+  <div id="transcript"></div>
+  <div class="input-row">
+    <textarea id="input" rows="3" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+    <button id="btn-send" type="button">Send</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+
+const originEl = $('origin');
+const statusEl = $('status');
+const nodesBody = $('nodes-body');
+const sessionsBody = $('sessions-body');
+const newSessionBtn = $('btn-new-session');
+const newSessionForm = $('new-session-form');
+const cancelNewSessionBtn = $('btn-cancel-new-session');
+const formNode = $('form-node');
+const formDir = $('form-dir');
+const formModel = $('form-model');
+const formPermission = $('form-permission');
+const formPrompt = $('form-prompt');
+const view = $('session-view');
+const viewId = $('view-id');
+const viewNode = $('view-node');
+const viewModel = $('view-model');
+const viewPermission = $('view-permission');
+const viewState = $('view-state');
+const btnInterrupt = $('btn-interrupt');
+const btnPermission = $('btn-permission');
+const btnStop = $('btn-stop');
+const btnClose = $('btn-close');
+const transcript = $('transcript');
+const input = $('input');
+const btnSend = $('btn-send');
+
+let nodes = [];
+let sessions = [];
+let current = null;   // the open session id
+let es = null;        // the open EventSource
+let liveEl = null;    // the assistant paragraph live deltas stream into
+let stick = true;     // auto-scroll the transcript when true
+let sending = false;
+
+originEl.textContent = location.origin;
+
+function showStatus(text) {
+  statusEl.textContent = text;
+}
+
+function ago(secs) {
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function cell(text) {
+  const td = document.createElement('td');
+  td.textContent = text;
+  return td;
+}
+
+function emptyRow(cols, text) {
+  const row = document.createElement('tr');
+  const td = document.createElement('td');
+  td.colSpan = cols;
+  td.className = 'empty';
+  td.textContent = text;
+  row.appendChild(td);
+  return row;
+}
+
+function renderNodes() {
+  nodesBody.textContent = '';
+  if (nodes.length === 0) {
+    nodesBody.appendChild(emptyRow(3, 'no nodes connected'));
+    return;
+  }
+  for (const node of nodes) {
+    const row = document.createElement('tr');
+    row.appendChild(cell(node.name));
+    const status = document.createElement('td');
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + (node.up ? 'up' : 'down');
+    status.appendChild(dot);
+    status.appendChild(document.createTextNode(node.up ? 'up' : 'down'));
+    row.appendChild(status);
+    row.appendChild(cell(ago(node.last_seen_secs)));
+    nodesBody.appendChild(row);
+  }
+}
+
+function renderNodeOptions() {
+  formNode.textContent = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'choose a node';
+  formNode.appendChild(placeholder);
+  for (const node of nodes) {
+    const option = document.createElement('option');
+    option.value = node.name;
+    option.textContent = node.name + (node.up ? '' : ' (down)');
+    formNode.appendChild(option);
+  }
+}
+
+function shortId(id) {
+  return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+function renderSessions() {
+  sessionsBody.textContent = '';
+  if (sessions.length === 0) {
+    sessionsBody.appendChild(emptyRow(5, 'no sessions'));
+    return;
+  }
+  for (const session of sessions) {
+    const row = document.createElement('tr');
+    row.className = 'clickable';
+    row.title = session.id;
+    row.appendChild(cell(shortId(session.id)));
+    row.appendChild(cell(session.node));
+    row.appendChild(cell(session.model));
+    row.appendChild(cell(session.state));
+    row.appendChild(cell(session.permission));
+    row.addEventListener('click', () => openSession(session.id));
+    sessionsBody.appendChild(row);
+  }
+}
+
+async function post(url, body) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error('HTTP ' + response.status + ': ' + (await response.text()));
+  }
+  return response;
+}
+
+let nodesFetching = false;
+async function refreshNodes() {
+  if (nodesFetching) return;
+  nodesFetching = true;
+  try {
+    const response = await fetch('/nodes');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    nodes = await response.json();
+    renderNodes();
+    renderNodeOptions();
+  } catch (error) {
+    showStatus('nodes: ' + error.message);
+  } finally {
+    nodesFetching = false;
+  }
+}
+
+let sessionsFetching = false;
+async function refreshSessions() {
+  if (sessionsFetching) return;
+  sessionsFetching = true;
+  try {
+    const response = await fetch('/sessions');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    sessions = await response.json();
+    renderSessions();
+    if (current && !sessions.some((session) => session.id === current)) {
+      showStatus('session ' + current + ' ended');
+      closeSession();
+    }
+  } catch (error) {
+    showStatus('sessions: ' + error.message);
+  } finally {
+    sessionsFetching = false;
+  }
+}
+
+newSessionBtn.addEventListener('click', () => {
+  newSessionForm.hidden = !newSessionForm.hidden;
+  if (!newSessionForm.hidden) formNode.focus();
+});
+
+cancelNewSessionBtn.addEventListener('click', () => {
+  newSessionForm.hidden = true;
+  newSessionForm.reset();
+});
+
+newSessionForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const body = {
+    node: formNode.value,
+    dir: formDir.value.trim(),
+    permission: formPermission.value,
+  };
+  const model = formModel.value.trim();
+  if (model) body.model = model;
+  const prompt = formPrompt.value.trim();
+  if (prompt) body.prompt = prompt;
+  try {
+    // A directory-based session on the node: the executor starts there and
+    // the loop can run tools immediately.
+    const response = await post('/dev', body);
+    const session = await response.json();
+    newSessionForm.hidden = true;
+    newSessionForm.reset();
+    await refreshSessions();
+    openSession(session.id);
+  } catch (error) {
+    showStatus('new session: ' + error.message);
+  }
+});
+
+function openSession(id) {
+  closeSession();
+  current = id;
+  view.hidden = false;
+  const session = sessions.find((s) => s.id === id);
+  if (session) updateHeader(session);
+  fetchSession(id);
+  // EventSource reconnects automatically; durable frames carry the event seq
+  // as their SSE id, so the browser resumes with Last-Event-ID.
+  es = new EventSource('/sessions/' + encodeURIComponent(id) + '/events');
+  es.onmessage = (event) => {
+    try {
+      handleFrame(JSON.parse(event.data));
+    } catch (error) {
+      showStatus('events: ' + error.message);
+    }
+  };
+  es.onerror = () => {
+    showStatus('events: stream lost, reconnecting');
+  };
+  input.focus();
+}
+
+function closeSession() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+  current = null;
+  liveEl = null;
+  transcript.textContent = '';
+  input.value = '';
+  view.hidden = true;
+}
+
+async function fetchSession(id) {
+  try {
+    const response = await fetch('/sessions/' + encodeURIComponent(id));
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    updateHeader(await response.json());
+  } catch (error) {
+    showStatus('session: ' + error.message);
+  }
+}
+
+function updateHeader(session) {
+  viewId.textContent = session.id;
+  viewNode.textContent = session.node;
+  viewModel.textContent = session.model;
+  updatePermissionBadge(session.permission);
+  viewState.textContent = session.state;
+}
+
+function updatePermissionBadge(permission) {
+  viewPermission.textContent = permission;
+  btnPermission.textContent =
+    permission === 'read_only' ? 'Switch to read-write' : 'Switch to read-only';
+}
+
+btnInterrupt.addEventListener('click', async () => {
+  try {
+    await post('/sessions/' + encodeURIComponent(current) + '/interrupt', {});
+  } catch (error) {
+    showStatus('interrupt: ' + error.message);
+  }
+});
+
+btnPermission.addEventListener('click', async () => {
+  const next = viewPermission.textContent === 'read_only' ? 'read_write' : 'read_only';
+  try {
+    await post('/sessions/' + encodeURIComponent(current) + '/permission', {
+      permission: next,
+    });
+  } catch (error) {
+    showStatus('permission: ' + error.message);
+  }
+});
+
+btnStop.addEventListener('click', async () => {
+  if (!window.confirm('Stop and delete this session?')) return;
+  try {
+    await post('/stop', { session_id: current });
+    showStatus('session stopped');
+    closeSession();
+    await refreshSessions();
+  } catch (error) {
+    showStatus('stop: ' + error.message);
+  }
+});
+
+btnClose.addEventListener('click', closeSession);
+
+async function send() {
+  if (sending || !input.value.trim()) return;
+  sending = true;
+  btnSend.disabled = true;
+  try {
+    await post('/sessions/' + encodeURIComponent(current) + '/messages', {
+      content: input.value,
+    });
+    input.value = '';
+  } catch (error) {
+    showStatus('send: ' + error.message);
+  } finally {
+    sending = false;
+    btnSend.disabled = false;
+    input.focus();
+  }
+}
+
+btnSend.addEventListener('click', send);
+input.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    send();
+  }
+});
+
+function scrollToBottom() {
+  if (stick) transcript.scrollTop = transcript.scrollHeight;
+}
+
+transcript.addEventListener('scroll', () => {
+  stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;
+});
+
+function appendLine(kind, text) {
+  const line = document.createElement('div');
+  line.className = 'line ' + kind;
+  line.textContent = text;
+  transcript.appendChild(line);
+  scrollToBottom();
+}
+
+function appendMsg(role, text) {
+  const paragraph = document.createElement('p');
+  paragraph.className = 'msg ' + role;
+  paragraph.textContent = text;
+  transcript.appendChild(paragraph);
+  scrollToBottom();
+}
+
+// Live deltas stream into one assistant paragraph until the turn's durable
+// text arrives (which supersedes the stream) or another message begins.
+function appendDelta(text) {
+  if (!liveEl) {
+    liveEl = document.createElement('p');
+    liveEl.className = 'msg assistant';
+    transcript.appendChild(liveEl);
+  }
+  liveEl.textContent += text;
+  scrollToBottom();
+}
+
+function closeLive() {
+  liveEl = null;
+}
+
+function renderMessage(message) {
+  const block = message.block;
+  if (message.role === 'assistant' && block.kind === 'text') {
+    if (liveEl) {
+      liveEl.textContent = block.text;
+      liveEl = null;
+      scrollToBottom();
+      return;
+    }
+    appendMsg('assistant', block.text);
+    return;
+  }
+  closeLive();
+  switch (block.kind) {
+    case 'text':
+      appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
+      break;
+    case 'tool_call':
+      appendLine('mono', '→ ' + block.name + '(' + JSON.stringify(block.args) + ')');
+      break;
+    case 'tool_result': {
+      const content =
+        typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+      appendLine(
+        block.is_error ? 'mono error' : 'mono',
+        '← ' + block.name + ': ' + content
+      );
+      break;
+    }
+    case 'ask': {
+      const box = document.createElement('div');
+      box.className = 'ask';
+      const question = document.createElement('div');
+      question.textContent = block.message;
+      box.appendChild(question);
+      const options = document.createElement('ul');
+      options.className = 'options';
+      for (const option of block.options || []) {
+        const item = document.createElement('li');
+        item.textContent = option;
+        options.appendChild(item);
+      }
+      box.appendChild(options);
+      if (block.answer) {
+        const answer = document.createElement('div');
+        answer.className = 'answer';
+        answer.textContent = 'answered: ' + block.answer;
+        box.appendChild(answer);
+      }
+      transcript.appendChild(box);
+      scrollToBottom();
+      break;
+    }
+    case 'summary':
+      appendLine('summary', '[summary] ' + block.text);
+      break;
+    case 'subagent':
+      appendLine(
+        'subagent',
+        '[subagent ' + block.subagent_type + ' ' + block.status + '] ' + block.text
+      );
+      break;
+    default:
+      appendLine('unknown', JSON.stringify(block));
+      break;
+  }
+}
+
+function renderModelCall(event) {
+  const detail = [];
+  if (event.input_tokens != null) detail.push('in=' + event.input_tokens);
+  if (event.output_tokens != null) detail.push('out=' + event.output_tokens);
+  const suffix = detail.length > 0 ? ' ' + detail.join(' ') : '';
+  appendLine('model-call', '[model ' + event.model + suffix + ']');
+}
+
+function handleEvent(event) {
+  switch (event.kind) {
+    case 'message':
+      renderMessage(event.message);
+      break;
+    case 'state':
+      appendLine('state', '* ' + event.state);
+      viewState.textContent = event.state;
+      break;
+    case 'permission':
+      updatePermissionBadge(event.permission);
+      break;
+    case 'model_call':
+      renderModelCall(event);
+      break;
+  }
+}
+
+function handleFrame(frame) {
+  if (Object.prototype.hasOwnProperty.call(frame, 'delta')) {
+    appendDelta(frame.delta);
+    return;
+  }
+  if (frame.event) handleEvent(frame.event);
+}
+
+refreshNodes();
+refreshSessions();
+setInterval(refreshNodes, 5000);
+setInterval(refreshSessions, 3000);
+</script>
+</body>
+</html>

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -6,6 +7,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::session::Permission;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlConfig {
@@ -13,6 +16,15 @@ pub struct ControlConfig {
     pub node_timeout_secs: u64,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
+    pub models: HashMap<String, ModelConfig>,
+    pub subagents: HashMap<String, SubagentConfig>,
+    pub default_model: Option<String>,
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("data")
 }
 
 impl Default for ControlConfig {
@@ -22,8 +34,31 @@ impl Default for ControlConfig {
             node_timeout_secs: 30,
             tls_cert: None,
             tls_key: None,
+            data_dir: default_data_dir(),
+            models: HashMap::new(),
+            subagents: HashMap::new(),
+            default_model: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    pub provider: String, // "anthropic" or "openai"
+    pub name: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub api_key: String, // a literal key, or "env:VAR" to read from the environment
+    #[serde(default)]
+    pub price_input_per_mtok: f64,
+    #[serde(default)]
+    pub price_output_per_mtok: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubagentConfig {
+    pub model: String,
+    pub permission: Permission,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +168,79 @@ mod tests {
         let config: ControlConfig = toml::from_str("").unwrap();
         assert_eq!(config.listen_addr, "127.0.0.1:8090");
         assert_eq!(config.node_timeout_secs, 30);
+    }
+
+    #[test]
+    fn empty_config_defaults_data_dir_and_empty_maps() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert!(config.models.is_empty());
+        assert!(config.subagents.is_empty());
+        assert_eq!(config.default_model, None);
+    }
+
+    #[test]
+    fn sparse_config_keeps_the_data_dir_default() {
+        let config: ControlConfig = toml::from_str("listen_addr = \"0.0.0.0:9000\"").unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+    }
+
+    #[test]
+    fn config_parses_models_and_subagents() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            [models.main]
+            provider = "anthropic"
+            name = "claude-sonnet-4-5"
+            api_key = "env:ANTHROPIC_API_KEY"
+            base_url = "https://api.anthropic.com"
+
+            [models.cheap]
+            provider = "openai"
+            name = "gpt-4o-mini"
+            api_key = "sk-test"
+
+            [subagents.coder]
+            model = "main"
+            permission = "read_write"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(config.subagents.len(), 1);
+        assert_eq!(config.default_model, None);
+
+        let main = &config.models["main"];
+        assert_eq!(main.provider, "anthropic");
+        assert_eq!(main.name, "claude-sonnet-4-5");
+        assert_eq!(main.api_key, "env:ANTHROPIC_API_KEY");
+        assert_eq!(main.base_url.as_deref(), Some("https://api.anthropic.com"));
+
+        let cheap = &config.models["cheap"];
+        assert_eq!(cheap.provider, "openai");
+        assert_eq!(cheap.name, "gpt-4o-mini");
+        assert_eq!(cheap.base_url, None);
+
+        let coder = &config.subagents["coder"];
+        assert_eq!(coder.model, "main");
+        assert_eq!(coder.permission, Permission::ReadWrite);
+    }
+
+    #[test]
+    fn model_without_prices_defaults_to_zero() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            [models.main]
+            provider = "anthropic"
+            name = "claude-sonnet-4-5"
+            api_key = "env:ANTHROPIC_API_KEY"
+            "#,
+        )
+        .unwrap();
+        let main = &config.models["main"];
+        assert_eq!(main.price_input_per_mtok, 0.0);
+        assert_eq!(main.price_output_per_mtok, 0.0);
     }
 
     #[test]

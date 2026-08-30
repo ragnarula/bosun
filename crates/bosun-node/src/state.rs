@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use bosun_common::session::Permission;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -15,12 +16,19 @@ pub struct PersistedSession {
     pub dir: Option<PathBuf>,
     #[serde(default = "default_reapable")]
     pub reapable: bool,
-    pub opencode_port: u16,
+    #[serde(default)]
+    pub executor_port: u16,
+    #[serde(default = "default_permission")]
+    pub permission: Permission,
     pub pid: u32,
 }
 
 fn default_reapable() -> bool {
     true
+}
+
+fn default_permission() -> Permission {
+    Permission::ReadWrite
 }
 
 pub fn state_path(work_dir: &Path) -> PathBuf {
@@ -39,7 +47,8 @@ mod tests {
             git_ref: Some("main".into()),
             dir: None,
             reapable: true,
-            opencode_port: 43210,
+            executor_port: 43210,
+            permission: Permission::ReadOnly,
             pid: 4242,
         };
         let json = serde_json::to_string(&session).unwrap();
@@ -49,20 +58,23 @@ mod tests {
         assert_eq!(decoded.git_ref, session.git_ref);
         assert_eq!(decoded.dir, session.dir);
         assert_eq!(decoded.reapable, session.reapable);
-        assert_eq!(decoded.opencode_port, session.opencode_port);
+        assert_eq!(decoded.executor_port, session.executor_port);
+        assert_eq!(decoded.permission, session.permission);
         assert_eq!(decoded.pid, session.pid);
     }
 
     #[test]
     fn old_state_json_without_new_fields_still_parses() {
         let json = r#"[
-            {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"opencode_port":43210,"pid":4242}
+            {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"executor_port":43210,"pid":4242}
         ]"#;
         let decoded: Vec<PersistedSession> = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].repo_url, Some("https://example.com/repo".into()));
         assert_eq!(decoded[0].dir, None);
         assert!(decoded[0].reapable);
+        assert_eq!(decoded[0].executor_port, 43210);
+        assert_eq!(decoded[0].permission, Permission::ReadWrite);
     }
 
     #[test]

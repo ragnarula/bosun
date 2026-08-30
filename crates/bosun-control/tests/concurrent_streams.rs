@@ -1,8 +1,9 @@
 //! Reproduction for: concurrent streams over one session tunnel stall after
 //! roughly 800 KiB of a large response. Mirrors the reported deployment: a
-//! control plane, a node that dials out over one tunnel, and a client that
-//! fetches two URLs through the same tunnel at the same time.
+//! control plane, a node that dials out over one tunnel, and two requests
+//! over logical connections on the same tunnel at the same time.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +14,10 @@ use bosun_common::tunnel::Tunnel;
 use bosun_control::api::AppState;
 use bosun_control::api::router;
 use bosun_control::commands::CommandQueue;
+use bosun_control::loops::AgentRegistry;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::tunnel::TunnelRegistry;
+use bosun_store::store::Store;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncReadExt;
@@ -26,7 +29,7 @@ const ASSET_BODY_LEN: usize = 2_738_956;
 const ROOT_BODY: &[u8] = b"root page";
 
 /// Serves a request head based on the path: `/assets/index.js` returns a body
-/// the size of the reported opencode bundle, everything else a tiny body.
+/// the size of a large web asset bundle, everything else a tiny body.
 async fn backend() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -70,12 +73,27 @@ async fn backend() -> SocketAddr {
     addr
 }
 
-/// A control plane whose gateway routes to a session tunnel.
-async fn control_plane() -> SocketAddr {
+/// A control plane with a session tunnel registry. Returns the store too, so
+/// a test can register the tunnel's session up front.
+async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>) {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+    let tunnels = Arc::new(TunnelRegistry::new());
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
         commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
-        tunnels: Arc::new(TunnelRegistry::new()),
+        tunnels: tunnels.clone(),
+        store: store.clone(),
+        loops: Arc::new(AgentRegistry::new(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )),
+        providers: HashMap::new(),
+        subagents: HashMap::new(),
+        default_model: None,
+        skills_dir: None,
     });
     let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -83,7 +101,31 @@ async fn control_plane() -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    addr
+    (addr, store, tunnels)
+}
+
+/// Registers the session in the store, as a clone/dev request would, so the
+/// tunnel endpoint accepts its tunnel.
+async fn register_session(store: &Store, session_id: &str) {
+    use bosun_common::session::Permission;
+    use bosun_common::session::Session;
+    use bosun_common::session::SessionState;
+
+    store
+        .create_session(&Session {
+            id: session_id.to_string(),
+            node: "node-1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: "/work".into(),
+            model: "mock-model".into(),
+            permission: Permission::ReadWrite,
+            state: SessionState::WaitingForInput,
+            created_at_secs: 1_700_000_000,
+            prompt: None,
+        })
+        .await
+        .unwrap();
 }
 
 /// The node side: opens the outbound tunnel and relays every logical
@@ -126,8 +168,33 @@ async fn node_tunnel(cp_addr: SocketAddr, session_id: &str, backend: SocketAddr)
     });
 }
 
-/// Waits until a session route answers, then fetches the root and the asset
-/// concurrently through the gateway, the way `curl --parallel` does.
+/// Opens a logical connection on the session's tunnel and sends one GET over
+/// HTTP/1.1, the way the control plane's tool transport does. Returns `None`
+/// while the tunnel is not yet registered.
+async fn tunnel_get(
+    tunnels: &TunnelRegistry,
+    session_id: &str,
+    path: &str,
+) -> Option<hyper::Response<hyper::body::Incoming>> {
+    let stream = tunnels.open(session_id).await.ok()?;
+    let (mut sender, conn) =
+        http1::handshake::<_, http_body_util::Empty<bytes::Bytes>>(TokioIo::new(stream))
+            .await
+            .ok()?;
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    let request = HttpRequest::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", "executor")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    sender.send_request(request).await.ok()
+}
+
+/// Waits until the tunnel is live, then fetches the root and the asset
+/// concurrently over two logical connections on one tunnel.
 #[tokio::test]
 async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
     let _ = tracing_subscriber::fmt()
@@ -137,21 +204,15 @@ async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
         )
         .try_init();
     let backend_addr = backend().await;
-    let cp_addr = control_plane().await;
+    let (cp_addr, store, tunnels) = control_plane().await;
     let session_id = uuid::Uuid::new_v4().to_string();
+    register_session(&store, &session_id).await;
     node_tunnel(cp_addr, &session_id, backend_addr).await;
 
-    let client = reqwest::Client::new();
-    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match client
-            .get(format!("http://{cp_addr}/"))
-            .header("host", &subdomain)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => break,
+        match tunnel_get(&tunnels, &session_id, "/index.html").await {
+            Some(response) if response.status().is_success() => break,
             _ => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -162,78 +223,8 @@ async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
         }
     }
 
-    let root = client
-        .get(format!("http://{cp_addr}/"))
-        .header("host", &subdomain)
-        .send();
-    let asset = client
-        .get(format!("http://{cp_addr}/assets/index.js"))
-        .header("host", &subdomain)
-        .send();
-
-    let (root, asset) = tokio::join!(root, asset);
-    let root = root
-        .expect("root request failed")
-        .error_for_status()
-        .unwrap();
-    let asset = asset
-        .expect("asset request failed")
-        .error_for_status()
-        .unwrap();
-
-    let (root_len, _) = tokio::join!(root.bytes(), async { ROOT_BODY.to_vec() });
-    let root_len = root_len.expect("root body incomplete");
-    assert_eq!(root_len.as_ref(), ROOT_BODY, "root body mismatch");
-
-    let asset_len = tokio::time::timeout(Duration::from_secs(10), asset.bytes())
-        .await
-        .expect("asset download stalled")
-        .expect("asset body error");
-    assert_eq!(asset_len.len(), ASSET_BODY_LEN, "asset body truncated");
-}
-
-/// The reported client speaks HTTP/2 (`curl --parallel --http2`), so its two
-/// streams share one HTTP/2 connection to the control plane. The gateway
-/// still opens one logical tunnel connection per request; both run over the
-/// same session tunnel at once.
-#[tokio::test]
-async fn concurrent_http2_streams_over_one_tunnel_deliver_both_bodies() {
-    let backend_addr = backend().await;
-    let cp_addr = control_plane().await;
-    let session_id = uuid::Uuid::new_v4().to_string();
-    node_tunnel(cp_addr, &session_id, backend_addr).await;
-
-    use hyper_util::client::legacy::Client;
-    use hyper_util::rt::TokioExecutor;
-    let client: Client<_, http_body_util::Empty<bytes::Bytes>> =
-        Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http();
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
-    let host_request = |path: &str| {
-        HttpRequest::builder()
-            .uri(format!("http://{cp_addr}{path}"))
-            .header("host", &subdomain)
-            .body(http_body_util::Empty::<bytes::Bytes>::new())
-            .unwrap()
-    };
-    loop {
-        match client.request(host_request("/")).await {
-            Ok(response) if response.status().is_success() => break,
-            _ => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "session route never became live"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-
-    let root = client.request(host_request("/"));
-    let asset = client.request(host_request("/assets/index.js"));
+    let root = tunnel_get(&tunnels, &session_id, "/index.html");
+    let asset = tunnel_get(&tunnels, &session_id, "/assets/index.js");
 
     let (root, asset) = tokio::join!(root, asset);
     let root = root.expect("root request failed");

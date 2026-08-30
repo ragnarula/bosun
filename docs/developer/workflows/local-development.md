@@ -8,7 +8,14 @@ This guide covers running Bosun locally for development.
 cargo run -p bosun -- serve --config cmd/bosun/settings/serve.toml
 ```
 
-The control plane reads its config from `--config`. See [config.md](../config.md) for the fields.
+The control plane reads its config from `--config`. See [config.md](../config.md) for the fields. A control plane needs at least one configured model; set `[models.default]` in the config and export the key it references, for example:
+
+```toml
+[models.default]
+provider = "anthropic"
+name = "claude-sonnet-4-5"
+api_key = "env:ANTHROPIC_API_KEY"
+```
 
 ## Node
 
@@ -16,11 +23,7 @@ The control plane reads its config from `--config`. See [config.md](../config.md
 cargo run -p bosun -- node --config cmd/bosun/settings/node.toml
 ```
 
-The node reads its config from `--config`. See [config.md](../config.md) for the fields.
-
-A node must have `opencode` (and its Node or Bun runtime) on `PATH`, with the
-provider key configured in its own opencode config. Bosun does not install or
-configure opencode — that is node provisioning.
+The node reads its config from `--config`. See [config.md](../config.md) for the fields. The node runs one `bosun executor` process per session from the same binary; no other runtime or provider key is needed on the node.
 
 ## Controlling Log Output
 
@@ -38,18 +41,26 @@ The `--log-filter` flag overrides `RUST_LOG`.
 
 ## Driving a session
 
-Clone a session, then connect the opencode client through the control-plane proxy:
+Clone a session and attach to it with the terminal client:
 
 ```bash
 cargo run -p bosun -- clone --node node-1 file:///path/to/repo
-# cloned session <id> on node node-1 (status running)
-# opencode attach http://127.0.0.1:<proxy-port>
+# cloned session <id> on node node-1 (state waiting_for_input)
+# open with: bosun open <id>
 
 cargo run -p bosun -- open <id>
-# opencode attach http://127.0.0.1:<proxy-port>
 ```
 
-Run the printed `opencode` command to drive the session. The client reaches the session through the control-plane proxy port, the node forwarder, and the opencode server on the node's loopback.
+`bosun open` attaches interactively: it renders the live transcript, sends
+messages from an input line, interrupts the current turn with ctrl-c, toggles
+permission with ctrl-p, and reconnects after a disconnection. With no session id
+it lists sessions to pick from. The web pane lives at the control-plane root
+(`http://127.0.0.1:8090/`).
+
+With no message, a new session idles at `waiting_for_input`; with
+`--message <prompt>` the first turn starts immediately. The control plane runs
+one agent loop per session; tool calls travel to the node's executor over the
+session tunnel.
 
 ## Dev session in an existing directory
 

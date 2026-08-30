@@ -1,3 +1,25 @@
 # Control-plane configuration. Every field is optional.
-# listen_addr = "127.0.0.1:8090"
+listen_addr = "127.0.0.1:8090"
 # node_timeout_secs = 30
+# data_dir = "data"
+
+# Models are configured once here; sessions choose one by name. The api_key
+# may be a literal or an `env:VAR` reference read at boot.
+# [models.default]
+# provider = "anthropic"
+# name = "claude-sonnet-4-5"
+# api_key = "env:ANTHROPIC_API_KEY"
+# price_input_per_mtok = 3
+# price_output_per_mtok = 15
+
+# [models.small]
+# provider = "openai"
+# name = "gpt-5-mini"
+# api_key = "env:OPENAI_API_KEY"
+
+# default_model = "default"
+
+# Subagent types pair a model with a permission mode.
+# [subagents.coder]
+# model = "default"
+# permission = "read-write"

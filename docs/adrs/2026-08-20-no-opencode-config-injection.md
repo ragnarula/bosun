@@ -3,6 +3,8 @@
 **Date:** 2026-08-20
 **Author:** Raghav
 
+> Superseded in part by `2026-08-30-agent-loop-on-control-plane.md` and `2026-08-30-executor-per-session.md`: Bosun now runs its own agent loop and executor, so opencode and its config are gone entirely. Model configuration returned to the control plane, as `2026-08-30-tool-surface.md` records.
+
 ## Context
 
 The ADR `2026-08-18-opencode-template-injected-at-spawn` had the control plane read a single `opencode.json` template and the node write it into each session's clone directory before starting `opencode serve`. The template carried the provider key.

@@ -41,7 +41,6 @@ pub async fn run_poll_loop(
         let request = PollRequest {
             node_name: node_name.clone(),
             status: NodeStatus::Up,
-            sessions: manager.sessions(),
             result: result.clone(),
         };
 

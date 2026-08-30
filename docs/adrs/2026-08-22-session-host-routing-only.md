@@ -3,6 +3,8 @@
 **Date:** 2026-08-22
 **Author:** Raghav
 
+> Superseded by `2026-08-30-tool-protocol-over-tunnel.md` and the removal of the opencode client: the gateway no longer exists. Sessions are driven through the session API and the terminal client; tool calls ride the tunnel as HTTP/1.1.
+
 > Supersedes the path-prefix routing in `2026-08-20-single-port-path-routing.md` and the path-prefix fallback kept by `2026-08-22-session-subdomains.md`.
 
 ## Context

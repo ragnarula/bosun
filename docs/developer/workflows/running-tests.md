@@ -21,9 +21,11 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 ## E2E Test
 
-One end-to-end test boots the control plane and a node, spawns a session on a
-local repo, drives it through the proxy, and stops it. It needs `git` and the
-`opencode` binary on PATH, so it is `#[ignore]`d and run on demand:
+The end-to-end tests boot the control plane and a node over HTTPS with a
+self-signed certificate, spawn a session on a local repo, drive it through the
+session API, and stop it. They need `git` on PATH (no model key: the tests use a
+model configured against an unreachable provider address), so they are
+`#[ignore]`d and run on demand:
 
 ```bash
 cargo test -p bosun --test e2e -- --ignored --nocapture

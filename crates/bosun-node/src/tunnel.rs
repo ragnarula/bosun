@@ -29,7 +29,7 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 pub async fn run_session_tunnel(
     cp_url: String,
     session_id: String,
-    opencode_port: u16,
+    executor_port: u16,
     tls_config: Option<Arc<ClientConfig>>,
 ) {
     loop {
@@ -41,7 +41,7 @@ pub async fn run_session_tunnel(
                         event = opens.recv() => {
                             let Some(event) = event else { break };
                             let tunnel = tunnel.clone();
-                            tokio::spawn(relay_connection(event, opencode_port, tunnel));
+                            tokio::spawn(relay_connection(event, executor_port, tunnel));
                         }
                         _ = tunnel.closed() => break,
                     }
@@ -59,15 +59,15 @@ pub async fn run_session_tunnel(
     }
 }
 
-/// Relays one logical connection to the local `opencode serve` process.
-async fn relay_connection(event: OpenEvent, opencode_port: u16, tunnel: Tunnel) {
-    let mut local = match TcpStream::connect(("127.0.0.1", opencode_port)).await {
+/// Relays one logical connection to the local executor process.
+async fn relay_connection(event: OpenEvent, executor_port: u16, tunnel: Tunnel) {
+    let mut local = match TcpStream::connect(("127.0.0.1", executor_port)).await {
         Ok(stream) => stream,
         Err(error) => {
             debug!(
                 conn_id = event.conn_id,
                 error = %error,
-                "failed to dial the local opencode server"
+                "failed to dial the local executor"
             );
             return;
         }

@@ -1,9 +1,9 @@
 //! End-to-end tests: boot the control plane and a node over HTTPS with a
-//! self-signed certificate, clone a session on a local repo, drive it through
-//! the control-plane proxy, and stop it. A second test spawns a dev session in
-//! an existing directory and checks the directory survives a stop.
+//! self-signed certificate, clone a session on a local repo, exercise the
+//! session API, and stop it. A second test spawns a dev session in an
+//! existing directory and checks the directory survives a stop.
 //!
-//! Needs `git` and the `opencode` binary on PATH.
+//! Needs `git` on PATH.
 //!
 //! Run with:
 //!   cargo test -p bosun --test e2e -- --ignored --nocapture
@@ -91,8 +91,17 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
              node_timeout_secs = 10\n\
+             data_dir = \"{}\"\n\
              tls_cert = \"{}\"\n\
-             tls_key = \"{}\"\n",
+             tls_key = \"{}\"\n\
+             default_model = \"test\"\n\
+             \n\
+             [models.test]\n\
+             provider = \"openai\"\n\
+             name = \"test\"\n\
+             base_url = \"http://127.0.0.1:1\"\n\
+             api_key = \"x\"\n",
+            root.join("cp-data").display(),
             cert_path.display(),
             key_path.display()
         ),
@@ -164,7 +173,8 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         String::from_utf8_lossy(&clone_out.stderr)
     );
 
-    // The session appears as running.
+    // The session appears in the store. Without a prompt no turn runs, so the
+    // session ends up waiting for input without ever contacting the provider.
     let session = wait_for_value(
         || async {
             let Ok(response) = client.get(format!("{cp_url}/sessions")).send().await else {
@@ -173,9 +183,11 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
             let Ok(sessions) = response.json::<Vec<Value>>().await else {
                 return None;
             };
-            sessions.into_iter().find(|s| s["status"] == "running")
+            sessions
+                .into_iter()
+                .find(|s| s["state"] == "creating" || s["state"] == "waiting_for_input")
         },
-        "session to become running",
+        "session to appear",
     )
     .await;
     let session_id = session["id"].as_str().unwrap().to_string();
@@ -184,183 +196,9 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         repo.to_str(),
         "clone session must report its repository"
     );
-
-    // The opencode server answers through the control-plane gateway at the
-    // session subdomain. The tunnel registers just after the session appears,
-    // so retry until the route is live.
-    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
-    let health = wait_for_value(
-        || async {
-            let Ok(response) = client
-                .get(format!("{cp_url}/global/health"))
-                .header("host", &subdomain)
-                .send()
-                .await
-            else {
-                return None;
-            };
-            if !response.status().is_success() {
-                return None;
-            }
-            response.json::<Value>().await.ok()
-        },
-        "session route to become live",
-    )
-    .await;
-    assert_eq!(health["healthy"], true);
-
-    // The client can create a session through the gateway, rooted in the
-    // clone, using opencode's own `/session` API path.
-    let created = wait_for_value(
-        || async {
-            let Ok(response) = client
-                .post(format!("{cp_url}/session"))
-                .header("host", &subdomain)
-                .send()
-                .await
-            else {
-                return None;
-            };
-            if !response.status().is_success() {
-                return None;
-            }
-            response.json::<Value>().await.ok()
-        },
-        "session creation through the route",
-    )
-    .await;
-    assert!(created["id"].as_str().is_some());
-
-    // The web UI is served at the subdomain root: the gateway routes purely
-    // on the Host header and passes the path through unchanged.
-    let web_ui = client
-        .get(format!("{cp_url}/"))
-        .header("host", &subdomain)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-    assert!(
-        web_ui
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("text/html"),
-        "the web UI must be served at the subdomain root"
-    );
-
-    // Cloning the same repo a second time must not share opencode state with
-    // the first session: each session gets its own data directory, so its
-    // database and `project/current` belong to it alone.
-    let second_clone: Value = client
-        .post(format!("{cp_url}/clone"))
-        .json(&serde_json::json!({
-            "node": "e2e-node",
-            "repo_url": repo.to_str().unwrap(),
-            "ref": null,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let second_id = second_clone["id"].as_str().unwrap().to_string();
-    let second_subdomain = format!("{second_id}.bosun.on.21cs.biz");
-    wait_for_value(
-        || async {
-            let Ok(response) = client
-                .get(format!("{cp_url}/global/health"))
-                .header("host", &second_subdomain)
-                .send()
-                .await
-            else {
-                return None;
-            };
-            if !response.status().is_success() {
-                return None;
-            }
-            response.json::<Value>().await.ok()
-        },
-        "second session route to become live",
-    )
-    .await;
-
-    // Create a session in each clone so opencode records its current project.
-    client
-        .post(format!("{cp_url}/session"))
-        .header("host", &subdomain)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-    client
-        .post(format!("{cp_url}/session"))
-        .header("host", &second_subdomain)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    let first_project: Value = client
-        .get(format!("{cp_url}/project/current"))
-        .header("host", &subdomain)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let second_project: Value = client
-        .get(format!("{cp_url}/project/current"))
-        .header("host", &second_subdomain)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let first_worktree = first_project["worktree"].as_str().unwrap();
-    let second_worktree = second_project["worktree"].as_str().unwrap();
-    assert_ne!(
-        first_worktree, second_worktree,
-        "two sessions must not share one project/current"
-    );
-    assert!(
-        Path::new(first_worktree).exists(),
-        "first session's project points at a missing directory"
-    );
-    assert!(
-        Path::new(second_worktree).exists(),
-        "second session's project points at a missing directory"
-    );
-
-    // Stop the second session; its state must go with it.
-    let second_stop = Command::new(BOSUN)
-        .env("BOSUN_CA_CERT", &ca_path)
-        .args(["stop", &second_id, "--cp-url", &cp_url])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        second_stop.status.success(),
-        "second stop failed: {}",
-        String::from_utf8_lossy(&second_stop.stderr)
-    );
-    assert!(
-        !work_dir.join(&second_id).exists(),
-        "stopping a session must remove its data directory"
+    assert_eq!(
+        session["state"], "waiting_for_input",
+        "a clone without a prompt idles at waiting_for_input"
     );
 
     // Stop the session.
@@ -376,7 +214,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         String::from_utf8_lossy(&stop_out.stderr)
     );
 
-    // The session disappears, its route closes, and the clone is removed.
+    // The session disappears and its data directory is removed.
     wait_for_value(
         || async {
             let Ok(response) = client.get(format!("{cp_url}/sessions")).send().await else {
@@ -388,21 +226,6 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
             sessions.is_empty().then_some(())
         },
         "session to be removed",
-    )
-    .await;
-    wait_for_value(
-        || async {
-            match client
-                .get(format!("{cp_url}/global/health"))
-                .header("host", &subdomain)
-                .send()
-                .await
-            {
-                Ok(response) => (response.status() == reqwest::StatusCode::NOT_FOUND).then_some(()),
-                Err(_) => None,
-            }
-        },
-        "session route to close",
     )
     .await;
     assert!(!work_dir.join(&session_id).exists());
@@ -432,8 +255,17 @@ async fn dev_session_in_existing_directory_end_to_end() {
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
              node_timeout_secs = 10\n\
+             data_dir = \"{}\"\n\
              tls_cert = \"{}\"\n\
-             tls_key = \"{}\"\n",
+             tls_key = \"{}\"\n\
+             default_model = \"test\"\n\
+             \n\
+             [models.test]\n\
+             provider = \"openai\"\n\
+             name = \"test\"\n\
+             base_url = \"http://127.0.0.1:1\"\n\
+             api_key = \"x\"\n",
+            root.join("cp-data").display(),
             cert_path.display(),
             key_path.display()
         ),
@@ -532,27 +364,7 @@ async fn dev_session_in_existing_directory_end_to_end() {
         .await
         .unwrap();
     let session_id = dev_response["id"].as_str().unwrap().to_string();
-
-    let subdomain = format!("{session_id}.bosun.on.21cs.biz");
-    let health = wait_for_value(
-        || async {
-            let Ok(response) = client
-                .get(format!("{cp_url}/global/health"))
-                .header("host", &subdomain)
-                .send()
-                .await
-            else {
-                return None;
-            };
-            if !response.status().is_success() {
-                return None;
-            }
-            response.json::<Value>().await.ok()
-        },
-        "session route to become live",
-    )
-    .await;
-    assert_eq!(health["healthy"], true);
+    assert_eq!(dev_response["state"], "waiting_for_input");
 
     // Stop the session; the existing directory stays.
     let stop_out = Command::new(BOSUN)

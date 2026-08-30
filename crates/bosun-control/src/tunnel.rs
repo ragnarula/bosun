@@ -15,8 +15,8 @@ pub enum TunnelError {
     TunnelClosed { session_id: String },
 }
 
-/// Maps each session to the node's outbound tunnel. The gateway opens a
-/// logical connection on it for every host-routed client request.
+/// Maps each session to the node's outbound tunnel. Tool calls open logical
+/// connections on it per request.
 #[derive(Clone)]
 pub struct TunnelRegistry {
     tunnels: Arc<RwLock<HashMap<String, Tunnel>>>,

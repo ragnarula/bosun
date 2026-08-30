@@ -3,6 +3,8 @@
 **Date:** 2026-08-18
 **Author:** Raghav
 
+> Superseded by `2026-08-30-sqlite-session-store.md`: the control plane now has its own durable store and is the source of truth for sessions; the node registry keeps only node liveness.
+
 ## Context
 
 The architecture says the control plane is the only component that stores state. In the MVP, sessions run on nodes: a node cloned a repo, started `opencode serve`, and opened a forwarder. A control plane that restarts must not lose track of those sessions, and a node that restarts must not lose the work in its checkout.

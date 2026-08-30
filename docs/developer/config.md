@@ -18,11 +18,26 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `node_timeout_secs` | `30` | Polls older than this mark a node down |
 | `tls_cert` | none | PEM certificate chain. When set with `tls_key`, the control plane serves HTTPS |
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
+| `data_dir` | `data` | Directory for the SQLite store and injected skills |
+| `models` | none | Named model entries (see `ModelConfig` below) |
+| `subagents` | none | Named subagent types (see `SubagentConfig` below) |
+| `default_model` | none | Model sessions use when the request does not name one. Falls back to `default`, then the first model |
 
-For session subdomains to work over HTTPS, the certificate must cover both the
-control-plane host and its wildcard (`bosun.on.21cs.biz` and
-`*.bosun.on.21cs.biz`), and DNS must resolve every session subdomain to the
-control plane. See `docs/adrs/2026-08-22-session-subdomains.md`.
+A model entry:
+
+| Field | Meaning |
+|---|---|
+| `provider` | `anthropic` or `openai` |
+| `name` | The provider's model name |
+| `base_url` | Provider API root. Defaults to the provider's public API |
+| `api_key` | A literal key, or `env:VAR` read from the environment at boot |
+| `price_input_per_mtok` | Cost per million input tokens, used by metering |
+| `price_output_per_mtok` | Cost per million output tokens, used by metering |
+
+A subagent entry pairs a model with a permission mode: `model` names a configured
+model, `permission` is `read-only` or `read-write`.
+
+See `crates/bosun-common/src/config.rs` for the current fields and defaults.
 
 ## Node
 

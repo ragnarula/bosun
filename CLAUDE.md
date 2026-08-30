@@ -4,9 +4,9 @@
 
 Bosun sends software work to AI agents and runs them on machines you own. Work arrives from an issue tracker, from a change waiting for review, from a schedule, or from a person typing a request. Bosun finds a machine, starts an agent there, gives it the standards you have set, and reports what happened. Each agent works on its own machine, so no agent affects another.
 
-This repository builds Bosun in Rust. The current sprint targets a single user, with no security and no scalability: Bosun spawns `opencode serve` sessions on machines the user names, and the user drives them with the opencode client through a control-plane proxy.
+This repository builds Bosun in Rust. The current sprint targets a single user, with no security and no scalability: Bosun runs one agent loop per session on the control plane, executes tools on the node the session works on, and the user drives sessions from a terminal client.
 
-Current state: setup, heading to a running MVP. The sprint plan is in `docs/sprints/001-setup.md`.
+Current state: MVP complete. Sessions run on the control plane: a per-session agent loop drives the provider API, tool calls execute on the node through the executor, and the user drives sessions from the terminal client or the web pane. The sprint plan is in `docs/sprints/002-agent-executor.md`.
 
 ## Development
 
