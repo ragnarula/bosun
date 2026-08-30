@@ -103,6 +103,24 @@
     font: inherit;
   }
   #new-session-form .actions { display: flex; gap: 8px; }
+  .dir-pick { display: flex; gap: 6px; }
+  .dir-pick input { flex: 1; }
+  #dir-browser {
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    font-size: 12px;
+  }
+  #dir-browser[hidden] { display: none; }
+  .dir-browser-head { display: flex; align-items: center; gap: 8px; }
+  .dir-browser-head #dir-path { flex: 1; color: var(--muted); word-break: break-all; }
+  #dir-entries { display: grid; gap: 4px; max-height: 260px; overflow-y: auto; }
+  .dir-entry { display: flex; align-items: center; gap: 8px; padding: 4px 6px; }
+  .dir-entry:hover { background: var(--border); }
+  .dir-entry .dir-name { flex: 1; word-break: break-all; }
   #session-view {
     position: fixed;
     inset: 0;
@@ -201,8 +219,20 @@
         <select id="form-node" required></select>
       </label>
       <label>Dir
-        <input id="form-dir" type="text" required placeholder="/path/to/work">
+        <span class="dir-pick">
+          <input id="form-dir" type="text" required placeholder="/path/to/work" readonly>
+          <button type="button" id="btn-browse">Browse</button>
+        </span>
       </label>
+      <div id="dir-browser" hidden>
+        <div class="dir-browser-head">
+          <span id="dir-path">browse roots</span>
+          <button type="button" id="btn-dir-up" disabled>Up</button>
+          <button type="button" id="btn-dir-use" disabled>Use this directory</button>
+          <button type="button" id="btn-dir-close">Close</button>
+        </div>
+        <div id="dir-entries"></div>
+      </div>
       <label>Model
         <input id="form-model" type="text" placeholder="default model">
       </label>
@@ -266,6 +296,13 @@ const newSessionForm = $('new-session-form');
 const cancelNewSessionBtn = $('btn-cancel-new-session');
 const formNode = $('form-node');
 const formDir = $('form-dir');
+const btnBrowse = $('btn-browse');
+const dirBrowser = $('dir-browser');
+const dirPathEl = $('dir-path');
+const btnDirUp = $('btn-dir-up');
+const btnDirUse = $('btn-dir-use');
+const btnDirClose = $('btn-dir-close');
+const dirEntries = $('dir-entries');
 const formModel = $('form-model');
 const formPermission = $('form-permission');
 const formPrompt = $('form-prompt');
@@ -290,6 +327,9 @@ let es = null;        // the open EventSource
 let liveEl = null;    // the assistant paragraph live deltas stream into
 let stick = true;     // auto-scroll the transcript when true
 let sending = false;
+let dirNode = null;   // the node the directory browser is looking at
+let dirPath = null;   // null = the node's browse roots
+let dirListing = null;
 
 originEl.textContent = location.origin;
 
@@ -433,9 +473,97 @@ newSessionBtn.addEventListener('click', () => {
   if (!newSessionForm.hidden) formNode.focus();
 });
 
+// A picked directory belongs to one node; switch nodes, drop the pick.
+formNode.addEventListener('change', () => {
+  formDir.value = '';
+  dirBrowser.hidden = true;
+});
+
+btnBrowse.addEventListener('click', () => {
+  const node = formNode.value;
+  if (!node) {
+    showStatus('choose a node first');
+    return;
+  }
+  dirNode = node;
+  dirPath = null;
+  dirListing = null;
+  dirBrowser.hidden = false;
+  loadDirs();
+});
+
+btnDirUp.addEventListener('click', () => {
+  if (dirPath === null) return;
+  dirPath = dirListing && dirListing.parent ? dirListing.parent : null;
+  loadDirs();
+});
+
+btnDirUse.addEventListener('click', () => {
+  if (dirPath === null) return;
+  formDir.value = dirPath;
+  dirBrowser.hidden = true;
+});
+
+btnDirClose.addEventListener('click', () => {
+  dirBrowser.hidden = true;
+});
+
+async function loadDirs() {
+  let url = '/nodes/' + encodeURIComponent(dirNode) + '/dirs';
+  if (dirPath) url += '?path=' + encodeURIComponent(dirPath);
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status + ': ' + (await response.text()));
+    }
+    dirListing = await response.json();
+    renderDirs();
+  } catch (error) {
+    showStatus('browse: ' + error.message);
+  }
+}
+
+function renderDirs() {
+  dirPathEl.textContent = dirPath === null ? 'browse roots' : dirPath;
+  btnDirUp.disabled = dirPath === null;
+  btnDirUse.disabled = dirPath === null;
+  dirEntries.textContent = '';
+  const entries = (dirListing && dirListing.entries) || [];
+  if (entries.length === 0) {
+    dirEntries.appendChild(document.createTextNode('(no directories)'));
+    return;
+  }
+  for (const entry of entries) {
+    const row = document.createElement('div');
+    row.className = 'dir-entry';
+    const name = document.createElement('span');
+    name.className = 'dir-name';
+    name.textContent = entry.name + (entry.is_repo ? ' [repo]' : '');
+    row.appendChild(name);
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.textContent = 'Open';
+    open.addEventListener('click', () => {
+      dirPath = entry.path;
+      loadDirs();
+    });
+    const use = document.createElement('button');
+    use.type = 'button';
+    use.textContent = 'Use';
+    use.addEventListener('click', () => {
+      formDir.value = entry.path;
+      dirBrowser.hidden = true;
+    });
+    row.appendChild(open);
+    row.appendChild(use);
+    dirEntries.appendChild(row);
+  }
+}
+
 cancelNewSessionBtn.addEventListener('click', () => {
   newSessionForm.hidden = true;
   newSessionForm.reset();
+  dirBrowser.hidden = true;
 });
 
 newSessionForm.addEventListener('submit', async (event) => {
