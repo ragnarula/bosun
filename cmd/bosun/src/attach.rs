@@ -583,6 +583,13 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     spawn_input_thread(input_tx, Arc::clone(&quit))?;
 
+    // A SIGINT/SIGTERM from outside (kill -INT <pid>, or a Ctrl-C in the
+    // terminal that owns the process) must exit cleanly: without a handler
+    // the process dies without restoring the terminal, leaving the shell in
+    // raw mode on the alternate screen.
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    spawn_signal_waiter(stop_tx);
+
     let mut app = App::new(session);
 
     let result = run_attach(
@@ -592,11 +599,38 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
         session_id,
         &mut app,
         input_rx,
+        stop_rx,
     )
     .await;
     quit.store(true, Ordering::Relaxed);
     let _ = terminal.show_cursor();
     result
+}
+
+/// Watches for SIGINT and SIGTERM and resolves `stop` on the first one. The
+/// terminal restore guard then runs, so an external kill leaves the terminal
+/// usable.
+fn spawn_signal_waiter(stop: tokio::sync::oneshot::Sender<()>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            use tokio::signal::unix::signal;
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to install the SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to install the SIGTERM handler");
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = stop.send(());
+    });
 }
 
 /// Restores the terminal when attach exits, including on error or panic.
@@ -655,11 +689,16 @@ async fn run_attach(
     session_id: &str,
     app: &mut App,
     mut input_rx: mpsc::UnboundedReceiver<TermEvent>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     redraw(terminal, app)?;
     let mut noticed = false;
     loop {
-        if let Ok(stream) = open_stream(client, cp_url, session_id, app.state.last_seq).await {
+        let opened = tokio::select! {
+            result = open_stream(client, cp_url, session_id, app.state.last_seq) => result,
+            _ = &mut stop_rx => return Ok(()),
+        };
+        if let Ok(stream) = opened {
             // The stream restarted: live deltas do not survive a reconnect,
             // and the outage is over, so the next drop reports again.
             app.state.pending_delta = None;
@@ -674,6 +713,7 @@ async fn run_attach(
                 cp_url,
                 session_id,
                 stream,
+                &mut stop_rx,
             )
             .await?;
             if outcome == StreamOutcome::Exited {
@@ -696,7 +736,10 @@ async fn run_attach(
             });
             redraw(terminal, app)?;
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        tokio::select! {
+            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            _ = &mut stop_rx => return Ok(()),
+        }
     }
 }
 
@@ -723,6 +766,7 @@ enum StreamOutcome {
     Reconnect,
 }
 
+#[allow(clippy::too_many_arguments)] // the stream loop needs the whole attach context
 async fn stream_events(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -731,6 +775,7 @@ async fn stream_events(
     cp_url: &str,
     session_id: &str,
     stream: impl Stream<Item = Result<SseEvent, SseError>>,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<StreamOutcome> {
     tokio::pin!(stream);
     loop {
@@ -752,6 +797,7 @@ async fn stream_events(
                 }
                 Some(Err(_)) | None => return Ok(StreamOutcome::Reconnect),
             },
+            _ = &mut *stop_rx => return Ok(StreamOutcome::Exited),
         }
     }
 }
