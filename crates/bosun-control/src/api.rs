@@ -767,20 +767,10 @@ async fn tunnel(
     AxumPath(session_id): AxumPath<String>,
     mut req: Request<Body>,
 ) -> Response {
-    // Refuse tunnels for sessions the store does not know, so a removed
-    // session's reconnect loop cannot re-register a tunnel.
-    match state.store.get_session(&session_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => {
-            tracing::error!(
-                session_id = %session_id,
-                error = %error.display_chain(),
-                "tunnel rejected: failed to check the session store"
-            );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
+    // The store cannot gate this route: the node opens the tunnel right after
+    // spawning the executor, which races the control plane creating the store
+    // session for a clone. A tunnel for a session the store does not know is
+    // inert — no loop dispatches tools on it — so it is harmless.
     if !wants_tunnel_upgrade(&req) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -1902,7 +1892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnel_for_a_session_the_store_does_not_know_is_rejected() {
+    async fn tunnel_accepts_a_session_the_store_does_not_know() {
         let dir = tempdir().unwrap();
         let addr = serve(test_state(&dir)).await;
 
@@ -1925,8 +1915,8 @@ mod tests {
         let response = sender.send_request(request).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::NOT_FOUND,
-            "a removed session's reconnect loop must not re-register a tunnel"
+            StatusCode::SWITCHING_PROTOCOLS,
+            "the tunnel must not depend on the store: a node's tunnel can arrive before the control plane records the clone"
         );
     }
 

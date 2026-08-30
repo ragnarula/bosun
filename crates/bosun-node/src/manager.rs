@@ -366,6 +366,10 @@ impl NodeManager {
         permission: Permission,
     ) -> Result<Child, NodeError> {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("bosun"));
+        // The session dir must be absolute: the executor resolves its tools
+        // against it, so a relative path would be re-resolved against the
+        // executor's own working directory and point at the wrong tree.
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut command = tokio::process::Command::new(exe);
         let permission_arg = match permission {
             Permission::ReadOnly => "read_only",
@@ -374,12 +378,12 @@ impl NodeManager {
         command
             .arg("executor")
             .arg("--session-dir")
-            .arg(dir)
+            .arg(&dir)
             .arg("--port")
             .arg(port.to_string())
             .arg("--permission")
             .arg(permission_arg)
-            .current_dir(dir)
+            .current_dir(&dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);

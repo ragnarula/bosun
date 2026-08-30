@@ -6,6 +6,9 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::anyhow;
 use bosun_common::session::Permission;
+use bosun_common::skills::Skill;
+use bosun_common::skills::parse_skill_dir;
+use bosun_common::skills::read_skill_markdown;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
@@ -127,6 +130,22 @@ pub fn read_file(session_dir: &Path, path: &str) -> Result<String, ToolError> {
     let bytes = std::fs::read(&resolved)
         .with_context(|| format!("failed to read {}", resolved.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The session's skills as parsed metadata, sorted by name. Skills live in
+/// the working copy on the node, so discovery happens here rather than on
+/// the control plane's filesystem.
+pub fn list_skills(session_dir: &Path) -> Vec<Skill> {
+    parse_skill_dir(&session_dir.join(".agents").join("skills"))
+}
+
+/// The full text of the skill named `name`, looked up by its parsed name.
+pub fn read_skill(session_dir: &Path, name: &str) -> Result<String, ToolError> {
+    read_skill_markdown(&session_dir.join(".agents").join("skills"), name).ok_or_else(|| {
+        ToolError::NotFound {
+            path: name.to_string(),
+        }
+    })
 }
 
 pub fn write_file(session_dir: &Path, path: &str, content: &str) -> Result<(), ToolError> {

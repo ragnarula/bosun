@@ -190,6 +190,11 @@ fn router_with_state(state: Arc<ExecutorState>) -> Router {
         .route("/tool/glob", post(tool_glob))
         .route("/tool/git", post(tool_git))
         .route("/tool/webfetch", post(tool_webfetch))
+        // Internal plumbing: the control plane calls these to read skills
+        // from the node's working copy; they are not advertised to models in
+        // the canonical tool list.
+        .route("/tool/skills", post(tool_skills))
+        .route("/tool/skill/read", post(tool_skill_read))
         .route("/tool/{run_id}/cancel", post(cancel))
         .fallback(not_found)
         .with_state(state)
@@ -284,6 +289,22 @@ async fn tool_webfetch(
     tool(state, "webfetch", req).await
 }
 
+#[instrument(skip_all)]
+async fn tool_skills(
+    State(state): State<Arc<ExecutorState>>,
+    Json(req): Json<ToolRequest>,
+) -> Response {
+    tool(state, "skills", req).await
+}
+
+#[instrument(skip_all)]
+async fn tool_skill_read(
+    State(state): State<Arc<ExecutorState>>,
+    Json(req): Json<ToolRequest>,
+) -> Response {
+    tool(state, "skill/read", req).await
+}
+
 /// Shared dispatcher for the JSON tools. Shell is handled separately because
 /// it returns an SSE stream.
 async fn tool(state: Arc<ExecutorState>, name: &str, req: ToolRequest) -> Response {
@@ -361,6 +382,13 @@ async fn tool(state: Arc<ExecutorState>, name: &str, req: ToolRequest) -> Respon
             tools::webfetch(url)
                 .await
                 .map(|content| json!({ "content": content }))
+        }
+        "skills" => Ok(json!({ "skills": tools::list_skills(&state.session_dir) })),
+        "skill/read" => {
+            let Some(name) = args.get("name").and_then(Value::as_str) else {
+                return bad_arg("name");
+            };
+            tools::read_skill(&state.session_dir, name).map(|content| json!({ "content": content }))
         }
         _ => return json_response(StatusCode::BAD_REQUEST, &format!("unknown tool {name}")),
     };
@@ -1301,6 +1329,51 @@ mod tests {
             json!({ "url": "file:///etc/hosts" }),
         )
         .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn skills_list_and_read_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join(".agents").join("skills");
+        std::fs::create_dir_all(skills_root.join("alpha")).unwrap();
+        std::fs::write(
+            skills_root.join("alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: The alpha skill\n---\n\nBody text",
+        )
+        .unwrap();
+        let (addr, _state) = test_app(dir.path(), Permission::ReadWrite).await;
+        let client = reqwest::Client::new();
+
+        let response = tool_call(&client, &addr, "skills", "run-1", json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["skills"][0]["name"], "alpha");
+        assert_eq!(body["skills"][0]["description"], "The alpha skill");
+
+        let response = tool_call(
+            &client,
+            &addr,
+            "skill/read",
+            "run-2",
+            json!({ "name": "alpha" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["content"].as_str().unwrap().contains("Body text"));
+
+        let response = tool_call(
+            &client,
+            &addr,
+            "skill/read",
+            "run-3",
+            json!({ "name": "absent" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = tool_call(&client, &addr, "skill/read", "run-4", json!({})).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 

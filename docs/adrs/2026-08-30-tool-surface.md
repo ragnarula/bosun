@@ -29,7 +29,7 @@ Each provider adapter exposes the same list; a read-only session removes `shell`
 - Adding a provider means writing one adapter over a fixed schema, not reshaping the tools.
 - The executor is the only component that touches the working copy, so path confinement is enforced in one place.
 - The loop's `ask` and `todowrite` keep the user in the loop without a node round-trip.
-- Working-copy skill discovery reads the session's directory, so it works when the control plane can read the node's filesystem (a shared volume or same machine); injected control-plane skills work in every deployment.
+- Working-copy skills are discovered and read through the executor (`/tool/skills`, `/tool/skill/read`), so they work even when the control plane and node are different machines; injected control-plane skills are read locally.
 
 ## Revisit When
 

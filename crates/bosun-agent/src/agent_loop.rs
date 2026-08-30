@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,8 +34,11 @@ use uuid::Uuid;
 use crate::provider::ProviderCall;
 use crate::provider::StreamEvent;
 use crate::skills::Skill;
-use crate::skills::discover_skills;
-use crate::skills::skill_markdown;
+use crate::skills::fetch_working_skills;
+use crate::skills::injected_skills;
+use crate::skills::merge_skills;
+use crate::skills::read_injected_skill;
+use crate::skills::read_working_skill;
 
 /// Caps the summarizer output so a compaction stays cheap.
 const MAX_TOKENS: u32 = 2048;
@@ -328,7 +330,18 @@ async fn run_turn_inner(
     let permission = session.permission;
     // Skills are discovered fresh each turn, so a working copy that gains or
     // drops a skill advertises the change on the next request.
-    let skills = discover_skills(Path::new(&session.dir), deps.injected_skills_dir.as_deref());
+    let working_skills = fetch_working_skills(&*deps.tools, session_id)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(
+                msg = "failed to fetch skills from the node",
+                session_id = %session_id,
+                error = %error.display_chain()
+            );
+            Vec::new()
+        });
+    let injected_skills = injected_skills(deps.injected_skills_dir.as_deref());
+    let skills = merge_skills(working_skills.clone(), injected_skills.clone());
     let tools: Vec<ToolSpec> = canonical_tools(permission)
         .into_iter()
         .filter(|tool| {
@@ -542,21 +555,33 @@ async fn run_turn_inner(
             }
             "skill" => {
                 let skill_name = args["name"].as_str().unwrap_or_default();
-                let content = skills
-                    .iter()
-                    .find(|skill| skill.name == skill_name)
-                    .and_then(|skill| match skill_markdown(skill) {
-                        Ok(markdown) => Some(json!({ "content": markdown })),
+                let content = if working_skills.iter().any(|skill| skill.name == skill_name) {
+                    match read_working_skill(&*deps.tools, session_id, skill_name).await {
+                        Ok(Some(markdown)) => Some(json!({ "content": markdown })),
+                        Ok(None) => {
+                            warn!(
+                                msg = "the node does not know a skill it listed",
+                                session_id = %session_id,
+                                skill = %skill_name
+                            );
+                            None
+                        }
                         Err(error) => {
                             warn!(
-                                msg = "failed to read the skill's instructions",
+                                msg = "failed to read the skill's instructions from the node",
                                 session_id = %session_id,
-                                skill = %skill.name,
+                                skill = %skill_name,
                                 error = %error.display_chain()
                             );
                             None
                         }
-                    });
+                    }
+                } else if injected_skills.iter().any(|skill| skill.name == skill_name) {
+                    read_injected_skill(deps.injected_skills_dir.as_deref(), skill_name)
+                        .map(|markdown| json!({ "content": markdown }))
+                } else {
+                    None
+                };
                 let (content, is_error) = match content {
                     Some(content) => (content, false),
                     None => (json!({ "error": "skill not found" }), true),
@@ -1474,6 +1499,8 @@ mod tests {
     /// completes, or never completes so a test can interrupt it.
     struct MockTools {
         outcome: ToolOutcome,
+        /// Canned outcomes for specific tool names; other tools get `outcome`.
+        outcomes: HashMap<String, ToolOutcome>,
         delta_text: Option<String>,
         block: bool,
         calls: Arc<Mutex<Vec<CapturedToolCall>>>,
@@ -1484,11 +1511,18 @@ mod tests {
         fn new(outcome: ToolOutcome) -> Self {
             Self {
                 outcome,
+                outcomes: HashMap::new(),
                 delta_text: None,
                 block: false,
                 calls: Arc::new(Mutex::new(Vec::new())),
                 cancels: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Serves a canned outcome for one tool name.
+        fn serving(mut self, name: &str, outcome: ToolOutcome) -> Self {
+            self.outcomes.insert(name.to_string(), outcome);
+            self
         }
 
         /// Streams one delta before the call completes.
@@ -1498,6 +1532,8 @@ mod tests {
         }
 
         /// Never completes, so an interrupt reaches the in-flight call.
+        /// Served per-name outcomes still complete: the skills plumbing must
+        /// not hang the turn it runs in.
         fn blocking(mut self) -> Self {
             self.block = true;
             self
@@ -1513,15 +1549,20 @@ mod tests {
             args: Value,
             delta: mpsc::UnboundedSender<ToolDelta>,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutcome, ToolError>> + Send>> {
+            let served = self.outcomes.contains_key(&name);
+            let outcome = self
+                .outcomes
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| self.outcome.clone());
             self.calls.lock().unwrap().push(CapturedToolCall {
                 session_id,
                 run_id,
                 name,
                 args,
             });
-            let outcome = self.outcome.clone();
             let delta_text = self.delta_text.clone();
-            let block = self.block;
+            let block = self.block && !served;
             Box::pin(async move {
                 if let Some(text) = delta_text {
                     let _ = delta.send(ToolDelta { text });
@@ -1972,19 +2013,31 @@ mod tests {
     #[tokio::test]
     async fn skills_are_advertised_and_loadable() {
         let dir = tempdir().unwrap();
-        let skill_dir = dir.path().join(".agents").join("skills").join("my-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        let markdown = "---\nname: my-skill\ndescription: Does things\n---\n\nBody text";
-        std::fs::write(skill_dir.join("SKILL.md"), markdown).unwrap();
-
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
-        store
-            .create_session(&Session {
-                dir: dir.path().display().to_string(),
-                ..session("s-skill")
-            })
-            .await
-            .unwrap();
+        store.create_session(&session("s-skill")).await.unwrap();
+
+        let markdown = "---\nname: my-skill\ndescription: Does things\n---\n\nBody text";
+        // The node's executor answers the internal skills plumbing: listing
+        // the working copy's skills and reading one skill's instructions.
+        let tools = Arc::new(
+            MockTools::new(default_outcome())
+                .serving(
+                    "skills",
+                    ToolOutcome {
+                        content: json!({ "skills": [
+                            { "name": "my-skill", "description": "Does things" }
+                        ] }),
+                        is_error: false,
+                    },
+                )
+                .serving(
+                    "skill/read",
+                    ToolOutcome {
+                        content: json!({ "content": markdown }),
+                        is_error: false,
+                    },
+                ),
+        );
 
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
@@ -2010,7 +2063,7 @@ mod tests {
         let deps = Arc::new(test_deps(
             &store,
             provider.clone(),
-            Arc::new(MockTools::new(default_outcome())),
+            tools.clone(),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
         ));
         let handle = spawn_loop("s-skill".into(), deps);
@@ -2070,6 +2123,21 @@ mod tests {
         assert_eq!(tool_calls[0].result, Some(json!({ "content": markdown })));
         assert!(!tool_calls[0].is_error);
 
+        // The loop listed the working copy's skills through the executor on
+        // each turn, and read the skill the model asked for.
+        let calls = tools.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().filter(|call| call.name == "skills").count(),
+            2,
+            "the skills list is fetched fresh each turn"
+        );
+        let read_calls: Vec<&CapturedToolCall> = calls
+            .iter()
+            .filter(|call| call.name == "skill/read")
+            .collect();
+        assert_eq!(read_calls.len(), 1);
+        assert_eq!(read_calls[0].args, json!({ "name": "my-skill" }));
+
         handle.stop();
     }
 
@@ -2103,10 +2171,17 @@ mod tests {
                 },
             ],
         ]));
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "skills",
+            ToolOutcome {
+                content: json!({ "skills": [] }),
+                is_error: false,
+            },
+        ));
         let deps = Arc::new(test_deps(
             &store,
             provider.clone(),
-            Arc::new(MockTools::new(default_outcome())),
+            tools.clone(),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
         ));
         let handle = spawn_loop("s-skill-miss".into(), deps);
@@ -2213,10 +2288,12 @@ mod tests {
 
         {
             let calls = tools.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].session_id, "s-tool");
-            assert_eq!(calls[0].name, "shell");
-            assert_eq!(calls[0].args, json!({ "command": "cargo build" }));
+            let shell_calls: Vec<&CapturedToolCall> =
+                calls.iter().filter(|call| call.name == "shell").collect();
+            assert_eq!(shell_calls.len(), 1);
+            assert_eq!(shell_calls[0].session_id, "s-tool");
+            assert_eq!(shell_calls[0].name, "shell");
+            assert_eq!(shell_calls[0].args, json!({ "command": "cargo build" }));
         }
 
         let messages = store.messages("s-tool", false).await.unwrap();
@@ -2448,7 +2525,17 @@ mod tests {
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("s-cancel")).await.unwrap();
 
-        let tools = Arc::new(MockTools::new(default_outcome()).blocking());
+        let tools = Arc::new(
+            MockTools::new(default_outcome())
+                .serving(
+                    "skills",
+                    ToolOutcome {
+                        content: json!({ "skills": [] }),
+                        is_error: false,
+                    },
+                )
+                .blocking(),
+        );
         let deps = Arc::new(test_deps(
             &store,
             Arc::new(ScriptedProvider::new(vec![vec![
@@ -2470,11 +2557,18 @@ mod tests {
 
         handle.send(LoopEvent::Wake);
 
-        wait_for("the tool call to be dispatched", {
+        wait_for("the shell call to be dispatched", {
             let tools = tools.clone();
             move || {
                 let tools = tools.clone();
-                async move { tools.calls.lock().unwrap().len() == 1 }
+                async move {
+                    tools
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|call| call.name == "shell")
+                }
             }
         })
         .await;
@@ -2498,10 +2592,13 @@ mod tests {
         {
             let calls = tools.calls.lock().unwrap();
             let cancels = tools.cancels.lock().unwrap();
-            assert_eq!(calls.len(), 1);
             assert_eq!(cancels.len(), 1);
+            let shell_call = calls
+                .iter()
+                .find(|call| call.name == "shell")
+                .expect("the shell call was dispatched");
             assert_eq!(cancels[0].0, "s-cancel");
-            assert_eq!(cancels[0].1, calls[0].run_id);
+            assert_eq!(cancels[0].1, shell_call.run_id);
         }
 
         wait_for("the session to be interrupted", || {
@@ -2890,11 +2987,13 @@ mod tests {
 
         {
             let calls = tools.calls.lock().unwrap();
-            assert_eq!(calls.len(), 2, "both calls are dispatched");
-            assert_eq!(calls[0].args, json!({ "command": "first" }));
-            assert_eq!(calls[1].args, json!({ "command": "second" }));
+            let shell_calls: Vec<&CapturedToolCall> =
+                calls.iter().filter(|call| call.name == "shell").collect();
+            assert_eq!(shell_calls.len(), 2, "both calls are dispatched");
+            assert_eq!(shell_calls[0].args, json!({ "command": "first" }));
+            assert_eq!(shell_calls[1].args, json!({ "command": "second" }));
             assert_ne!(
-                calls[0].run_id, calls[1].run_id,
+                shell_calls[0].run_id, shell_calls[1].run_id,
                 "each call gets its own run id"
             );
         }
@@ -3074,9 +3173,11 @@ mod tests {
 
         {
             let calls = tools.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, "shell");
-            assert_eq!(calls[0].args, json!({ "command": "cargo build" }));
+            let shell_calls: Vec<&CapturedToolCall> =
+                calls.iter().filter(|call| call.name == "shell").collect();
+            assert_eq!(shell_calls.len(), 1);
+            assert_eq!(shell_calls[0].name, "shell");
+            assert_eq!(shell_calls[0].args, json!({ "command": "cargo build" }));
         }
 
         let messages = store.messages("s-frag", false).await.unwrap();
