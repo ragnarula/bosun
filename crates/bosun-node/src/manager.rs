@@ -554,18 +554,39 @@ impl NodeManager {
     }
 }
 
+/// Kills a stale executor before restore re-spawns it. The pid comes from
+/// `state.json` and may belong to an executor that died long ago, whose number
+/// was reused by an unrelated process; killing that pid would kill whatever
+/// the number now names. Only signal when the process at the pid is actually
+/// a `bosun executor` from this binary, and never a system pid.
 async fn kill_pid_if_alive(pid: u32) {
-    if pid == 0 {
+    if pid <= 1 {
         return;
     }
-    let alive = tokio::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
+    let our_exe_name = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let Ok(output) = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
         .await
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !alive {
+    else {
+        return;
+    };
+    if !output.status.success() {
         debug!(pid = pid, "no stale executor process to kill");
+        return;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    if !is_bosun_executor(&command, &our_exe_name) {
+        debug!(
+            pid = pid,
+            "the pid does not name a bosun executor; leaving it alone"
+        );
         return;
     }
     info!(pid = pid, "killing stale executor process");
@@ -576,6 +597,20 @@ async fn kill_pid_if_alive(pid: u32) {
     {
         debug!(pid = pid, error = %e, "failed to terminate stale executor process");
     }
+}
+
+/// True when a command line is a `bosun executor`: the executable basename
+/// matches ours (or is `bosun`) and one of the arguments is `executor`.
+fn is_bosun_executor(command_line: &str, our_exe_name: &str) -> bool {
+    let mut parts = command_line.split_whitespace();
+    let Some(executable) = parts.next() else {
+        return false;
+    };
+    let basename = executable.rsplit('/').next().unwrap_or(executable);
+    if basename != our_exe_name && basename != "bosun" {
+        return false;
+    }
+    parts.any(|arg| arg == "executor")
 }
 
 async fn pick_free_port() -> Result<u16, anyhow::Error> {
@@ -774,8 +809,35 @@ mod tests {
         assert!(manager.sessions().is_empty());
     }
 
+    #[test]
+    fn is_bosun_executor_recognizes_only_executor_command_lines() {
+        let our = "bosun";
+        assert!(is_bosun_executor(
+            "/usr/local/bin/bosun executor --session-dir work/s1 --port 51503 --permission read_write",
+            our
+        ));
+        assert!(
+            is_bosun_executor(
+                "/Users/me/bosun executor --port 1 --permission read_only",
+                our
+            ),
+            "an installed bosun at another path is still an executor"
+        );
+        assert!(!is_bosun_executor("sleep 30", our));
+        assert!(!is_bosun_executor("git status", our));
+        assert!(
+            !is_bosun_executor("/usr/local/bin/bosun node --config node.toml", our),
+            "a bosun process running a different subcommand is not an executor"
+        );
+        assert!(
+            !is_bosun_executor("/usr/bin/executor --session-dir x", our),
+            "a different binary named executor is not ours"
+        );
+        assert!(!is_bosun_executor("", our));
+    }
+
     #[tokio::test]
-    async fn kill_pid_if_alive_terminates_a_process() {
+    async fn kill_pid_if_alive_leaves_unrelated_processes_alone() {
         let mut child = tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -783,9 +845,41 @@ mod tests {
         let pid = child.id().unwrap();
 
         kill_pid_if_alive(pid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let output = child.wait().await.unwrap();
-        assert!(!output.success());
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(
+            alive,
+            "a reused pid must not be signalled when it is not a bosun executor"
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kill_pid_if_alive_refuses_system_pids() {
+        // `kill -TERM 1` would signal the system init process; the guard must
+        // return without signalling anything.
+        kill_pid_if_alive(0).await;
+        kill_pid_if_alive(1).await;
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(alive, "the test's own process must survive");
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
     }
 
     #[test]
