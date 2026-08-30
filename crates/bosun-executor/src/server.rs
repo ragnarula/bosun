@@ -35,6 +35,7 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -61,6 +62,10 @@ pub struct ExecutorState {
 
 pub struct RunningShell {
     pub pid: u32,
+    /// Tells the owner task to kill the shell. Killing happens there, while
+    /// the child is still alive and not yet reaped, so the pid it signals
+    /// always belongs to this shell and never to a reused process group.
+    kill: Arc<Notify>,
 }
 
 #[derive(Debug, Error)]
@@ -75,35 +80,42 @@ enum ShellMsg {
     ReaderDone,
 }
 
-/// Owns the shell's process-group id for the lifetime of the SSE stream. On
-/// drop the whole group is killed and the run is removed from the running
-/// map, so an aborted client leaks nothing.
+/// Owns the shell's kill signal for the lifetime of the SSE stream. On drop
+/// it asks the owner task to kill the shell and removes the run from the
+/// running map, so an aborted client leaks nothing. The guard never signals a
+/// pid itself: the owner task owns the child and reaps it, so no kill can
+/// target a reaped pid.
 struct ShellGuard {
-    pid: u32,
+    kill: Arc<Notify>,
     state: Arc<ExecutorState>,
     run_id: String,
 }
 
 impl Drop for ShellGuard {
     fn drop(&mut self) {
-        let pid = self.pid;
+        self.kill.notify_waiters();
         let state = self.state.clone();
         let run_id = self.run_id.clone();
         tokio::spawn(async move {
-            kill_process_tree(pid).await;
             state.running.write().await.remove(&run_id);
         });
     }
 }
 
-/// Kills a shell and its children. On Unix the shell runs in its own process
-/// group, so killing the negative pid kills the whole tree. On Windows there
-/// are no process groups; taskkill with /T covers the tree.
-async fn kill_process_tree(pid: u32) {
+/// Kills a shell's process group. Called only by the owner task while the
+/// child is still alive, so the group it names cannot have been reused. On
+/// Unix the shell runs in its own session (setsid), so the group is confined
+/// to the shell and its children; on Windows taskkill with /T covers the
+/// tree. Pids at or below 1 are refused: `kill -KILL -1` would reach every
+/// process the user can signal and `-0` would reach the caller's own group.
+async fn kill_group(pgid: u32) {
+    if pgid <= 1 {
+        return;
+    }
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
+            .args(["-KILL", &format!("-{pgid}")])
             .stderr(Stdio::null())
             .status()
             .await;
@@ -111,14 +123,14 @@ async fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .args(["/PID", &pgid.to_string(), "/T", "/F"])
             .stderr(Stdio::null())
             .status()
             .await;
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = pid;
+        let _ = pgid;
     }
 }
 
@@ -378,10 +390,20 @@ async fn shell(State(state): State<Arc<ExecutorState>>, Json(req): Json<ToolRequ
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Run the shell in its own process group so cancel can kill it and its
-    // children at once. Windows has no process groups; taskkill covers it.
     #[cfg(unix)]
-    shell.process_group(0);
+    {
+        // The shell becomes a session leader (own session, own process
+        // group), so a group kill is confined to the shell and its children
+        // and terminal signals from the node's session never reach it.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = match shell.spawn() {
         Ok(child) => child,
         Err(e) => return tool_error_response("shell", ToolError::Internal(anyhow!(e))),
@@ -395,25 +417,37 @@ async fn shell(State(state): State<Arc<ExecutorState>>, Json(req): Json<ToolRequ
     let stdout = child.stdout.take().expect("shell stdout is piped");
     let stderr = child.stderr.take().expect("shell stderr is piped");
     let run_id = req.run_id.clone();
+    let kill_signal = Arc::new(Notify::new());
     // Register the run before returning the response, so a cancel arriving
     // right after the POST returns still finds it.
-    state
-        .running
-        .write()
-        .await
-        .insert(run_id.clone(), RunningShell { pid });
+    state.running.write().await.insert(
+        run_id.clone(),
+        RunningShell {
+            pid,
+            kill: kill_signal.clone(),
+        },
+    );
 
-    // Wait for the shell in a task: the stream must not hang on the pipes
-    // when a backgrounded grandchild inherited them and keeps them open.
+    // One task owns the child: it reaps it and answers kill requests. Killing
+    // happens here, while the child is alive and its pid is still allocated,
+    // so the process group it signals is this shell's own and cannot have
+    // been reused by another process.
     let (exit_tx, exit_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let code = child
-            .wait()
-            .await
-            .ok()
-            .and_then(|status| status.code())
-            .unwrap_or(-1);
-        let _ = exit_tx.send(code);
+    tokio::spawn({
+        let kill_signal = kill_signal.clone();
+        async move {
+            let code = tokio::select! {
+                _ = kill_signal.notified() => {
+                    if child.try_wait().ok().flatten().is_none() {
+                        kill_group(pid).await;
+                    }
+                    child.kill().await.ok();
+                    child.wait().await.ok().and_then(|status| status.code()).unwrap_or(-1)
+                }
+                status = child.wait() => status.ok().and_then(|status| status.code()).unwrap_or(-1),
+            };
+            let _ = exit_tx.send(code);
+        }
     });
 
     let (tx, rx) = mpsc::channel::<ShellMsg>(64);
@@ -422,7 +456,7 @@ async fn shell(State(state): State<Arc<ExecutorState>>, Json(req): Json<ToolRequ
     tokio::spawn(pump(stderr, tx, total));
 
     let guard = ShellGuard {
-        pid,
+        kill: kill_signal,
         state: state.clone(),
         run_id,
     };
@@ -520,12 +554,12 @@ async fn cancel(
     State(state): State<Arc<ExecutorState>>,
     AxumPath(run_id): AxumPath<String>,
 ) -> Json<Value> {
-    let pid = {
+    let kill = {
         let running = state.running.read().await;
-        running.get(&run_id).map(|shell| shell.pid)
+        running.get(&run_id).map(|shell| shell.kill.clone())
     };
-    if let Some(pid) = pid {
-        kill_process_tree(pid).await;
+    if let Some(kill) = kill {
+        kill.notify_waiters();
     }
     Json(json!({}))
 }
@@ -926,6 +960,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_kills_the_shells_children_too() {
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (addr, _state) = test_app(dir.path(), Permission::ReadWrite).await;
+            let client = reqwest::Client::new();
+            let run_id = "run-tree";
+
+            let response = tool_call(
+                &client,
+                &addr,
+                "shell",
+                run_id,
+                json!({ "command": "sleep 27 & wait" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let grandchild_running = || async {
+                std::process::Command::new("pgrep")
+                    .args(["-f", "sleep 27"])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !grandchild_running().await {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("the shell's child never started");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let cancel = client
+                .post(format!("http://{addr}/tool/{run_id}/cancel"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(cancel.status(), StatusCode::OK);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while grandchild_running().await {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("the shell's child survived the cancel");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = response.text().await;
+        }
+    }
+
+    #[tokio::test]
     async fn shell_cancel_kills_the_command() {
         let dir = tempfile::tempdir().unwrap();
         let (addr, _state) = test_app(dir.path(), Permission::ReadWrite).await;
@@ -1040,6 +1126,34 @@ mod tests {
                 .any(|(event, data)| event == "done" && data == "0"),
             "expected done with exit 0: {text:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn kill_group_never_broadcasts_or_targets_system_pids() {
+        #[cfg(unix)]
+        {
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            // If the guard were absent, `kill -KILL -1` would signal every
+            // process this test can reach, killing `sleep` too.
+            kill_group(0).await;
+            kill_group(1).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            assert!(
+                alive,
+                "pid 0 and 1 must never be signalled as a process group"
+            );
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
     }
 
     #[tokio::test]

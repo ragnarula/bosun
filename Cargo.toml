@@ -34,6 +34,7 @@ http-body-util = "0.1"
 hyper = "1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "tls12", "http1", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+libc = "0.2"
 dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
 rcgen = "0.13"
 regex = "1"

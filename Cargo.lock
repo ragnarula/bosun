@@ -257,6 +257,7 @@ dependencies = [
  "futures-util",
  "glob",
  "http-body-util",
+ "libc",
  "regex",
  "reqwest",
  "serde",
