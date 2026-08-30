@@ -63,6 +63,8 @@ const MAX_LINES: usize = 5000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum characters the input line may hold.
 const MAX_INPUT_CHARS: usize = 10_000;
+/// Submitted messages kept for arrow-key recall.
+const MAX_HISTORY: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -419,6 +421,13 @@ pub struct App {
     /// resumes auto-follow.
     max_scroll: usize,
     connected: bool,
+    /// Submitted message inputs, oldest first, for arrow-key recall.
+    history: Vec<String>,
+    /// Position in `history` the input currently shows; equal to
+    /// `history.len()` while editing a fresh message.
+    history_pos: usize,
+    /// The draft being edited before arrow-key recall replaced it.
+    draft: String,
 }
 
 impl App {
@@ -433,7 +442,50 @@ impl App {
             viewport: 0,
             max_scroll: 0,
             connected: false,
+            history: Vec::new(),
+            history_pos: 0,
+            draft: String::new(),
         }
+    }
+
+    /// Moves the input to the previous submitted message, saving the current
+    /// draft the first time the user leaves it.
+    fn history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        if self.history_pos == self.history.len() {
+            self.draft = std::mem::take(&mut self.state.input);
+            self.history_pos = self.history.len() - 1;
+        } else if self.history_pos > 0 {
+            self.history_pos -= 1;
+        }
+        self.state.input = self.history[self.history_pos].clone();
+    }
+
+    /// Moves the input back toward the fresh draft after recall.
+    fn history_down(&mut self) {
+        if self.history_pos >= self.history.len() {
+            return;
+        }
+        self.history_pos += 1;
+        if self.history_pos == self.history.len() {
+            self.state.input = std::mem::take(&mut self.draft);
+        } else {
+            self.state.input = self.history[self.history_pos].clone();
+        }
+    }
+
+    /// Records a submitted message so the next session can recall it.
+    fn history_submit(&mut self, content: &str) {
+        if !content.is_empty() && self.history.last().map(String::as_str) != Some(content) {
+            self.history.push(content.to_string());
+            if self.history.len() > MAX_HISTORY {
+                self.history.remove(0);
+            }
+        }
+        self.history_pos = self.history.len();
+        self.draft.clear();
     }
 }
 
@@ -492,7 +544,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    "message  ·  ^C interrupt  ·  ^P permission  ·  ^Q quit  ·  pgup/pgdn scroll",
+                    "message  ·  esc/^C interrupt  ·  ^P permission  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll",
                     Style::default().fg(Color::DarkGray),
                 )),
         )
@@ -844,25 +896,23 @@ async fn handle_key(
             Ok(Action::Continue)
         }
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Ok(Action::Exit),
-        KeyCode::Esc => Ok(Action::Exit),
+        // Esc interrupts like Ctrl-C; Ctrl-Q and /exit quit.
+        KeyCode::Esc => {
+            interrupt(app, client, cp_url, session_id).await;
+            Ok(Action::Continue)
+        }
         KeyCode::Enter => submit_input(app, client, cp_url, session_id).await,
         KeyCode::Backspace | KeyCode::Delete => {
             app.state.input.pop();
             Ok(Action::Continue)
         }
+        // Up and Down recall previous inputs; PgUp/PgDn scroll the transcript.
         KeyCode::Up => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_sub(1);
+            app.history_up();
             Ok(Action::Continue)
         }
         KeyCode::Down => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_add(1);
-            if app.scroll >= app.max_scroll {
-                // Reaching the bottom means the user is done reading the
-                // past; resume following the newest rows.
-                app.follow = true;
-            }
+            app.history_down();
             Ok(Action::Continue)
         }
         KeyCode::PageUp => {
@@ -908,6 +958,7 @@ async fn submit_input(
         }
         _ => {
             if !content.is_empty() {
+                app.history_submit(&content);
                 send_message(app, client, cp_url, session_id, &content).await;
             }
             Ok(Action::Continue)
@@ -1494,38 +1545,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scrolling_up_disables_follow_and_scrolling_to_the_bottom_resumes_it() {
+    async fn paging_up_disables_follow_and_paging_to_the_bottom_resumes_it() {
         let client = reqwest::Client::new();
         let mut app = App::new(test_session());
         app.follow = true;
         app.max_scroll = 100;
+        app.viewport = 30;
 
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         app.follow = true;
-        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Up))
-            .await
-            .unwrap();
-        assert!(!app.follow, "scrolling up must stop auto-follow");
         handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::PageUp))
             .await
             .unwrap();
-        assert!(!app.follow);
+        assert!(!app.follow, "paging up must stop auto-follow");
 
-        // Scrolling back to the bottom resumes auto-follow, no End needed.
+        // Paging back to the bottom resumes auto-follow, no End needed.
         app.follow = false;
-        app.scroll = 99;
-        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Down))
-            .await
-            .unwrap();
-        assert!(app.follow, "reaching the bottom must resume auto-follow");
-
-        app.follow = false;
-        app.viewport = 30;
         app.scroll = 80;
         handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::PageDown))
             .await
             .unwrap();
         assert!(app.follow, "paging to the bottom must resume auto-follow");
+    }
+
+    #[test]
+    fn up_and_down_arrows_recall_submitted_inputs() {
+        let mut app = App::new(test_session());
+        app.history_submit("first message");
+        app.history_submit("second message");
+
+        // Up recalls the newest, then the previous one.
+        app.history_up();
+        assert_eq!(app.state.input, "second message");
+        app.history_up();
+        assert_eq!(app.state.input, "first message");
+
+        // Down walks back to the draft that was being edited.
+        app.draft = "draft in progress".into();
+        app.history_pos = app.history.len();
+        app.state.input = app.draft.clone();
+        app.history_up();
+        assert_eq!(app.state.input, "second message");
+        app.history_down();
+        assert_eq!(app.state.input, "draft in progress");
+    }
+
+    #[test]
+    fn history_keeps_the_last_entry_and_skips_duplicates() {
+        let mut app = App::new(test_session());
+        for i in 0..(MAX_HISTORY + 5) {
+            app.history_submit(&format!("message {i}"));
+        }
+        assert_eq!(app.history.len(), MAX_HISTORY);
+        assert_eq!(app.history[0], "message 5");
+
+        app.history_submit("repeat");
+        app.history_submit("repeat");
+        assert_eq!(app.history.last().map(String::as_str), Some("repeat"));
+        assert_eq!(
+            app.history
+                .iter()
+                .filter(|m| m.as_str() == "repeat")
+                .count(),
+            1,
+            "consecutive duplicates must not be stored twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_interrupts_instead_of_exiting() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue, "Esc must interrupt, not exit");
+        assert!(
+            app.state
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with("interrupt failed")
+                    || line.text.starts_with("request timed out")),
+            "Esc must issue an interrupt request"
+        );
     }
 
     #[tokio::test]
