@@ -151,7 +151,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bosun"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-agent"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-common"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-control"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-executor"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-node"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bosun-common",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-store"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bosun-common",
