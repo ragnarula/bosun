@@ -1,8 +1,8 @@
 //! Interactive terminal client for a session: renders the live transcript
-//! over SSE and sends the user's input back over the session API.
+//! over SSE in a two-pane TUI (scrollable output, pinned input box) and sends
+//! the user's input back over the session API.
 
 use std::io;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -17,7 +17,7 @@ use bosun_common::session::Event;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
-use crossterm::cursor;
+use bosun_common::session::SessionState;
 use crossterm::event;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::EnableBracketedPaste;
@@ -28,11 +28,24 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use crossterm::execute;
 use crossterm::terminal;
-use crossterm::terminal::ClearType;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use futures_util::Stream;
 use futures_util::StreamExt;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::text::Line as TuiLine;
+use ratatui::text::Span;
+use ratatui::widgets::Block as TuiBlock;
+use ratatui::widgets::Borders;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -79,16 +92,18 @@ pub struct ClientState {
     pub last_seq: i64,
     pub pending_delta: Option<String>,
     pub permission: Permission,
+    pub session_state: SessionState,
 }
 
 impl ClientState {
-    pub fn new(permission: Permission) -> Self {
+    pub fn new(permission: Permission, session_state: SessionState) -> Self {
         Self {
             lines: Vec::new(),
             input: String::new(),
             last_seq: 0,
             pending_delta: None,
             permission,
+            session_state,
         }
     }
 
@@ -102,6 +117,9 @@ impl ClientState {
         self.last_seq = seq;
         if let Event::Permission { permission } = event {
             self.permission = *permission;
+        }
+        if let Event::State { state } = event {
+            self.session_state = *state;
         }
         if matches!(
             event,
@@ -250,43 +268,9 @@ fn clip(text: &str, max: usize) -> String {
     clipped
 }
 
-/// Renders the transcript tail, the pending delta, and the input line into a
-/// screen of `height` rows and `width` columns. The last row is the input.
-fn render(state: &ClientState, width: usize, height: usize) -> String {
-    let width = width.max(1);
-    let height = height.max(1);
-    let mut rows: Vec<String> = Vec::new();
-    for line in &state.lines {
-        rows.extend(wrap(&render_line(line), width));
-    }
-    if let Some(pending) = &state.pending_delta {
-        rows.extend(wrap(pending, width));
-    }
-    let input_row = format!("> {}", input_tail(&state.input, width));
-    let keep = height.saturating_sub(1).max(1);
-    let scroll = rows.len().saturating_sub(keep);
-    let mut screen: Vec<String> = rows.into_iter().skip(scroll).collect();
-    screen.push(input_row);
-    screen.join("\n")
-}
-
-fn render_line(line: &Line) -> String {
-    match line.kind {
-        LineKind::User => format!("you: {}", line.text),
-        LineKind::Assistant => line.text.clone(),
-        LineKind::ToolCall => format!("tool call: {}", line.text),
-        LineKind::ToolResult => format!("tool result: {}", line.text),
-        LineKind::Ask => format!("ask: {}", line.text),
-        LineKind::Summary => format!("summary: {}", line.text),
-        LineKind::Subagent => format!("subagent: {}", line.text),
-        LineKind::ModelCall => format!("model: {}", line.text),
-        LineKind::Status => format!("* {}", line.text),
-    }
-}
-
 /// Word-wraps text to `width` columns, splitting on newlines first. A word
 /// longer than the width is hard-wrapped at character width.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for paragraph in text.split('\n') {
@@ -329,16 +313,206 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// The visible tail of the input line, so a long input keeps its end on
-/// screen where the user is typing.
-fn input_tail(input: &str, width: usize) -> String {
-    let keep = width.saturating_sub(2);
+/// The wrapped, prefixed transcript rows: the durable lines plus the live
+/// delta, cut to `width` columns. Kept pure so the layout is testable.
+fn transcript_rows(state: &ClientState, width: usize) -> Vec<(LineKind, String)> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in &state.lines {
+        let prefix = prefix_for(line);
+        let prefix_width = prefix.chars().count();
+        let inner = width.saturating_sub(prefix_width).max(1);
+        let wrapped = wrap_text(&line.text, inner);
+        for (i, row) in wrapped.iter().enumerate() {
+            let indent = if i == 0 {
+                prefix.to_string()
+            } else {
+                " ".repeat(prefix_width)
+            };
+            rows.push((line.kind, format!("{indent}{row}")));
+        }
+    }
+    if let Some(pending) = &state.pending_delta {
+        for row in wrap_text(pending, width) {
+            rows.push((LineKind::Assistant, row));
+        }
+    }
+    rows
+}
+
+/// The per-kind prefix that aligns the transcript: messages start at the
+/// margin, tool activity and meta rows are indented, state rows are separated.
+fn prefix_for(line: &Line) -> &'static str {
+    match line.kind {
+        LineKind::User => "you: ",
+        LineKind::Assistant => "",
+        LineKind::ToolCall => "  → ",
+        LineKind::ToolResult => "  ← ",
+        LineKind::Ask => "  ? ",
+        LineKind::Summary => "  ⤷ ",
+        LineKind::Subagent => "  ⤷ ",
+        LineKind::ModelCall => "  ",
+        LineKind::Status => "── ",
+    }
+}
+
+/// The color each transcript kind renders with.
+fn kind_color(kind: LineKind, error: bool) -> Color {
+    match kind {
+        LineKind::User => Color::Green,
+        LineKind::Assistant => Color::White,
+        LineKind::ToolCall => Color::Magenta,
+        LineKind::ToolResult if error => Color::Red,
+        LineKind::ToolResult => Color::Blue,
+        LineKind::Ask => Color::Yellow,
+        LineKind::Summary | LineKind::Subagent | LineKind::ModelCall => Color::DarkGray,
+        LineKind::Status => Color::Cyan,
+    }
+}
+
+/// The `(kind, text)` rows become styled TUI lines for the output pane. Error
+/// tool results are detected from their text prefix.
+fn styled_row(kind: LineKind, text: String) -> TuiLine<'static> {
+    let error = kind == LineKind::ToolResult && text.starts_with("error: ");
+    let style = if kind == LineKind::Status {
+        Style::default()
+            .fg(kind_color(kind, error))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(kind_color(kind, error))
+    };
+    TuiLine::styled(text, style)
+}
+
+/// The full client UI state, including the scroll position.
+#[derive(Debug)]
+pub struct App {
+    pub session: Session,
+    pub state: ClientState,
+    /// Rows of the output pane that are hidden above the viewport.
+    pub scroll: usize,
+    /// Follow the newest rows instead of holding a manual scroll position.
+    pub follow: bool,
+    /// The output pane's inner height from the last draw, for paging.
+    viewport: u16,
+    connected: bool,
+}
+
+impl App {
+    pub fn new(session: Session) -> Self {
+        let permission = session.permission;
+        let session_state = session.state;
+        Self {
+            session,
+            state: ClientState::new(permission, session_state),
+            scroll: 0,
+            follow: true,
+            viewport: 0,
+            connected: false,
+        }
+    }
+}
+
+/// Draws the whole screen: status bar, scrollable output pane, and the input
+/// box pinned to the bottom with a visible cursor.
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let status = status_line(app);
+    frame.render_widget(Paragraph::new(status), chunks[0]);
+
+    let output = chunks[1];
+    let inner = output.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let width = inner.width as usize;
+    let rows = transcript_rows(&app.state, width);
+    app.viewport = inner.height;
+    let max_scroll = rows.len().saturating_sub(inner.height as usize);
+    let scroll = if app.follow {
+        max_scroll
+    } else {
+        app.scroll.min(max_scroll)
+    };
+    app.scroll = scroll;
+
+    let tui_lines: Vec<TuiLine<'static>> = rows
+        .iter()
+        .map(|(kind, text)| styled_row(*kind, text.clone()))
+        .collect();
+    let transcript = Paragraph::new(tui_lines)
+        .block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    "transcript",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+        )
+        .scroll((scroll as u16, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(transcript, output);
+
+    let input = chunks[2];
+    let (text, tail_len) = input_row(&app.state.input, input.width.saturating_sub(2) as usize);
+    let input_widget = Paragraph::new(text)
+        .block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    "message  ·  ^C interrupt  ·  ^P permission  ·  ^Q quit  ·  pgup/pgdn scroll",
+                    Style::default().fg(Color::DarkGray),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(input_widget, input);
+    frame.set_cursor_position((input.x + 1 + 2 + tail_len as u16, input.y + 1));
+}
+
+fn status_line(app: &App) -> TuiLine<'static> {
+    let id = clip(&app.session.id, 12);
+    let state = state_name(app.state.session_state);
+    let connection = if app.connected {
+        "connected"
+    } else {
+        "connecting"
+    };
+    TuiLine::from(vec![
+        Span::styled("session", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {id} · {} · ", app.session.model)),
+        Span::styled(state, Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" · {} · ", permission_name(app.state.permission))),
+        Span::styled(connection, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// The input box content and the length of the visible text tail. The text is
+/// the input tail that fits the box, prefixed with a prompt; the caller places
+/// the cursor after it.
+fn input_row(input: &str, inner_width: usize) -> (TuiLine<'static>, usize) {
+    let inner_width = inner_width.max(1);
+    let prompt_len = 2;
+    let visible = inner_width.saturating_sub(prompt_len);
     let chars: Vec<char> = input.chars().collect();
-    if chars.len() > keep {
-        chars[chars.len() - keep..].iter().collect()
+    let tail: String = if chars.len() > visible {
+        chars[chars.len() - visible..].iter().collect()
     } else {
         input.to_string()
-    }
+    };
+    let line = TuiLine::from(vec![
+        Span::styled("> ", Style::default().fg(Color::DarkGray)),
+        Span::raw(tail.clone()),
+    ]);
+    (line, tail.chars().count())
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,28 +551,28 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
         .await
         .context("failed to parse session")?;
 
+    terminal::enable_raw_mode()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let _restore = RestoreTerminal;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+
     let quit = Arc::new(AtomicBool::new(false));
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     spawn_input_thread(input_tx, Arc::clone(&quit))?;
 
-    terminal::enable_raw_mode()?;
-    let _restore = RestoreTerminal;
-    execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        cursor::Hide
-    )?;
+    let mut app = App::new(session);
 
     let result = run_attach(
+        &mut terminal,
         &client,
         cp_url,
         session_id,
-        ClientState::new(session.permission),
+        &mut app,
         input_rx,
     )
     .await;
     quit.store(true, Ordering::Relaxed);
+    let _ = terminal.show_cursor();
     result
 }
 
@@ -408,12 +582,7 @@ struct RestoreTerminal;
 impl Drop for RestoreTerminal {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            cursor::Show,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -457,23 +626,26 @@ fn push_input(state: &mut ClientState, text: &str) {
 }
 
 async fn run_attach(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
-    mut state: ClientState,
+    app: &mut App,
     mut input_rx: mpsc::UnboundedReceiver<TermEvent>,
 ) -> anyhow::Result<()> {
-    draw(&state)?;
+    redraw(terminal, app)?;
     let mut noticed = false;
     loop {
-        if let Ok(stream) = open_stream(client, cp_url, session_id, state.last_seq).await {
+        if let Ok(stream) = open_stream(client, cp_url, session_id, app.state.last_seq).await {
             // The stream restarted: live deltas do not survive a reconnect,
             // and the outage is over, so the next drop reports again.
-            state.pending_delta = None;
+            app.state.pending_delta = None;
             noticed = false;
-            draw(&state)?;
+            app.connected = true;
+            redraw(terminal, app)?;
             let outcome = stream_events(
-                &mut state,
+                terminal,
+                app,
                 &mut input_rx,
                 client,
                 cp_url,
@@ -484,21 +656,22 @@ async fn run_attach(
             if outcome == StreamOutcome::Exited {
                 return Ok(());
             }
+            app.connected = false;
             if !noticed {
                 noticed = true;
-                state.push_line(Line {
+                app.state.push_line(Line {
                     kind: LineKind::Status,
                     text: "connection lost; reconnecting".to_string(),
                 });
-                draw(&state)?;
+                redraw(terminal, app)?;
             }
         } else if !noticed {
             noticed = true;
-            state.push_line(Line {
+            app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "connection lost; reconnecting".to_string(),
             });
-            draw(&state)?;
+            redraw(terminal, app)?;
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
@@ -528,7 +701,8 @@ enum StreamOutcome {
 }
 
 async fn stream_events(
-    state: &mut ClientState,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
     input_rx: &mut mpsc::UnboundedReceiver<TermEvent>,
     client: &reqwest::Client,
     cp_url: &str,
@@ -542,16 +716,16 @@ async fn stream_events(
                 let Some(event) = event else {
                     return Ok(StreamOutcome::Exited);
                 };
-                let action = handle_term_event(state, client, cp_url, session_id, event).await?;
+                let action = handle_term_event(app, client, cp_url, session_id, event).await?;
                 if action == Action::Exit {
                     return Ok(StreamOutcome::Exited);
                 }
-                draw(state)?;
+                redraw(terminal, app)?;
             }
             item = stream.next() => match item {
                 Some(Ok(sse)) => {
-                    apply_sse(state, &sse);
-                    draw(state)?;
+                    apply_sse(&mut app.state, &sse);
+                    redraw(terminal, app)?;
                 }
                 Some(Err(_)) | None => return Ok(StreamOutcome::Reconnect),
             },
@@ -566,7 +740,7 @@ enum Action {
 }
 
 async fn handle_term_event(
-    state: &mut ClientState,
+    app: &mut App,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
@@ -574,10 +748,10 @@ async fn handle_term_event(
 ) -> anyhow::Result<Action> {
     match event {
         TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            handle_key(state, client, cp_url, session_id, key).await
+            handle_key(app, client, cp_url, session_id, key).await
         }
         TermEvent::Paste(text) => {
-            push_input(state, &text);
+            push_input(&mut app.state, &text);
             Ok(Action::Continue)
         }
         _ => Ok(Action::Continue),
@@ -585,7 +759,7 @@ async fn handle_term_event(
 }
 
 async fn handle_key(
-    state: &mut ClientState,
+    app: &mut App,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
@@ -593,22 +767,46 @@ async fn handle_key(
 ) -> anyhow::Result<Action> {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            interrupt(state, client, cp_url, session_id).await;
+            interrupt(app, client, cp_url, session_id).await;
             Ok(Action::Continue)
         }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            toggle_permission(state, client, cp_url, session_id).await;
+            toggle_permission(app, client, cp_url, session_id).await;
             Ok(Action::Continue)
         }
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Ok(Action::Exit),
         KeyCode::Esc => Ok(Action::Exit),
-        KeyCode::Enter => submit_input(state, client, cp_url, session_id).await,
+        KeyCode::Enter => submit_input(app, client, cp_url, session_id).await,
         KeyCode::Backspace | KeyCode::Delete => {
-            state.input.pop();
+            app.state.input.pop();
+            Ok(Action::Continue)
+        }
+        KeyCode::Up => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_sub(1);
+            Ok(Action::Continue)
+        }
+        KeyCode::Down => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_add(1);
+            Ok(Action::Continue)
+        }
+        KeyCode::PageUp => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_sub(app.viewport.max(1) as usize);
+            Ok(Action::Continue)
+        }
+        KeyCode::PageDown => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_add(app.viewport.max(1) as usize);
+            Ok(Action::Continue)
+        }
+        KeyCode::End => {
+            app.follow = true;
             Ok(Action::Continue)
         }
         KeyCode::Char(c) => {
-            push_input(state, &c.to_string());
+            push_input(&mut app.state, &c.to_string());
             Ok(Action::Continue)
         }
         _ => Ok(Action::Continue),
@@ -616,21 +814,21 @@ async fn handle_key(
 }
 
 async fn submit_input(
-    state: &mut ClientState,
+    app: &mut App,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
 ) -> anyhow::Result<Action> {
-    let content = std::mem::take(&mut state.input);
+    let content = std::mem::take(&mut app.state.input);
     match content.as_str() {
         "/exit" => Ok(Action::Exit),
         "/permission" => {
-            toggle_permission(state, client, cp_url, session_id).await;
+            toggle_permission(app, client, cp_url, session_id).await;
             Ok(Action::Continue)
         }
         _ => {
             if !content.is_empty() {
-                send_message(state, client, cp_url, session_id, &content).await;
+                send_message(app, client, cp_url, session_id, &content).await;
             }
             Ok(Action::Continue)
         }
@@ -638,7 +836,7 @@ async fn submit_input(
 }
 
 async fn send_message(
-    state: &mut ClientState,
+    app: &mut App,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
@@ -655,7 +853,7 @@ async fn send_message(
     let result = match send {
         Ok(result) => result.and_then(reqwest::Response::error_for_status),
         Err(_) => {
-            state.push_line(Line {
+            app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
             });
@@ -663,19 +861,14 @@ async fn send_message(
         }
     };
     if let Err(error) = result {
-        state.push_line(Line {
+        app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("send failed: {error}"),
         });
     }
 }
 
-async fn interrupt(
-    state: &mut ClientState,
-    client: &reqwest::Client,
-    cp_url: &str,
-    session_id: &str,
-) {
+async fn interrupt(app: &mut App, client: &reqwest::Client, cp_url: &str, session_id: &str) {
     let send = tokio::time::timeout(
         REQUEST_TIMEOUT,
         client
@@ -686,7 +879,7 @@ async fn interrupt(
     let result = match send {
         Ok(result) => result.and_then(reqwest::Response::error_for_status),
         Err(_) => {
-            state.push_line(Line {
+            app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
             });
@@ -694,7 +887,7 @@ async fn interrupt(
         }
     };
     if let Err(error) = result {
-        state.push_line(Line {
+        app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("interrupt failed: {error}"),
         });
@@ -702,12 +895,12 @@ async fn interrupt(
 }
 
 async fn toggle_permission(
-    state: &mut ClientState,
+    app: &mut App,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
 ) {
-    let next = match state.permission {
+    let next = match app.state.permission {
         Permission::ReadOnly => Permission::ReadWrite,
         Permission::ReadWrite => Permission::ReadOnly,
     };
@@ -722,7 +915,7 @@ async fn toggle_permission(
     let result = match send {
         Ok(result) => result.and_then(reqwest::Response::error_for_status),
         Err(_) => {
-            state.push_line(Line {
+            app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
             });
@@ -730,26 +923,22 @@ async fn toggle_permission(
         }
     };
     match result {
-        Ok(_) => state.permission = next,
-        Err(error) => state.push_line(Line {
+        Ok(_) => app.state.permission = next,
+        Err(error) => app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("permission change failed: {error}"),
         }),
     }
 }
 
-/// Redraws the screen from the state.
-fn draw(state: &ClientState) -> io::Result<()> {
-    let (width, height) = terminal::size()?;
-    let screen = render(state, width as usize, height as usize);
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        terminal::Clear(ClearType::All)
-    )?;
-    write!(stdout, "{screen}")?;
-    stdout.flush()?;
+/// Renders the current frame.
+fn redraw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    terminal
+        .draw(|frame| draw(frame, app))
+        .context("failed to render the terminal")?;
     Ok(())
 }
 
@@ -762,60 +951,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_shows_the_transcript_tail_then_input() {
-        let mut state = ClientState::new(Permission::ReadWrite);
-        state.lines.push(Line {
+    fn wrap_hard_breaks_words_longer_than_the_width() {
+        assert_eq!(wrap_text("abcdefghij", 5), vec!["abcde", "fghij"]);
+        assert_eq!(wrap_text("abcdefghijk", 5), vec!["abcde", "fghij", "k"]);
+        assert_eq!(
+            wrap_text("one abcdefghij two", 5),
+            vec!["one", "abcde", "fghij", "two"]
+        );
+        assert_eq!(wrap_text("ab", 5), vec!["ab"]);
+    }
+
+    #[test]
+    fn transcript_rows_align_each_kind_and_include_the_delta() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
             kind: LineKind::User,
             text: "hello".into(),
         });
-        state.lines.push(Line {
-            kind: LineKind::Assistant,
-            text: "hi there".into(),
+        state.push_line(Line {
+            kind: LineKind::ToolCall,
+            text: "shell {\"cmd\":\"ls\"}".into(),
+        });
+        state.push_line(Line {
+            kind: LineKind::Status,
+            text: "state: waiting_for_input".into(),
         });
         state.pending_delta = Some("streaming".into());
-        state.input = "next".into();
+
+        let rows = transcript_rows(&state, 40);
+        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(
-            render(&state, 40, 10),
-            "you: hello\nhi there\nstreaming\n> next"
+            texts,
+            vec![
+                "you: hello",
+                "  → shell {\"cmd\":\"ls\"}",
+                "── state: waiting_for_input",
+                "streaming"
+            ]
+        );
+        let kinds: Vec<LineKind> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::User,
+                LineKind::ToolCall,
+                LineKind::Status,
+                LineKind::Assistant,
+            ]
         );
     }
 
     #[test]
-    fn render_scrolls_to_the_transcript_tail() {
-        let mut state = ClientState::new(Permission::ReadWrite);
-        for i in 0..5 {
-            state.push_line(Line {
-                kind: LineKind::Assistant,
-                text: format!("line {i}"),
-            });
-        }
-        assert_eq!(render(&state, 40, 3), "line 3\nline 4\n> ");
-    }
-
-    #[test]
-    fn render_wraps_long_rows_to_the_width() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+    fn transcript_rows_wrap_long_rows() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         state.push_line(Line {
             kind: LineKind::Assistant,
             text: "one two three four".into(),
         });
-        assert_eq!(render(&state, 10, 5), "one two\nthree four\n> ");
+        let rows = transcript_rows(&state, 10);
+        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(texts, vec!["one two", "three four"]);
     }
 
     #[test]
-    fn wrap_hard_breaks_words_longer_than_the_width() {
-        assert_eq!(wrap("abcdefghij", 5), vec!["abcde", "fghij"]);
-        assert_eq!(wrap("abcdefghijk", 5), vec!["abcde", "fghij", "k"]);
-        assert_eq!(
-            wrap("one abcdefghij two", 5),
-            vec!["one", "abcde", "fghij", "two"]
-        );
-        assert_eq!(wrap("ab", 5), vec!["ab"]);
+    fn input_row_tails_a_long_input_and_reports_the_visible_length() {
+        let (line, tail_len) = input_row("hello", 10);
+        assert_eq!(line.to_string(), "> hello");
+        assert_eq!(tail_len, 5);
+
+        let (line, tail_len) = input_row(&"x".repeat(50), 10);
+        let text = line.to_string();
+        assert_eq!(text.chars().count(), 10, "the input tail fits the box");
+        assert_eq!(tail_len, 8);
     }
 
     #[test]
     fn input_is_capped_at_max_input_chars() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         state.input = "x".repeat(MAX_INPUT_CHARS);
         push_input(&mut state, "y");
         assert_eq!(state.input.chars().count(), MAX_INPUT_CHARS);
@@ -830,7 +1042,7 @@ mod tests {
 
     #[test]
     fn paste_is_trimmed_to_fit_the_input_cap() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         state.input = "x".repeat(MAX_INPUT_CHARS - 3);
         push_input(&mut state, "abcdef");
         assert_eq!(state.input, "x".repeat(MAX_INPUT_CHARS - 3) + "abc");
@@ -845,7 +1057,7 @@ mod tests {
 
     #[test]
     fn durable_text_supersedes_the_pending_delta() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         state.apply_delta("building");
         state.apply_delta(" the crate");
         assert_eq!(state.pending_delta.as_deref(), Some("building the crate"));
@@ -871,7 +1083,7 @@ mod tests {
 
     #[test]
     fn state_events_clear_the_pending_delta_at_turn_boundaries() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
 
         // An interrupted turn never commits text, so its delta must not
         // linger on screen.
@@ -897,7 +1109,7 @@ mod tests {
 
     #[test]
     fn apply_sse_parses_live_and_durable_frames() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         apply_sse(
             &mut state,
             &SseEvent {
@@ -1098,7 +1310,7 @@ mod tests {
 
     #[test]
     fn apply_event_skips_replayed_seq() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         let event = Event::State {
             state: SessionState::Running,
         };
@@ -1117,7 +1329,7 @@ mod tests {
 
     #[test]
     fn permission_events_update_the_state() {
-        let mut state = ClientState::new(Permission::ReadWrite);
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         let event = Event::Permission {
             permission: Permission::ReadOnly,
         };
