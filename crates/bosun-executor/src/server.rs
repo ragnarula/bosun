@@ -90,13 +90,35 @@ impl Drop for ShellGuard {
         let state = self.state.clone();
         let run_id = self.run_id.clone();
         tokio::spawn(async move {
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
-                .stderr(Stdio::null())
-                .status()
-                .await;
+            kill_process_tree(pid).await;
             state.running.write().await.remove(&run_id);
         });
+    }
+}
+
+/// Kills a shell and its children. On Unix the shell runs in its own process
+/// group, so killing the negative pid kills the whole tree. On Windows there
+/// are no process groups; taskkill with /T covers the tree.
+async fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
     }
 }
 
@@ -348,16 +370,19 @@ async fn shell(State(state): State<Arc<ExecutorState>>, Json(req): Json<ToolRequ
     if command.is_empty() {
         return bad_arg("command");
     }
-    let mut child = match Command::new("sh")
+    let mut shell = Command::new("sh");
+    shell
         .arg("-c")
         .arg(command)
         .current_dir(&state.session_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    // Run the shell in its own process group so cancel can kill it and its
+    // children at once. Windows has no process groups; taskkill covers it.
+    #[cfg(unix)]
+    shell.process_group(0);
+    let mut child = match shell.spawn() {
         Ok(child) => child,
         Err(e) => return tool_error_response("shell", ToolError::Internal(anyhow!(e))),
     };
@@ -500,11 +525,7 @@ async fn cancel(
         running.get(&run_id).map(|shell| shell.pid)
     };
     if let Some(pid) = pid {
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        kill_process_tree(pid).await;
     }
     Json(json!({}))
 }
