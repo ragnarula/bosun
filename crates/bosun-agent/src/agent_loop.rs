@@ -35,10 +35,16 @@ use crate::provider::ProviderCall;
 use crate::provider::StreamEvent;
 use crate::skills::Skill;
 use crate::skills::fetch_working_skills;
-use crate::skills::injected_skills;
 use crate::skills::merge_skills;
 use crate::skills::read_injected_skill;
 use crate::skills::read_working_skill;
+
+/// The session's skills, discovered once and reused across turns.
+struct SessionSkills {
+    working: Vec<Skill>,
+    injected: Vec<Skill>,
+    merged: Vec<Skill>,
+}
 
 /// Caps the summarizer output so a compaction stays cheap.
 const MAX_TOKENS: u32 = 2048;
@@ -143,21 +149,39 @@ pub fn spawn_loop(session_id: String, deps: Arc<LoopDeps>) -> LoopHandle {
     let task = tokio::spawn(async move {
         let result = async {
             let mut todos = Vec::new();
+            // The working-copy skill list is fetched once per session; the
+            // on-demand `skill` read still goes to the node per call.
+            let mut skills_cache: Option<SessionSkills> = None;
             // Wakes that arrive while a turn is in flight are counted here and
             // consumed by the next turn, so a user message posted mid-turn is
             // still processed once the current batch of turns ends.
             let pending_wakes = Arc::new(AtomicU64::new(0));
             loop {
                 if pending_wakes.load(Ordering::Acquire) > 0 {
-                    handle_wake(&deps, &session_id, &mut todos, &mut rx, &pending_wakes).await?;
+                    handle_wake(
+                        &deps,
+                        &session_id,
+                        &mut todos,
+                        &mut skills_cache,
+                        &mut rx,
+                        &pending_wakes,
+                    )
+                    .await?;
                     continue;
                 }
                 match rx.recv().await {
                     None => break,
                     Some(LoopEvent::Wake) => {
                         pending_wakes.fetch_add(1, Ordering::AcqRel);
-                        handle_wake(&deps, &session_id, &mut todos, &mut rx, &pending_wakes)
-                            .await?;
+                        handle_wake(
+                            &deps,
+                            &session_id,
+                            &mut todos,
+                            &mut skills_cache,
+                            &mut rx,
+                            &pending_wakes,
+                        )
+                        .await?;
                     }
                     // This arm is only reachable while no turn is in flight:
                     // handle_wake owns the channel (and cancels the in-flight
@@ -230,6 +254,7 @@ async fn handle_wake(
     deps: &Arc<LoopDeps>,
     session_id: &str,
     todos: &mut Vec<Value>,
+    skills_cache: &mut Option<SessionSkills>,
     rx: &mut mpsc::UnboundedReceiver<LoopEvent>,
     pending_wakes: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
@@ -244,7 +269,7 @@ async fn handle_wake(
     loop {
         let signal = Arc::new(InterruptSignal::new());
         let outcome = {
-            let mut turn = Box::pin(run_turn(deps, session_id, todos, &signal));
+            let mut turn = Box::pin(run_turn(deps, session_id, todos, skills_cache, &signal));
             loop {
                 tokio::select! {
                     biased;
@@ -289,9 +314,10 @@ async fn run_turn(
     deps: &Arc<LoopDeps>,
     session_id: &str,
     todos: &mut Vec<Value>,
+    skills_cache: &mut Option<SessionSkills>,
     signal: &Arc<InterruptSignal>,
 ) -> TurnOutcome {
-    match run_turn_inner(deps, session_id, todos, signal).await {
+    match run_turn_inner(deps, session_id, todos, skills_cache, signal).await {
         Ok(outcome) => outcome,
         Err(error) => {
             error!(
@@ -308,6 +334,7 @@ async fn run_turn_inner(
     deps: &Arc<LoopDeps>,
     session_id: &str,
     todos: &mut Vec<Value>,
+    skills_cache: &mut Option<SessionSkills>,
     signal: &Arc<InterruptSignal>,
 ) -> anyhow::Result<TurnOutcome> {
     let messages: Vec<Message> = maybe_compact(deps, session_id, signal)
@@ -328,20 +355,32 @@ async fn run_turn_inner(
         .await?
         .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
     let permission = session.permission;
-    // Skills are discovered fresh each turn, so a working copy that gains or
-    // drops a skill advertises the change on the next request.
-    let working_skills = fetch_working_skills(&*deps.tools, session_id)
-        .await
-        .unwrap_or_else(|error| {
-            warn!(
-                msg = "failed to fetch skills from the node",
-                session_id = %session_id,
-                error = %error.display_chain()
-            );
-            Vec::new()
+    // The working-copy skill list is fetched once per session and cached, so
+    // a turn does not round-trip to the node for it. The on-demand `skill`
+    // read still goes to the executor when the model asks for it.
+    if skills_cache.is_none() {
+        let working = fetch_working_skills(&*deps.tools, session_id)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(
+                    msg = "failed to fetch skills from the node",
+                    session_id = %session_id,
+                    error = %error.display_chain()
+                );
+                Vec::new()
+            });
+        let injected = crate::skills::injected_skills(deps.injected_skills_dir.as_deref());
+        let merged = merge_skills(working.clone(), injected.clone());
+        *skills_cache = Some(SessionSkills {
+            working,
+            injected,
+            merged,
         });
-    let injected_skills = injected_skills(deps.injected_skills_dir.as_deref());
-    let skills = merge_skills(working_skills.clone(), injected_skills.clone());
+    }
+    let cached = skills_cache.as_ref().expect("populated above");
+    let working_skills: &[Skill] = &cached.working;
+    let injected_skills: &[Skill] = &cached.injected;
+    let skills: &[Skill] = &cached.merged;
     let tools: Vec<ToolSpec> = canonical_tools(permission)
         .into_iter()
         .filter(|tool| {
@@ -351,7 +390,7 @@ async fn run_turn_inner(
         })
         .collect();
 
-    let system = system_prompt(todos, &skills);
+    let system = system_prompt(todos, skills);
     let mut stream = deps.provider.chat_stream(ProviderCall {
         model: deps.provider.model(),
         max_tokens: 4096,
@@ -2123,13 +2162,13 @@ mod tests {
         assert_eq!(tool_calls[0].result, Some(json!({ "content": markdown })));
         assert!(!tool_calls[0].is_error);
 
-        // The loop listed the working copy's skills through the executor on
-        // each turn, and read the skill the model asked for.
+        // The loop listed the working copy's skills through the executor once,
+        // cached for the second turn, and read the skill the model asked for.
         let calls = tools.calls.lock().unwrap();
         assert_eq!(
             calls.iter().filter(|call| call.name == "skills").count(),
-            2,
-            "the skills list is fetched fresh each turn"
+            1,
+            "the skills list is fetched once per session, not per turn"
         );
         let read_calls: Vec<&CapturedToolCall> = calls
             .iter()
