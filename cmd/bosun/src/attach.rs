@@ -50,6 +50,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::markdown::markdown_rows;
 use crate::state_name;
 
 /// How long to wait before reconnecting after the event stream ends.
@@ -313,12 +314,23 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// The wrapped, prefixed transcript rows: the durable lines plus the live
-/// delta, cut to `width` columns. Kept pure so the layout is testable.
-fn transcript_rows(state: &ClientState, width: usize) -> Vec<(LineKind, String)> {
+/// The wrapped, prefixed transcript rows as styled spans: the durable lines
+/// plus the live delta, cut to `width` columns. Assistant text is rendered as
+/// markdown; everything else keeps the per-kind prefix and color.
+fn transcript_rows(state: &ClientState, width: usize) -> Vec<(LineKind, Vec<Span<'static>>)> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for line in &state.lines {
+        if line.kind == LineKind::Assistant {
+            for row in markdown_rows(&line.text, width) {
+                rows.push((LineKind::Assistant, row));
+            }
+            continue;
+        }
+        let mut style = Style::default().fg(row_color(line.kind, &line.text));
+        if line.kind == LineKind::Status {
+            style = style.add_modifier(Modifier::BOLD);
+        }
         let prefix = prefix_for(line);
         let prefix_width = prefix.chars().count();
         let inner = width.saturating_sub(prefix_width).max(1);
@@ -329,15 +341,30 @@ fn transcript_rows(state: &ClientState, width: usize) -> Vec<(LineKind, String)>
             } else {
                 " ".repeat(prefix_width)
             };
-            rows.push((line.kind, format!("{indent}{row}")));
+            rows.push((
+                line.kind,
+                vec![
+                    Span::styled(indent, style),
+                    Span::styled(row.clone(), style),
+                ],
+            ));
         }
     }
     if let Some(pending) = &state.pending_delta {
-        for row in wrap_text(pending, width) {
+        for row in markdown_rows(pending, width) {
             rows.push((LineKind::Assistant, row));
         }
     }
     rows
+}
+
+/// The color an error tool result renders with, distinct from the kind color.
+fn row_color(kind: LineKind, text: &str) -> Color {
+    if kind == LineKind::ToolResult && text.starts_with("error: ") {
+        Color::Red
+    } else {
+        kind_color(kind)
+    }
 }
 
 /// The per-kind prefix that aligns the transcript: messages start at the
@@ -357,12 +384,11 @@ fn prefix_for(line: &Line) -> &'static str {
 }
 
 /// The color each transcript kind renders with.
-fn kind_color(kind: LineKind, error: bool) -> Color {
+fn kind_color(kind: LineKind) -> Color {
     match kind {
         LineKind::User => Color::Green,
         LineKind::Assistant => Color::White,
         LineKind::ToolCall => Color::Magenta,
-        LineKind::ToolResult if error => Color::Red,
         LineKind::ToolResult => Color::Blue,
         LineKind::Ask => Color::Yellow,
         LineKind::Summary | LineKind::Subagent | LineKind::ModelCall => Color::DarkGray,
@@ -370,18 +396,12 @@ fn kind_color(kind: LineKind, error: bool) -> Color {
     }
 }
 
-/// The `(kind, text)` rows become styled TUI lines for the output pane. Error
-/// tool results are detected from their text prefix.
-fn styled_row(kind: LineKind, text: String) -> TuiLine<'static> {
-    let error = kind == LineKind::ToolResult && text.starts_with("error: ");
-    let style = if kind == LineKind::Status {
-        Style::default()
-            .fg(kind_color(kind, error))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(kind_color(kind, error))
-    };
-    TuiLine::styled(text, style)
+/// The `(kind, spans)` rows become styled TUI lines for the output pane; the
+/// spans already carry the markdown and kind styling.
+fn span_rows_to_lines(rows: &[(LineKind, Vec<Span<'static>>)]) -> Vec<TuiLine<'static>> {
+    rows.iter()
+        .map(|(_, spans)| TuiLine::from(spans.clone()))
+        .collect()
 }
 
 /// The full client UI state, including the scroll position.
@@ -395,6 +415,9 @@ pub struct App {
     pub follow: bool,
     /// The output pane's inner height from the last draw, for paging.
     viewport: u16,
+    /// The bottom scroll position from the last draw; scrolling to it
+    /// resumes auto-follow.
+    max_scroll: usize,
     connected: bool,
 }
 
@@ -408,6 +431,7 @@ impl App {
             scroll: 0,
             follow: true,
             viewport: 0,
+            max_scroll: 0,
             connected: false,
         }
     }
@@ -438,17 +462,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let rows = transcript_rows(&app.state, width);
     app.viewport = inner.height;
     let max_scroll = rows.len().saturating_sub(inner.height as usize);
+    app.max_scroll = max_scroll;
     let scroll = if app.follow {
         max_scroll
     } else {
         app.scroll.min(max_scroll)
     };
     app.scroll = scroll;
+    let scroll_y = scroll.min(u16::MAX as usize) as u16;
 
-    let tui_lines: Vec<TuiLine<'static>> = rows
-        .iter()
-        .map(|(kind, text)| styled_row(*kind, text.clone()))
-        .collect();
+    let tui_lines = span_rows_to_lines(&rows);
     let transcript = Paragraph::new(tui_lines)
         .block(
             TuiBlock::default()
@@ -458,7 +481,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
         )
-        .scroll((scroll as u16, 0))
+        .scroll((scroll_y, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(transcript, output);
 
@@ -789,6 +812,11 @@ async fn handle_key(
         KeyCode::Down => {
             app.follow = false;
             app.scroll = app.scroll.saturating_add(1);
+            if app.scroll >= app.max_scroll {
+                // Reaching the bottom means the user is done reading the
+                // past; resume following the newest rows.
+                app.follow = true;
+            }
             Ok(Action::Continue)
         }
         KeyCode::PageUp => {
@@ -799,6 +827,9 @@ async fn handle_key(
         KeyCode::PageDown => {
             app.follow = false;
             app.scroll = app.scroll.saturating_add(app.viewport.max(1) as usize);
+            if app.scroll >= app.max_scroll {
+                app.follow = true;
+            }
             Ok(Action::Continue)
         }
         KeyCode::End => {
@@ -819,6 +850,9 @@ async fn submit_input(
     cp_url: &str,
     session_id: &str,
 ) -> anyhow::Result<Action> {
+    // Sending a message is the user saying "look at what comes next", so the
+    // transcript returns to the newest rows even after a manual scroll-up.
+    app.follow = true;
     let content = std::mem::take(&mut app.state.input);
     match content.as_str() {
         "/exit" => Ok(Action::Exit),
@@ -961,6 +995,12 @@ mod tests {
         assert_eq!(wrap_text("ab", 5), vec!["ab"]);
     }
 
+    fn row_texts(rows: &[(LineKind, Vec<Span<'static>>)]) -> Vec<String> {
+        rows.iter()
+            .map(|(_, spans)| TuiLine::from(spans.clone()).to_string())
+            .collect()
+    }
+
     #[test]
     fn transcript_rows_align_each_kind_and_include_the_delta() {
         let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
@@ -979,9 +1019,8 @@ mod tests {
         state.pending_delta = Some("streaming".into());
 
         let rows = transcript_rows(&state, 40);
-        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(
-            texts,
+            row_texts(&rows),
             vec![
                 "you: hello",
                 "  → shell {\"cmd\":\"ls\"}",
@@ -1009,8 +1048,22 @@ mod tests {
             text: "one two three four".into(),
         });
         let rows = transcript_rows(&state, 10);
-        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
-        assert_eq!(texts, vec!["one two", "three four"]);
+        assert_eq!(row_texts(&rows), vec!["one two", "three four"]);
+    }
+
+    #[test]
+    fn assistant_rows_render_markdown() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::Assistant,
+            text: "## Done\n\nIt **works** now.".into(),
+        });
+        let rows = transcript_rows(&state, 40);
+        assert_eq!(row_texts(&rows), vec!["Done", "", "It works now."]);
+        let (kind, spans) = &rows[0];
+        assert_eq!(*kind, LineKind::Assistant);
+        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1335,5 +1388,113 @@ mod tests {
         };
         assert!(state.apply_event(1, &event));
         assert_eq!(state.permission, Permission::ReadOnly);
+    }
+
+    fn test_session() -> Session {
+        Session {
+            id: "s1".into(),
+            node: "n1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: "/tmp".into(),
+            model: "m".into(),
+            permission: Permission::ReadWrite,
+            state: SessionState::WaitingForInput,
+            created_at_secs: 0,
+            prompt: None,
+        }
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        let mut text = String::new();
+        for x in 0..width {
+            text.push_str(buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(""));
+        }
+        text
+    }
+
+    #[test]
+    fn follow_keeps_the_newest_rows_visible() {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new(test_session());
+        for i in 0..50 {
+            app.state.push_line(Line {
+                kind: LineKind::Assistant,
+                text: format!("line {i}"),
+            });
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // Layout: status row 0, output rows 1..=6 (inner 2..=5), input 7..=9.
+        let bottom = buffer_row_text(terminal.backend().buffer(), 5, 40);
+        assert!(
+            bottom.contains("line 49"),
+            "the newest row must be visible at the bottom: {bottom:?}"
+        );
+
+        for i in 50..60 {
+            app.state.push_line(Line {
+                kind: LineKind::Assistant,
+                text: format!("line {i}"),
+            });
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let bottom = buffer_row_text(terminal.backend().buffer(), 5, 40);
+        assert!(
+            bottom.contains("line 59"),
+            "the view must follow to the newest row: {bottom:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrolling_up_disables_follow_and_scrolling_to_the_bottom_resumes_it() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        app.follow = true;
+        app.max_scroll = 100;
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.follow = true;
+        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Up))
+            .await
+            .unwrap();
+        assert!(!app.follow, "scrolling up must stop auto-follow");
+        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::PageUp))
+            .await
+            .unwrap();
+        assert!(!app.follow);
+
+        // Scrolling back to the bottom resumes auto-follow, no End needed.
+        app.follow = false;
+        app.scroll = 99;
+        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Down))
+            .await
+            .unwrap();
+        assert!(app.follow, "reaching the bottom must resume auto-follow");
+
+        app.follow = false;
+        app.viewport = 30;
+        app.scroll = 80;
+        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::PageDown))
+            .await
+            .unwrap();
+        assert!(app.follow, "paging to the bottom must resume auto-follow");
+    }
+
+    #[tokio::test]
+    async fn submitting_re_enables_follow() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        app.follow = false;
+
+        let action = submit_input(&mut app, &client, "http://x", "s1")
+            .await
+            .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(
+            app.follow,
+            "sending a message must return to the newest rows"
+        );
     }
 }

@@ -45,6 +45,7 @@ use tracing::info;
 use tracing::warn;
 
 mod attach;
+mod markdown;
 
 #[derive(Parser)]
 #[command(name = "bosun", version, about = "Control panel for coding agents")]
