@@ -233,77 +233,28 @@ async fn set_permission(
     Json(json!({})).into_response()
 }
 
-#[instrument(skip_all)]
-async fn tool_read(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "file/read", req).await
+/// One JSON tool handler: extracts the request and delegates to `tool`.
+macro_rules! tool_handler {
+    ($name:literal, $fn:ident) => {
+        #[instrument(skip_all)]
+        async fn $fn(
+            State(state): State<Arc<ExecutorState>>,
+            Json(req): Json<ToolRequest>,
+        ) -> Response {
+            tool(state, $name, req).await
+        }
+    };
 }
 
-#[instrument(skip_all)]
-async fn tool_write(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "file/write", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_edit(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "edit", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_grep(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "grep", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_glob(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "glob", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_git(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "git", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_webfetch(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "webfetch", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_skills(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "skills", req).await
-}
-
-#[instrument(skip_all)]
-async fn tool_skill_read(
-    State(state): State<Arc<ExecutorState>>,
-    Json(req): Json<ToolRequest>,
-) -> Response {
-    tool(state, "skill/read", req).await
-}
+tool_handler!("file/read", tool_read);
+tool_handler!("file/write", tool_write);
+tool_handler!("edit", tool_edit);
+tool_handler!("grep", tool_grep);
+tool_handler!("glob", tool_glob);
+tool_handler!("git", tool_git);
+tool_handler!("webfetch", tool_webfetch);
+tool_handler!("skills", tool_skills);
+tool_handler!("skill/read", tool_skill_read);
 
 /// Shared dispatcher for the JSON tools. Shell is handled separately because
 /// it returns an SSE stream.
@@ -638,6 +589,9 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use bosun_test_support::init_repo;
+    use bosun_test_support::stub_backend;
+
     use super::*;
 
     /// Boots the executor router on an ephemeral loopback port, returning the
@@ -711,53 +665,6 @@ mod tests {
             events.push((event, data));
         }
         events
-    }
-
-    /// Serves one `ok` response per connection until the listener is dropped.
-    async fn stub_backend() -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    use tokio::io::AsyncWriteExt;
-                    let mut buf = [0u8; 4096];
-                    let mut read = 0;
-                    while let Ok(n) = stream.read(&mut buf[read..]).await {
-                        if n == 0 {
-                            break;
-                        }
-                        read += n;
-                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                        .await;
-                });
-            }
-        });
-        addr
-    }
-
-    fn git_quiet(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("failed to run git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn init_repo(dir: &Path) {
-        git_quiet(dir, &["init", "-q"]);
-        git_quiet(dir, &["config", "user.name", "test"]);
-        git_quiet(dir, &["config", "user.email", "test@example.com"]);
     }
 
     #[test]

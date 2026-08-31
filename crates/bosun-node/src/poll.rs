@@ -5,7 +5,6 @@ use bosun_common::error::ErrorExt;
 use bosun_common::types::NodeStatus;
 use bosun_common::types::PollRequest;
 use bosun_common::types::PollResponse;
-use reqwest::Client;
 use rustls::ClientConfig;
 use tracing::warn;
 
@@ -26,13 +25,8 @@ pub async fn run_poll_loop(
     manager: Arc<NodeManager>,
     tls_config: Option<Arc<ClientConfig>>,
 ) {
-    let client = match &tls_config {
-        Some(config) => Client::builder()
-            .use_preconfigured_tls((**config).clone())
-            .build()
-            .expect("failed to build the polling HTTP client"),
-        None => Client::new(),
-    };
+    let client = bosun_common::tls::reqwest_client_with_tls(tls_config.clone())
+        .expect("failed to build the polling HTTP client");
     let url = format!("{}/poll", cp_url.trim_end_matches('/'));
     let mut pending: Option<bosun_common::types::CommandResult> = None;
 

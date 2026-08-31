@@ -3,6 +3,7 @@ pub mod error;
 pub mod session;
 pub mod skills;
 pub mod telemetry;
+pub mod time;
 pub mod tls;
 pub mod tool;
 pub mod tunnel;

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use rustls::ServerConfig;
@@ -32,6 +33,26 @@ pub fn load_client_config(ca_cert: Option<&Path>) -> anyhow::Result<Option<rustl
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Some(config))
+}
+
+/// A reqwest client that trusts the PEM CA file when one is configured and
+/// the default trust otherwise.
+pub fn reqwest_client(ca_cert: Option<&Path>) -> anyhow::Result<reqwest::Client> {
+    reqwest_client_with_tls(load_client_config(ca_cert)?.map(Arc::new))
+}
+
+/// A reqwest client using a prebuilt TLS config, or the default trust when
+/// none is given.
+pub fn reqwest_client_with_tls(
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> anyhow::Result<reqwest::Client> {
+    match tls {
+        Some(config) => Ok(reqwest::Client::builder()
+            .use_preconfigured_tls((*config).clone())
+            .build()
+            .context("failed to build the HTTP client")?),
+        None => Ok(reqwest::Client::new()),
+    }
 }
 
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {

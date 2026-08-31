@@ -474,6 +474,9 @@ pub fn permission_from_str(s: &str) -> Option<Permission> {
 
 #[cfg(test)]
 mod tests {
+    use bosun_test_support::git_quiet;
+    use bosun_test_support::init_repo;
+
     use super::*;
 
     #[test]
@@ -764,21 +767,6 @@ mod tests {
         }
         let err = glob(root, "**/*").unwrap_err();
         assert!(matches!(err, ToolError::TooManyResults { limit: 1000 }));
-    }
-
-    fn git_quiet(root: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .status()
-            .expect("failed to run git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn init_repo(root: &Path) {
-        git_quiet(root, &["init", "-q"]);
-        git_quiet(root, &["config", "user.name", "test"]);
-        git_quiet(root, &["config", "user.email", "test@example.com"]);
     }
 
     #[tokio::test]

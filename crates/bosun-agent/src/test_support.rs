@@ -12,9 +12,19 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use bosun_common::session::Block;
+use bosun_common::session::Message;
+use bosun_common::session::Role;
+use bosun_common::tool::ToolSpec;
+use futures_util::StreamExt;
 use serde_json::Value;
+use serde_json::json;
 use tokio::net::TcpListener;
 
+use crate::provider::Provider;
+use crate::provider::ProviderCall;
+use crate::provider::ProviderError;
+use crate::provider::StreamEvent;
 use crate::sse::SseEvent;
 
 #[derive(Clone)]
@@ -99,4 +109,41 @@ async fn handle(State(state): State<FakeState>, request: Request<Body>) -> Respo
     };
     *state.captured.lock().unwrap() = Some(captured.clone());
     (state.respond)(captured)
+}
+
+/// A canonical provider call fixture with the given model name.
+pub fn provider_call(model: &'static str) -> ProviderCall<'static> {
+    ProviderCall {
+        model,
+        max_tokens: 100,
+        system: "You are Bosun.",
+        messages: vec![Message {
+            role: Role::User,
+            block: Block::Text {
+                text: "hello".into(),
+            },
+        }],
+        tools: vec![ToolSpec {
+            name: "shell".into(),
+            description: "Run a command.".into(),
+            schema: json!({"type": "object"}),
+        }],
+    }
+}
+
+/// Collect a provider's whole stream into its emitted events.
+pub async fn collect_stream(provider: &impl Provider, call: ProviderCall<'_>) -> Vec<StreamEvent> {
+    let mut stream = provider.chat_stream(call).unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    events
+}
+
+/// Assert the provider's first stream item is a non-200 error.
+pub async fn assert_non_200_is_an_error_item(provider: &impl Provider, call: ProviderCall<'_>) {
+    let mut stream = provider.chat_stream(call).unwrap();
+    let item = stream.next().await.unwrap();
+    assert!(matches!(item, Err(ProviderError::Non200 { .. })));
 }

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use bosun_agent::adapters::provider_for;
@@ -247,15 +246,11 @@ fn resolve_cp_url_from(flag: Option<&str>, env_url: Option<String>, stored: Stri
 /// `BOSUN_CA_CERT` names a PEM file, the client trusts it, so a control plane
 /// behind a private CA (or self-signed certificate) can be reached.
 fn cp_client() -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
-    if let Ok(ca_cert) = std::env::var("BOSUN_CA_CERT")
-        && !ca_cert.is_empty()
-    {
-        let config = bosun_common::tls::load_client_config(Some(Path::new(&ca_cert)))?
-            .expect("a CA cert was configured");
-        builder = builder.use_preconfigured_tls(config);
-    }
-    builder.build().context("failed to build the HTTP client")
+    let ca_cert = std::env::var("BOSUN_CA_CERT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    bosun_common::tls::reqwest_client(ca_cert.as_deref())
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -802,10 +797,7 @@ async fn run_executor(args: ExecutorArgs) -> anyhow::Result<()> {
 }
 
 fn format_ago(now: SystemTime, unix_secs: u64) -> String {
-    let now_secs = now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_secs = bosun_common::time::unix_secs(now) as u64;
     let diff = now_secs.saturating_sub(unix_secs);
     if diff < 60 {
         format!("{diff}s ago")
@@ -818,6 +810,8 @@ fn format_ago(now: SystemTime, unix_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use super::*;
 
     #[test]

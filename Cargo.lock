@@ -191,6 +191,7 @@ dependencies = [
  "axum",
  "bosun-common",
  "bosun-store",
+ "bosun-test-support",
  "bytes",
  "futures-util",
  "reqwest",
@@ -209,6 +210,7 @@ version = "0.5.4"
 dependencies = [
  "anyhow",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -230,6 +232,7 @@ dependencies = [
  "bosun-agent",
  "bosun-common",
  "bosun-store",
+ "bosun-test-support",
  "bytes",
  "futures-util",
  "http-body-util",
@@ -253,6 +256,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bosun-common",
+ "bosun-test-support",
  "bytes",
  "futures-util",
  "glob",
@@ -301,6 +305,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "bosun-test-support"
+version = "0.5.4"
+dependencies = [
  "tokio",
 ]
 

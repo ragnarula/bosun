@@ -21,6 +21,7 @@ use bosun_common::tool::ToolDelta;
 use bosun_common::tool::ToolSpec;
 use bosun_common::tool::canonical_tools;
 use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::Notify;
@@ -32,6 +33,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::provider::ProviderCall;
+use crate::provider::ProviderError;
 use crate::provider::StreamEvent;
 use crate::skills::Skill;
 use crate::skills::fetch_working_skills;
@@ -247,6 +249,17 @@ struct AccumulatedToolCall {
     args_delta: String,
 }
 
+/// How a provider stream ended, before the caller decides what it means.
+enum StreamEnd {
+    Collected {
+        text: String,
+        tool_calls: BTreeMap<usize, AccumulatedToolCall>,
+        stopped: bool,
+    },
+    Interrupted,
+    Failed(anyhow::Error),
+}
+
 /// Runs turns until one ends the session: no more tool calls, an ask, an
 /// interrupt, or a failure. Each turn gets a fresh [`InterruptSignal`]; the
 /// channel is polled alongside the turn so an interrupt reaches it mid-flight.
@@ -399,67 +412,32 @@ async fn run_turn_inner(
         tools,
     })?;
 
-    let mut text = String::new();
-    let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
-    let mut stopped = false;
-
-    loop {
-        if signal.flag.load(Ordering::Acquire) {
-            return Ok(TurnOutcome::Interrupted);
+    let (text, tool_calls, stopped) = match collect_stream(
+        &mut stream,
+        deps,
+        session_id,
+        signal,
+        deps.provider.model(),
+        deps.provider.name(),
+    )
+    .await?
+    {
+        StreamEnd::Collected {
+            text,
+            tool_calls,
+            stopped,
+        } => (text, tool_calls, stopped),
+        StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
+        StreamEnd::Failed(error) => {
+            error!(
+                msg = "provider stream failed",
+                session_id = %session_id,
+                provider = %deps.provider.name(),
+                error = %error.display_chain()
+            );
+            return Ok(TurnOutcome::Failed);
         }
-        tokio::select! {
-            event = stream.next() => match event {
-                Some(Ok(StreamEvent::TextDelta(delta))) => {
-                    text.push_str(&delta);
-                    deps.delta_sink.send(delta);
-                }
-                Some(Ok(StreamEvent::ToolCallDelta { index, id, name, args_delta })) => {
-                    let call = tool_calls.entry(index).or_default();
-                    if call.id.is_none() {
-                        call.id = id;
-                    }
-                    if call.name.is_none() {
-                        call.name = name;
-                    }
-                    call.args_delta.push_str(&args_delta);
-                }
-                Some(Ok(StreamEvent::Stop { input_tokens, output_tokens })) => {
-                    deps.store
-                        .append_model_call(
-                            session_id,
-                            deps.provider.model(),
-                            deps.provider.name(),
-                            "completion",
-                            Some(input_tokens),
-                            Some(output_tokens),
-                            Some(model_call_cost(
-                                Some(input_tokens),
-                                Some(output_tokens),
-                                deps.price_input_per_mtok,
-                                deps.price_output_per_mtok,
-                            )),
-                        )
-                        .await?;
-                    stopped = true;
-                }
-                Some(Err(error)) => {
-                    error!(
-                        msg = "provider stream failed",
-                        session_id = %session_id,
-                        provider = %deps.provider.name(),
-                        error = %error.display_chain()
-                    );
-                    return Ok(TurnOutcome::Failed);
-                }
-                None => break,
-            },
-            _ = signal.notify.notified() => {
-                if signal.flag.load(Ordering::Acquire) {
-                    return Ok(TurnOutcome::Interrupted);
-                }
-            }
-        }
-    }
+    };
 
     if !stopped {
         error!(
@@ -476,24 +454,7 @@ async fn run_turn_inner(
             .await?;
     }
 
-    let calls: Vec<(String, String, Value)> = tool_calls
-        .into_values()
-        .map(|call| {
-            let args = serde_json::from_str(&call.args_delta).unwrap_or_else(|error| {
-                warn!(
-                    msg = "tool call arguments are not valid JSON",
-                    session_id = %session_id,
-                    error = %error.display_chain()
-                );
-                Value::Null
-            });
-            (
-                call.id.unwrap_or_default(),
-                call.name.unwrap_or_default(),
-                args,
-            )
-        })
-        .collect();
+    let calls: Vec<(String, String, Value)> = parse_tool_calls(tool_calls, session_id, None);
 
     if calls.is_empty() {
         return Ok(TurnOutcome::Finished);
@@ -769,68 +730,11 @@ async fn run_turn_inner(
                     tool = %name,
                     run_id = %run_id
                 );
-                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
-                let mut call = deps.tools.call(
-                    session_id.to_string(),
-                    run_id.clone(),
-                    name.clone(),
-                    args,
-                    delta_tx,
-                );
-                let outcome = loop {
-                    if signal.flag.load(Ordering::Acquire) {
-                        return Ok(TurnOutcome::Interrupted);
-                    }
-                    tokio::select! {
-                        result = &mut call => {
-                            break match result {
-                                Ok(outcome) => outcome,
-                                Err(error) => {
-                                    error!(
-                                        msg = "tool call failed",
-                                        session_id = %session_id,
-                                        tool = %name,
-                                        run_id = %run_id,
-                                        error = %error.display_chain()
-                                    );
-                                    ToolOutcome {
-                                        content: json!({ "error": "tool call failed" }),
-                                        is_error: true,
-                                    }
-                                }
-                            };
-                        }
-                        delta = delta_rx.recv() => {
-                            if let Some(delta) = delta {
-                                deps.delta_sink.send(delta.text);
-                            }
-                        }
-                        _ = signal.notify.notified() => {
-                            if signal.flag.load(Ordering::Acquire) {
-                                if let Err(error) = deps
-                                    .tools
-                                    .cancel(session_id.to_string(), run_id.clone())
-                                    .await
-                                {
-                                    warn!(
-                                        msg = "failed to cancel tool call",
-                                        session_id = %session_id,
-                                        tool = %name,
-                                        run_id = %run_id,
-                                        error = %error.display_chain()
-                                    );
-                                }
-                                return Ok(TurnOutcome::Interrupted);
-                            }
-                        }
-                    }
+                let Some(outcome) =
+                    run_tool_call(deps, session_id, &run_id, &name, args, signal, None).await?
+                else {
+                    return Ok(TurnOutcome::Interrupted);
                 };
-                drop(call);
-                // The outcome can overtake the tool's final deltas, so drain
-                // whatever the select left in the channel before recording.
-                while let Ok(delta) = delta_rx.try_recv() {
-                    deps.delta_sink.send(delta.text);
-                }
                 deps.store
                     .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
                     .await?;
@@ -853,19 +757,250 @@ async fn run_turn_inner(
     Ok(TurnOutcome::ToolCalls)
 }
 
+/// Runs the provider stream to its end, accumulating text and tool-call
+/// deltas and forwarding text to the delta sink. The caller decides what the
+/// end state means and logs it, so the main and subagent turns share the loop
+/// body.
+async fn collect_stream(
+    stream: &mut BoxStream<'static, Result<StreamEvent, ProviderError>>,
+    deps: &Arc<LoopDeps>,
+    session_id: &str,
+    signal: &Arc<InterruptSignal>,
+    model: &str,
+    provider: &str,
+) -> Result<StreamEnd, anyhow::Error> {
+    let mut text = String::new();
+    let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
+    let mut stopped = false;
+
+    loop {
+        if signal.flag.load(Ordering::Acquire) {
+            return Ok(StreamEnd::Interrupted);
+        }
+        tokio::select! {
+            event = stream.next() => match event {
+                Some(Ok(StreamEvent::TextDelta(delta))) => {
+                    text.push_str(&delta);
+                    deps.delta_sink.send(delta);
+                }
+                Some(Ok(StreamEvent::ToolCallDelta { index, id, name, args_delta })) => {
+                    let call = tool_calls.entry(index).or_default();
+                    if call.id.is_none() {
+                        call.id = id;
+                    }
+                    if call.name.is_none() {
+                        call.name = name;
+                    }
+                    call.args_delta.push_str(&args_delta);
+                }
+                Some(Ok(StreamEvent::Stop { input_tokens, output_tokens })) => {
+                    deps.store
+                        .append_model_call(
+                            session_id,
+                            model,
+                            provider,
+                            "completion",
+                            Some(input_tokens),
+                            Some(output_tokens),
+                            Some(model_call_cost(
+                                Some(input_tokens),
+                                Some(output_tokens),
+                                deps.price_input_per_mtok,
+                                deps.price_output_per_mtok,
+                            )),
+                        )
+                        .await?;
+                    stopped = true;
+                }
+                Some(Err(error)) => return Ok(StreamEnd::Failed(anyhow::Error::new(error))),
+                None => break,
+            },
+            _ = signal.notify.notified() => {
+                if signal.flag.load(Ordering::Acquire) {
+                    return Ok(StreamEnd::Interrupted);
+                }
+            }
+        }
+    }
+
+    Ok(StreamEnd::Collected {
+        text,
+        tool_calls,
+        stopped,
+    })
+}
+
+/// Runs one tool call to its end, streaming deltas to the delta sink. An
+/// interrupt cancels the in-flight call and returns `Ok(None)`; the callers
+/// translate that into their own interrupted outcome. `subagent_type` picks
+/// the log message prefix, so both callers keep their exact lines.
+async fn run_tool_call(
+    deps: &Arc<LoopDeps>,
+    session_id: &str,
+    run_id: &str,
+    name: &str,
+    args: Value,
+    signal: &Arc<InterruptSignal>,
+    subagent_type: Option<&str>,
+) -> anyhow::Result<Option<ToolOutcome>> {
+    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
+    let mut call = deps.tools.call(
+        session_id.to_string(),
+        run_id.to_string(),
+        name.to_string(),
+        args,
+        delta_tx,
+    );
+    let outcome = loop {
+        if signal.flag.load(Ordering::Acquire) {
+            if let Err(error) = deps
+                .tools
+                .cancel(session_id.to_string(), run_id.to_string())
+                .await
+            {
+                match subagent_type {
+                    Some(subagent_type) => warn!(
+                        msg = "failed to cancel subagent tool call",
+                        session_id = %session_id,
+                        subagent_type = %subagent_type,
+                        tool = %name,
+                        run_id = %run_id,
+                        error = %error.display_chain()
+                    ),
+                    None => warn!(
+                        msg = "failed to cancel tool call",
+                        session_id = %session_id,
+                        tool = %name,
+                        run_id = %run_id,
+                        error = %error.display_chain()
+                    ),
+                }
+            }
+            return Ok(None);
+        }
+        tokio::select! {
+            result = &mut call => {
+                break match result {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        match subagent_type {
+                            Some(subagent_type) => error!(
+                                msg = "subagent tool call failed",
+                                session_id = %session_id,
+                                subagent_type = %subagent_type,
+                                tool = %name,
+                                run_id = %run_id,
+                                error = %error.display_chain()
+                            ),
+                            None => error!(
+                                msg = "tool call failed",
+                                session_id = %session_id,
+                                tool = %name,
+                                run_id = %run_id,
+                                error = %error.display_chain()
+                            ),
+                        }
+                        ToolOutcome {
+                            content: json!({ "error": "tool call failed" }),
+                            is_error: true,
+                        }
+                    }
+                };
+            }
+            delta = delta_rx.recv() => {
+                if let Some(delta) = delta {
+                    deps.delta_sink.send(delta.text);
+                }
+            }
+            _ = signal.notify.notified() => {
+                if signal.flag.load(Ordering::Acquire) {
+                    if let Err(error) = deps
+                        .tools
+                        .cancel(session_id.to_string(), run_id.to_string())
+                        .await
+                    {
+                        match subagent_type {
+                            Some(subagent_type) => warn!(
+                                msg = "failed to cancel subagent tool call",
+                                session_id = %session_id,
+                                subagent_type = %subagent_type,
+                                tool = %name,
+                                run_id = %run_id,
+                                error = %error.display_chain()
+                            ),
+                            None => warn!(
+                                msg = "failed to cancel tool call",
+                                session_id = %session_id,
+                                tool = %name,
+                                run_id = %run_id,
+                                error = %error.display_chain()
+                            ),
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    };
+    drop(call);
+    // The outcome can overtake the tool's final deltas, so drain whatever the
+    // select left in the channel before recording.
+    while let Ok(delta) = delta_rx.try_recv() {
+        deps.delta_sink.send(delta.text);
+    }
+    Ok(Some(outcome))
+}
+
+/// Maps the accumulated tool-call deltas into `(id, name, args)` triples;
+/// unparseable argument JSON becomes `Value::Null` with a warning. The
+/// `subagent_type` picks the warning's prefix and field, keeping both callers'
+/// log lines intact.
+fn parse_tool_calls(
+    tool_calls: BTreeMap<usize, AccumulatedToolCall>,
+    session_id: &str,
+    subagent_type: Option<&str>,
+) -> Vec<(String, String, Value)> {
+    tool_calls
+        .into_values()
+        .map(|call| {
+            let args = serde_json::from_str(&call.args_delta).unwrap_or_else(|error| {
+                match subagent_type {
+                    Some(subagent_type) => warn!(
+                        msg = "subagent tool call arguments are not valid JSON",
+                        session_id = %session_id,
+                        subagent_type = %subagent_type,
+                        error = %error.display_chain()
+                    ),
+                    None => warn!(
+                        msg = "tool call arguments are not valid JSON",
+                        session_id = %session_id,
+                        error = %error.display_chain()
+                    ),
+                }
+                Value::Null
+            });
+            (
+                call.id.unwrap_or_default(),
+                call.name.unwrap_or_default(),
+                args,
+            )
+        })
+        .collect()
+}
+
 /// Runs the subagent's nested loop: its own window, its own tool list (node
 /// tools only), its own model and permission. Every streamed message and tool
 /// call is written to the session store as a Subagent block, so the parent's
 /// transcript shows the subagent's work. Returns the subagent's accumulated
 /// text as the summary the parent reports to its model.
 async fn run_subagent(
-    deps: &LoopDeps,
+    deps: &Arc<LoopDeps>,
     session_id: &str,
     subagent_type: &str,
     config: &SubagentConfig,
     provider: Arc<dyn crate::provider::Provider>,
     instructions: &str,
-    interrupt: &InterruptSignal,
+    interrupt: &Arc<InterruptSignal>,
 ) -> Result<String, anyhow::Error> {
     // The preamble rides in the first user message, the same way the parent's
     // system prompt would, so the subagent needs no separate system text.
@@ -901,69 +1036,33 @@ async fn run_subagent(
             tools: tools.clone(),
         })?;
 
-        let mut text = String::new();
-        let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
-        let mut stopped = false;
-
-        loop {
-            if interrupt.flag.load(Ordering::Acquire) {
-                return Err(anyhow::anyhow!("subagent interrupted"));
+        let (text, tool_calls, stopped) = match collect_stream(
+            &mut stream,
+            deps,
+            session_id,
+            interrupt,
+            &config.model,
+            provider.name(),
+        )
+        .await?
+        {
+            StreamEnd::Collected {
+                text,
+                tool_calls,
+                stopped,
+            } => (text, tool_calls, stopped),
+            StreamEnd::Interrupted => return Err(anyhow::anyhow!("subagent interrupted")),
+            StreamEnd::Failed(error) => {
+                error!(
+                    msg = "subagent provider stream failed",
+                    session_id = %session_id,
+                    subagent_type = %subagent_type,
+                    provider = %provider.name(),
+                    error = %error.display_chain()
+                );
+                return Err(error);
             }
-            tokio::select! {
-                event = stream.next() => match event {
-                    Some(Ok(StreamEvent::TextDelta(delta))) => {
-                        text.push_str(&delta);
-                        deps.delta_sink.send(delta);
-                    }
-                    Some(Ok(StreamEvent::ToolCallDelta { index, id, name, args_delta })) => {
-                        let call = tool_calls.entry(index).or_default();
-                        if call.id.is_none() {
-                            call.id = id;
-                        }
-                        if call.name.is_none() {
-                            call.name = name;
-                        }
-                        call.args_delta.push_str(&args_delta);
-                    }
-                    Some(Ok(StreamEvent::Stop { input_tokens, output_tokens })) => {
-                        deps.store
-                            .append_model_call(
-                                session_id,
-                                &config.model,
-                                provider.name(),
-                                "completion",
-                                Some(input_tokens),
-                                Some(output_tokens),
-                                Some(model_call_cost(
-                                    Some(input_tokens),
-                                    Some(output_tokens),
-                                    deps.price_input_per_mtok,
-                                    deps.price_output_per_mtok,
-                                )),
-                            )
-                            .await?;
-                        stopped = true;
-                    }
-                    Some(Err(error)) => {
-                        let error = anyhow::Error::new(error);
-                        error!(
-                            msg = "subagent provider stream failed",
-                            session_id = %session_id,
-                            subagent_type = %subagent_type,
-                            provider = %provider.name(),
-                            error = %error.display_chain()
-                        );
-                        return Err(error);
-                    }
-                    None => break,
-                },
-                _ = interrupt.notify.notified() => {
-                    if interrupt.flag.load(Ordering::Acquire) {
-                        return Err(anyhow::anyhow!("subagent interrupted"));
-                    }
-                }
-            }
-        }
+        };
 
         if !stopped {
             error!(
@@ -996,25 +1095,8 @@ async fn run_subagent(
                 .await?;
         }
 
-        let calls: Vec<(String, String, Value)> = tool_calls
-            .into_values()
-            .map(|call| {
-                let args = serde_json::from_str(&call.args_delta).unwrap_or_else(|error| {
-                    warn!(
-                        msg = "subagent tool call arguments are not valid JSON",
-                        session_id = %session_id,
-                        subagent_type = %subagent_type,
-                        error = %error.display_chain()
-                    );
-                    Value::Null
-                });
-                (
-                    call.id.unwrap_or_default(),
-                    call.name.unwrap_or_default(),
-                    args,
-                )
-            })
-            .collect();
+        let calls: Vec<(String, String, Value)> =
+            parse_tool_calls(tool_calls, session_id, Some(subagent_type));
 
         if calls.is_empty() {
             return Ok(summary.trim().to_string());
@@ -1045,84 +1127,19 @@ async fn run_subagent(
                 .await?;
 
             let run_id = Uuid::new_v4().to_string();
-            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
-            let mut call = deps.tools.call(
-                session_id.to_string(),
-                run_id.clone(),
-                name.clone(),
+            let Some(outcome) = run_tool_call(
+                deps,
+                session_id,
+                &run_id,
+                &name,
                 args,
-                delta_tx,
-            );
-            let outcome = loop {
-                if interrupt.flag.load(Ordering::Acquire) {
-                    if let Err(error) = deps
-                        .tools
-                        .cancel(session_id.to_string(), run_id.clone())
-                        .await
-                    {
-                        warn!(
-                            msg = "failed to cancel subagent tool call",
-                            session_id = %session_id,
-                            subagent_type = %subagent_type,
-                            tool = %name,
-                            run_id = %run_id,
-                            error = %error.display_chain()
-                        );
-                    }
-                    return Err(anyhow::anyhow!("subagent interrupted"));
-                }
-                tokio::select! {
-                    result = &mut call => {
-                        break match result {
-                            Ok(outcome) => outcome,
-                            Err(error) => {
-                                error!(
-                                    msg = "subagent tool call failed",
-                                    session_id = %session_id,
-                                    subagent_type = %subagent_type,
-                                    tool = %name,
-                                    run_id = %run_id,
-                                    error = %error.display_chain()
-                                );
-                                ToolOutcome {
-                                    content: json!({ "error": "tool call failed" }),
-                                    is_error: true,
-                                }
-                            }
-                        };
-                    }
-                    delta = delta_rx.recv() => {
-                        if let Some(delta) = delta {
-                            deps.delta_sink.send(delta.text);
-                        }
-                    }
-                    _ = interrupt.notify.notified() => {
-                        if interrupt.flag.load(Ordering::Acquire) {
-                            if let Err(error) = deps
-                                .tools
-                                .cancel(session_id.to_string(), run_id.clone())
-                                .await
-                            {
-                                warn!(
-                                    msg = "failed to cancel subagent tool call",
-                                    session_id = %session_id,
-                                    subagent_type = %subagent_type,
-                                    tool = %name,
-                                    run_id = %run_id,
-                                    error = %error.display_chain()
-                                );
-                            }
-                            return Err(anyhow::anyhow!("subagent interrupted"));
-                        }
-                    }
-                }
+                interrupt,
+                Some(subagent_type),
+            )
+            .await?
+            else {
+                return Err(anyhow::anyhow!("subagent interrupted"));
             };
-            drop(call);
-            // The outcome can overtake the tool's final deltas, so drain
-            // whatever the select left in the channel before recording.
-            while let Ok(delta) = delta_rx.try_recv() {
-                deps.delta_sink.send(delta.text);
-            }
             deps.store
                 .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
                 .await?;
@@ -1224,7 +1241,7 @@ async fn summarize_tail(
     for (_, message) in tail {
         prompt.push_str(&format!(
             "\n\n{}: {}",
-            role_label(message.role),
+            message.role.as_str(),
             render_block(&message.block)
         ));
     }
@@ -1308,13 +1325,6 @@ async fn summarize_tail(
     Some((text, input_tokens, output_tokens))
 }
 
-fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
-    }
-}
-
 /// One message as plain text for the summarizer.
 fn render_block(block: &Block) -> String {
     match block {
@@ -1376,6 +1386,7 @@ mod tests {
     use bosun_common::session::SessionState;
     use bosun_common::tool::ToolDelta;
     use bosun_store::store::Store;
+    use bosun_test_support::wait_for;
     use futures_util::StreamExt;
     use futures_util::stream;
     use futures_util::stream::BoxStream;
@@ -1633,24 +1644,6 @@ mod tests {
     impl DeltaSink for CollectSink {
         fn send(&self, text: String) {
             self.0.lock().unwrap().push(text);
-        }
-    }
-
-    async fn wait_for<F, Fut>(what: &str, mut condition: F)
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if condition().await {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

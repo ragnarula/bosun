@@ -118,11 +118,13 @@ fn openai_message(message: &Message) -> Value {
             }],
         }),
         (_, Block::Ask { message: ask, .. }) => {
-            json!({ "role": role_str(&message.role), "content": format!("[question to user] {ask}") })
+            json!({ "role": message.role.as_str(), "content": format!("[question to user] {ask}") })
         }
-        (_, Block::Summary { text }) => json!({ "role": role_str(&message.role), "content": text }),
+        (_, Block::Summary { text }) => {
+            json!({ "role": message.role.as_str(), "content": text })
+        }
         (_, Block::Subagent { text, .. }) => {
-            json!({ "role": role_str(&message.role), "content": text })
+            json!({ "role": message.role.as_str(), "content": text })
         }
         (Role::User, Block::ToolCall { name, .. }) => {
             json!({ "role": "user", "content": format!("[tool call {name}]") })
@@ -140,13 +142,6 @@ fn openai_message(message: &Message) -> Value {
             "tool_call_id": id,
             "content": tool_result_text(*is_error, content),
         }),
-    }
-}
-
-fn role_str(role: &Role) -> &'static str {
-    match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
     }
 }
 

@@ -3,40 +3,32 @@
 
 use std::collections::HashMap;
 
-use futures_util::StreamExt;
-use futures_util::stream;
 use futures_util::stream::BoxStream;
 use serde_json::Value;
 use serde_json::json;
 
 use crate::provider::Provider;
+use crate::provider::ProviderAdapter;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
 use crate::provider::StreamEvent;
+use crate::provider::messages_url;
 use crate::serialize::anthropic_messages;
 use crate::serialize::anthropic_tools;
-use crate::sse::SseError;
 use crate::sse::SseEvent;
-use crate::sse::sse_stream;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 /// Anthropic adapter. `base_url` is the provider root; the adapter appends
 /// `/v1/messages`.
 pub struct Anthropic {
-    client: reqwest::Client,
-    model: String,
-    api_key: String,
-    base_url: String,
+    inner: ProviderAdapter,
 }
 
 impl Anthropic {
     pub fn new(model: &str, api_key: &str, base_url: Option<&str>) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            model: model.to_string(),
-            api_key: api_key.to_string(),
-            base_url: base_url.unwrap_or(DEFAULT_BASE_URL).to_string(),
+            inner: ProviderAdapter::new(model, api_key, base_url, DEFAULT_BASE_URL),
         }
     }
 
@@ -56,7 +48,7 @@ impl Provider for Anthropic {
     }
 
     fn model(&self) -> &str {
-        &self.model
+        &self.inner.model
     }
 
     fn chat_stream<'a>(
@@ -64,84 +56,14 @@ impl Provider for Anthropic {
         call: ProviderCall<'a>,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         let request = self
+            .inner
             .client
-            .post(messages_url(&self.base_url))
-            .header("x-api-key", &self.api_key)
+            .post(messages_url(&self.inner.base_url, "messages"))
+            .header("x-api-key", &self.inner.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&self.request_body(&call));
-        let events = stream::unfold(StreamPhase::Requesting(request), |mut phase| async move {
-            loop {
-                match phase {
-                    StreamPhase::Done => return None,
-                    StreamPhase::Requesting(request) => match request.send().await {
-                        Ok(response) if response.status().is_success() => {
-                            phase = StreamPhase::Streaming {
-                                events: Box::pin(sse_stream(response.bytes_stream())),
-                                parser: AnthropicParser::default(),
-                            };
-                        }
-                        Ok(response) => {
-                            let status = response.status().to_string();
-                            let body = response.text().await.unwrap_or_default();
-                            return Some((
-                                Err(ProviderError::Non200 { status, body }),
-                                StreamPhase::Done,
-                            ));
-                        }
-                        Err(error) => {
-                            return Some((Err(ProviderError::Request(error)), StreamPhase::Done));
-                        }
-                    },
-                    StreamPhase::Streaming {
-                        mut events,
-                        mut parser,
-                    } => match events.next().await {
-                        Some(Ok(event)) => {
-                            let parsed = parse_event(&event, &mut parser);
-                            phase = StreamPhase::Streaming { events, parser };
-                            match parsed {
-                                Ok(Some(stream_event)) => {
-                                    return Some((Ok(stream_event), phase));
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    return Some((Err(error), StreamPhase::Done));
-                                }
-                            }
-                        }
-                        Some(Err(error)) => {
-                            return Some((
-                                Err(ProviderError::Internal(error.into())),
-                                StreamPhase::Done,
-                            ));
-                        }
-                        None => return None,
-                    },
-                }
-            }
-        });
-        Ok(Box::pin(events))
+        crate::provider::chat_stream(request, AnthropicParser::default(), parse_event)
     }
-}
-
-/// Build the messages URL from a provider root. A trailing slash is trimmed
-/// and an already-`/v1` root is not duplicated.
-fn messages_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/v1/messages")
-    }
-}
-
-enum StreamPhase {
-    Requesting(reqwest::RequestBuilder),
-    Streaming {
-        events: BoxStream<'static, Result<SseEvent, SseError>>,
-        parser: AnthropicParser,
-    },
-    Done,
 }
 
 /// Token counts and in-flight tool call identities carried between SSE
@@ -153,24 +75,24 @@ struct AnthropicParser {
     tool_starts: HashMap<usize, (Option<String>, Option<String>)>,
 }
 
-/// Turn one SSE event into a [`StreamEvent`]. Unknown event kinds (ping,
+/// Turn one SSE event into [`StreamEvent`]s. Unknown event kinds (ping,
 /// content_block_stop) and empty deltas are skipped.
 fn parse_event(
     event: &SseEvent,
     parser: &mut AnthropicParser,
-) -> Result<Option<StreamEvent>, ProviderError> {
+) -> Result<Vec<StreamEvent>, ProviderError> {
     let data: Value = serde_json::from_str(&event.data).map_err(|error| ProviderError::Parse {
         detail: format!("anthropic event data is not JSON: {error}"),
     })?;
     let Some(kind) = data["type"].as_str() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     match kind {
         "message_start" => {
             parser.input_tokens = data["message"]["usage"]["input_tokens"]
                 .as_u64()
                 .unwrap_or(0);
-            Ok(None)
+            Ok(Vec::new())
         }
         "content_block_start" => {
             let block = &data["content_block"];
@@ -180,7 +102,7 @@ fn parse_event(
                 let name = block["name"].as_str().map(str::to_string);
                 parser.tool_starts.insert(index, (id, name));
             }
-            Ok(None)
+            Ok(Vec::new())
         }
         "content_block_delta" => {
             let index = data["index"].as_u64().unwrap_or(0) as usize;
@@ -189,9 +111,9 @@ fn parse_event(
                 Some("text_delta") => {
                     let text = delta["text"].as_str().unwrap_or_default();
                     if text.is_empty() {
-                        Ok(None)
+                        Ok(Vec::new())
                     } else {
-                        Ok(Some(StreamEvent::TextDelta(text.to_string())))
+                        Ok(vec![StreamEvent::TextDelta(text.to_string())])
                     }
                 }
                 Some("input_json_delta") => {
@@ -201,27 +123,27 @@ fn parse_event(
                         .unwrap_or_default()
                         .to_string();
                     if id.is_none() && name.is_none() && args_delta.is_empty() {
-                        Ok(None)
+                        Ok(Vec::new())
                     } else {
-                        Ok(Some(StreamEvent::ToolCallDelta {
+                        Ok(vec![StreamEvent::ToolCallDelta {
                             index,
                             id,
                             name,
                             args_delta,
-                        }))
+                        }])
                     }
                 }
-                _ => Ok(None),
+                _ => Ok(Vec::new()),
             }
         }
         "message_delta" => {
             parser.output_tokens = data["usage"]["output_tokens"].as_u64().unwrap_or(0);
-            Ok(None)
+            Ok(Vec::new())
         }
-        "message_stop" => Ok(Some(StreamEvent::Stop {
+        "message_stop" => Ok(vec![StreamEvent::Stop {
             input_tokens: parser.input_tokens,
             output_tokens: parser.output_tokens,
-        })),
+        }]),
         "error" => {
             let message = data["error"]["message"]
                 .as_str()
@@ -229,41 +151,22 @@ fn parse_event(
                 .unwrap_or_else(|| "unknown error".to_string());
             Err(ProviderError::Parse { detail: message })
         }
-        _ => Ok(None),
+        _ => Ok(Vec::new()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use axum::response::IntoResponse;
-    use bosun_common::session::Block;
-    use bosun_common::session::Message;
-    use bosun_common::session::Role;
-    use bosun_common::tool::ToolSpec;
+    use futures_util::StreamExt;
     use serde_json::json;
 
     use super::*;
     use crate::test_support::FakeProvider;
+    use crate::test_support::assert_non_200_is_an_error_item;
+    use crate::test_support::collect_stream;
+    use crate::test_support::provider_call;
     use crate::test_support::sse_response;
-
-    fn call() -> ProviderCall<'static> {
-        ProviderCall {
-            model: "claude-test",
-            max_tokens: 100,
-            system: "You are Bosun.",
-            messages: vec![Message {
-                role: Role::User,
-                block: Block::Text {
-                    text: "hello".into(),
-                },
-            }],
-            tools: vec![ToolSpec {
-                name: "shell".into(),
-                description: "Run a command.".into(),
-                schema: json!({"type": "object"}),
-            }],
-        }
-    }
 
     fn sse(name: &'static str, data: Value) -> SseEvent {
         SseEvent {
@@ -272,20 +175,11 @@ mod tests {
         }
     }
 
-    async fn collect(provider: &Anthropic, call: ProviderCall<'_>) -> Vec<StreamEvent> {
-        let mut stream = provider.chat_stream(call).unwrap();
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            events.push(event.unwrap());
-        }
-        events
-    }
-
     #[tokio::test]
     async fn request_headers_and_body_match_the_provider_shape() {
         let server = FakeProvider::start(|_| sse_response(&[])).await;
         let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
-        let events = collect(&provider, call()).await;
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
         assert!(events.is_empty());
 
         let captured = server.captured();
@@ -386,7 +280,7 @@ mod tests {
         let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
         let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
 
-        let events = collect(&provider, call()).await;
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
         assert_eq!(
             events,
             vec![
@@ -420,9 +314,7 @@ mod tests {
         .await;
         let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
 
-        let mut stream = provider.chat_stream(call()).unwrap();
-        let item = stream.next().await.unwrap();
-        assert!(matches!(item, Err(ProviderError::Non200 { .. })));
+        assert_non_200_is_an_error_item(&provider, provider_call("claude-test")).await;
     }
 
     #[tokio::test]
@@ -446,28 +338,8 @@ mod tests {
         let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
         let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
 
-        let mut stream = provider.chat_stream(call()).unwrap();
+        let mut stream = provider.chat_stream(provider_call("claude-test")).unwrap();
         let item = stream.next().await.unwrap();
         assert!(matches!(item, Err(ProviderError::Parse { detail }) if detail == "Overloaded"));
-    }
-
-    #[test]
-    fn messages_url_normalizes_the_base_url() {
-        assert_eq!(
-            messages_url("https://api.anthropic.com"),
-            "https://api.anthropic.com/v1/messages"
-        );
-        assert_eq!(
-            messages_url("https://api.anthropic.com/"),
-            "https://api.anthropic.com/v1/messages"
-        );
-        assert_eq!(
-            messages_url("https://example.com/v1"),
-            "https://example.com/v1/messages"
-        );
-        assert_eq!(
-            messages_url("https://example.com/v1/"),
-            "https://example.com/v1/messages"
-        );
     }
 }

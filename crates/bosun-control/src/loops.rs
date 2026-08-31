@@ -157,6 +157,7 @@ mod tests {
     use bosun_common::session::Session;
     use bosun_common::session::SessionState;
     use bosun_store::store::Store;
+    use bosun_test_support::wait_for;
     use futures_util::StreamExt;
     use futures_util::stream;
     use futures_util::stream::BoxStream;
@@ -190,24 +191,6 @@ mod tests {
                 }),
             ];
             Ok(stream::iter(items).boxed())
-        }
-    }
-
-    async fn wait_for<F, Fut>(what: &str, mut condition: F)
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if condition().await {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

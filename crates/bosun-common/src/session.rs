@@ -40,6 +40,16 @@ pub enum Role {
     Assistant,
 }
 
+impl Role {
+    /// The role's wire-format name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+}
+
 /// One piece of a turn's transcript. A message carries exactly one block, so
 /// tool calls, results, questions and text all append as separate messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +161,8 @@ mod tests {
         assert_eq!(user, Role::User);
         assert_eq!(assistant, Role::Assistant);
         assert_eq!(serde_json::to_string(&assistant).unwrap(), "\"assistant\"");
+        assert_eq!(assistant.as_str(), "assistant");
+        assert_eq!(user.as_str(), "user");
     }
 
     fn assert_round_trips<T>(value: &T)

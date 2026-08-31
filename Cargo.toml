@@ -7,6 +7,7 @@ members = [
     "crates/bosun-executor",
     "crates/bosun-node",
     "crates/bosun-store",
+    "crates/bosun-test-support",
 ]
 resolver = "2"
 
@@ -25,6 +26,7 @@ bosun-control = { path = "crates/bosun-control" }
 bosun-executor = { path = "crates/bosun-executor" }
 bosun-node = { path = "crates/bosun-node" }
 bosun-store = { path = "crates/bosun-store" }
+bosun-test-support = { path = "crates/bosun-test-support" }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 bytes = "1"

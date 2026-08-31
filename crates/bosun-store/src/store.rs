@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use bosun_common::session::Block;
@@ -136,9 +135,32 @@ impl Store {
         })
     }
 
+    /// Runs `f` against the shared connection on a blocking thread.
+    async fn with_conn<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T, anyhow::Error> + Send + 'static,
+    {
+        blocking(self.conn.clone(), f).await
+    }
+
+    /// Runs `f` on the shared connection after checking the session exists.
+    async fn with_session<T, F>(&self, session_id: &str, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection, &str) -> Result<T, anyhow::Error> + Send + 'static,
+    {
+        let session_id = session_id.to_string();
+        blocking(self.conn.clone(), move |conn| {
+            ensure_session_exists(conn, &session_id)?;
+            f(conn, &session_id)
+        })
+        .await
+    }
+
     pub async fn create_session(&self, session: &Session) -> Result<(), StoreError> {
         let session = session.clone();
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let permission = serde_json::to_string(&session.permission)?;
             let state = serde_json::to_string(&session.state)?;
             conn.execute(
@@ -165,7 +187,7 @@ impl Store {
 
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>, StoreError> {
         let id = id.to_string();
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, node, repo_url, git_ref, dir, model, permission, state, created_at_secs, prompt
@@ -182,7 +204,7 @@ impl Store {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, node, repo_url, git_ref, dir, model, permission, state, created_at_secs, prompt
@@ -203,21 +225,15 @@ impl Store {
     /// transaction, so the SSE stream and the sessions table never diverge.
     /// Callers must not append the event separately.
     pub async fn set_state(&self, id: &str, state: SessionState) -> Result<(), StoreError> {
-        let id = id.to_string();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &id)?;
+        self.with_session(id, move |conn, session_id| {
             let state_json = serde_json::to_string(&state)?;
-            let tx = conn.transaction().context("failed to begin transaction")?;
+            let tx = transaction(conn)?;
             tx.execute(
                 "UPDATE sessions SET state = ?1 WHERE id = ?2",
-                params![state_json, id],
+                params![state_json, session_id],
             )
             .context("failed to update session state")?;
-            tx.execute(
-                "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
-                params![id, serde_json::to_string(&Event::State { state })?],
-            )
-            .context("failed to append state event")?;
+            append_event(&tx, session_id, "state", &Event::State { state })?;
             tx.commit().context("failed to commit state change")?;
             Ok(())
         })
@@ -228,24 +244,20 @@ impl Store {
     /// `Event::Permission` in one transaction. Callers must not append the
     /// event separately.
     pub async fn set_permission(&self, id: &str, permission: Permission) -> Result<(), StoreError> {
-        let id = id.to_string();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &id)?;
+        self.with_session(id, move |conn, session_id| {
             let permission_json = serde_json::to_string(&permission)?;
-            let tx = conn.transaction().context("failed to begin transaction")?;
+            let tx = transaction(conn)?;
             tx.execute(
                 "UPDATE sessions SET permission = ?1 WHERE id = ?2",
-                params![permission_json, id],
+                params![permission_json, session_id],
             )
             .context("failed to update session permission")?;
-            tx.execute(
-                "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
-                params![
-                    id,
-                    serde_json::to_string(&Event::Permission { permission })?
-                ],
-            )
-            .context("failed to append permission event")?;
+            append_event(
+                &tx,
+                session_id,
+                "permission",
+                &Event::Permission { permission },
+            )?;
             tx.commit().context("failed to commit permission change")?;
             Ok(())
         })
@@ -260,12 +272,10 @@ impl Store {
         role: Role,
         block: &Block,
     ) -> Result<i64, StoreError> {
-        let session_id = session_id.to_string();
         let block = block.clone();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &session_id)?;
+        self.with_session(session_id, move |conn, session_id| {
             let message = Message { role, block };
-            let tx = conn.transaction().context("failed to begin transaction")?;
+            let tx = transaction(conn)?;
             tx.execute(
                 "INSERT INTO messages (session_id, role, block) VALUES (?1, ?2, ?3)",
                 params![
@@ -276,14 +286,7 @@ impl Store {
             )
             .context("failed to insert message")?;
             let message_id = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
-                params![
-                    session_id,
-                    serde_json::to_string(&Event::Message { message })?
-                ],
-            )
-            .context("failed to append message event")?;
+            append_event(&tx, session_id, "message", &Event::Message { message })?;
             tx.commit().context("failed to commit message")?;
             Ok(message_id)
         })
@@ -293,16 +296,9 @@ impl Store {
     /// Appends an arbitrary event. The store's own write methods emit their
     /// matching events, so this is only for events they do not produce.
     pub async fn append_event(&self, session_id: &str, event: &Event) -> Result<i64, StoreError> {
-        let session_id = session_id.to_string();
         let event = event.clone();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &session_id)?;
-            conn.execute(
-                "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
-                params![session_id, serde_json::to_string(&event)?],
-            )
-            .context("failed to append event")?;
-            Ok(conn.last_insert_rowid())
+        self.with_session(session_id, move |conn, session_id| {
+            append_event(conn, session_id, "event", &event)
         })
         .await
     }
@@ -313,7 +309,7 @@ impl Store {
         after: i64,
     ) -> Result<Vec<(i64, Event)>, StoreError> {
         let session_id = session_id.to_string();
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq, payload FROM events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
@@ -343,7 +339,7 @@ impl Store {
         include_archived: bool,
     ) -> Result<Vec<(i64, Message)>, StoreError> {
         let session_id = session_id.to_string();
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let mut stmt = if include_archived {
                 conn.prepare(
                     "SELECT id, role, block FROM messages WHERE session_id = ?1 ORDER BY id",
@@ -378,9 +374,7 @@ impl Store {
         session_id: &str,
         upto_message_id: i64,
     ) -> Result<(), StoreError> {
-        let session_id = session_id.to_string();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &session_id)?;
+        self.with_session(session_id, move |conn, session_id| {
             conn.execute(
                 "UPDATE messages SET archived = 1 WHERE session_id = ?1 AND id <= ?2",
                 params![session_id, upto_message_id],
@@ -401,12 +395,10 @@ impl Store {
         name: &str,
         args: &Value,
     ) -> Result<i64, StoreError> {
-        let session_id = session_id.to_string();
         let call_id = call_id.to_string();
         let name = name.to_string();
         let args = args.clone();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &session_id)?;
+        self.with_session(session_id, move |conn, session_id| {
             conn.execute(
                 "INSERT INTO tool_calls (session_id, call_id, name, args) VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, call_id, name, serde_json::to_string(&args)?],
@@ -427,11 +419,9 @@ impl Store {
         result: &Value,
         is_error: bool,
     ) -> Result<(), StoreError> {
-        let session_id = session_id.to_string();
         let call_id = call_id.to_string();
         let result = result.clone();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &session_id)?;
+        self.with_session(session_id, move |conn, session_id| {
             conn.execute(
                 "UPDATE tool_calls SET result = ?1, is_error = ?2 WHERE session_id = ?3 AND call_id = ?4",
                 params![serde_json::to_string(&result)?, is_error, session_id, call_id],
@@ -444,7 +434,7 @@ impl Store {
 
     pub async fn tool_calls(&self, session_id: &str) -> Result<Vec<ToolCall>, StoreError> {
         let session_id = session_id.to_string();
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, session_id, call_id, name, args, result, is_error
@@ -489,17 +479,12 @@ impl Store {
         output_tokens: Option<u64>,
         cost: Option<f64>,
     ) -> Result<i64, StoreError> {
-        let session_id = session_id.to_string();
         let model = model.to_string();
         let provider = provider.to_string();
         let kind = kind.to_string();
-        blocking(self.conn.clone(), move |conn| {
-            ensure_session_exists(conn, &session_id)?;
-            let started_at_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock before unix epoch")?
-                .as_secs() as i64;
-            let tx = conn.transaction().context("failed to begin transaction")?;
+        self.with_session(session_id, move |conn, session_id| {
+            let started_at_secs = bosun_common::time::unix_secs(SystemTime::now());
+            let tx = transaction(conn)?;
             tx.execute(
                 "INSERT INTO model_calls (session_id, model, provider, kind, input_tokens, output_tokens, cost, started_at_secs)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -516,21 +501,14 @@ impl Store {
             )
             .context("failed to insert model call")?;
             let model_call_id = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
-                params![
-                    session_id,
-                    serde_json::to_string(&Event::ModelCall {
-                        model,
-                        provider,
-                        kind,
-                        input_tokens,
-                        output_tokens,
-                        cost,
-                    })?
-                ],
-            )
-            .context("failed to append model call event")?;
+            append_event(&tx, session_id, "model call", &Event::ModelCall {
+                model,
+                provider,
+                kind,
+                input_tokens,
+                output_tokens,
+                cost,
+            })?;
             tx.commit().context("failed to commit model call")?;
             Ok(model_call_id)
         })
@@ -539,7 +517,7 @@ impl Store {
 
     pub async fn model_calls(&self, session_id: &str) -> Result<Vec<ModelCall>, StoreError> {
         let session_id = session_id.to_string();
-        blocking(self.conn.clone(), move |conn| {
+        self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, session_id, model, provider, kind, input_tokens, output_tokens, cost, started_at_secs
@@ -572,8 +550,8 @@ impl Store {
     /// calls in one transaction.
     pub async fn remove_session(&self, id: &str) -> Result<(), StoreError> {
         let id = id.to_string();
-        blocking(self.conn.clone(), move |conn| {
-            let tx = conn.transaction().context("failed to begin transaction")?;
+        self.with_conn(move |conn| {
+            let tx = transaction(conn)?;
             tx.execute("DELETE FROM events WHERE session_id = ?1", [&id])
                 .context("failed to delete session events")?;
             tx.execute("DELETE FROM messages WHERE session_id = ?1", [&id])
@@ -589,6 +567,26 @@ impl Store {
         })
         .await
     }
+}
+
+fn transaction(
+    conn: &mut rusqlite::Connection,
+) -> Result<rusqlite::Transaction<'_>, anyhow::Error> {
+    conn.transaction().context("failed to begin transaction")
+}
+
+fn append_event(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    label: &str,
+    event: &Event,
+) -> Result<i64, anyhow::Error> {
+    conn.execute(
+        "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
+        params![session_id, serde_json::to_string(event)?],
+    )
+    .with_context(|| format!("failed to append {label} event"))?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Runs `f` against the shared connection on a blocking thread, converting the
@@ -654,6 +652,8 @@ fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use serde_json::json;
     use tempfile::tempdir;
 

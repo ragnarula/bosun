@@ -97,19 +97,7 @@ async fn call_tool(
     let mut sender = open_connection(tunnels, session_id).await?;
     let body = serde_json::to_vec(&json!({ "run_id": run_id, "args": args }))
         .context("failed to serialize the tool request")?;
-    let uri: hyper::Uri = format!("{EXECUTOR_BASE}/tool/{name}")
-        .parse()
-        .context("failed to build the tool request URI")?;
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .context("failed to build the tool request")?;
-    let response = sender
-        .send_request(request)
-        .await
-        .context("failed to send the tool request")?;
+    let response = post_json(&mut sender, &format!("/tool/{name}"), body.into(), "tool").await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -147,19 +135,13 @@ async fn cancel_tool(
     run_id: &str,
 ) -> anyhow::Result<()> {
     let mut sender = open_connection(tunnels, session_id).await?;
-    let uri: hyper::Uri = format!("{EXECUTOR_BASE}/tool/{run_id}/cancel")
-        .parse()
-        .context("failed to build the cancel request URI")?;
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::new()))
-        .context("failed to build the cancel request")?;
-    let _ = sender
-        .send_request(request)
-        .await
-        .context("failed to send the cancel request")?;
+    let _ = post_json(
+        &mut sender,
+        &format!("/tool/{run_id}/cancel"),
+        Bytes::new(),
+        "cancel",
+    )
+    .await?;
     Ok(())
 }
 
@@ -174,19 +156,7 @@ pub async fn set_executor_permission(
     let mut sender = open_connection(tunnels, session_id).await?;
     let body = serde_json::to_vec(&json!({ "permission": permission }))
         .context("failed to serialize the permission request")?;
-    let uri: hyper::Uri = format!("{EXECUTOR_BASE}/permission")
-        .parse()
-        .context("failed to build the permission request URI")?;
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .context("failed to build the permission request")?;
-    let response = sender
-        .send_request(request)
-        .await
-        .context("failed to send the permission request")?;
+    let response = post_json(&mut sender, "/permission", body.into(), "permission").await?;
     if !response.status().is_success() {
         let body = read_bounded_body(response.into_body(), ERROR_BODY_LIMIT).await?;
         anyhow::bail!(
@@ -195,6 +165,28 @@ pub async fn set_executor_permission(
         );
     }
     Ok(())
+}
+
+/// Sends a JSON POST to the executor over the session tunnel.
+async fn post_json(
+    sender: &mut http1::SendRequest<Full<Bytes>>,
+    path: &str,
+    body: Bytes,
+    what: &str,
+) -> anyhow::Result<hyper::Response<hyper::body::Incoming>> {
+    let uri: hyper::Uri = format!("{EXECUTOR_BASE}{path}")
+        .parse()
+        .with_context(|| format!("failed to build the {what} request URI"))?;
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(body))
+        .with_context(|| format!("failed to build the {what} request"))?;
+    sender
+        .send_request(request)
+        .await
+        .with_context(|| format!("failed to send the {what} request"))
 }
 
 /// Opens a logical connection on the session's tunnel and handshakes HTTP/1.1

@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use axum::Json;
 use axum::Router;
@@ -822,10 +821,7 @@ fn wants_tunnel_upgrade(req: &Request<Body>) -> bool {
 }
 
 fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    bosun_common::time::unix_secs(SystemTime::now())
 }
 
 fn resolve_provider(
@@ -895,6 +891,8 @@ mod tests {
     use bosun_agent::adapters::provider_for;
     use bosun_agent::config::ResolvedModel;
     use bosun_common::config::ModelConfig;
+    use bosun_test_support::stub_backend;
+    use bosun_test_support::wait_for;
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
     use serde_json::Value;
@@ -934,24 +932,6 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr
-    }
-
-    async fn wait_for<F, Fut>(what: &str, mut condition: F)
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if condition().await {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
     }
 
     /// One parsed SSE frame: the `id:` line (None for live delta frames) and
@@ -1218,38 +1198,6 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(!wants_tunnel_upgrade(&ws));
-    }
-
-    /// A backend that answers every request head with a tiny `200 OK` body.
-    async fn stub_backend() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    use tokio::io::AsyncWriteExt;
-                    let mut buf = [0u8; 4096];
-                    let mut read = 0;
-                    while let Ok(n) = stream.read(&mut buf[read..]).await {
-                        if n == 0 {
-                            break;
-                        }
-                        read += n;
-                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                        .await;
-                });
-            }
-        });
-        addr
     }
 
     #[tokio::test]

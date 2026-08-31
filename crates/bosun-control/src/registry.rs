@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -57,11 +56,7 @@ impl NodeRegistry {
             .map(|(name, record)| NodeHealth {
                 name,
                 up: is_up(record.last_seen, now, self.timeout),
-                last_seen_secs: record
-                    .last_seen
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                last_seen_secs: bosun_common::time::unix_secs(record.last_seen) as u64,
             })
             .collect()
     }
@@ -75,11 +70,7 @@ impl NodeRegistry {
         Some(NodeHealth {
             name: name.to_string(),
             up: true,
-            last_seen_secs: record
-                .last_seen
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            last_seen_secs: bosun_common::time::unix_secs(record.last_seen) as u64,
         })
     }
 }
@@ -93,6 +84,7 @@ fn is_up(last_seen: SystemTime, now: SystemTime, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use std::time::UNIX_EPOCH;
 
     use super::*;
 
