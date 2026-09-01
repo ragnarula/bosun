@@ -4,7 +4,43 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use semver::Prerelease;
+use semver::Version;
 use tokio::net::TcpListener;
+
+/// A version strictly newer than `version`: the patch bumped and the
+/// prerelease dropped, so a zero patch or a prerelease `version` cannot break
+/// the arithmetic.
+pub fn newer_than(version: &str) -> String {
+    let mut parsed = Version::parse(version).expect("version must parse as semver");
+    if parsed.patch == u64::MAX {
+        parsed.minor += 1;
+        parsed.patch = 0;
+    } else {
+        parsed.patch += 1;
+    }
+    parsed.pre = Prerelease::EMPTY;
+    parsed.to_string()
+}
+
+/// A version strictly older than `version`: the patch dropped, or the
+/// previous minor or major release when the patch is 0, with the prerelease
+/// dropped. `0.0.0` falls back to a prerelease, which sorts below every
+/// release.
+pub fn older_than(version: &str) -> String {
+    let mut parsed = Version::parse(version).expect("version must parse as semver");
+    if parsed.patch > 0 {
+        parsed.patch -= 1;
+    } else if parsed.minor > 0 {
+        parsed.minor -= 1;
+    } else if parsed.major > 0 {
+        parsed.major -= 1;
+    } else {
+        return "0.0.0-0".to_string();
+    }
+    parsed.pre = Prerelease::EMPTY;
+    parsed.to_string()
+}
 
 /// Polls `condition` every 10ms until it returns true, failing the test after
 /// 5 seconds.

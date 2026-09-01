@@ -21,10 +21,22 @@ pub struct ControlConfig {
     pub models: HashMap<String, ModelConfig>,
     pub subagents: HashMap<String, SubagentConfig>,
     pub default_model: Option<String>,
+    pub update: UpdateConfig,
 }
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("data")
+}
+
+impl ControlConfig {
+    /// The directory holding one update binary per platform, named
+    /// `bosun.<target-triple>`. Defaults to `<data dir>/artifacts`.
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.update
+            .artifacts_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("artifacts"))
+    }
 }
 
 impl Default for ControlConfig {
@@ -38,8 +50,17 @@ impl Default for ControlConfig {
             models: HashMap::new(),
             subagents: HashMap::new(),
             default_model: None,
+            update: UpdateConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Where per-platform update binaries live, when not the default of
+    /// `<data dir>/artifacts`.
+    pub artifacts_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +82,20 @@ pub struct SubagentConfig {
     pub permission: Permission,
 }
 
+/// The node's auto-update settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NodeUpdateConfig {
+    /// Whether the node applies the control plane's version on its own.
+    pub enabled: bool,
+}
+
+impl Default for NodeUpdateConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct NodeConfig {
@@ -69,6 +104,7 @@ pub struct NodeConfig {
     pub work_dir: PathBuf,
     pub browse_roots: Vec<PathBuf>,
     pub ca_cert: Option<PathBuf>,
+    pub update: NodeUpdateConfig,
 }
 
 impl Default for NodeConfig {
@@ -79,6 +115,7 @@ impl Default for NodeConfig {
             work_dir: "work".into(),
             browse_roots: Vec::new(),
             ca_cert: None,
+            update: NodeUpdateConfig::default(),
         }
     }
 }
@@ -180,6 +217,42 @@ mod tests {
     }
 
     #[test]
+    fn update_artifacts_dir_defaults_to_data_dir_artifacts() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(config.artifacts_dir(), PathBuf::from("data/artifacts"));
+    }
+
+    #[test]
+    fn update_artifacts_dir_follows_data_dir_by_default() {
+        let config: ControlConfig = toml::from_str("data_dir = \"/var/bosun\"").unwrap();
+        assert_eq!(
+            config.artifacts_dir(),
+            PathBuf::from("/var/bosun/artifacts")
+        );
+    }
+
+    #[test]
+    fn empty_update_table_defaults_artifacts_dir() {
+        let config: ControlConfig = toml::from_str("[update]").unwrap();
+        assert_eq!(config.artifacts_dir(), PathBuf::from("data/artifacts"));
+    }
+
+    #[test]
+    fn update_artifacts_dir_overrides_the_default() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            [update]
+            artifacts_dir = "/opt/bosun/artifacts"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.artifacts_dir(),
+            PathBuf::from("/opt/bosun/artifacts")
+        );
+    }
+
+    #[test]
     fn sparse_config_keeps_the_data_dir_default() {
         let config: ControlConfig = toml::from_str("listen_addr = \"0.0.0.0:9000\"").unwrap();
         assert_eq!(config.data_dir, PathBuf::from("data"));
@@ -259,6 +332,18 @@ mod tests {
     fn node_config_defaults_to_no_browse_roots() {
         let config: NodeConfig = toml::from_str("").unwrap();
         assert!(config.browse_roots.is_empty());
+    }
+
+    #[test]
+    fn node_update_defaults_to_enabled() {
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert!(config.update.enabled);
+    }
+
+    #[test]
+    fn node_update_can_be_disabled() {
+        let config: NodeConfig = toml::from_str("[update]\nenabled = false").unwrap();
+        assert!(!config.update.enabled);
     }
 
     #[test]

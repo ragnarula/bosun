@@ -4,3 +4,7 @@ node_name = "node-1"
 # work_dir = "work"
 # The launch directory; lets `bosun dev` browse this repository.
 browse_roots = ["."]
+
+# The node auto-updates to the control plane's version when one is available.
+# [update]
+# enabled = false

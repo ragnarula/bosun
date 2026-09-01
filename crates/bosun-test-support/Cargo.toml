@@ -6,4 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+semver.workspace = true
 tokio.workspace = true

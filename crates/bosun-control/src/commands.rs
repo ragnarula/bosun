@@ -51,11 +51,20 @@ impl CommandQueue {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Queues a command for the node and records where to send its result.
-    pub fn enqueue(&self, node: &str, command: NodeCommand, reply: oneshot::Sender<CommandResult>) {
+    /// Queues a command for the node. Records `reply` when given, so the
+    /// command's result reaches the awaiting handler; without one the command
+    /// is fire-and-forget and its result, if any, is dropped.
+    pub fn enqueue(
+        &self,
+        node: &str,
+        command: NodeCommand,
+        reply: Option<oneshot::Sender<CommandResult>>,
+    ) {
         let mut nodes = self.nodes.write().unwrap();
         let entry = nodes.entry(node.to_string()).or_default();
-        entry.results.insert(command.id(), reply);
+        if let Some(reply) = reply {
+            entry.results.insert(command.id(), reply);
+        }
         entry.queue.push_back(command);
         entry.notify.notify_waiters();
     }
@@ -146,7 +155,7 @@ mod tests {
     async fn next_returns_an_enqueued_command_immediately() {
         let queue = CommandQueue::new(Duration::from_secs(30));
         let (tx, _rx) = oneshot::channel();
-        queue.enqueue("n1", command(7), tx);
+        queue.enqueue("n1", command(7), Some(tx));
 
         let next = queue.next("n1").await.expect("a command should be queued");
         assert_eq!(next.id(), 7);
@@ -167,7 +176,7 @@ mod tests {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            queue_clone.enqueue("n1", command(1), tx);
+            queue_clone.enqueue("n1", command(1), Some(tx));
         });
 
         let next = queue
@@ -181,7 +190,7 @@ mod tests {
     async fn report_delivers_the_result_to_the_awaiting_handler() {
         let queue = CommandQueue::new(Duration::from_secs(30));
         let (tx, rx) = oneshot::channel();
-        queue.enqueue("n1", command(3), tx);
+        queue.enqueue("n1", command(3), Some(tx));
 
         queue.report("n1", result(3));
 
@@ -195,7 +204,7 @@ mod tests {
         queue.report("n1", result(1));
 
         let (tx, rx) = oneshot::channel();
-        queue.enqueue("n1", command(2), tx);
+        queue.enqueue("n1", command(2), Some(tx));
         queue.forget("n1", 2);
         queue.report("n1", result(2));
         drop(rx);
@@ -204,12 +213,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_without_a_reply_keeps_no_result_channel() {
+        let queue = CommandQueue::new(Duration::from_secs(30));
+        queue.enqueue("n1", command(7), None);
+
+        assert_eq!(queue.next("n1").await.unwrap().id(), 7);
+        assert!(
+            !queue.pending("n1"),
+            "a fire-and-forget command must leave no result channel behind"
+        );
+
+        queue.report("n1", result(7));
+    }
+
+    #[tokio::test]
     async fn commands_follow_fifo_order() {
         let queue = CommandQueue::new(Duration::from_secs(30));
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
-        queue.enqueue("n1", command(1), tx1);
-        queue.enqueue("n1", command(2), tx2);
+        queue.enqueue("n1", command(1), Some(tx1));
+        queue.enqueue("n1", command(2), Some(tx2));
 
         assert_eq!(queue.next("n1").await.unwrap().id(), 1);
         assert_eq!(queue.next("n1").await.unwrap().id(), 2);

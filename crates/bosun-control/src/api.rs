@@ -12,9 +12,12 @@ use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header;
+use axum::middleware::Next;
+use axum::middleware::from_fn;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::sse::Event as SseEvent;
@@ -36,7 +39,9 @@ use bosun_common::types::CloneRequest;
 use bosun_common::types::CommandResult;
 use bosun_common::types::DevRequest;
 use bosun_common::types::DirListing;
+use bosun_common::types::Manifest;
 use bosun_common::types::NodeCommand;
+use bosun_common::types::NodeUpdateRequest;
 use bosun_common::types::PollRequest;
 use bosun_common::types::PollResponse;
 use bosun_common::types::StopRequest;
@@ -53,10 +58,13 @@ use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::oneshot;
+use tokio_util::io::ReaderStream;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
 
+use crate::artifacts::ArtifactError;
+use crate::artifacts::ArtifactStore;
 use crate::commands::CommandQueue;
 use crate::loops::AgentRegistry;
 use crate::registry::NodeHealth;
@@ -74,6 +82,11 @@ pub enum ApiError {
     #[error("node {node} is not up")]
     NodeNotUp { node: String },
 
+    #[error(
+        "node {node} predates auto-update and cannot parse an Update command; upgrade it out of band"
+    )]
+    NodePredatesAutoUpdate { node: String },
+
     #[error("node {node} rejected the request: {detail}")]
     NodeRejected { node: String, detail: String },
 
@@ -82,6 +95,9 @@ pub enum ApiError {
 
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
+
+    #[error("artifact for target {target} was not found")]
+    ArtifactNotFound { target: String },
 
     #[error("no model configured")]
     NoModel,
@@ -102,16 +118,27 @@ impl From<StoreError> for ApiError {
     }
 }
 
+impl From<ArtifactError> for ApiError {
+    fn from(error: ArtifactError) -> Self {
+        match error {
+            ArtifactError::Internal(error) => ApiError::Internal(error),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, text) = match &self {
-            ApiError::NodeNotUp { .. } | ApiError::NoModel | ApiError::ModelNotFound { .. } => {
-                (StatusCode::BAD_REQUEST, Some(self.to_string()))
-            }
+            ApiError::NodeNotUp { .. }
+            | ApiError::NodePredatesAutoUpdate { .. }
+            | ApiError::NoModel
+            | ApiError::ModelNotFound { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
             ApiError::NodeRejected { .. } | ApiError::NodeUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
-            ApiError::SessionNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
+            ApiError::SessionNotFound { .. } | ApiError::ArtifactNotFound { .. } => {
+                (StatusCode::NOT_FOUND, Some(self.to_string()))
+            }
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
 
@@ -136,6 +163,8 @@ pub struct AppState {
     pub default_model: Option<String>,
     /// Skills injected into every session from the control plane's data dir.
     pub skills_dir: Option<PathBuf>,
+    /// Per-platform update binaries served from the artifacts directory.
+    pub artifacts: Arc<ArtifactStore>,
 }
 
 impl AppState {
@@ -232,10 +261,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/clone", post(clone))
         .route("/dev", post(dev))
         .route("/nodes/{name}/dirs", get(dirs))
+        .route("/nodes/{name}/update", post(node_update))
+        .route("/update/manifest", get(manifest))
+        .route("/update/artifact/{target}", get(artifact))
         .route("/stop", post(stop))
         .route("/tunnel/session/{id}", get(tunnel))
         .fallback(not_found)
+        .layer(from_fn(add_version_header))
         .with_state(state)
+}
+
+/// Puts the control plane's version on every response, so a client learns it
+/// is outdated from any command, with no extra roundtrip.
+async fn add_version_header(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        bosun_common::types::X_BOSUN_VERSION,
+        HeaderValue::from_static(bosun_common::version::VERSION),
+    );
+    response
 }
 
 async fn not_found() -> StatusCode {
@@ -249,12 +293,73 @@ async fn poll(
     State(state): State<Arc<AppState>>,
     Json(poll): Json<PollRequest>,
 ) -> Json<PollResponse> {
-    state.registry.upsert(&poll.node_name, SystemTime::now());
+    state.registry.upsert(
+        &poll.node_name,
+        &poll.version,
+        poll.update_status,
+        SystemTime::now(),
+    );
     if let Some(result) = poll.result {
         state.commands.report(&poll.node_name, result);
     }
     let command = state.commands.next(&poll.node_name).await;
-    Json(PollResponse { command })
+    let artifact_available = match state.artifacts.manifest().await {
+        Ok(manifest) => manifest.artifacts.contains_key(&poll.target_triple),
+        Err(error) => {
+            warn!(
+                node = %poll.node_name,
+                target = %poll.target_triple,
+                error = %error.display_chain(),
+                "failed to read the artifacts manifest"
+            );
+            false
+        }
+    };
+    Json(PollResponse {
+        command,
+        version: bosun_common::version::VERSION.to_string(),
+        artifact_available,
+    })
+}
+
+/// The update manifest: the control plane's version plus one sha256 and size
+/// per artifact currently in the artifacts directory.
+#[instrument(skip(state))]
+async fn manifest(State(state): State<Arc<AppState>>) -> Result<Json<Manifest>, ApiError> {
+    Ok(Json(state.artifacts.manifest().await?))
+}
+
+/// Streams one artifact's bytes: `bosun.<target-triple>` from the artifacts
+/// directory.
+#[instrument(skip(state))]
+async fn artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath(target): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let path =
+        state
+            .artifacts
+            .artifact_path(&target)
+            .ok_or_else(|| ApiError::ArtifactNotFound {
+                target: target.clone(),
+            })?;
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::ArtifactNotFound { target });
+        }
+        Err(error) => {
+            return Err(ApiError::Internal(
+                anyhow::Error::new(error)
+                    .context(format!("failed to open artifact for target {target}")),
+            ));
+        }
+    };
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        Body::from_stream(ReaderStream::new(file)),
+    )
+        .into_response())
 }
 
 #[instrument(skip(state))]
@@ -531,6 +636,48 @@ async fn dirs(
     Ok(Json(listing))
 }
 
+/// Queues an `Update` command for a node, carrying the control plane's
+/// version. The command is fire-and-forget: a successful update restarts the
+/// node, so its result never arrives; the node reports the outcome through
+/// its poll's update status instead.
+///
+/// The version handshake and the `Update` command ship in the same release,
+/// so a node that reports a parsable version understands the command. A node
+/// with no version or an unparsable one predates the handshake and cannot
+/// parse an `Update` command at all: enqueuing one would wedge it, because
+/// every poll returns the same command and every parse fails. Those nodes
+/// must be upgraded out of band.
+#[instrument(skip(state))]
+async fn node_update(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<NodeUpdateRequest>,
+) -> Result<StatusCode, ApiError> {
+    let Some(node) = state.registry.node(&name, SystemTime::now()) else {
+        return Err(ApiError::NodeNotUp { node: name.clone() });
+    };
+    if !parses_as_semver(&node.version) {
+        return Err(ApiError::NodePredatesAutoUpdate { node: name.clone() });
+    }
+    state.commands.enqueue(
+        &name,
+        NodeCommand::Update {
+            id: state.commands.next_id(),
+            version: bosun_common::version::VERSION.to_string(),
+            force: req.force,
+        },
+        None,
+    );
+    info!(node = %name, force = req.force, "update command queued");
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Whether a version string parses as semver. Old nodes report an empty
+/// version, and anything unparsable predates the version handshake.
+fn parses_as_semver(version: &str) -> bool {
+    bosun_common::version::compare(version, version).is_some()
+}
+
 #[instrument(skip(state))]
 async fn stop(
     State(state): State<Arc<AppState>>,
@@ -573,7 +720,7 @@ async fn stop(
                 id: state.commands.next_id(),
                 session_id: req.session_id.clone(),
             },
-            reply,
+            Some(reply),
         );
     }
 
@@ -747,7 +894,7 @@ async fn enqueue_and_await(
     command: NodeCommand,
 ) -> Result<CommandResult, ApiError> {
     let (reply, reply_rx) = oneshot::channel();
-    state.commands.enqueue(node, command, reply);
+    state.commands.enqueue(node, command, Some(reply));
     match tokio::time::timeout(Duration::from_secs(SPAWN_TIMEOUT_SECS), reply_rx).await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(_)) => Err(ApiError::Internal(anyhow::anyhow!(
@@ -891,6 +1038,7 @@ mod tests {
     use bosun_agent::adapters::provider_for;
     use bosun_agent::config::ResolvedModel;
     use bosun_common::config::ModelConfig;
+    use bosun_common::types::UpdateStatus;
     use bosun_test_support::stub_backend;
     use bosun_test_support::wait_for;
     use hyper::client::conn::http1;
@@ -921,6 +1069,7 @@ mod tests {
             subagents: HashMap::new(),
             default_model: None,
             skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
     }
 
@@ -1073,6 +1222,7 @@ mod tests {
             subagents: HashMap::new(),
             default_model: default_model.map(ToString::to_string),
             skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
     }
 
@@ -1328,6 +1478,304 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn poll_response_carries_the_control_plane_version() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"bin").unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        // A queued command makes the poll answer immediately instead of
+        // holding for the queue's timeout.
+        let (reply, _reply_rx) = oneshot::channel();
+        state.commands.enqueue(
+            "node-1",
+            NodeCommand::Stop {
+                id: 1,
+                session_id: "s1".into(),
+            },
+            Some(reply),
+        );
+
+        let response = client
+            .post(format!("http://{addr}/poll"))
+            .json(&json!({
+                "node_name": "node-1",
+                "status": "up",
+                "version": "0.5.5",
+                "target_triple": "aarch64-unknown-linux-musl",
+                "result": null
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(bosun_common::types::X_BOSUN_VERSION)
+                .and_then(|value| value.to_str().ok()),
+            Some(bosun_common::version::VERSION),
+            "every response carries the control-plane version"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["version"], bosun_common::version::VERSION);
+        assert_eq!(body["artifact_available"], true);
+    }
+
+    #[tokio::test]
+    async fn poll_records_the_node_version_in_the_registry() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let (reply, _reply_rx) = oneshot::channel();
+        state.commands.enqueue(
+            "node-1",
+            NodeCommand::Stop {
+                id: 1,
+                session_id: "s1".into(),
+            },
+            Some(reply),
+        );
+
+        let response = client
+            .post(format!("http://{addr}/poll"))
+            .json(&json!({
+                "node_name": "node-1",
+                "status": "up",
+                "version": "0.9.0",
+                "result": null
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let nodes: Value = client
+            .get(format!("http://{addr}/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(nodes[0]["name"], "node-1");
+        assert_eq!(nodes[0]["version"], "0.9.0");
+    }
+
+    #[tokio::test]
+    async fn poll_records_the_node_update_status_in_the_registry() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let (reply, _reply_rx) = oneshot::channel();
+        state.commands.enqueue(
+            "node-1",
+            NodeCommand::Stop {
+                id: 1,
+                session_id: "s1".into(),
+            },
+            Some(reply),
+        );
+        client
+            .post(format!("http://{addr}/poll"))
+            .json(&json!({
+                "node_name": "node-1",
+                "status": "up",
+                "version": "0.5.5",
+                "update_status": {"failed": "checksum mismatch"},
+                "result": null
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let (reply, _reply_rx) = oneshot::channel();
+        state.commands.enqueue(
+            "node-2",
+            NodeCommand::Stop {
+                id: 1,
+                session_id: "s1".into(),
+            },
+            Some(reply),
+        );
+        client
+            .post(format!("http://{addr}/poll"))
+            .json(&json!({
+                "node_name": "node-2",
+                "status": "up",
+                "version": "0.5.5",
+                "update_status": "disabled",
+                "result": null
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let nodes: Value = client
+            .get(format!("http://{addr}/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(nodes[0]["update_status"]["failed"], "checksum mismatch");
+        assert_eq!(nodes[1]["update_status"], "disabled");
+    }
+
+    /// A poll against `state` with the given target triple, answered promptly
+    /// by a queued command.
+    async fn poll_with_target(
+        state: &Arc<AppState>,
+        addr: SocketAddr,
+        node: &str,
+        target: Option<&str>,
+    ) -> Value {
+        let client = reqwest::Client::new();
+        let (reply, _reply_rx) = oneshot::channel();
+        state.commands.enqueue(
+            node,
+            NodeCommand::Stop {
+                id: 1,
+                session_id: "s1".into(),
+            },
+            Some(reply),
+        );
+        let mut poll = json!({
+            "node_name": node,
+            "status": "up",
+            "version": "0.5.5",
+            "result": null
+        });
+        if let Some(target) = target {
+            poll["target_triple"] = target.into();
+        }
+        client
+            .post(format!("http://{addr}/poll"))
+            .json(&poll)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn poll_reports_artifact_available_from_the_manifest() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"bin").unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+
+        let available =
+            poll_with_target(&state, addr, "node-a", Some("aarch64-unknown-linux-musl")).await;
+        assert_eq!(available["artifact_available"], true);
+
+        let missing =
+            poll_with_target(&state, addr, "node-b", Some("x86_64-unknown-linux-musl")).await;
+        assert_eq!(missing["artifact_available"], false);
+    }
+
+    #[tokio::test]
+    async fn poll_from_a_node_without_a_target_triple_finds_no_artifact() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+
+        let body = poll_with_target(&state, addr, "node-a", None).await;
+        assert_eq!(body["artifact_available"], false);
+    }
+
+    #[tokio::test]
+    async fn manifest_endpoint_lists_artifacts_with_hashes() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"hello").unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let body: Value = client
+            .get(format!("http://{addr}/update/manifest"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["version"], bosun_common::version::VERSION);
+        assert_eq!(
+            body["artifacts"]["aarch64-unknown-linux-musl"]["sha256"],
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(body["artifacts"]["aarch64-unknown-linux-musl"]["size"], 5);
+    }
+
+    #[tokio::test]
+    async fn artifact_endpoint_serves_the_binary() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"hello").unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!(
+                "http://{addr}/update/artifact/aarch64-unknown-linux-musl"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.bytes().await.unwrap();
+        assert_eq!(&bytes[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn artifact_endpoint_404s_for_a_missing_target() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!(
+                "http://{addr}/update/artifact/x86_64-unknown-linux-musl"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artifact_endpoint_404s_for_a_target_that_cannot_name_a_file() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("http://{addr}/update/artifact/..%2F..%2Fetc"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     /// A fake OpenAI-compatible provider: answers every chat completion with
     /// one text delta and a stop, so a wake completes a full turn.
     async fn fake_provider() -> SocketAddr {
@@ -1407,6 +1855,7 @@ mod tests {
             subagents: HashMap::new(),
             default_model: None,
             skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -1425,7 +1874,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let session: Value = response.json().await.unwrap();
         let id = session["id"].as_str().unwrap().to_string();
-
         wait_for("the session to wait for input", || {
             let client = client.clone();
             let id = id.clone();
@@ -1653,6 +2101,7 @@ mod tests {
             subagents: HashMap::new(),
             default_model: None,
             skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -1760,7 +2209,9 @@ mod tests {
     async fn clone_with_an_unconfigured_model_rejects_before_the_node_sees_a_command() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
-        state.registry.upsert("n1", SystemTime::now());
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
         let addr = serve(state.clone()).await;
         let client = reqwest::Client::new();
 
@@ -1788,7 +2239,9 @@ mod tests {
     async fn dev_with_an_unconfigured_model_rejects_before_the_node_sees_a_command() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
-        state.registry.upsert("n1", SystemTime::now());
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
         let addr = serve(state.clone()).await;
         let client = reqwest::Client::new();
 
@@ -1816,7 +2269,9 @@ mod tests {
     async fn clone_without_any_model_rejects_before_the_node_sees_a_command() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
-        state.registry.upsert("n1", SystemTime::now());
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
         let addr = serve(state.clone()).await;
         let client = reqwest::Client::new();
 
@@ -2028,5 +2483,160 @@ mod tests {
             "the stop command must be waiting for the node's next poll"
         );
         assert!(store.get_session("s1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn node_update_enqueues_an_update_command_with_the_cp_version() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/nodes/n1/update"))
+            .json(&json!({ "force": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let command = state
+            .commands
+            .next("n1")
+            .await
+            .expect("the update command must be queued");
+        let NodeCommand::Update { version, force, .. } = command else {
+            panic!("the queued command must be an update");
+        };
+        assert_eq!(version, bosun_common::version::VERSION);
+        assert!(force);
+    }
+
+    #[tokio::test]
+    async fn node_update_is_fire_and_forget_and_keeps_no_pending_reply() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/nodes/n1/update"))
+            .json(&json!({ "force": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            state.commands.pending("n1"),
+            "the update command must be waiting for the node's next poll"
+        );
+
+        let command = state
+            .commands
+            .next("n1")
+            .await
+            .expect("the update command must be queued");
+        assert!(matches!(command, NodeCommand::Update { .. }));
+        assert!(
+            !state.commands.pending("n1"),
+            "a fire-and-forget update must leave no reply channel behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_update_defaults_force_to_false() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/nodes/n1/update"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let command = state
+            .commands
+            .next("n1")
+            .await
+            .expect("the update command must be queued");
+        let NodeCommand::Update { force, .. } = command else {
+            panic!("the queued command must be an update");
+        };
+        assert!(!force);
+    }
+
+    #[tokio::test]
+    async fn node_update_refuses_a_node_that_predates_the_version_handshake() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        state
+            .registry
+            .upsert("n1", "", UpdateStatus::default(), SystemTime::now());
+        let response = client
+            .post(format!("http://{addr}/nodes/n1/update"))
+            .json(&json!({ "force": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("predates auto-update"), "{text}");
+        assert!(
+            !state.commands.pending("n1"),
+            "a node without a version must never receive an update command"
+        );
+
+        state.registry.upsert(
+            "n2",
+            "not-a-version",
+            UpdateStatus::default(),
+            SystemTime::now(),
+        );
+        let response = client
+            .post(format!("http://{addr}/nodes/n2/update"))
+            .json(&json!({ "force": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !state.commands.pending("n2"),
+            "a node with an unparsable version must never receive an update command"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_update_rejects_an_unknown_node_without_queueing() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/nodes/ghost/update"))
+            .json(&json!({ "force": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("ghost is not up"), "{text}");
+        assert!(!state.commands.pending("ghost"));
     }
 }

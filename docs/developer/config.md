@@ -19,6 +19,7 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `tls_cert` | none | PEM certificate chain. When set with `tls_key`, the control plane serves HTTPS |
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
 | `data_dir` | `data` | Directory for the SQLite store and injected skills |
+| `update.artifacts_dir` | `<data_dir>/artifacts` | Directory holding one update binary per platform, named `bosun.<target-triple>` |
 | `models` | none | Named model entries (see `ModelConfig` below) |
 | `subagents` | none | Named subagent types (see `SubagentConfig` below) |
 | `default_model` | none | Model sessions use when the request does not name one. Falls back to `default`, then the first model |
@@ -48,6 +49,7 @@ See `crates/bosun-common/src/config.rs` for the current fields and defaults.
 | `work_dir` | `work` | Directory session clones are created in |
 | `browse_roots` | none | Directories `bosun dev` may browse and spawn into. Empty disables `bosun dev` on this node |
 | `ca_cert` | none | PEM certificate the node trusts in addition to the system roots, for a control plane behind a private CA |
+| `update.enabled` | `true` | Whether the node auto-updates to the control plane's version when one is available |
 
 The node opens no inbound ports. It polls the control plane and holds one
 outbound tunnel per session, per `docs/adrs/2026-08-21-nodes-dial-out-only.md`.

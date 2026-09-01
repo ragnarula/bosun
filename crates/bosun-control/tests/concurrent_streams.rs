@@ -94,6 +94,9 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>) {
         subagents: HashMap::new(),
         default_model: None,
         skills_dir: None,
+        artifacts: Arc::new(bosun_control::artifacts::ArtifactStore::new(
+            dir.path().join("artifacts"),
+        )),
     });
     let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

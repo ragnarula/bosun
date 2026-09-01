@@ -615,16 +615,16 @@ fn apply_sse(state: &mut ClientState, sse: &SseEvent) {
 /// input, interrupt, and permission changes until the user exits.
 pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
     let client = crate::cp_client()?;
-    let session: Session = client
+    let response = client
         .get(format!("{cp_url}/sessions/{session_id}"))
         .send()
         .await
-        .with_context(|| format!("failed to reach control plane at {cp_url}"))?
+        .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
+    let response = response
         .error_for_status()
-        .with_context(|| format!("session {session_id} is not available"))?
-        .json()
-        .await
-        .context("failed to parse session")?;
+        .with_context(|| format!("session {session_id} is not available"))?;
+    crate::maybe_print_update_notice(response.headers());
+    let session: Session = response.json().await.context("failed to parse session")?;
 
     terminal::enable_raw_mode()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;

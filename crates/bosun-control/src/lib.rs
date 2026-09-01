@@ -1,4 +1,5 @@
 pub mod api;
+pub mod artifacts;
 pub mod commands;
 pub mod loops;
 pub mod registry;
