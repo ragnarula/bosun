@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "bosun"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-agent"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-common"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-control"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-executor"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-node"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-store"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bosun-common",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "bosun-test-support"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "semver",
  "tokio",
