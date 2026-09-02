@@ -1605,9 +1605,12 @@ mod tests {
             dir: "/tmp".into(),
             model: "m".into(),
             persona: None,
+            parent_id: None,
+            owner_id: "s1".into(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
             state: SessionState::WaitingForInput,
+            interrupt_cause: None,
             created_at_secs: 0,
             prompt: None,
         }

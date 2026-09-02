@@ -775,26 +775,52 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         println!("no sessions");
         return Ok(());
     }
-    println!(
-        "{:<36}  {:<10}  {:<28}  {:<12}  {:<6}",
-        "id", "node", "source", "ref", "status"
-    );
-    for session in &sessions {
+    for line in session_rows(&sessions) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The `bosun list` table: roots in id order with their children indented
+/// beneath them. Children are grouped by owner (the tree root), so every
+/// session in one tree renders under the row that owns it. The id column is
+/// wide enough for the two-space tree indent plus a session id, so indenting
+/// a child cannot push the later columns out of line.
+fn session_rows(sessions: &[Session]) -> Vec<String> {
+    // 36 characters for a session id plus the two reserved for the indent.
+    let mut lines = vec![format!(
+        "{:<38}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
+        "id", "node", "source", "ref", "persona", "status"
+    )];
+    let row = |session: &Session, indent: &str| {
         let source = session
             .repo_url
             .clone()
             .unwrap_or_else(|| session.dir.clone());
-        let git_ref = session.git_ref.as_deref().unwrap_or("-");
-        println!(
-            "{:<36}  {:<10}  {:<28}  {:<12}  {:<6}",
-            session.id,
+        format!(
+            "{:<38}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
+            format!("{indent}{}", session.id),
             session.node,
             source,
-            git_ref,
+            session.git_ref.as_deref().unwrap_or("-"),
+            session.persona.as_deref().unwrap_or("-"),
             state_name(session.state)
-        );
+        )
+    };
+    let mut roots: Vec<&Session> = sessions.iter().filter(|s| s.parent_id.is_none()).collect();
+    roots.sort_by_key(|s| s.id.as_str());
+    for root in roots {
+        lines.push(row(root, ""));
+        let mut children: Vec<&Session> = sessions
+            .iter()
+            .filter(|s| s.parent_id.is_some() && s.owner_id == root.id)
+            .collect();
+        children.sort_by_key(|s| s.id.as_str());
+        for child in children {
+            lines.push(row(child, "  "));
+        }
     }
-    Ok(())
+    lines
 }
 
 fn state_name(state: SessionState) -> &'static str {
@@ -1053,6 +1079,132 @@ mod tests {
                 && row.contains("down"),
             "unexpected row: {row}"
         );
+    }
+
+    fn root_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            node: "n1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: "/work".into(),
+            model: "m".into(),
+            persona: Some("coder".into()),
+            parent_id: None,
+            owner_id: id.to_string(),
+            permission: Permission::ReadWrite,
+            allowed_tools: "*".into(),
+            state: SessionState::WaitingForInput,
+            interrupt_cause: None,
+            created_at_secs: 0,
+            prompt: None,
+        }
+    }
+
+    /// A child of `root_session(owner)`, born on its node and directory.
+    fn child_session(id: &str, owner: &str) -> Session {
+        let parent = root_session(owner);
+        Session {
+            id: id.to_string(),
+            dir: parent.dir.clone(),
+            persona: Some("reviewer".into()),
+            parent_id: Some(owner.to_string()),
+            owner_id: owner.to_string(),
+            permission: Permission::ReadOnly,
+            state: SessionState::Running,
+            ..root_session(id)
+        }
+    }
+
+    #[test]
+    fn session_rows_group_children_under_their_owner() {
+        let sessions = vec![
+            root_session("root-b"),
+            root_session("root-a"),
+            child_session("child-b", "root-a"),
+            child_session("child-a", "root-a"),
+        ];
+        let rows = session_rows(&sessions);
+        assert_eq!(rows.len(), 5, "the header plus four sessions");
+        assert!(rows[0].starts_with("id"), "the header names the columns");
+
+        let text = rows.join("\n");
+        let root_a = text.find("root-a").expect("root-a is listed");
+        let child_a = text.find("child-a").expect("child-a is listed");
+        let child_b = text.find("child-b").expect("child-b is listed");
+        let root_b = text.find("root-b").expect("root-b is listed");
+        assert!(
+            root_a < child_a && child_a < child_b && child_b < root_b,
+            "children render directly under their owner, before the next root: {text}"
+        );
+    }
+
+    #[test]
+    fn session_rows_indent_children_and_show_their_persona() {
+        let sessions = vec![root_session("root-1"), child_session("child-1", "root-1")];
+        let rows = session_rows(&sessions);
+        let root = rows[1].to_string();
+        assert!(!root.starts_with("  "), "a root is not indented: {root}");
+        assert!(
+            root.contains("coder"),
+            "a root row shows its persona: {root}"
+        );
+
+        let child = rows[2].to_string();
+        assert!(child.starts_with("  "), "a child is indented: {child}");
+        assert!(
+            child.contains("child-1"),
+            "the child's id is on its row: {child}"
+        );
+        assert!(
+            child.contains("reviewer"),
+            "a child row shows its persona: {child}"
+        );
+    }
+
+    #[test]
+    fn session_rows_keep_columns_aligned_when_children_are_indented() {
+        // Ids as long as a UUID fill the id column, so a child row that
+        // shifts right would visibly break the table.
+        let root_id = "r".repeat(36);
+        let child_id = "c".repeat(36);
+        let mut root = root_session(&root_id);
+        root.node = "node-a".into();
+        let mut child = child_session(&child_id, &root_id);
+        child.node = "node-b".into();
+
+        let rows = session_rows(&[root, child]);
+        assert_eq!(rows.len(), 3);
+        let header_node = rows[0]
+            .find("node")
+            .expect("the header names the node column");
+        let root_node = rows[1]
+            .find("node-a")
+            .expect("the root's node is on its row");
+        let child_node = rows[2]
+            .find("node-b")
+            .expect("the child's node is on its row");
+        assert_eq!(
+            (header_node, root_node),
+            (child_node, child_node),
+            "indenting a child id must not shift its later columns: {}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn session_rows_without_children_match_the_flat_id_order() {
+        let sessions = vec![root_session("b"), root_session("a")];
+        let rows = session_rows(&sessions);
+        assert_eq!(rows.len(), 3);
+        let id_of = |row: &str| {
+            row.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(id_of(&rows[1]), "a");
+        assert_eq!(id_of(&rows[2]), "b");
     }
 
     #[test]

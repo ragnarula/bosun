@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use anyhow::Context;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
+use bosun_common::session::InterruptCause;
 use bosun_common::session::Message;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
@@ -78,7 +79,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   allowed_tools TEXT NOT NULL DEFAULT '*',
   state TEXT NOT NULL,
   created_at_secs INTEGER NOT NULL,
-  prompt TEXT
+  prompt TEXT,
+  parent_id TEXT,
+  owner_id TEXT NOT NULL,
+  interrupt_cause TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +139,9 @@ impl Store {
         // Additive migrations for databases created by an older schema. The
         // column list is checked first, so the migration does not depend on
         // the wording of SQLite's duplicate-column error. Old rows then mean
-        // what the defaults say: '*' for allowed_tools, no persona.
+        // what the defaults say: '*' for allowed_tools, no persona, and, for
+        // rows older than the session tree, no parent and the session as its
+        // own owner.
         if !column_exists(&conn, "sessions", "allowed_tools")? {
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT '*'",
@@ -146,6 +152,27 @@ impl Store {
         if !column_exists(&conn, "sessions", "persona")? {
             conn.execute("ALTER TABLE sessions ADD COLUMN persona TEXT", [])
                 .context("failed to add the persona column")?;
+        }
+        if !column_exists(&conn, "sessions", "parent_id")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN parent_id TEXT", [])
+                .context("failed to add the parent_id column")?;
+        }
+        if !column_exists(&conn, "sessions", "owner_id")? {
+            // SQLite cannot add a NOT NULL column without a constant default,
+            // so the column is added nullable and existing rows are backfilled
+            // with their own id: every pre-tree session is a root and owns
+            // itself. New rows always carry an owner.
+            conn.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT", [])
+                .context("failed to add the owner_id column")?;
+            conn.execute(
+                "UPDATE sessions SET owner_id = id WHERE owner_id IS NULL",
+                [],
+            )
+            .context("failed to backfill the owner_id column")?;
+        }
+        if !column_exists(&conn, "sessions", "interrupt_cause")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN interrupt_cause TEXT", [])
+                .context("failed to add the interrupt_cause column")?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -180,9 +207,13 @@ impl Store {
         self.with_conn(move |conn| {
             let permission = serde_json::to_string(&session.permission)?;
             let state = serde_json::to_string(&session.state)?;
+            let interrupt_cause = session
+                .interrupt_cause
+                .map(|cause| serde_json::to_string(&cause))
+                .transpose()?;
             conn.execute(
-                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     session.id,
                     session.node,
@@ -196,6 +227,9 @@ impl Store {
                     state,
                     session.created_at_secs,
                     session.prompt,
+                    session.parent_id,
+                    session.owner_id,
+                    interrupt_cause,
                 ],
             )
             .context("failed to insert session")?;
@@ -209,7 +243,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
                      FROM sessions WHERE id = ?1",
                 )
                 .context("failed to prepare session query")?;
@@ -226,7 +260,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
                      FROM sessions ORDER BY id",
                 )
                 .context("failed to prepare session list query")?;
@@ -254,6 +288,42 @@ impl Store {
             .context("failed to update session state")?;
             append_event(&tx, session_id, "state", &Event::State { state })?;
             tx.commit().context("failed to commit state change")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Marks the session interrupted, recording why, and emits the matching
+    /// `Event::State` in one transaction, so the SSE stream, the sessions
+    /// table and the recorded cause never diverge. Callers must not append
+    /// the event separately. A later `set_state` keeps the recorded cause,
+    /// which is why the session was last interrupted.
+    pub async fn mark_interrupted(
+        &self,
+        id: &str,
+        cause: InterruptCause,
+    ) -> Result<(), StoreError> {
+        self.with_session(id, move |conn, session_id| {
+            let cause_json = serde_json::to_string(&cause)?;
+            let tx = transaction(conn)?;
+            tx.execute(
+                "UPDATE sessions SET state = ?1, interrupt_cause = ?2 WHERE id = ?3",
+                params![
+                    serde_json::to_string(&SessionState::Interrupted)?,
+                    cause_json,
+                    session_id,
+                ],
+            )
+            .context("failed to mark the session interrupted")?;
+            append_event(
+                &tx,
+                session_id,
+                "state",
+                &Event::State {
+                    state: SessionState::Interrupted,
+                },
+            )?;
+            tx.commit().context("failed to commit the interrupt")?;
             Ok(())
         })
         .await
@@ -722,6 +792,7 @@ fn column_exists(
 fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
     let permission: String = row.get("permission")?;
     let state: String = row.get("state")?;
+    let interrupt_cause: Option<String> = row.get("interrupt_cause")?;
     Ok(Session {
         id: row.get("id")?,
         node: row.get("node")?,
@@ -730,9 +801,14 @@ fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
         dir: row.get("dir")?,
         model: row.get("model")?,
         persona: row.get("persona")?,
+        parent_id: row.get("parent_id")?,
+        owner_id: row.get("owner_id")?,
         permission: serde_json::from_str(&permission).context("failed to parse permission")?,
         allowed_tools: row.get("allowed_tools")?,
         state: serde_json::from_str(&state).context("failed to parse state")?,
+        interrupt_cause: interrupt_cause
+            .map(|raw| serde_json::from_str(&raw).context("failed to parse interrupt cause"))
+            .transpose()?,
         created_at_secs: row.get("created_at_secs")?,
         prompt: row.get("prompt")?,
     })
@@ -756,11 +832,33 @@ mod tests {
             dir: "/work/repo".to_string(),
             model: "claude".to_string(),
             persona: Some("coder".to_string()),
+            parent_id: None,
+            owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "shell, file/read".to_string(),
             state: SessionState::Running,
+            interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: Some("finish the feature".to_string()),
+        }
+    }
+
+    /// A child of `session(owner)`: born on the parent's node and directory.
+    fn child_session(id: &str, owner: &str) -> Session {
+        let parent = session(owner);
+        Session {
+            id: id.to_string(),
+            repo_url: None,
+            git_ref: None,
+            dir: parent.dir.clone(),
+            persona: Some("reviewer".to_string()),
+            parent_id: Some(parent.id),
+            owner_id: owner.to_string(),
+            permission: Permission::ReadOnly,
+            allowed_tools: "file/read, grep".to_string(),
+            state: SessionState::Creating,
+            prompt: Some("review the change".to_string()),
+            ..session(id)
         }
     }
 
@@ -772,9 +870,12 @@ mod tests {
         assert_eq!(actual.dir, expected.dir);
         assert_eq!(actual.model, expected.model);
         assert_eq!(actual.persona, expected.persona);
+        assert_eq!(actual.parent_id, expected.parent_id);
+        assert_eq!(actual.owner_id, expected.owner_id);
         assert_eq!(actual.permission, expected.permission);
         assert_eq!(actual.allowed_tools, expected.allowed_tools);
         assert_eq!(actual.state, expected.state);
+        assert_eq!(actual.interrupt_cause, expected.interrupt_cause);
         assert_eq!(actual.created_at_secs, expected.created_at_secs);
         assert_eq!(actual.prompt, expected.prompt);
     }
@@ -1294,6 +1395,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_child_session_round_trips_with_its_tree_fields() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+
+        let root = store.get_session("root-1").await.unwrap().unwrap();
+        assert_eq!(root.parent_id, None);
+        assert_eq!(root.owner_id, "root-1", "a root session owns itself");
+
+        let child = store.get_session("child-1").await.unwrap().unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some("root-1"));
+        assert_eq!(child.owner_id, "root-1");
+        assert_eq!(
+            child.node, root.node,
+            "a child is born on its parent's node"
+        );
+        assert_eq!(
+            child.dir, root.dir,
+            "a child is born on its parent's directory"
+        );
+        assert_eq!(child.state, SessionState::Creating);
+
+        let listed = store.list_sessions().await.unwrap();
+        let fields: Vec<(&str, Option<&str>, &str)> = listed
+            .iter()
+            .map(|s| (s.id.as_str(), s.parent_id.as_deref(), s.owner_id.as_str()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("child-1", Some("root-1"), "root-1"),
+                ("root-1", None, "root-1")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_interrupted_records_the_cause_and_emits_one_state_event() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        store
+            .mark_interrupted("a", InterruptCause::User)
+            .await
+            .unwrap();
+
+        let stored = store.get_session("a").await.unwrap().unwrap();
+        assert_eq!(stored.state, SessionState::Interrupted);
+        assert_eq!(stored.interrupt_cause, Some(InterruptCause::User));
+
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].1,
+            Event::State { state } if *state == SessionState::Interrupted
+        ));
+
+        // A later interruption replaces the cause; leaving the state keeps it.
+        store
+            .mark_interrupted("a", InterruptCause::Crash)
+            .await
+            .unwrap();
+        let stored = store.get_session("a").await.unwrap().unwrap();
+        assert_eq!(stored.interrupt_cause, Some(InterruptCause::Crash));
+
+        store
+            .set_state("a", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let stored = store.get_session("a").await.unwrap().unwrap();
+        assert_eq!(stored.state, SessionState::WaitingForInput);
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "the recorded cause survives until the next interruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_interrupted_on_a_missing_session_is_session_not_found() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        let error = store
+            .mark_interrupted("ghost", InterruptCause::User)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::SessionNotFound { id } if id == "ghost"));
+    }
+
+    #[tokio::test]
     async fn a_database_without_the_allowed_tools_column_is_migrated() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.db");
@@ -1365,6 +1563,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_database_without_the_tree_columns_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // The post-S1 shape: allowed_tools and persona exist, the session
+            // tree columns do not yet.
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   node TEXT NOT NULL,
+                   repo_url TEXT,
+                   git_ref TEXT,
+                   dir TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   persona TEXT,
+                   permission TEXT NOT NULL,
+                   allowed_tools TEXT NOT NULL DEFAULT '*',
+                   state TEXT NOT NULL,
+                   created_at_secs INTEGER NOT NULL,
+                   prompt TEXT
+                 );
+                 INSERT INTO sessions (id, node, dir, model, persona, permission, state, created_at_secs, prompt)
+                 VALUES ('old', 'node-1', '/work', 'claude', 'coder', '\"read_write\"', '\"waiting_for_input\"', 1700000000, NULL);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("old").await.unwrap().unwrap();
+        assert_eq!(session.persona.as_deref(), Some("coder"));
+        assert_eq!(
+            session.owner_id, "old",
+            "a pre-tree row is a root and is backfilled as its own owner"
+        );
+        assert_eq!(session.parent_id, None);
+        assert_eq!(session.interrupt_cause, None);
+    }
+
+    #[tokio::test]
     async fn reopening_an_up_to_date_database_is_a_no_op() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.db");
@@ -1376,6 +1614,10 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let session = store.get_session("s1").await.unwrap().unwrap();
         assert_eq!(session.persona.as_deref(), Some("coder"));
+        assert_eq!(
+            session.owner_id, "s1",
+            "a row written by the current schema owns itself"
+        );
     }
 
     #[tokio::test]

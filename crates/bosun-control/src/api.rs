@@ -30,6 +30,7 @@ use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
+use bosun_common::session::InterruptCause;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
@@ -92,6 +93,11 @@ pub enum ApiError {
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
 
+    #[error(
+        "session {id} is a child session and is watch-only; only its owner accepts user actions"
+    )]
+    ChildIsWatchOnly { id: String },
+
     #[error("no persona configured")]
     NoPersona,
 
@@ -127,6 +133,7 @@ impl IntoResponse for ApiError {
             ApiError::NodeRejected { .. } | ApiError::NodeUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
+            ApiError::ChildIsWatchOnly { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
             ApiError::SessionNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
@@ -205,7 +212,7 @@ pub async fn recover(state: &AppState) {
         ) {
             if let Err(error) = state
                 .store
-                .set_state(&session.id, SessionState::Interrupted)
+                .mark_interrupted(&session.id, InterruptCause::Crash)
                 .await
             {
                 warn!(
@@ -385,17 +392,21 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<Session>, ApiError> {
     let (persona, config, provider) = state.resolve_persona(&req.persona)?;
+    let session_id = uuid::Uuid::new_v4().to_string();
     let session = Session {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: session_id.clone(),
         node: req.node,
         repo_url: req.repo_url,
         git_ref: req.git_ref,
         dir: req.dir,
         model: config.model.clone(),
         persona: Some(persona),
+        parent_id: None,
+        owner_id: session_id,
         permission: config.permission,
         allowed_tools: config.allowed_tools.clone(),
         state: SessionState::Creating,
+        interrupt_cause: None,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
     };
@@ -454,16 +465,19 @@ async fn clone(
             ))
         })?;
     let session = Session {
-        id: session_id,
+        id: session_id.clone(),
         node: req.node.clone(),
         repo_url: node_session.repo_url.clone(),
         git_ref: node_session.git_ref.clone(),
         dir,
         model: config.model.clone(),
         persona: Some(persona),
+        parent_id: None,
+        owner_id: session_id,
         permission: config.permission,
         allowed_tools: config.allowed_tools.clone(),
         state: SessionState::Creating,
+        interrupt_cause: None,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
     };
@@ -521,16 +535,19 @@ async fn dev(
             ))
         })?;
     let session = Session {
-        id: session_id,
+        id: session_id.clone(),
         node: req.node.clone(),
         repo_url: node_session.repo_url.clone(),
         git_ref: node_session.git_ref.clone(),
         dir,
         model: config.model.clone(),
         persona: Some(persona),
+        parent_id: None,
+        owner_id: session_id,
         permission: config.permission,
         allowed_tools: config.allowed_tools.clone(),
         state: SessionState::Creating,
+        interrupt_cause: None,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
     };
@@ -622,6 +639,18 @@ fn parses_as_semver(version: &str) -> bool {
     bosun_common::version::compare(version, version).is_some()
 }
 
+/// Refuses a user action aimed at a child session: children are watch-only,
+/// and messages, interrupts, permission and persona changes, and stops reach
+/// only the tree owner.
+fn ensure_root(session: &Session) -> Result<(), ApiError> {
+    if session.parent_id.is_some() {
+        return Err(ApiError::ChildIsWatchOnly {
+            id: session.id.clone(),
+        });
+    }
+    Ok(())
+}
+
 #[instrument(skip(state))]
 async fn stop(
     State(state): State<Arc<AppState>>,
@@ -630,6 +659,7 @@ async fn stop(
     let Some(session) = state.store.get_session(&req.session_id).await? else {
         return Ok(StatusCode::NO_CONTENT);
     };
+    ensure_root(&session)?;
 
     if state
         .registry
@@ -679,15 +709,19 @@ struct AddMessageRequest {
     content: String,
 }
 
+/// Accepts a user message for a session. Only the owner of a tree accepts
+/// input: attaching to a child session is watch-only, so a message aimed at
+/// a child is refused.
 #[instrument(skip(state))]
 async fn add_message(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<AddMessageRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if state.store.get_session(&id).await?.is_none() {
+    let Some(session) = state.store.get_session(&id).await? else {
         return Err(ApiError::SessionNotFound { id });
-    }
+    };
+    ensure_root(&session)?;
     state
         .store
         .append_message(&id, Role::User, &Block::Text { text: req.content })
@@ -701,9 +735,10 @@ async fn interrupt(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    if state.store.get_session(&id).await?.is_none() {
+    let Some(session) = state.store.get_session(&id).await? else {
         return Err(ApiError::SessionNotFound { id });
-    }
+    };
+    ensure_root(&session)?;
     state.loops.interrupt(&id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -719,9 +754,10 @@ async fn set_permission(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<PermissionBody>,
 ) -> Result<StatusCode, ApiError> {
-    if state.store.get_session(&id).await?.is_none() {
+    let Some(session) = state.store.get_session(&id).await? else {
         return Err(ApiError::SessionNotFound { id: id.clone() });
-    }
+    };
+    ensure_root(&session)?;
     state.store.set_permission(&id, req.permission).await?;
     // The forward is best-effort: the store is authoritative and the loop
     // gates the tool schema per turn, so a node restart reverting the
@@ -757,6 +793,7 @@ async fn switch_persona(
     let Some(session) = state.store.get_session(&id).await? else {
         return Err(ApiError::SessionNotFound { id: id.clone() });
     };
+    ensure_root(&session)?;
     let (name, config, _provider) = state.resolve_persona(&Some(req.persona))?;
     let permission_changed = session.permission != config.permission;
     state
@@ -1004,6 +1041,7 @@ async fn start_session(
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -1023,7 +1061,6 @@ mod tests {
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
     use serde_json::Value;
-    use std::sync::Mutex;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
@@ -1182,12 +1219,26 @@ mod tests {
             dir: "/tmp/x".into(),
             model: "test".into(),
             persona: Some("coder".into()),
+            parent_id: None,
+            owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
             state: SessionState::Creating,
+            interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: None,
         }
+    }
+
+    /// A child of `session(owner)`: born on its parent's node and directory.
+    fn child_session(id: &str, owner: &str) -> Session {
+        let mut child = session(id);
+        child.repo_url = None;
+        child.persona = Some("reviewer".into());
+        child.parent_id = Some(owner.to_string());
+        child.owner_id = owner.to_string();
+        child.state = SessionState::Creating;
+        child
     }
 
     /// A provider that only exists to fill the providers map; model resolution
@@ -1413,6 +1464,17 @@ mod tests {
         assert_eq!(
             state
                 .store
+                .get_session("running")
+                .await
+                .unwrap()
+                .unwrap()
+                .interrupt_cause,
+            Some(InterruptCause::Crash),
+            "a boot-time interruption is recorded as a crash"
+        );
+        assert_eq!(
+            state
+                .store
                 .get_session("creating")
                 .await
                 .unwrap()
@@ -1429,6 +1491,17 @@ mod tests {
                 .unwrap()
                 .state,
             SessionState::WaitingForInput
+        );
+        assert_eq!(
+            state
+                .store
+                .get_session("waiting")
+                .await
+                .unwrap()
+                .unwrap()
+                .interrupt_cause,
+            None,
+            "a session that was not mid-flight is not interrupted"
         );
     }
 
@@ -1451,6 +1524,176 @@ mod tests {
             state.loops.subscribe("ghost").is_none(),
             "a session without a configured model gets no loop"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sessions_api_reports_parent_and_owner_for_clients_to_render_the_tree() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+
+        let sessions: Value = client
+            .get(format!("http://{addr}/sessions"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sessions = sessions.as_array().unwrap();
+        let root = sessions
+            .iter()
+            .find(|s| s["id"] == "root-1")
+            .expect("the root session is listed");
+        assert_eq!(root["parent_id"], serde_json::Value::Null);
+        assert_eq!(root["owner_id"], "root-1", "a root session owns itself");
+        let child = sessions
+            .iter()
+            .find(|s| s["id"] == "child-1")
+            .expect("the child session is listed");
+        assert_eq!(child["parent_id"], "root-1");
+        assert_eq!(child["owner_id"], "root-1");
+
+        let detail: Value = client
+            .get(format!("http://{addr}/sessions/child-1"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["parent_id"], "root-1");
+        assert_eq!(detail["owner_id"], "root-1");
+    }
+
+    #[tokio::test]
+    async fn a_child_session_accepts_no_user_messages() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+
+        let response = client
+            .post(format!("http://{addr}/sessions/child-1/messages"))
+            .json(&json!({ "content": "hello" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("watch-only"), "{text}");
+        assert!(
+            store.messages("child-1", true).await.unwrap().is_empty(),
+            "a refused message records nothing"
+        );
+
+        // The owner keeps accepting input.
+        let response = client
+            .post(format!("http://{addr}/sessions/root-1/messages"))
+            .json(&json!({ "content": "hello" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(store.messages("root-1", true).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mutating_endpoints_refuse_a_child_session() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+
+        // interrupt, permission, persona, and stop are user actions, and a
+        // child is watch-only: every one is refused.
+        let refused: Vec<(&str, reqwest::Response)> = vec![
+            ("interrupt", {
+                client
+                    .post(format!("http://{addr}/sessions/child-1/interrupt"))
+                    .send()
+                    .await
+                    .unwrap()
+            }),
+            ("permission", {
+                client
+                    .post(format!("http://{addr}/sessions/child-1/permission"))
+                    .json(&json!({ "permission": "read_only" }))
+                    .send()
+                    .await
+                    .unwrap()
+            }),
+            ("persona", {
+                client
+                    .post(format!("http://{addr}/sessions/child-1/persona"))
+                    .json(&json!({ "persona": "coder" }))
+                    .send()
+                    .await
+                    .unwrap()
+            }),
+            ("stop", {
+                client
+                    .post(format!("http://{addr}/stop"))
+                    .json(&json!({ "session_id": "child-1" }))
+                    .send()
+                    .await
+                    .unwrap()
+            }),
+        ];
+        for (action, response) in refused {
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{action} on a child session must be refused"
+            );
+            let text = response.text().await.unwrap();
+            assert!(text.contains("watch-only"), "{action}: {text}");
+        }
+
+        let child = store
+            .get_session("child-1")
+            .await
+            .unwrap()
+            .expect("a refused stop leaves the child stored");
+        assert_eq!(child.state, SessionState::Creating, "no action touched it");
+        assert_eq!(
+            child.interrupt_cause, None,
+            "a refused interrupt records no cause"
+        );
+
+        // The owner keeps accepting the same actions.
+        let response = client
+            .post(format!("http://{addr}/sessions/root-1/interrupt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = client
+            .post(format!("http://{addr}/sessions/root-1/permission"))
+            .json(&json!({ "permission": "read_only" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[test]
@@ -1492,9 +1735,12 @@ mod tests {
                 dir: "/tmp/x".into(),
                 model: "test".into(),
                 persona: Some("coder".into()),
+                parent_id: None,
+                owner_id: session_id.clone(),
                 permission: Permission::ReadWrite,
                 allowed_tools: "*".into(),
                 state: SessionState::WaitingForInput,
+                interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
             })
@@ -2068,6 +2314,20 @@ mod tests {
         assert_eq!(
             session["persona"], "reviewer",
             "the default persona is stored on the session"
+        );
+        assert_eq!(
+            session["parent_id"],
+            serde_json::Value::Null,
+            "a session the user starts is a root"
+        );
+        assert_eq!(
+            session["owner_id"], session["id"],
+            "a root session owns itself"
+        );
+        assert_eq!(
+            session["interrupt_cause"],
+            serde_json::Value::Null,
+            "a fresh session has not been interrupted"
         );
 
         // The loop starts and idles once the turn completes.

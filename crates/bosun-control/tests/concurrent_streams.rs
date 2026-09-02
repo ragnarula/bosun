@@ -120,9 +120,12 @@ async fn register_session(store: &Store, session_id: &str) {
             dir: "/work".into(),
             model: "mock-model".into(),
             persona: None,
+            parent_id: None,
+            owner_id: session_id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
             state: SessionState::WaitingForInput,
+            interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: None,
         })

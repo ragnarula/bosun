@@ -15,6 +15,7 @@ use anyhow::Context;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Block;
+use bosun_common::session::InterruptCause;
 use bosun_common::session::Message;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
@@ -329,7 +330,9 @@ async fn handle_wake(
                     outcome = &mut turn => break outcome,
                     event = rx.recv() => match event {
                         Some(LoopEvent::Interrupt) => {
-                            deps.store.set_state(session_id, SessionState::Interrupted).await?;
+                            deps.store
+                                .mark_interrupted(session_id, InterruptCause::User)
+                                .await?;
                             signal.interrupt();
                             interrupted = true;
                         }
@@ -350,6 +353,16 @@ async fn handle_wake(
             TurnOutcome::Finished | TurnOutcome::AskedUser => {
                 deps.store
                     .set_state(session_id, SessionState::WaitingForInput)
+                    .await?;
+                return Ok(());
+            }
+            // A turn that fails on its own interrupts the session as a crash:
+            // no user request stopped it. A turn that ended under a user
+            // interrupt already recorded its cause when the interrupt landed,
+            // so a plain state write keeps it.
+            TurnOutcome::Failed if !interrupted => {
+                deps.store
+                    .mark_interrupted(session_id, InterruptCause::Crash)
                     .await?;
                 return Ok(());
             }
@@ -1559,9 +1572,12 @@ mod tests {
             dir: "/work".to_string(),
             model: "mock-model".to_string(),
             persona: None,
+            parent_id: None,
+            owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: ALL_TOOLS.to_string(),
             state: SessionState::Creating,
+            interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: None,
         }
@@ -2086,6 +2102,12 @@ mod tests {
             }
         })
         .await;
+        let stored = store.get_session("s2").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::User),
+            "a user interrupt is recorded as user"
+        );
 
         handle.stop();
     }
@@ -2863,6 +2885,13 @@ mod tests {
         })
         .await;
 
+        let stored = store.get_session("s-cancel").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::User),
+            "an interrupt that cancels a tool is recorded as user"
+        );
+
         handle.stop();
     }
 
@@ -2893,6 +2922,12 @@ mod tests {
             }
         })
         .await;
+        let stored = store.get_session("s-fail").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "a turn that fails on its own interrupts the session as a crash"
+        );
 
         // The failed turn commits nothing to the transcript.
         assert!(store.messages("s-fail", false).await.unwrap().is_empty());
@@ -4088,10 +4123,14 @@ mod tests {
         handle.send(LoopEvent::Interrupt);
 
         // No turn is in flight, so the interrupt kills nothing: the session
-        // stays waiting for input.
+        // stays waiting for input and no cause is recorded.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stored = store.get_session("s-parked").await.unwrap().unwrap();
         assert_eq!(stored.state, SessionState::WaitingForInput);
+        assert_eq!(
+            stored.interrupt_cause, None,
+            "an interrupt that kills no turn records no cause"
+        );
 
         handle.stop();
     }

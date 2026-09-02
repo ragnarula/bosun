@@ -21,6 +21,18 @@ pub enum SessionState {
     Stopped,
 }
 
+/// Why a session was interrupted, recorded on the session so stop semantics
+/// can tell a user-requested halt from a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptCause {
+    /// The user interrupted the session.
+    User,
+    /// A crash interrupted the session: a control-plane restart, or a turn
+    /// that failed on its own.
+    Crash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -34,12 +46,28 @@ pub struct Session {
     /// default system prompt.
     #[serde(default)]
     pub persona: Option<String>,
+    /// The session that spawned this one. None for a root session; a child
+    /// runs on its parent's node and working copy as a session of its own.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// The tree root's session id; a root session owns itself. Every session
+    /// in one tree shares this id, which is how list and metering views group
+    /// them. A missing owner on the wire means the session predates the tree.
+    #[serde(default)]
+    pub owner_id: String,
     pub permission: Permission,
     /// The persona's allowed-tools spec, resolved onto the session at
     /// creation: `"*"` for every canonical tool, or a list of tool names.
     #[serde(default = "default_allowed_tools")]
     pub allowed_tools: String,
     pub state: SessionState,
+    /// Why the session was last interrupted: by the user, or by a crash.
+    /// Recorded when the session becomes interrupted and kept when it later
+    /// resumes, so stop semantics can still tell a user-requested halt from
+    /// a crash. The next interruption replaces it. None for a session that
+    /// has never been interrupted.
+    #[serde(default)]
+    pub interrupt_cause: Option<InterruptCause>,
     pub created_at_secs: i64,
     pub prompt: Option<String>,
 }
@@ -170,6 +198,16 @@ mod tests {
                 format!("\"{name}\"")
             );
         }
+    }
+
+    #[test]
+    fn interrupt_cause_parses_and_serializes_snake_case() {
+        let user: InterruptCause = serde_json::from_str("\"user\"").unwrap();
+        let crash: InterruptCause = serde_json::from_str("\"crash\"").unwrap();
+        assert_eq!(user, InterruptCause::User);
+        assert_eq!(crash, InterruptCause::Crash);
+        assert_eq!(serde_json::to_string(&user).unwrap(), "\"user\"");
+        assert_eq!(serde_json::to_string(&crash).unwrap(), "\"crash\"");
     }
 
     #[test]
@@ -348,9 +386,12 @@ mod tests {
             dir: "/work".into(),
             model: "main".into(),
             persona: Some("reviewer".into()),
+            parent_id: Some("root-1".into()),
+            owner_id: "root-1".into(),
             permission: Permission::ReadOnly,
             allowed_tools: "file/read, git".into(),
-            state: SessionState::WaitingForInput,
+            state: SessionState::Interrupted,
+            interrupt_cause: Some(InterruptCause::User),
             created_at_secs: 1_700_000_000,
             prompt: None,
         };
@@ -374,5 +415,31 @@ mod tests {
         .unwrap();
         assert_eq!(session.persona, None);
         assert_eq!(session.allowed_tools, "*");
+        // A session without tree fields predates children, so it is a root.
+        assert_eq!(session.parent_id, None);
+        assert_eq!(session.owner_id, "");
+        assert_eq!(session.interrupt_cause, None);
+    }
+
+    #[test]
+    fn a_child_session_round_trips_its_tree_fields() {
+        let session = Session {
+            id: "child-1".into(),
+            node: "n1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: "/work".into(),
+            model: "cheap".into(),
+            persona: Some("reviewer".into()),
+            parent_id: Some("root-1".into()),
+            owner_id: "root-1".into(),
+            permission: Permission::ReadOnly,
+            allowed_tools: "file/read, grep".into(),
+            state: SessionState::Running,
+            interrupt_cause: None,
+            created_at_secs: 1_700_000_000,
+            prompt: Some("review the change".into()),
+        };
+        assert_round_trips(&session);
     }
 }
