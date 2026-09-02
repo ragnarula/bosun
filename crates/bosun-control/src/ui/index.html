@@ -177,6 +177,18 @@
   }
   #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
   #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
+  #transcript .fold {
+    margin-left: 6px;
+    padding: 0 2px;
+    min-height: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  #transcript .fold:hover { text-decoration: underline; }
   .input-row {
     display: flex;
     gap: 10px;
@@ -772,6 +784,67 @@ function appendLine(kind, text) {
   scrollToBottom();
 }
 
+const INLINE_TOOL_LIMIT = 240;
+
+// Tool traffic shows as a one-line summary and expands to the raw payload on
+// request, so assistant text is not buried under long tool output.
+function appendToolLine(kind, prefix, payload, suffix) {
+  const flat = payload.replace(/\s+/g, ' ').trim();
+  const clipped = clipAt(flat, INLINE_TOOL_LIMIT);
+  if (clipped === null) {
+    appendLine(kind, prefix + payload + suffix);
+    return;
+  }
+  const line = document.createElement('div');
+  line.className = 'line ' + kind;
+  const summary = document.createElement('span');
+  const full = document.createElement('span');
+  full.hidden = true;
+  summary.textContent = prefix + clipped + '…' + suffix;
+  const fold = document.createElement('button');
+  fold.type = 'button';
+  fold.className = 'fold';
+  fold.setAttribute('aria-expanded', 'false');
+  fold.textContent = 'show all';
+  let revealed = false;
+  fold.addEventListener('click', () => {
+    const wasOpen = !full.hidden;
+    if (wasOpen) {
+      full.hidden = true;
+      summary.hidden = false;
+      fold.setAttribute('aria-expanded', 'false');
+      fold.textContent = 'show all';
+      return;
+    }
+    if (!revealed) {
+      full.textContent = prefix + payload + suffix;
+      revealed = true;
+    }
+    full.hidden = false;
+    summary.hidden = true;
+    fold.setAttribute('aria-expanded', 'true');
+    fold.textContent = 'show less';
+    scrollToBottom();
+  });
+  line.appendChild(summary);
+  line.appendChild(full);
+  line.appendChild(fold);
+  transcript.appendChild(line);
+  scrollToBottom();
+}
+
+// The first `max` code points of `text`, or null when none are cut.
+function clipAt(text, max) {
+  let end = 0;
+  let count = 0;
+  for (const char of text) {
+    if (count === max) return text.slice(0, end);
+    count += 1;
+    end += char.length;
+  }
+  return null;
+}
+
 function appendMsg(role, text) {
   const paragraph = document.createElement('p');
   paragraph.className = 'msg ' + role;
@@ -814,14 +887,16 @@ function renderMessage(message) {
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
       break;
     case 'tool_call':
-      appendLine('mono', '→ ' + block.name + '(' + JSON.stringify(block.args) + ')');
+      appendToolLine('mono', '→ ' + block.name + '(', JSON.stringify(block.args), ')');
       break;
     case 'tool_result': {
       const content =
         typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-      appendLine(
+      appendToolLine(
         block.is_error ? 'mono error' : 'mono',
-        '← ' + block.name + ': ' + content
+        '← ' + block.name + ': ',
+        content,
+        ''
       );
       break;
     }
