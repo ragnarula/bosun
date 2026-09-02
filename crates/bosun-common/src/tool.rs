@@ -92,8 +92,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
         },
         ToolSpec {
-            name: "spawn_subagent".into(),
-            description: "Hand work to a subagent under a configured persona, synchronously. Its activity appears in the transcript and its summary is returned.".into(),
+            name: "spawn".into(),
+            description: "Create a child session under a configured persona and hand it a task. Returns the child session's id; the child runs on its own executor and reports back when done.".into(),
             schema: json!({"type":"object","properties":{"persona":{"type":"string"},"instructions":{"type":"string"}},"required":["persona","instructions"]}),
         },
     ];
@@ -174,7 +174,7 @@ mod tests {
                 "git",
                 "webfetch",
                 "skill",
-                "spawn_subagent",
+                "spawn",
             ]
         );
         for tool in &tools {
@@ -198,7 +198,7 @@ mod tests {
                 "git",
                 "webfetch",
                 "skill",
-                "spawn_subagent",
+                "spawn",
             ]
         );
     }

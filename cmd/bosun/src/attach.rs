@@ -74,7 +74,7 @@ pub enum LineKind {
     ToolResult,
     Ask,
     Summary,
-    Subagent,
+    ChildReport,
     ModelCall,
     Status,
 }
@@ -198,13 +198,9 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     kind: LineKind::Summary,
                     text: text.clone(),
                 }],
-                Block::Subagent {
-                    subagent_type,
-                    status,
-                    text,
-                } => vec![Line {
-                    kind: LineKind::Subagent,
-                    text: format!("{subagent_type} {status}: {text}"),
+                Block::ChildReport { child_id, text } => vec![Line {
+                    kind: LineKind::ChildReport,
+                    text: format!("child {child_id} reported: {text}"),
                 }],
             }
         }
@@ -383,7 +379,7 @@ fn prefix_for(line: &Line) -> &'static str {
         LineKind::ToolResult => "  ← ",
         LineKind::Ask => "  ? ",
         LineKind::Summary => "  ⤷ ",
-        LineKind::Subagent => "  ⤷ ",
+        LineKind::ChildReport => "  ⤷ ",
         LineKind::ModelCall => "  ",
         LineKind::Status => "── ",
     }
@@ -397,7 +393,7 @@ fn kind_color(kind: LineKind) -> Color {
         LineKind::ToolCall => Color::Magenta,
         LineKind::ToolResult => Color::Blue,
         LineKind::Ask => Color::Yellow,
-        LineKind::Summary | LineKind::Subagent | LineKind::ModelCall => Color::DarkGray,
+        LineKind::Summary | LineKind::ChildReport | LineKind::ModelCall => Color::DarkGray,
         LineKind::Status => Color::Cyan,
     }
 }
@@ -1463,21 +1459,20 @@ mod tests {
             }]
         );
 
-        let subagent = Event::Message {
+        let child_report = Event::Message {
             message: Message {
                 role: Role::Assistant,
-                block: Block::Subagent {
-                    subagent_type: "explorer".into(),
-                    status: "done".into(),
+                block: Block::ChildReport {
+                    child_id: "explorer-1".into(),
                     text: "found it".into(),
                 },
             },
         };
         assert_eq!(
-            event_lines(&subagent),
+            event_lines(&child_report),
             vec![Line {
-                kind: LineKind::Subagent,
-                text: "explorer done: found it".into(),
+                kind: LineKind::ChildReport,
+                text: "child explorer-1 reported: found it".into(),
             }]
         );
 

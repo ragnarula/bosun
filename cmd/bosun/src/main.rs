@@ -379,6 +379,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         default_persona: config.default_persona,
         skills_dir: Some(skills_dir),
     });
+    // The loops' `spawn` tool starts child sessions through the registry, so
+    // the registry needs the node-facing handles before any loop runs.
+    state.loops.attach_child_spawner(
+        state.registry.clone(),
+        state.commands.clone(),
+        state.tunnels.clone(),
+    );
     bosun_control::api::recover(&state).await;
     let app = bosun_control::api::router(state);
 

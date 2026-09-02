@@ -3,6 +3,8 @@
 **Date:** 2026-08-30
 **Author:** Raghav
 
+> Superseded by the sprint-005 agent-tree decisions in `../sprints/005-agent-tree.md` for the tool surface: `spawn_subagent` is replaced by `spawn`, which creates a real child session and returns its id instead of running a nested loop that returns a summary. The final ADR for sprint 005 records this.
+
 ## Context
 
 The MVP had no tools: opencode owned the tool set and the client drove it through a proxy. Sprint 002's agent loop calls tools itself, so Bosun must choose the tool surface, its schemas, and which tools run where. Bosun also runs with an explicit permission mode per session.

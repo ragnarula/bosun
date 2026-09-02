@@ -78,7 +78,9 @@ fn anthropic_message(message: &Message) -> Value {
             json!({ "type": "text", "text": format!("[question to user] {ask}") })
         }
         (_, Block::Summary { text }) => json!({ "type": "text", "text": text }),
-        (_, Block::Subagent { text, .. }) => json!({ "type": "text", "text": text }),
+        (_, Block::ChildReport { child_id, text }) => {
+            json!({ "type": "text", "text": report_text(child_id, text) })
+        }
         (Role::User, Block::ToolCall { name, .. }) => {
             json!({ "type": "text", "text": format!("[tool call {name}]") })
         }
@@ -123,8 +125,8 @@ fn openai_message(message: &Message) -> Value {
         (_, Block::Summary { text }) => {
             json!({ "role": message.role.as_str(), "content": text })
         }
-        (_, Block::Subagent { text, .. }) => {
-            json!({ "role": message.role.as_str(), "content": text })
+        (_, Block::ChildReport { child_id, text }) => {
+            json!({ "role": message.role.as_str(), "content": report_text(child_id, text) })
         }
         (Role::User, Block::ToolCall { name, .. }) => {
             json!({ "role": "user", "content": format!("[tool call {name}]") })
@@ -156,6 +158,16 @@ fn tool_result_text(is_error: bool, content: &Value) -> String {
         format!("Error: {text}")
     } else {
         text
+    }
+}
+
+/// A child's completion report as provider text: attributed to the child so
+/// the parent does not read the words as its own.
+fn report_text(child_id: &str, text: &str) -> String {
+    if text.is_empty() {
+        format!("[report from child {child_id}]")
+    } else {
+        format!("[report from child {child_id}]\n{text}")
     }
 }
 
@@ -216,10 +228,9 @@ mod tests {
                 },
             },
             Message {
-                role: Role::User,
-                block: Block::Subagent {
-                    subagent_type: "coder".into(),
-                    status: "done".into(),
+                role: Role::Assistant,
+                block: Block::ChildReport {
+                    child_id: "child-1".into(),
                     text: "sub done".into(),
                 },
             },
@@ -278,7 +289,7 @@ mod tests {
                 { "type": "tool_use", "id": "call-3", "name": "shell", "input": { "command": "ls" } },
                 { "type": "text", "text": "[question to user] continue?" },
                 { "type": "text", "text": "did things" },
-                { "type": "text", "text": "sub done" },
+                { "type": "text", "text": "[report from child child-1]\nsub done" },
                 { "type": "text", "text": "[tool call git]" },
                 { "type": "text", "text": "{\"ok\":true}" },
             ],
@@ -333,7 +344,7 @@ mod tests {
             },
             { "role": "user", "content": "[question to user] continue?" },
             { "role": "assistant", "content": "did things" },
-            { "role": "user", "content": "sub done" },
+            { "role": "assistant", "content": "[report from child child-1]\nsub done" },
             { "role": "user", "content": "[tool call git]" },
             { "role": "tool", "tool_call_id": "call-5", "content": "{\"ok\":true}" },
         ]);

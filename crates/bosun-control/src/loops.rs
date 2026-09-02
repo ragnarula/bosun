@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use bosun_agent::agent_loop::ChildSpawner;
 use bosun_agent::agent_loop::DeltaSink;
 use bosun_agent::agent_loop::LoopDeps;
 use bosun_agent::agent_loop::LoopEvent;
@@ -18,6 +19,9 @@ use bosun_store::store::Store;
 use tokio::sync::broadcast;
 use tracing::debug;
 
+use crate::commands::CommandQueue;
+use crate::registry::NodeRegistry;
+use crate::spawn::ChildSessionSpawner;
 use crate::tools::TunnelToolExecutor;
 use crate::tunnel::TunnelRegistry;
 
@@ -38,10 +42,14 @@ pub struct AgentRegistry {
     /// Providers for persona models, keyed by model name.
     pub providers: HashMap<String, Arc<dyn Provider>>,
     /// Configured personas, keyed by persona name. The loop resolves the
-    /// legacy `spawn_subagent` tool's persona from here.
+    /// `spawn` tool's persona from here.
     pub personas: HashMap<String, PersonaConfig>,
     /// Per-million-token prices keyed by model name: (input, output).
     pub prices: HashMap<String, (f64, f64)>,
+    /// The machinery that spawns child sessions for the loops, attached once
+    /// the registry exists (it holds a weak reference back to it). None
+    /// disables the `spawn` tool.
+    spawner: RwLock<Option<Arc<dyn ChildSpawner>>>,
 }
 
 impl AgentRegistry {
@@ -58,7 +66,26 @@ impl AgentRegistry {
             providers,
             personas,
             prices,
+            spawner: RwLock::new(None),
         }
+    }
+
+    /// Attaches the child-session spawner: the registry is the only component
+    /// that starts loops, so the spawner must reach it, and the registry owns
+    /// the spawner, so the link is a weak reference. Called once at startup
+    /// before any loop runs.
+    pub fn attach_child_spawner(
+        self: &Arc<Self>,
+        nodes: Arc<NodeRegistry>,
+        commands: Arc<CommandQueue>,
+        tunnels: Arc<TunnelRegistry>,
+    ) {
+        *self.spawner.write().unwrap() = Some(Arc::new(ChildSessionSpawner {
+            registry: Arc::downgrade(self),
+            nodes,
+            commands,
+            tunnels,
+        }));
     }
 
     /// Starts one loop task for the session and publishes a live-delta
@@ -90,6 +117,7 @@ impl AgentRegistry {
             prices: self.prices.clone(),
             price_input_per_mtok,
             price_output_per_mtok,
+            spawner: self.spawner.read().unwrap().clone(),
         };
         let handle = spawn_loop(session_id.to_string(), Arc::new(deps));
         self.loops

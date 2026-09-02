@@ -160,7 +160,7 @@
   #transcript .error { color: var(--error); }
   #transcript .state { color: var(--muted); font-size: 12px; }
   #transcript .summary { color: var(--muted); font-style: italic; }
-  #transcript .subagent { color: var(--muted); padding-left: 18px; }
+  #transcript .child-report { color: var(--muted); padding-left: 18px; }
   #transcript .model-call {
     color: var(--muted);
     opacity: 0.65;
@@ -819,10 +819,10 @@ function renderMessage(message) {
     case 'summary':
       appendLine('summary', '[summary] ' + block.text);
       break;
-    case 'subagent':
+    case 'child_report':
       appendLine(
-        'subagent',
-        '[subagent ' + block.subagent_type + ' ' + block.status + '] ' + block.text
+        'child-report',
+        '[child ' + block.child_id + ' reported] ' + block.text
       );
       break;
     default:

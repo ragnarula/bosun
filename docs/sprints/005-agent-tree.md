@@ -18,7 +18,7 @@ Status: **planned**.
 - **Transport is one tunnel per node.** A node holds one outbound connection to the control plane; every tool call is a logical connection addressed by session id, and the node relay dials that session's executor port. This supersedes the one-tunnel-per-session arrangement of `2026-08-21-nodes-dial-out-only.md` as carried into `2026-08-30-tool-protocol-over-tunnel.md`; the frame codec, per-connection flow control, and relay survive unchanged.
 - **Repo standards.** The loop scans the working copy for `AGENTS.md` and `CLAUDE.md` and injects a presence notice into each session's context; the contents are read on demand with file tools. Persona prompts stay purely about role and behaviour.
 - **States and store.** The five session states are reused unchanged; a child that completes transitions to `stopped`, and completed-versus-failed-versus-user-stopped is distinguished by the final authored event, not the state. A stopped or interrupted child resumes when its parent messages it, from its archived thread. `model_calls` stay per session; cost rolls up by `owner_id` in the views.
-- The `Block::Subagent` transcript hack and the sprint-002 "subagent type is `{ name, model, permission }`" model are superseded by personas and real child sessions. Tests drive the loops with per-loop scripted providers plus an event-injection seam, so interleavings are deterministic.
+- The `Block::Subagent` transcript hack and the sprint-002 "subagent type is `{ name, model, permission }`" model are superseded by personas and real child sessions. Stored transcripts that contain `{"kind":"subagent",...}` blocks stop deserializing once `Block::Subagent` is gone, so a pre-S4 session that used `spawn_subagent` can neither run a turn nor replay its transcript; there is no migration (pre-1.0 dev data). Tests drive the loops with per-loop scripted providers plus an event-injection seam, so interleavings are deterministic.
 
 ## CLI surface
 
@@ -67,6 +67,8 @@ As a user, I want the session agent to hand a task to a child session under a ch
 - The child loop mirrors the root loop except for its role: ending a turn without an ask authors a completion report to its parent and stops; a root ending without an ask waits for the user as today.
 - A child runs concurrently with its parent and siblings (own executor), and its report, transcript, and model calls are stored on the child session.
 - The parent's transcript renders the child as authored events, not raw tool traffic.
+- Note: until S6 delivers ask gating, a child that calls `ask` hangs — `ask` is still advertised to children, and no parent-answer path exists yet.
+- Note: until S8 owns the stop cascade, a completed child keeps its executor, node session record, and tunnel until the tree is stopped, so a long-lived tree accumulates live executors.
 
 - [ ] **S5 — Authored events and the manifest**
 
@@ -104,6 +106,7 @@ As a user, I want interrupt and stop to behave predictably across the tree and a
 - On control-plane boot, `running`/`creating` sessions become `interrupted`; crash-interrupted children report to their parent, which re-decides each — resume from archive, abandon, or swap persona.
 - `bosun stop` on the owner cascades to the whole tree; stopping a child cascades its subtree.
 - A stopped or interrupted child resumes from its archived thread when its parent messages it.
+- Note: a control-plane crash between the node starting a child's executor and the child row existing can orphan an executor on the node.
 
 - [ ] **S9 — One tunnel per node**
 

@@ -120,9 +120,11 @@ pub enum Block {
     Summary {
         text: String,
     },
-    Subagent {
-        subagent_type: String,
-        status: String,
+    /// One authored completion report a child session wrote into its
+    /// parent's thread: the child's final text, attributed by session id.
+    /// The child's own transcript stays on the child session.
+    ChildReport {
+        child_id: String,
         text: String,
     },
 }
@@ -262,9 +264,8 @@ mod tests {
             Block::Summary {
                 text: "summarized".into(),
             },
-            Block::Subagent {
-                subagent_type: "coder".into(),
-                status: "done".into(),
+            Block::ChildReport {
+                child_id: "child-1".into(),
                 text: "finished the change".into(),
             },
         ] {
@@ -300,6 +301,15 @@ mod tests {
         .unwrap();
         assert_eq!(json["kind"], "ask");
         assert_eq!(json["answer"], serde_json::Value::Null);
+
+        let json = serde_json::to_value(Block::ChildReport {
+            child_id: "child-1".into(),
+            text: "done".into(),
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "child_report");
+        assert_eq!(json["child_id"], "child-1");
+        assert_eq!(json["text"], "done");
     }
 
     #[test]

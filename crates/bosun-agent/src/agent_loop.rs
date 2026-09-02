@@ -55,10 +55,6 @@ struct SessionSkills {
 /// Caps the summarizer output so a compaction stays cheap.
 const MAX_TOKENS: u32 = 2048;
 
-/// Caps the subagent loop at this many turns, so a subagent that never
-/// finishes cannot hold the parent's turn forever.
-const MAX_SUBAGENT_TURNS: usize = 20;
-
 const SUMMARIZATION_PROMPT: &str = "Summarize the conversation so far. Preserve: \
      decisions, file paths, commands run, tool results that still matter, and any \
      open questions. Be concise.";
@@ -101,6 +97,38 @@ pub enum ToolError {
     Internal(#[from] anyhow::Error),
 }
 
+/// One child session the `spawn` tool asks for: the parent session, the
+/// persona the child runs under, and the assignment that becomes the child's
+/// first user message.
+#[derive(Clone)]
+pub struct SpawnChild {
+    pub parent: Session,
+    pub persona_name: String,
+    pub persona: PersonaConfig,
+    pub instructions: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// The child could not be started; the message says why.
+    #[error("{0}")]
+    Failed(String),
+    #[error("internal error")]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Creates a child session and starts its loop, returning the child's id
+/// once its executor is up. The control plane implements this; the loop calls
+/// it from the `spawn` tool, so a parent delegates without running the child
+/// inside its own turn.
+pub trait ChildSpawner: Send + Sync {
+    fn spawn(
+        &self,
+        store: bosun_store::store::Store,
+        request: SpawnChild,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SpawnError>> + Send>>;
+}
+
 pub struct LoopDeps {
     pub store: bosun_store::store::Store,
     pub provider: Arc<dyn crate::provider::Provider>,
@@ -110,9 +138,9 @@ pub struct LoopDeps {
     pub max_window_messages: usize,
     /// The control plane's injected skills directory, when one is configured.
     pub injected_skills_dir: Option<PathBuf>,
-    /// Configured personas, keyed by persona name. The legacy
-    /// `spawn_subagent` tool resolves its persona here; sprint 004's later
-    /// stories replace that tool with real child sessions.
+    /// Configured personas, keyed by persona name. The `spawn` tool resolves
+    /// its target persona from here, and a session's persona prompt is read
+    /// from it at every turn.
     pub personas: HashMap<String, PersonaConfig>,
     /// Providers for persona models, keyed by model name.
     pub providers: HashMap<String, Arc<dyn crate::provider::Provider>>,
@@ -123,6 +151,9 @@ pub struct LoopDeps {
     pub price_input_per_mtok: f64,
     /// Price per million output tokens, used to meter model-call cost.
     pub price_output_per_mtok: f64,
+    /// The control plane's child-session spawner. None disables the `spawn`
+    /// tool, which the loop advertises only when a spawner is attached.
+    pub spawner: Option<Arc<dyn ChildSpawner>>,
 }
 
 /// The provider and prices one model call runs under: resolved from the
@@ -276,7 +307,12 @@ impl InterruptSignal {
 }
 
 enum TurnOutcome {
-    Finished,
+    /// The turn ended without tool calls. `text` is the turn's own assistant
+    /// text, so a child's completion report carries the final turn's words —
+    /// a silent final turn reports empty instead of reusing earlier text.
+    Finished {
+        text: String,
+    },
     ToolCalls,
     AskedUser,
     Interrupted,
@@ -315,9 +351,29 @@ async fn handle_wake(
     // Consume one pending wake; wakes that arrived mid-turn keep the loop
     // running after this batch of turns ends.
     pending_wakes.fetch_sub(1, Ordering::AcqRel);
+
+    // A wake on a session that has already stopped must not start another
+    // turn: nothing wakes a stopped session today, but the resume path will,
+    // and a stray wake would run a second completion and author a second
+    // report to the parent.
+    let stored = deps.store.get_session(session_id).await?;
+    if stored
+        .as_ref()
+        .is_some_and(|session| session.state == SessionState::Stopped)
+    {
+        return Ok(());
+    }
     deps.store
         .set_state(session_id, SessionState::Running)
         .await?;
+
+    // Whether this session is a child decides what a completed wake does: a
+    // child ends by reporting to its parent and stopping, a root waits for
+    // the user. The tree fields never change mid-wake, so one read covers
+    // every turn in it.
+    let is_child = stored
+        .as_ref()
+        .is_some_and(|session| session.parent_id.is_some());
 
     let mut interrupted = false;
     loop {
@@ -350,7 +406,11 @@ async fn handle_wake(
         };
         match outcome {
             TurnOutcome::ToolCalls if !interrupted => {}
-            TurnOutcome::Finished | TurnOutcome::AskedUser => {
+            TurnOutcome::Finished { text } if is_child && !interrupted => {
+                finish_child(deps, session_id, text).await?;
+                return Ok(());
+            }
+            TurnOutcome::Finished { .. } | TurnOutcome::AskedUser => {
                 deps.store
                     .set_state(session_id, SessionState::WaitingForInput)
                     .await?;
@@ -374,6 +434,51 @@ async fn handle_wake(
             }
         }
     }
+}
+
+/// Ends a completed child's wake: the child authors its final words as one
+/// completion report in its parent's thread and the child session stops. A
+/// root's completed wake instead waits for the user. The report's append can
+/// fail when the parent is gone; the child still stops cleanly.
+async fn finish_child(
+    deps: &Arc<LoopDeps>,
+    session_id: &str,
+    final_text: String,
+) -> anyhow::Result<()> {
+    let Some(parent_id) = deps
+        .store
+        .get_session(session_id)
+        .await?
+        .and_then(|session| session.parent_id)
+    else {
+        return Ok(());
+    };
+    // The completion report is the child's final words: the text of the turn
+    // that ended the wake, so a child whose final turn is a textless stop
+    // authors an empty report instead of one carrying stale mid-task text.
+    if let Err(error) = deps
+        .store
+        .append_message(
+            &parent_id,
+            Role::Assistant,
+            &Block::ChildReport {
+                child_id: session_id.to_string(),
+                text: final_text,
+            },
+        )
+        .await
+    {
+        warn!(
+            msg = "failed to append the child report to the parent's thread",
+            session_id = %session_id,
+            parent_id = %parent_id,
+            error = %error.display_chain()
+        );
+    }
+    deps.store
+        .set_state(session_id, SessionState::Stopped)
+        .await?;
+    Ok(())
 }
 
 async fn run_turn(
@@ -460,10 +565,13 @@ async fn run_turn_inner(
         .into_iter()
         .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
         .filter(|tool| {
-            // spawn_subagent is the sprint-002 nested-loop tool, kept as a
-            // shim until the sprint 004 spawn story replaces it with child
-            // sessions; it is advertised only when personas are configured.
-            tool.name != "spawn_subagent" || !deps.personas.is_empty()
+            // `spawn` (real child sessions) is advertised to root sessions
+            // only, when personas exist and a spawner is attached. Children
+            // spawning their own children arrive in a later sprint.
+            tool.name != "spawn"
+                || (session.parent_id.is_none()
+                    && !deps.personas.is_empty()
+                    && deps.spawner.is_some())
         })
         .collect();
 
@@ -506,14 +614,18 @@ async fn run_turn_inner(
 
     if !text.is_empty() {
         deps.store
-            .append_message(session_id, Role::Assistant, &Block::Text { text })
+            .append_message(
+                session_id,
+                Role::Assistant,
+                &Block::Text { text: text.clone() },
+            )
             .await?;
     }
 
-    let calls: Vec<(String, String, Value)> = parse_tool_calls(tool_calls, session_id, None);
+    let calls: Vec<(String, String, Value)> = parse_tool_calls(tool_calls, session_id);
 
     if calls.is_empty() {
-        return Ok(TurnOutcome::Finished);
+        return Ok(TurnOutcome::Finished { text });
     }
 
     for (id, name, args) in calls {
@@ -688,123 +800,64 @@ async fn run_turn_inner(
                     )
                     .await?;
             }
-            // Legacy spawn_subagent shim, superseded by the sprint 004 spawn
-            // story: resolves its target from the persona catalog and runs a
-            // nested loop under that persona's model and permission.
-            "spawn_subagent" => {
+            // Creates a real child session: the child runs its own loop and
+            // executor on this working copy under the target persona. The
+            // call returns the child's id and the turn continues; the child's
+            // completion report arrives later as an authored event in this
+            // session's thread.
+            "spawn" => {
                 let persona_name = args["persona"].as_str().unwrap_or_default().to_string();
                 let instructions = args["instructions"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                let Some(persona) = deps.personas.get(&persona_name) else {
-                    let content = json!({ "error": format!("unknown persona {persona_name}") });
-                    deps.store
-                        .complete_tool_call(session_id, &id, &content, true)
-                        .await?;
-                    deps.store
-                        .append_message(
-                            session_id,
-                            Role::User,
-                            &Block::ToolResult {
-                                id,
-                                name,
-                                is_error: true,
-                                content,
+                let outcome = async {
+                    if session.parent_id.is_some() {
+                        anyhow::bail!("spawn is only available to root sessions");
+                    }
+                    let Some(persona) = deps.personas.get(&persona_name) else {
+                        anyhow::bail!("unknown persona {persona_name}");
+                    };
+                    if !deps.providers.contains_key(&persona.model) {
+                        anyhow::bail!("no provider for model {}", persona.model);
+                    }
+                    let Some(spawner) = &deps.spawner else {
+                        anyhow::bail!("spawn is not available");
+                    };
+                    let child_id = spawner
+                        .spawn(
+                            deps.store.clone(),
+                            SpawnChild {
+                                parent: session.clone(),
+                                persona_name: persona_name.clone(),
+                                persona: persona.clone(),
+                                instructions: instructions.clone(),
                             },
                         )
-                        .await?;
-                    continue;
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    Ok::<String, anyhow::Error>(child_id)
+                }
+                .await;
+                let (content, is_error) = match outcome {
+                    Ok(child_id) => (json!({ "child_id": child_id }), false),
+                    Err(error) => (json!({ "error": error.to_string() }), true),
                 };
-                if !deps.providers.contains_key(&persona.model) {
-                    let content =
-                        json!({ "error": format!("no provider for model {}", persona.model) });
-                    deps.store
-                        .complete_tool_call(session_id, &id, &content, true)
-                        .await?;
-                    deps.store
-                        .append_message(
-                            session_id,
-                            Role::User,
-                            &Block::ToolResult {
-                                id,
-                                name,
-                                is_error: true,
-                                content,
-                            },
-                        )
-                        .await?;
-                    continue;
-                };
+                deps.store
+                    .complete_tool_call(session_id, &id, &content, is_error)
+                    .await?;
                 deps.store
                     .append_message(
                         session_id,
-                        Role::Assistant,
-                        &Block::Subagent {
-                            subagent_type: persona_name.clone(),
-                            status: "started".into(),
-                            text: instructions.clone(),
+                        Role::User,
+                        &Block::ToolResult {
+                            id,
+                            name,
+                            is_error,
+                            content,
                         },
                     )
                     .await?;
-                match run_subagent(
-                    deps,
-                    session_id,
-                    &persona_name,
-                    persona,
-                    &instructions,
-                    signal,
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        deps.store
-                            .append_message(
-                                session_id,
-                                Role::Assistant,
-                                &Block::Subagent {
-                                    subagent_type: persona_name.clone(),
-                                    status: "done".into(),
-                                    text: summary.clone(),
-                                },
-                            )
-                            .await?;
-                        let content = json!({ "summary": summary });
-                        deps.store
-                            .complete_tool_call(session_id, &id, &content, false)
-                            .await?;
-                        deps.store
-                            .append_message(
-                                session_id,
-                                Role::User,
-                                &Block::ToolResult {
-                                    id,
-                                    name,
-                                    is_error: false,
-                                    content,
-                                },
-                            )
-                            .await?;
-                    }
-                    Err(_) => {
-                        let content = json!({ "error": "subagent failed" });
-                        deps.store
-                            .complete_tool_call(session_id, &id, &content, true)
-                            .await?;
-                        deps.store
-                            .append_message(
-                                session_id,
-                                Role::User,
-                                &Block::ToolResult {
-                                    id,
-                                    name,
-                                    is_error: true,
-                                    content,
-                                },
-                            )
-                            .await?;
-                    }
-                }
             }
             _ => {
                 let run_id = Uuid::new_v4().to_string();
@@ -815,7 +868,7 @@ async fn run_turn_inner(
                     run_id = %run_id
                 );
                 let Some(outcome) =
-                    run_tool_call(deps, session_id, &run_id, &name, args, signal, None).await?
+                    run_tool_call(deps, session_id, &run_id, &name, args, signal).await?
                 else {
                     return Ok(TurnOutcome::Interrupted);
                 };
@@ -843,8 +896,7 @@ async fn run_turn_inner(
 
 /// Runs the provider stream to its end, accumulating text and tool-call
 /// deltas and forwarding text to the delta sink. The caller decides what the
-/// end state means and logs it, so the main and subagent turns share the loop
-/// body.
+/// end state means and logs it.
 async fn collect_stream(
     stream: &mut BoxStream<'static, Result<StreamEvent, ProviderError>>,
     deps: &Arc<LoopDeps>,
@@ -914,9 +966,8 @@ async fn collect_stream(
 }
 
 /// Runs one tool call to its end, streaming deltas to the delta sink. An
-/// interrupt cancels the in-flight call and returns `Ok(None)`; the callers
-/// translate that into their own interrupted outcome. `subagent_type` picks
-/// the log message prefix, so both callers keep their exact lines.
+/// interrupt cancels the in-flight call and returns `Ok(None)`; the caller
+/// translates that into its own interrupted outcome.
 async fn run_tool_call(
     deps: &Arc<LoopDeps>,
     session_id: &str,
@@ -924,7 +975,6 @@ async fn run_tool_call(
     name: &str,
     args: Value,
     signal: &Arc<InterruptSignal>,
-    subagent_type: Option<&str>,
 ) -> anyhow::Result<Option<ToolOutcome>> {
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
     let mut call = deps.tools.call(
@@ -941,23 +991,13 @@ async fn run_tool_call(
                 .cancel(session_id.to_string(), run_id.to_string())
                 .await
             {
-                match subagent_type {
-                    Some(subagent_type) => warn!(
-                        msg = "failed to cancel subagent tool call",
-                        session_id = %session_id,
-                        subagent_type = %subagent_type,
-                        tool = %name,
-                        run_id = %run_id,
-                        error = %error.display_chain()
-                    ),
-                    None => warn!(
-                        msg = "failed to cancel tool call",
-                        session_id = %session_id,
-                        tool = %name,
-                        run_id = %run_id,
-                        error = %error.display_chain()
-                    ),
-                }
+                warn!(
+                    msg = "failed to cancel tool call",
+                    session_id = %session_id,
+                    tool = %name,
+                    run_id = %run_id,
+                    error = %error.display_chain()
+                );
             }
             return Ok(None);
         }
@@ -966,23 +1006,13 @@ async fn run_tool_call(
                 break match result {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        match subagent_type {
-                            Some(subagent_type) => error!(
-                                msg = "subagent tool call failed",
-                                session_id = %session_id,
-                                subagent_type = %subagent_type,
-                                tool = %name,
-                                run_id = %run_id,
-                                error = %error.display_chain()
-                            ),
-                            None => error!(
-                                msg = "tool call failed",
-                                session_id = %session_id,
-                                tool = %name,
-                                run_id = %run_id,
-                                error = %error.display_chain()
-                            ),
-                        }
+                        error!(
+                            msg = "tool call failed",
+                            session_id = %session_id,
+                            tool = %name,
+                            run_id = %run_id,
+                            error = %error.display_chain()
+                        );
                         ToolOutcome {
                             content: json!({ "error": "tool call failed" }),
                             is_error: true,
@@ -1002,23 +1032,13 @@ async fn run_tool_call(
                         .cancel(session_id.to_string(), run_id.to_string())
                         .await
                     {
-                        match subagent_type {
-                            Some(subagent_type) => warn!(
-                                msg = "failed to cancel subagent tool call",
-                                session_id = %session_id,
-                                subagent_type = %subagent_type,
-                                tool = %name,
-                                run_id = %run_id,
-                                error = %error.display_chain()
-                            ),
-                            None => warn!(
-                                msg = "failed to cancel tool call",
-                                session_id = %session_id,
-                                tool = %name,
-                                run_id = %run_id,
-                                error = %error.display_chain()
-                            ),
-                        }
+                        warn!(
+                            msg = "failed to cancel tool call",
+                            session_id = %session_id,
+                            tool = %name,
+                            run_id = %run_id,
+                            error = %error.display_chain()
+                        );
                     }
                     return Ok(None);
                 }
@@ -1035,31 +1055,20 @@ async fn run_tool_call(
 }
 
 /// Maps the accumulated tool-call deltas into `(id, name, args)` triples;
-/// unparseable argument JSON becomes `Value::Null` with a warning. The
-/// `subagent_type` picks the warning's prefix and field, keeping both callers'
-/// log lines intact.
+/// unparseable argument JSON becomes `Value::Null` with a warning.
 fn parse_tool_calls(
     tool_calls: BTreeMap<usize, AccumulatedToolCall>,
     session_id: &str,
-    subagent_type: Option<&str>,
 ) -> Vec<(String, String, Value)> {
     tool_calls
         .into_values()
         .map(|call| {
             let args = serde_json::from_str(&call.args_delta).unwrap_or_else(|error| {
-                match subagent_type {
-                    Some(subagent_type) => warn!(
-                        msg = "subagent tool call arguments are not valid JSON",
-                        session_id = %session_id,
-                        subagent_type = %subagent_type,
-                        error = %error.display_chain()
-                    ),
-                    None => warn!(
-                        msg = "tool call arguments are not valid JSON",
-                        session_id = %session_id,
-                        error = %error.display_chain()
-                    ),
-                }
+                warn!(
+                    msg = "tool call arguments are not valid JSON",
+                    session_id = %session_id,
+                    error = %error.display_chain()
+                );
                 Value::Null
             });
             (
@@ -1077,239 +1086,6 @@ fn tool_allowed(allowed_tools: &Option<Vec<String>>, name: &str) -> bool {
         None => true,
         Some(names) => names.iter().any(|n| n == name),
     }
-}
-
-/// Runs the subagent's nested loop: its own window, its own tool list (node
-/// tools only, restricted to the persona's allow-list), its own model and
-/// permission. Every streamed message and tool call is written to the session
-/// store as a Subagent block, so the parent's transcript shows the subagent's
-/// work. Returns the subagent's accumulated text as the summary the parent
-/// reports to its model.
-async fn run_subagent(
-    deps: &Arc<LoopDeps>,
-    session_id: &str,
-    persona_name: &str,
-    persona: &PersonaConfig,
-    instructions: &str,
-    interrupt: &Arc<InterruptSignal>,
-) -> Result<String, anyhow::Error> {
-    let turn = deps.turn_model(&persona.model);
-    // The preamble rides in the first user message, the same way the parent's
-    // system prompt would, so the subagent needs no separate system text.
-    let mut window = vec![Message {
-        role: Role::User,
-        block: Block::Text {
-            text: format!(
-                "You are a subagent of type {persona_name} working on the task below. \
-                 You share the session's working copy. Make the requested change directly \
-                 using your tools. Do not ask questions; finish on your own.\n\n{instructions}"
-            ),
-        },
-    }];
-    // Node-side tools only: the subagent never asks the user, rewrites the
-    // session todo list, loads skills, or spawns further subagents. Its
-    // persona's allow-list applies on top of that. An unparsable allow-list
-    // refuses the subagent's tool surface instead of widening it to every
-    // tool; the caller reports the failure to the parent.
-    let persona_tools = match parse_allowed_tools(&persona.allowed_tools) {
-        Ok(tools) => tools,
-        Err(error) => {
-            let detail = error.to_string();
-            error!(
-                msg = "subagent refused: persona allowed_tools are invalid",
-                session_id = %session_id,
-                persona = %persona_name,
-                error = %detail
-            );
-            return Err(anyhow::anyhow!(
-                "persona {persona_name} allowed_tools are invalid: {detail}"
-            ));
-        }
-    };
-    let tools: Vec<ToolSpec> = canonical_tools(persona.permission)
-        .into_iter()
-        .filter(|tool| {
-            !matches!(
-                tool.name.as_str(),
-                "ask" | "todowrite" | "skill" | "spawn_subagent"
-            )
-        })
-        .filter(|tool| tool_allowed(&persona_tools, &tool.name))
-        .collect();
-    let mut summary = String::new();
-
-    for _ in 0..MAX_SUBAGENT_TURNS {
-        let mut stream = turn.provider.chat_stream(ProviderCall {
-            model: turn.provider.model(),
-            max_tokens: MAX_TOKENS,
-            system: "",
-            messages: window.clone(),
-            tools: tools.clone(),
-        })?;
-
-        let (text, tool_calls, stopped) =
-            match collect_stream(&mut stream, deps, session_id, interrupt, &turn).await? {
-                StreamEnd::Collected {
-                    text,
-                    tool_calls,
-                    stopped,
-                } => (text, tool_calls, stopped),
-                StreamEnd::Interrupted => return Err(anyhow::anyhow!("subagent interrupted")),
-                StreamEnd::Failed(error) => {
-                    error!(
-                        msg = "subagent provider stream failed",
-                        session_id = %session_id,
-                        persona = %persona_name,
-                        provider = %turn.provider.name(),
-                        error = %error.display_chain()
-                    );
-                    return Err(error);
-                }
-            };
-
-        if !stopped {
-            error!(
-                msg = "subagent provider stream ended without a stop event",
-                session_id = %session_id,
-                persona = %persona_name,
-                provider = %turn.provider.name()
-            );
-            return Err(anyhow::anyhow!(
-                "subagent provider stream ended without a stop event"
-            ));
-        }
-
-        if !text.is_empty() {
-            summary.push_str(&text);
-            window.push(Message {
-                role: Role::Assistant,
-                block: Block::Text { text: text.clone() },
-            });
-            deps.store
-                .append_message(
-                    session_id,
-                    Role::Assistant,
-                    &Block::Subagent {
-                        subagent_type: persona_name.to_string(),
-                        status: "message".into(),
-                        text,
-                    },
-                )
-                .await?;
-        }
-
-        let calls: Vec<(String, String, Value)> =
-            parse_tool_calls(tool_calls, session_id, Some(persona_name));
-
-        if calls.is_empty() {
-            return Ok(summary.trim().to_string());
-        }
-
-        for (id, name, args) in calls {
-            window.push(Message {
-                role: Role::Assistant,
-                block: Block::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                },
-            });
-            deps.store
-                .append_message(
-                    session_id,
-                    Role::Assistant,
-                    &Block::Subagent {
-                        subagent_type: persona_name.to_string(),
-                        status: "tool".into(),
-                        text: format!("{name} {args}"),
-                    },
-                )
-                .await?;
-            deps.store
-                .append_tool_call(session_id, &id, &name, &args)
-                .await?;
-
-            if !tool_allowed(&persona_tools, &name) {
-                warn!(
-                    msg = "subagent tool call refused: not allowed for the persona",
-                    session_id = %session_id,
-                    persona = %persona_name,
-                    tool = %name,
-                    call_id = %id
-                );
-                let content = json!({ "error": format!("tool {name} is not allowed") });
-                deps.store
-                    .complete_tool_call(session_id, &id, &content, true)
-                    .await?;
-                window.push(Message {
-                    role: Role::User,
-                    block: Block::ToolResult {
-                        id: id.clone(),
-                        name: name.clone(),
-                        is_error: true,
-                        content: content.clone(),
-                    },
-                });
-                deps.store
-                    .append_message(
-                        session_id,
-                        Role::User,
-                        &Block::Subagent {
-                            subagent_type: persona_name.to_string(),
-                            status: "tool_result".into(),
-                            text: content.to_string(),
-                        },
-                    )
-                    .await?;
-                continue;
-            }
-
-            let run_id = Uuid::new_v4().to_string();
-            let Some(outcome) = run_tool_call(
-                deps,
-                session_id,
-                &run_id,
-                &name,
-                args,
-                interrupt,
-                Some(persona_name),
-            )
-            .await?
-            else {
-                return Err(anyhow::anyhow!("subagent interrupted"));
-            };
-            deps.store
-                .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
-                .await?;
-            window.push(Message {
-                role: Role::User,
-                block: Block::ToolResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    is_error: outcome.is_error,
-                    content: outcome.content.clone(),
-                },
-            });
-            deps.store
-                .append_message(
-                    session_id,
-                    Role::User,
-                    &Block::Subagent {
-                        subagent_type: persona_name.to_string(),
-                        status: "tool_result".into(),
-                        text: outcome.content.to_string(),
-                    },
-                )
-                .await?;
-        }
-    }
-
-    warn!(
-        msg = "subagent exceeded its turn limit",
-        session_id = %session_id,
-        persona = %persona_name
-    );
-    Err(anyhow::anyhow!("subagent exceeded its turn limit"))
 }
 
 /// Compacts the non-archived transcript when it exceeds
@@ -1482,11 +1258,9 @@ fn render_block(block: &Block) -> String {
             options.join(", ")
         ),
         Block::Summary { text } => format!("summary: {text}"),
-        Block::Subagent {
-            subagent_type,
-            status,
-            text,
-        } => format!("subagent {subagent_type} ({status}): {text}"),
+        Block::ChildReport { child_id, text } => {
+            format!("report from child {child_id}: {text}")
+        }
     }
 }
 
@@ -1912,6 +1686,7 @@ mod tests {
             prices: HashMap::new(),
             price_input_per_mtok,
             price_output_per_mtok,
+            spawner: None,
         }
     }
 
@@ -1937,6 +1712,79 @@ mod tests {
             prices: HashMap::new(),
             price_input_per_mtok: 0.0,
             price_output_per_mtok: 0.0,
+            spawner: None,
+        }
+    }
+
+    /// A deps with a fake child spawner attached, for `spawn` tool tests.
+    fn test_deps_with_spawner(
+        store: &Store,
+        provider: Arc<dyn Provider>,
+        tools: Arc<MockTools>,
+        sink: Arc<CollectSink>,
+        personas: HashMap<String, PersonaConfig>,
+        providers: HashMap<String, Arc<dyn Provider>>,
+        spawner: Arc<dyn ChildSpawner>,
+    ) -> LoopDeps {
+        LoopDeps {
+            spawner: Some(spawner),
+            ..test_deps_with_personas(store, provider, tools, sink, personas, providers)
+        }
+    }
+
+    /// The session that spawned `id`; children run on the parent's node and
+    /// working copy under their own persona.
+    fn child_session_of(id: &str, parent: &str) -> Session {
+        let mut child = session(id);
+        child.parent_id = Some(parent.to_string());
+        child.owner_id = parent.to_string();
+        child.persona = Some("coder".to_string());
+        child
+    }
+
+    /// A fake spawner that records its request and answers `result` without
+    /// starting anything: the loop under test must not depend on the child
+    /// running inside the parent's turn.
+    struct FakeSpawner {
+        calls: Arc<Mutex<Vec<SpawnChild>>>,
+        result: Result<String, SpawnError>,
+    }
+
+    impl FakeSpawner {
+        fn ok(child_id: &str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                result: Ok(child_id.to_string()),
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                result: Err(SpawnError::Failed(message.to_string())),
+            }
+        }
+
+        fn requested(&self) -> Vec<SpawnChild> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ChildSpawner for FakeSpawner {
+        fn spawn(
+            &self,
+            _store: Store,
+            request: SpawnChild,
+        ) -> Pin<Box<dyn Future<Output = Result<String, SpawnError>> + Send>> {
+            self.calls.lock().unwrap().push(request);
+            let result = match &self.result {
+                Ok(child_id) => Ok(child_id.clone()),
+                Err(SpawnError::Failed(message)) => Err(SpawnError::Failed(message.clone())),
+                Err(SpawnError::Internal(_)) => {
+                    unreachable!("the fake spawner never fails internally")
+                }
+            };
+            Box::pin(async move { result })
         }
     }
 
@@ -3263,8 +3111,8 @@ mod tests {
             .collect();
         assert_eq!(names, ["file/read", "grep", "glob"]);
         assert!(
-            !names.contains(&"spawn_subagent"),
-            "an allow-list without spawn_subagent does not advertise it"
+            !names.contains(&"spawn"),
+            "an allow-list without spawn does not advertise it"
         );
 
         handle.stop();
@@ -3852,99 +3700,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_subagent_persona_with_unparsable_allowed_tools_is_refused() {
-        let dir = tempdir().unwrap();
-        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
-        // The parent runs on its own model so its provider stays distinct from
-        // the subagent persona's provider under the same mock model.
-        let mut parent_session = session("s-subagent-bad");
-        parent_session.model = "parent-model".into();
-        store.create_session(&parent_session).await.unwrap();
-
-        let mut coder = persona("mock-model", Permission::ReadWrite);
-        coder.allowed_tools = "websurf".into();
-        let subagent_provider = Arc::new(ScriptedProvider::new(vec![vec![
-            StreamEvent::TextDelta("should never run".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
-        ]]));
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::ToolCallDelta {
-                    index: 0,
-                    id: Some("call-1".into()),
-                    name: Some("spawn_subagent".into()),
-                    args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
-                },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-        ]));
-        let deps = Arc::new(test_deps_with_personas(
-            &store,
-            provider.clone(),
-            Arc::new(MockTools::new(default_outcome())),
-            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
-            HashMap::from([("coder".to_string(), coder)]),
-            HashMap::from([
-                (
-                    "parent-model".to_string(),
-                    provider.clone() as Arc<dyn Provider>,
-                ),
-                (
-                    "mock-model".to_string(),
-                    subagent_provider.clone() as Arc<dyn Provider>,
-                ),
-            ]),
-        ));
-        let handle = spawn_loop("s-subagent-bad".into(), deps);
-
-        handle.send(LoopEvent::Wake);
-
-        wait_for("the session to wait for input", || {
-            let store = store.clone();
-            async move {
-                let stored = store.get_session("s-subagent-bad").await.unwrap().unwrap();
-                stored.state == SessionState::WaitingForInput
-            }
-        })
-        .await;
-
-        let messages = store.messages("s-subagent-bad", false).await.unwrap();
-        assert!(
-            messages.iter().any(|(_, message)| {
-                message.role == Role::User
-                    && matches!(
-                        &message.block,
-                        Block::ToolResult { id, name, is_error, content } if id == "call-1"
-                            && name == "spawn_subagent"
-                            && *is_error
-                            && content == &json!({ "error": "subagent failed" })
-                    )
-            }),
-            "the refused subagent records an error result"
-        );
-
-        assert!(
-            subagent_provider.captured_calls().is_empty(),
-            "a persona with an unparsable allow-list never reaches the provider"
-        );
-
-        handle.stop();
-    }
-
-    #[tokio::test]
     async fn two_tool_calls_in_one_turn_dispatch_in_order_with_distinct_run_ids() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -4418,27 +4173,256 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_subagent_runs_a_nested_loop_and_reports_the_summary() {
+    async fn a_child_that_finishes_reports_to_its_parent_and_stops() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
-        store.create_session(&session("s-subagent")).await.unwrap();
+        store.create_session(&session("parent-1")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-1", "parent-1"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-1",
+                Role::User,
+                &Block::Text {
+                    text: "make the change".into(),
+                },
+            )
+            .await
+            .unwrap();
 
-        // One queue serves every chat_stream call: the parent's first turn
-        // spawns the subagent, the subagent's turn streams its work, and the
-        // parent's second turn wraps up with the summary in its window.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("made the change".into()),
+            StreamEvent::Stop {
+                input_tokens: 2,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-1").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        // The child's words, transcript and model calls stay on the child.
+        let child_messages = store.messages("child-1", false).await.unwrap();
+        assert!(
+            child_messages.iter().any(|(_, message)| {
+                message.role == Role::Assistant
+                    && matches!(&message.block, Block::Text { text } if text == "made the change")
+            }),
+            "the child stores its own final text"
+        );
+        let child_calls = store.model_calls("child-1").await.unwrap();
+        assert_eq!(child_calls.len(), 1);
+        assert_eq!(child_calls[0].model, "mock-model");
+
+        // The parent's thread shows exactly one authored report: the child's
+        // final text, attributed to the child, with no child tool traffic.
+        let parent_messages = store.messages("parent-1", false).await.unwrap();
+        let reports: Vec<(&str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildReport { child_id, text } => Some((child_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            [("child-1", "made the change")],
+            "the parent thread shows one authored report from the child"
+        );
+        assert!(
+            !parent_messages.iter().any(|(_, message)| {
+                matches!(
+                    &message.block,
+                    Block::ToolCall { .. } | Block::ToolResult { .. }
+                )
+            }),
+            "no raw child tool traffic reaches the parent's thread"
+        );
+
+        // The parent's own state was not touched by the child's wake.
+        let parent = store.get_session("parent-1").await.unwrap().unwrap();
+        assert_eq!(parent.state, SessionState::Creating);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_with_nothing_more_to_say_reports_and_stops_instead_of_hanging() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-2")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-2", "parent-2"))
+            .await
+            .unwrap();
+
+        // The child's turn ends with a stop and no text and no tool calls.
+        let deps = Arc::new(test_deps(
+            &store,
+            Arc::new(ScriptedProvider::new(vec![vec![StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 0,
+            }]])),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-2".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-2").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        let parent_messages = store.messages("parent-2", false).await.unwrap();
+        assert_eq!(parent_messages.len(), 1);
+        let (child_id, text) = match &parent_messages[0].1.block {
+            Block::ChildReport { child_id, text } => (child_id.as_str(), text.as_str()),
+            _ => panic!("the parent thread must show the child's completion report"),
+        };
+        assert_eq!(child_id, "child-2");
+        assert_eq!(
+            text, "",
+            "a child with nothing to say authors an empty completion report"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_final_turn_authors_an_empty_report_not_stale_mid_task_text() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-6")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-6", "parent-6"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-6",
+                Role::User,
+                &Block::Text {
+                    text: "make the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Turn one talks mid-task and runs a tool; the final turn then ends
+        // with a textless stop. The report must be empty, not the mid-task
+        // words of the earlier turn.
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
+                StreamEvent::TextDelta("working on it".into()),
                 StreamEvent::ToolCallDelta {
                     index: 0,
                     id: Some("call-1".into()),
-                    name: Some("spawn_subagent".into()),
-                    args_delta: r#"{"persona":"coder","instructions":"add a test"}"#.into(),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"ls"}"#.into(),
                 },
                 StreamEvent::Stop {
-                    input_tokens: 3,
-                    output_tokens: 2,
+                    input_tokens: 2,
+                    output_tokens: 1,
                 },
             ],
+            vec![StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 0,
+            }],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-6".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-6").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        // The mid-task words stay on the child's own transcript...
+        let child_messages = store.messages("child-6", false).await.unwrap();
+        assert!(
+            child_messages.iter().any(|(_, message)| {
+                message.role == Role::Assistant
+                    && matches!(&message.block, Block::Text { text } if text == "working on it")
+            }),
+            "the child's transcript keeps its mid-task text"
+        );
+        // ... but the report to the parent carries only the silent final
+        // turn, so it is empty.
+        let parent_messages = store.messages("parent-6", false).await.unwrap();
+        let reports: Vec<(&str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildReport { child_id, text } => Some((child_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            [("child-6", "")],
+            "a silent final turn authors an empty report, not stale mid-task text"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_wake_on_an_already_stopped_child_runs_no_second_turn_or_report() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-5")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-5", "parent-5"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-5",
+                Role::User,
+                &Block::Text {
+                    text: "make the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The second script would run a whole second turn if the wake were
+        // let through; the assertions below prove it never ran.
+        let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
                 StreamEvent::TextDelta("made the change".into()),
                 StreamEvent::Stop {
@@ -4447,14 +4431,264 @@ mod tests {
                 },
             ],
             vec![
-                StreamEvent::TextDelta("done".into()),
+                StreamEvent::TextDelta("a second turn ran".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
             ],
         ]));
-        let deps = Arc::new(test_deps_with_personas(
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-5".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-5").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        // Nothing wakes a stopped child today, but the resume path will; a
+        // stray wake must not start another turn or author a second report.
+        handle.send(LoopEvent::Wake);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stored = store.get_session("child-5").await.unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::Stopped,
+            "a wake on a stopped child starts no turn"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "a wake on a stopped child runs no model call"
+        );
+        let parent_messages = store.messages("parent-5", false).await.unwrap();
+        let reports: Vec<(&str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildReport { child_id, text } => Some((child_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            [("child-5", "made the change")],
+            "a wake on a stopped child authors no second report"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_root_that_finishes_waits_for_input_instead_of_reporting() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-1").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+        assert_eq!(
+            store.messages("root-1", false).await.unwrap().len(),
+            1,
+            "a root's completed wake authors nothing extra"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn two_children_run_concurrently_with_independent_in_flight_activity() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-3")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-a", "parent-3"))
+            .await
+            .unwrap();
+        store
+            .create_session(&child_session_of("child-b", "parent-3"))
+            .await
+            .unwrap();
+
+        // Child a parks in a blocking tool call; child b runs a full turn to
+        // completion. Both wake at once: b must finish while a's tool call is
+        // still in flight, which proves the two loops do not serialize on a
+        // shared mutex or task structure.
+        let tools_a = Arc::new(
+            MockTools::new(default_outcome())
+                .serving(
+                    "skills",
+                    ToolOutcome {
+                        content: json!({ "skills": [] }),
+                        is_error: false,
+                    },
+                )
+                .blocking(),
+        );
+        let provider_a = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-a1".into()),
+                name: Some("shell".into()),
+                args_delta: r#"{"command":"sleep 100"}"#.into(),
+            },
+            StreamEvent::Stop {
+                input_tokens: 2,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps_a = Arc::new(test_deps(
+            &store,
+            provider_a.clone(),
+            tools_a.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle_a = spawn_loop("child-a".into(), deps_a);
+
+        let provider_b = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("b done".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps_b = Arc::new(test_deps(
+            &store,
+            provider_b.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle_b = spawn_loop("child-b".into(), deps_b);
+
+        handle_a.send(LoopEvent::Wake);
+        handle_b.send(LoopEvent::Wake);
+
+        wait_for("child a's tool call to be dispatched", {
+            let tools_a = tools_a.clone();
+            move || {
+                let tools_a = tools_a.clone();
+                async move {
+                    tools_a
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|call| call.name == "shell")
+                }
+            }
+        })
+        .await;
+
+        wait_for(
+            "child b to stop while child a's tool call is still running",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("child-b").await.unwrap().unwrap();
+                    stored.state == SessionState::Stopped
+                }
+            },
+        )
+        .await;
+
+        let a = store.get_session("child-a").await.unwrap().unwrap();
+        assert_eq!(
+            a.state,
+            SessionState::Running,
+            "child a is still mid-turn while child b completed"
+        );
+        let a_calls = store.tool_calls("child-a").await.unwrap();
+        assert_eq!(a_calls.len(), 1);
+        assert!(
+            a_calls[0].result.is_none(),
+            "child a's in-flight tool call has no result yet"
+        );
+        let b_messages = store.messages("parent-3", false).await.unwrap();
+        assert!(
+            b_messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::ChildReport { child_id, text } if child_id == "child-b" && text == "b done"
+            )),
+            "child b's report is in the parent's thread"
+        );
+        assert!(
+            !b_messages
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::ChildReport { child_id, .. } if child_id == "child-a")),
+            "child a has not reported while still running"
+        );
+
+        // Each child metered its own model call under its own loop.
+        let calls_b = store.model_calls("child-b").await.unwrap();
+        assert_eq!(calls_b.len(), 1);
+
+        handle_a.stop();
+        handle_b.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_returns_the_child_id_and_the_parent_turn_continues() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-4")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"review the diff"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("spawned, continuing".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let spawner = Arc::new(FakeSpawner::ok("child-4"));
+        let deps = Arc::new(test_deps_with_spawner(
             &store,
             provider.clone(),
             Arc::new(MockTools::new(default_outcome())),
@@ -4467,103 +4701,289 @@ mod tests {
                 "mock-model".to_string(),
                 provider.clone() as Arc<dyn Provider>,
             )]),
+            spawner.clone(),
         ));
-        let handle = spawn_loop("s-subagent".into(), deps);
+        let handle = spawn_loop("parent-4".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the parent's turn to continue past the spawn", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        wait_for("the parent to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("parent-4").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        // The spawn call recorded the child id and the turn kept going: the
+        // parent never waited for the child to do any work.
+        let messages = store.messages("parent-4", false).await.unwrap();
+        let result = messages
+            .iter()
+            .find(|(_, message)| {
+                matches!(&message.block, Block::ToolResult { name, .. } if name == "spawn")
+            })
+            .expect("a spawn result is recorded");
+        assert_eq!(result.1.role, Role::User);
+        let (is_error, content) = match &result.1.block {
+            Block::ToolResult {
+                is_error, content, ..
+            } => (*is_error, content.clone()),
+            _ => unreachable!(),
+        };
+        assert!(!is_error);
+        assert_eq!(content, json!({ "child_id": "child-4" }));
+
+        let requests = spawner.requested();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].parent.id, "parent-4");
+        assert_eq!(requests[0].persona_name, "coder");
+        assert_eq!(requests[0].instructions, "review the diff");
+
+        let tool_calls = store.tool_calls("parent-4").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "spawn");
+        assert_eq!(tool_calls[0].result, Some(json!({ "child_id": "child-4" })));
+        assert!(!tool_calls[0].is_error);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_is_advertised_to_roots_but_not_to_children() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-5")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-5", "parent-5"))
+            .await
+            .unwrap();
+
+        let personas = HashMap::from([(
+            "coder".to_string(),
+            persona("mock-model", Permission::ReadWrite),
+        )]);
+        let spawner = Arc::new(FakeSpawner::ok("never-spawned"));
+
+        for (id, role) in [("parent-5", "root"), ("child-5", "child")] {
+            let provider = Arc::new(ScriptedProvider::new(vec![vec![
+                StreamEvent::TextDelta("hi".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ]]));
+            let deps = Arc::new(test_deps_with_spawner(
+                &store,
+                provider.clone(),
+                Arc::new(MockTools::new(default_outcome())),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                personas.clone(),
+                HashMap::new(),
+                spawner.clone(),
+            ));
+            let handle = spawn_loop(id.to_string(), deps);
+            handle.send(LoopEvent::Wake);
+
+            wait_for(&format!("the {role} turn to run"), {
+                let provider = provider.clone();
+                move || {
+                    let provider = provider.clone();
+                    async move { provider.captured_calls().len() == 1 }
+                }
+            })
+            .await;
+
+            let calls = provider.captured_calls();
+            let names: Vec<&str> = calls[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(
+                names.contains(&"spawn"),
+                role == "root",
+                "spawn is advertised to the {role} only: {names:?}"
+            );
+            handle.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_on_a_child_session_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-6")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-6", "parent-6"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-6",
+                Role::User,
+                &Block::Text {
+                    text: "delegate".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The child's model calls spawn anyway; the loop refuses it: child
+        // sessions spawning their own children arrive in a later sprint.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let spawner = Arc::new(FakeSpawner::ok("never-spawned"));
+        let deps = Arc::new(test_deps_with_spawner(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::from([(
+                "mock-model".to_string(),
+                provider.clone() as Arc<dyn Provider>,
+            )]),
+            spawner.clone(),
+        ));
+        let handle = spawn_loop("child-6".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child's turn to wrap up", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-6").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        let messages = store.messages("child-6", false).await.unwrap();
+        assert!(
+            messages.iter().any(|(_, message)| message.role == Role::User
+                && matches!(
+                    &message.block,
+                    Block::ToolResult { id, name, is_error, content } if id == "call-1"
+                        && name == "spawn"
+                        && *is_error
+                        && content == &json!({ "error": "spawn is only available to root sessions" })
+                )),
+            "the child's spawn call records a refusal"
+        );
+        assert!(
+            spawner.requested().is_empty(),
+            "a refused spawn never reaches the spawner"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_reports_the_spawners_error_as_a_tool_result() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-spawn-fail"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let spawner = Arc::new(FakeSpawner::failing("node n1 is not up"));
+        let deps = Arc::new(test_deps_with_spawner(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::from([(
+                "mock-model".to_string(),
+                provider.clone() as Arc<dyn Provider>,
+            )]),
+            spawner,
+        ));
+        let handle = spawn_loop("s-spawn-fail".into(), deps);
 
         handle.send(LoopEvent::Wake);
 
         wait_for("the session to wait for input", || {
             let store = store.clone();
             async move {
-                let stored = store.get_session("s-subagent").await.unwrap().unwrap();
+                let stored = store.get_session("s-spawn-fail").await.unwrap().unwrap();
                 stored.state == SessionState::WaitingForInput
             }
         })
         .await;
 
-        let messages = store.messages("s-subagent", false).await.unwrap();
-        let subagent_blocks: Vec<(&str, &str)> = messages
-            .iter()
-            .filter_map(|(_, message)| match &message.block {
-                Block::Subagent { status, text, .. } => Some((status.as_str(), text.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            subagent_blocks,
-            [
-                ("started", "add a test"),
-                ("message", "made the change"),
-                ("done", "made the change"),
-            ],
-            "the subagent's activity appears in the session transcript"
+        let messages = store.messages("s-spawn-fail", false).await.unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|(_, message)| message.role == Role::User
+                    && matches!(
+                        &message.block,
+                        Block::ToolResult { id, name, is_error, content } if id == "call-1"
+                            && name == "spawn"
+                            && *is_error
+                            && content == &json!({ "error": "node n1 is not up" })
+                    )),
+            "a failed spawn records the spawner's error as the tool result"
         );
-
-        let result = messages
-            .iter()
-            .find(|(_, message)| {
-                matches!(&message.block, Block::ToolResult { name, .. } if name == "spawn_subagent")
-            })
-            .expect("a spawn_subagent result is recorded");
-        assert_eq!(result.1.role, Role::User);
-        let (id, name, is_error, content) = match &result.1.block {
-            Block::ToolResult {
-                id,
-                name,
-                is_error,
-                content,
-            } => (id, name, is_error, content),
-            _ => unreachable!(),
-        };
-        assert_eq!(id.as_str(), "call-1");
-        assert_eq!(name.as_str(), "spawn_subagent");
-        assert!(!is_error);
-        assert_eq!(
-            content["summary"].as_str(),
-            Some("made the change"),
-            "the summary is the subagent's text: {content}"
-        );
-
-        let tool_calls = store.tool_calls("s-subagent").await.unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].call_id, "call-1");
-        assert_eq!(tool_calls[0].name, "spawn_subagent");
-        assert_eq!(
-            tool_calls[0].result,
-            Some(json!({ "summary": "made the change" }))
-        );
-        assert!(!tool_calls[0].is_error);
-
-        // The three calls are: parent, subagent, parent.
-        let calls = provider.captured_calls();
-        assert_eq!(calls.len(), 3);
-        let subagent_call = &calls[1];
-        assert_eq!(subagent_call.model, "mock-model");
-        let tool_names: Vec<&str> = subagent_call
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        for excluded in ["ask", "todowrite", "skill", "spawn_subagent"] {
-            assert!(
-                !tool_names.contains(&excluded),
-                "the subagent sees no {excluded} tool: {tool_names:?}"
-            );
-        }
-        assert!(tool_names.contains(&"shell"));
-        let first = &subagent_call.messages[0];
-        assert_eq!(first.role, Role::User);
-        let first_text = match &first.block {
-            Block::Text { text } => text,
-            _ => unreachable!("the subagent window starts with a text message"),
-        };
-        assert!(first_text.contains("subagent of type coder"));
-        assert!(first_text.contains("add a test"));
-
-        let model_calls = store.model_calls("s-subagent").await.unwrap();
-        assert_eq!(model_calls.len(), 3, "parent, subagent, and parent again");
-        assert_eq!(model_calls[1].model, "mock-model");
-        assert_eq!(model_calls[1].kind, "completion");
 
         handle.stop();
     }
@@ -4582,7 +5002,7 @@ mod tests {
                 StreamEvent::ToolCallDelta {
                     index: 0,
                     id: Some("call-1".into()),
-                    name: Some("spawn_subagent".into()),
+                    name: Some("spawn".into()),
                     args_delta: r#"{"persona":"nope","instructions":"do it"}"#.into(),
                 },
                 StreamEvent::Stop {
@@ -4626,8 +5046,8 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|(_, message)| matches!(&message.block, Block::Subagent { .. })),
-            "no subagent activity is recorded for an unknown persona"
+                .any(|(_, message)| matches!(&message.block, Block::ChildReport { .. })),
+            "no child report is recorded for an unknown persona"
         );
         assert!(
             messages
@@ -4636,7 +5056,7 @@ mod tests {
                     && matches!(
                         &message.block,
                         Block::ToolResult { id, name, is_error, content } if id == "call-1"
-                            && name == "spawn_subagent"
+                            && name == "spawn"
                             && *is_error
                             && content == &json!({ "error": "unknown persona nope" })
                     )),
@@ -4646,11 +5066,83 @@ mod tests {
         let tool_calls = store.tool_calls("s-subagent-miss").await.unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].call_id, "call-1");
-        assert_eq!(tool_calls[0].name, "spawn_subagent");
+        assert_eq!(tool_calls[0].name, "spawn");
         assert!(tool_calls[0].is_error);
         assert_eq!(
             tool_calls[0].result,
             Some(json!({ "error": "unknown persona nope" }))
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn spawn_without_a_configured_provider_reports_an_error_result() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-no-provider"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("ghost-model", Permission::ReadWrite),
+            )]),
+            HashMap::new(),
+        ));
+        let handle = spawn_loop("s-no-provider".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-no-provider").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("s-no-provider", false).await.unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|(_, message)| message.role == Role::User
+                    && matches!(
+                        &message.block,
+                        Block::ToolResult { id, name, is_error, content } if id == "call-1"
+                            && name == "spawn"
+                            && *is_error
+                            && content == &json!({ "error": "no provider for model ghost-model" })
+                    )),
+            "the spawn call for a model without a provider records an error result"
         );
 
         handle.stop();

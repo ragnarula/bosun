@@ -1040,6 +1040,7 @@ async fn start_session(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -1054,6 +1055,7 @@ mod tests {
     use bosun_agent::provider::ProviderError;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
+    use bosun_common::types::SessionInfo;
     use bosun_common::types::UpdateStatus;
     use bosun_test_support::stub_backend;
     use bosun_test_support::wait_for;
@@ -2034,6 +2036,70 @@ mod tests {
         (addr, requests)
     }
 
+    /// A fake OpenAI-compatible provider that serves one scripted completion
+    /// per request, in order. Each script holds the JSON chunk payloads of
+    /// one streaming answer; the closing `[DONE]` marker is appended here.
+    /// Two loops need two providers, because each loop consumes its own
+    /// provider's scripts.
+    async fn scripted_provider(scripts: Arc<Mutex<VecDeque<Vec<Value>>>>) -> SocketAddr {
+        use axum::routing::post;
+
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let scripts = scripts.clone();
+                async move { scripted_completions(scripts).await }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn scripted_completions(
+        scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+    ) -> axum::response::Response {
+        let chunks = scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("no script left for the provider call");
+        let mut frames = chunks
+            .into_iter()
+            .map(|chunk| {
+                Ok::<_, Infallible>(
+                    SseEvent::default()
+                        .json_data(&chunk)
+                        .expect("serializing a json value cannot fail"),
+                )
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(SseEvent::default().data("[DONE]")));
+        Sse::new(futures_util::stream::iter(frames)).into_response()
+    }
+
+    /// One OpenAI text chunk.
+    fn text_chunk(text: &str) -> Value {
+        json!({ "choices": [{ "index": 0, "delta": { "content": text } }] })
+    }
+
+    /// One fragment of the `spawn` tool call's arguments. The first fragment
+    /// of a call carries its id and name, like a real provider stream.
+    fn spawn_call_fragment(with_id_name: bool, args_fragment: &str) -> Value {
+        let mut function = json!({ "arguments": args_fragment });
+        if with_id_name {
+            function["name"] = json!("spawn");
+        }
+        let mut tool_call = json!({ "index": 0, "type": "function", "function": function });
+        if with_id_name {
+            tool_call["id"] = json!("call-1");
+        }
+        json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [tool_call] } }] })
+    }
+
     async fn completions(delay: Duration, requests: Arc<AtomicUsize>) -> axum::response::Response {
         requests.fetch_add(1, Ordering::Relaxed);
         let stream = futures_util::stream::unfold(0u8, move |step| async move {
@@ -2337,6 +2403,298 @@ mod tests {
             let id = id.clone();
             async move {
                 let stored = store.get_session(&id).await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn spawn_creates_a_child_session_that_runs_concurrently_and_reports() {
+        // The root's model answers with a spawn call and then an
+        // acknowledgement; the child's model (a separate persona and provider)
+        // answers with the review text. Two scripted servers keep the two
+        // loops' scripts apart, so the interleaving stays deterministic.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![spawn_call_fragment(
+                    true,
+                    r#"{"persona":"reviewer","instructions":"review the change"}"#,
+                )],
+                vec![text_chunk("acknowledged")],
+            ])));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
+            vec![vec![text_chunk("the change looks good")]],
+        )));
+        let root_addr = scripted_provider(root_scripts).await;
+        let child_addr = scripted_provider(child_scripts).await;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let node_timeout = Duration::from_secs(4);
+        let nodes = Arc::new(NodeRegistry::new(node_timeout));
+        let commands = Arc::new(CommandQueue::new(node_timeout));
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let providers = HashMap::from([
+            (
+                "main-model".to_string(),
+                openai_provider_with_model(root_addr, "main-model"),
+            ),
+            (
+                "reviewer-model".to_string(),
+                openai_provider_with_model(child_addr, "reviewer-model"),
+            ),
+        ]);
+        let personas = HashMap::from([
+            (
+                "coder".to_string(),
+                PersonaConfig {
+                    model: "main-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Makes changes".into(),
+                    system_prompt: None,
+                },
+            ),
+            (
+                "reviewer".to_string(),
+                PersonaConfig {
+                    model: "reviewer-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Reviews changes".into(),
+                    system_prompt: None,
+                },
+            ),
+        ]);
+        let loops = Arc::new(AgentRegistry::new(
+            None,
+            providers.clone(),
+            personas.clone(),
+            HashMap::new(),
+        ));
+        let state = Arc::new(AppState {
+            registry: nodes.clone(),
+            commands: commands.clone(),
+            tunnels: tunnels.clone(),
+            store: store.clone(),
+            loops,
+            providers,
+            personas,
+            default_persona: Some("coder".into()),
+            skills_dir: None,
+        });
+        state.loops.attach_child_spawner(nodes, commands, tunnels);
+
+        // A node that answers `Dev` commands like a real node: it starts an
+        // executor on the requested dir and reports the session. The commands
+        // it received are captured, so the test can see the child's executor
+        // was requested on the parent's working copy.
+        let seen: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let seen_for_node = seen.clone();
+        let addr_for_node = addr;
+        tokio::spawn(async move {
+            let mut result: Option<CommandResult> = None;
+            loop {
+                let poll = json!({
+                    "node_name": "n1",
+                    "status": "up",
+                    "version": bosun_common::version::VERSION,
+                    "result": result,
+                });
+                let response: Value = match client
+                    .post(format!("http://{addr_for_node}/poll"))
+                    .json(&poll)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.json().await.unwrap(),
+                    Err(_) => break,
+                };
+                let Some(command) = response["command"].clone().as_object().cloned() else {
+                    result = None;
+                    continue;
+                };
+                let command: NodeCommand = serde_json::from_value(Value::Object(command)).unwrap();
+                seen_for_node.lock().unwrap().push(command.clone());
+                match command {
+                    NodeCommand::Dev {
+                        ref dir,
+                        ref session_id,
+                        ..
+                    } => {
+                        let id = command.id();
+                        result = Some(CommandResult::Session {
+                            id,
+                            session: SessionInfo {
+                                id: session_id.clone(),
+                                repo_url: None,
+                                git_ref: None,
+                                dir: Some(dir.clone()),
+                                status: "running".into(),
+                            },
+                        });
+                    }
+                    NodeCommand::Stop { .. } => {
+                        result = Some(CommandResult::Stop { id: command.id() });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Register the node before the root session exists: the spawn tool
+        // call refuses a node that is not up.
+        let state_for_ready = state.clone();
+        wait_for("the fake node to register", move || {
+            let state = state_for_ready.clone();
+            async move { state.registry.node("n1", SystemTime::now()).is_some() }
+        })
+        .await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/work/repo",
+                "persona": "coder",
+                "prompt": "review the change for me"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let root: Value = response.json().await.unwrap();
+        let root_id = root["id"].as_str().unwrap().to_string();
+
+        // The root's first turn calls spawn; the tool result carries the
+        // child's id, and the root's turn continues to its own second answer.
+        wait_for("the spawn tool result with the child id to land", || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move {
+                let messages = store.messages(&root_id, false).await.unwrap();
+                messages.iter().any(|(_, message)| {
+                    matches!(&message.block, Block::ToolResult { name, content, .. } if name == "spawn" && content.get("child_id").is_some())
+                })
+            }
+        })
+        .await;
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        let child_id = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ToolResult { name, content, .. } if name == "spawn" => {
+                    content["child_id"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .expect("the spawn result names the child");
+
+        // The child is a full session on the parent's node and working copy,
+        // under its own persona, and its executor was requested through a Dev
+        // command for its own session id.
+        wait_for("the child to run its assignment and stop", || {
+            let store = store.clone();
+            let child_id = child_id.clone();
+            async move {
+                let stored = store.get_session(&child_id).await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+        let child = store
+            .get_session(&child_id)
+            .await
+            .unwrap()
+            .expect("the child session row exists");
+        assert_eq!(child.parent_id.as_deref(), Some(root_id.as_str()));
+        assert_eq!(child.owner_id, root_id);
+        assert_eq!(child.node, "n1");
+        assert_eq!(
+            child.dir, "/work/repo",
+            "the child runs on the parent's working copy"
+        );
+        assert_eq!(child.persona.as_deref(), Some("reviewer"));
+        assert_eq!(child.model, "reviewer-model");
+        assert_eq!(child.permission, Permission::ReadWrite);
+        assert_eq!(
+            child.prompt.as_deref(),
+            Some("review the change"),
+            "the assignment is stored as the child's prompt"
+        );
+
+        let dev = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|command| match command {
+                NodeCommand::Dev {
+                    session_id,
+                    dir,
+                    permission,
+                    ..
+                } if session_id == &child_id => Some((dir.clone(), *permission)),
+                _ => None,
+            });
+        let (dev_dir, dev_permission) =
+            dev.expect("a Dev command for the child's executor was queued");
+        assert_eq!(dev_dir, std::path::PathBuf::from("/work/repo"));
+        assert_eq!(dev_permission, Permission::ReadWrite);
+
+        // The child stored its own transcript and model call; the parent's
+        // thread shows exactly one authored report, not the child's raw work.
+        let child_messages = store.messages(&child_id, false).await.unwrap();
+        let texts: Vec<&str> = child_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["review the change", "the change looks good"],
+            "the child's thread is its assignment followed by its own answer"
+        );
+        assert_eq!(store.model_calls(&child_id).await.unwrap().len(), 1);
+
+        wait_for("the child report to reach the parent's thread", || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            let child_id = child_id.clone();
+            async move {
+                let messages = store.messages(&root_id, false).await.unwrap();
+                messages.iter().any(|(_, message)| matches!(
+                    &message.block,
+                    Block::ChildReport { child_id: id, text } if id == &child_id && text == "the change looks good"
+                ))
+            }
+        })
+        .await;
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        let reports: Vec<&str> = root_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildReport { child_id: id, .. } if id == &child_id => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            [child_id.as_str()],
+            "one authored report per completion"
+        );
+
+        // The root's own turn finished and the session waits for the user.
+        wait_for("the root to wait for input", || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move {
+                let stored = store.get_session(&root_id).await.unwrap().unwrap();
                 stored.state == SessionState::WaitingForInput
             }
         })
