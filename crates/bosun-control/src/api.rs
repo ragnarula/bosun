@@ -26,7 +26,7 @@ use axum::response::sse::Sse;
 use axum::routing::get;
 use axum::routing::post;
 use bosun_agent::provider::Provider;
-use bosun_common::config::SubagentConfig;
+use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
@@ -99,11 +99,14 @@ pub enum ApiError {
     #[error("artifact for target {target} was not found")]
     ArtifactNotFound { target: String },
 
-    #[error("no model configured")]
-    NoModel,
+    #[error("no persona configured")]
+    NoPersona,
 
-    #[error("model {model} is not configured")]
-    ModelNotFound { model: String },
+    #[error("persona {persona} is not configured")]
+    PersonaNotFound { persona: String },
+
+    #[error("persona {persona} references model {model} which is not configured")]
+    PersonaModelNotFound { persona: String, model: String },
 
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
@@ -131,8 +134,11 @@ impl IntoResponse for ApiError {
         let (status, text) = match &self {
             ApiError::NodeNotUp { .. }
             | ApiError::NodePredatesAutoUpdate { .. }
-            | ApiError::NoModel
-            | ApiError::ModelNotFound { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
+            | ApiError::NoPersona
+            | ApiError::PersonaNotFound { .. }
+            | ApiError::PersonaModelNotFound { .. } => {
+                (StatusCode::BAD_REQUEST, Some(self.to_string()))
+            }
             ApiError::NodeRejected { .. } | ApiError::NodeUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
@@ -158,9 +164,10 @@ pub struct AppState {
     pub store: Store,
     pub loops: Arc<AgentRegistry>,
     pub providers: HashMap<String, Arc<dyn Provider>>,
-    /// Configured subagent types, keyed by type name.
-    pub subagents: HashMap<String, SubagentConfig>,
-    pub default_model: Option<String>,
+    /// Configured personas, keyed by persona name.
+    pub personas: HashMap<String, PersonaConfig>,
+    /// The persona sessions use when a request names none.
+    pub default_persona: Option<String>,
     /// Skills injected into every session from the control plane's data dir.
     pub skills_dir: Option<PathBuf>,
     /// Per-platform update binaries served from the artifacts directory.
@@ -168,25 +175,31 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The model name to use when a request names none: the configured
-    /// default when it is a configured provider, else the `default` entry,
-    /// else the first configured provider in sorted order.
-    fn default_model(&self) -> Result<String, ApiError> {
-        if let Some(model) = &self.default_model
-            && self.providers.contains_key(model)
-        {
-            return Ok(model.clone());
-        }
-        let mut names: Vec<&String> = self.providers.keys().collect();
-        names.sort();
-        if let Some(name) = names.iter().find(|name| name.as_str() == "default") {
-            return Ok((*name).clone());
-        }
-        names
-            .into_iter()
-            .next()
-            .map(ToString::to_string)
-            .ok_or(ApiError::NoModel)
+    /// Resolves the persona a session request names, falling back to the
+    /// configured default, and the provider of its model. Resolution is live
+    /// by name, so an unknown persona is a clear error at session start.
+    /// Returns the persona's name, its config, and the model's provider.
+    fn resolve_persona(
+        &self,
+        requested: &Option<String>,
+    ) -> Result<(String, &PersonaConfig, Arc<dyn Provider>), ApiError> {
+        let name = match requested {
+            Some(name) => name.clone(),
+            None => self.default_persona.clone().ok_or(ApiError::NoPersona)?,
+        };
+        let persona = self
+            .personas
+            .get(&name)
+            .ok_or_else(|| ApiError::PersonaNotFound {
+                persona: name.clone(),
+            })?;
+        let provider = self.providers.get(&persona.model).cloned().ok_or_else(|| {
+            ApiError::PersonaModelNotFound {
+                persona: name.clone(),
+                model: persona.model.clone(),
+            }
+        })?;
+        Ok((name, persona, provider))
     }
 }
 
@@ -256,6 +269,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/messages", post(add_message))
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/permission", post(set_permission))
+        .route("/sessions/{id}/persona", post(switch_persona))
         .route("/sessions/{id}/model-calls", get(session_model_calls))
         .route("/sessions/{id}/events", get(events))
         .route("/clone", post(clone))
@@ -435,8 +449,7 @@ struct CreateSessionRequest {
     dir: String,
     repo_url: Option<String>,
     git_ref: Option<String>,
-    model: Option<String>,
-    permission: Option<Permission>,
+    persona: Option<String>,
     prompt: Option<String>,
 }
 
@@ -445,15 +458,17 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<Session>, ApiError> {
-    let (model, provider) = resolve_provider(&state, &req.model)?;
+    let (persona, config, provider) = state.resolve_persona(&req.persona)?;
     let session = Session {
         id: uuid::Uuid::new_v4().to_string(),
         node: req.node,
         repo_url: req.repo_url,
         git_ref: req.git_ref,
         dir: req.dir,
-        model,
-        permission: req.permission.unwrap_or(Permission::ReadWrite),
+        model: config.model.clone(),
+        persona: Some(persona),
+        permission: config.permission,
+        allowed_tools: config.allowed_tools.clone(),
         state: SessionState::Creating,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
@@ -478,10 +493,10 @@ async fn clone(
             node: req.node.clone(),
         });
     }
-    // Resolve the model before the node does any work, so an unconfigured
-    // model rejects without leaving a cloned dir, executor, or tunnel behind.
-    let permission = req.permission.unwrap_or(Permission::ReadWrite);
-    let (model, provider) = resolve_provider(&state, &req.model)?;
+    // Resolve the persona before the node does any work, so an unconfigured
+    // persona rejects without leaving a cloned dir, executor, or tunnel
+    // behind.
+    let (persona, config, provider) = state.resolve_persona(&req.persona)?;
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let command = NodeCommand::Clone {
@@ -489,7 +504,7 @@ async fn clone(
         session_id: session_id.clone(),
         repo_url: req.repo_url.clone(),
         git_ref: req.git_ref.clone(),
-        permission,
+        permission: config.permission,
     };
     let node_session = enqueue_and_await(&state, &req.node, command)
         .await
@@ -518,8 +533,10 @@ async fn clone(
         repo_url: node_session.repo_url.clone(),
         git_ref: node_session.git_ref.clone(),
         dir,
-        model,
-        permission,
+        model: config.model.clone(),
+        persona: Some(persona),
+        permission: config.permission,
+        allowed_tools: config.allowed_tools.clone(),
         state: SessionState::Creating,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
@@ -545,17 +562,16 @@ async fn dev(
             node: req.node.clone(),
         });
     }
-    // Resolve the model before the node does any work, so an unconfigured
-    // model rejects without leaving an executor or tunnel behind.
-    let permission = req.permission.unwrap_or(Permission::ReadWrite);
-    let (model, provider) = resolve_provider(&state, &req.model)?;
+    // Resolve the persona before the node does any work, so an unconfigured
+    // persona rejects without leaving an executor or tunnel behind.
+    let (persona, config, provider) = state.resolve_persona(&req.persona)?;
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let command = NodeCommand::Dev {
         id: state.commands.next_id(),
         session_id: session_id.clone(),
         dir: req.dir.clone(),
-        permission,
+        permission: config.permission,
     };
     let node_session = enqueue_and_await(&state, &req.node, command)
         .await
@@ -584,8 +600,10 @@ async fn dev(
         repo_url: node_session.repo_url.clone(),
         git_ref: node_session.git_ref.clone(),
         dir,
-        model,
-        permission,
+        model: config.model.clone(),
+        persona: Some(persona),
+        permission: config.permission,
+        allowed_tools: config.allowed_tools.clone(),
         state: SessionState::Creating,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
@@ -793,6 +811,53 @@ async fn set_permission(
 }
 
 #[derive(Debug, Deserialize)]
+struct SwitchPersonaRequest {
+    persona: String,
+}
+
+/// Switches a session to another persona: the stored session's persona,
+/// model, permission and allowed-tool spec are replaced in one store
+/// transaction and the switch is recorded on the event stream. The loop
+/// re-resolves the session's model at every turn, so the switch applies to
+/// the next model call; a turn in flight is not aborted. When the persona's
+/// permission differs from the stored one, the executor's permission is
+/// toggled best-effort through `/permission` exactly like `set_permission`.
+#[instrument(skip(state))]
+async fn switch_persona(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<SwitchPersonaRequest>,
+) -> Result<StatusCode, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id: id.clone() });
+    };
+    let (name, config, _provider) = state.resolve_persona(&Some(req.persona))?;
+    let permission_changed = session.permission != config.permission;
+    state
+        .store
+        .switch_persona(
+            &id,
+            &name,
+            &config.model,
+            config.permission,
+            &config.allowed_tools,
+        )
+        .await?;
+    // The toggle is best-effort like `set_permission`: the store is
+    // authoritative and the loop gates the tool schema per turn.
+    if permission_changed
+        && let Err(error) = set_executor_permission(&state.tunnels, &id, config.permission).await
+    {
+        warn!(
+            msg = "failed to forward the permission change to the executor",
+            session_id = %id,
+            error = %error.display_chain()
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
 struct EventsQuery {
     after: Option<i64>,
 }
@@ -971,24 +1036,6 @@ fn now_secs() -> i64 {
     bosun_common::time::unix_secs(SystemTime::now())
 }
 
-fn resolve_provider(
-    state: &AppState,
-    requested: &Option<String>,
-) -> Result<(String, Arc<dyn Provider>), ApiError> {
-    let model = match requested {
-        Some(model) => model.clone(),
-        None => state.default_model()?,
-    };
-    let provider = state
-        .providers
-        .get(&model)
-        .cloned()
-        .ok_or_else(|| ApiError::ModelNotFound {
-            model: model.clone(),
-        })?;
-    Ok((model, provider))
-}
-
 /// Creates the session in the store, starts its loop, and kicks off the first
 /// turn when a prompt is present.
 async fn start_session(
@@ -1031,25 +1078,75 @@ async fn start_session(
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use bosun_agent::adapters::provider_for;
     use bosun_agent::config::ResolvedModel;
+    use bosun_agent::provider::ProviderCall;
+    use bosun_agent::provider::ProviderError;
+    use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
     use bosun_common::types::UpdateStatus;
     use bosun_test_support::stub_backend;
     use bosun_test_support::wait_for;
+    use futures_util::stream::BoxStream;
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
     use serde_json::Value;
+    use std::sync::Mutex;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
 
     use super::*;
     use crate::tunnel::TunnelError;
+
+    /// A provider that answers every turn with one text delta and a stop and
+    /// records each request's system prompt, so a test can see what the loop
+    /// sent under a session's persona. `model` is the name the loop records
+    /// on the session's model calls.
+    struct RecordingProvider {
+        systems: Arc<Mutex<Vec<String>>>,
+        model: String,
+    }
+
+    impl RecordingProvider {
+        fn new(systems: Arc<Mutex<Vec<String>>>, model: &str) -> Self {
+            Self {
+                systems,
+                model: model.to_string(),
+            }
+        }
+    }
+
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn model(&self) -> &str {
+            &self.model
+        }
+
+        fn chat_stream<'a>(
+            &'a self,
+            call: ProviderCall<'a>,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+            self.systems.lock().unwrap().push(call.system.to_string());
+            let items: Vec<Result<StreamEvent, ProviderError>> = vec![
+                Ok(StreamEvent::TextDelta("hi".into())),
+                Ok(StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            ];
+            Ok(stream::iter(items).boxed())
+        }
+    }
 
     /// A control-plane state backed by a fresh store in `dir`, with no models
     /// configured.
@@ -1066,8 +1163,8 @@ mod tests {
                 HashMap::new(),
             )),
             providers: HashMap::new(),
-            subagents: HashMap::new(),
-            default_model: None,
+            personas: HashMap::new(),
+            default_persona: None,
             skills_dir: None,
             artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
@@ -1159,7 +1256,9 @@ mod tests {
             git_ref: None,
             dir: "/tmp/x".into(),
             model: "test".into(),
+            persona: Some("coder".into()),
             permission: Permission::ReadWrite,
+            allowed_tools: "*".into(),
             state: SessionState::Creating,
             created_at_secs: 1_700_000_000,
             prompt: None,
@@ -1193,11 +1292,14 @@ mod tests {
         }
     }
 
-    /// A state whose providers map holds one dummy provider per name.
-    fn state_with_models(
+    /// A state whose providers map holds one dummy provider per model and
+    /// whose persona catalog holds one persona per `(name, model)` pair, all
+    /// read-write with every tool allowed.
+    fn state_with_personas(
         dir: &tempfile::TempDir,
-        model_names: &[&str],
-        default_model: Option<&str>,
+        providers: &[&str],
+        personas: &[(&str, &str)],
+        default_persona: Option<&str>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
@@ -1210,7 +1312,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
             )),
-            providers: model_names
+            providers: providers
                 .iter()
                 .map(|name| {
                     (
@@ -1219,46 +1321,144 @@ mod tests {
                     )
                 })
                 .collect(),
-            subagents: HashMap::new(),
-            default_model: default_model.map(ToString::to_string),
+            personas: personas
+                .iter()
+                .map(|(name, model)| {
+                    (
+                        name.to_string(),
+                        PersonaConfig {
+                            model: model.to_string(),
+                            permission: Permission::ReadWrite,
+                            allowed_tools: "*".into(),
+                            description: String::new(),
+                            system_prompt: None,
+                        },
+                    )
+                })
+                .collect(),
+            default_persona: default_persona.map(ToString::to_string),
+            skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
+        })
+    }
+
+    fn persona_for<'a>(state: &'a AppState, name: &str) -> (&'a PersonaConfig, String) {
+        let requested = Some(name.to_string());
+        let (_name, persona, _provider) = state.resolve_persona(&requested).unwrap();
+        (persona, persona.model.clone())
+    }
+
+    /// A persona config with the given surface, used by the switch tests.
+    fn persona_config(
+        model: &str,
+        permission: Permission,
+        allowed_tools: &str,
+        system_prompt: Option<&str>,
+    ) -> PersonaConfig {
+        PersonaConfig {
+            model: model.to_string(),
+            permission,
+            allowed_tools: allowed_tools.to_string(),
+            description: String::new(),
+            system_prompt: system_prompt.map(ToString::to_string),
+        }
+    }
+
+    /// A state built the way main() builds one: the loop registry and the
+    /// request path share the same provider and persona maps, so a persona
+    /// switch re-resolves the loop's provider from the session's new model.
+    fn state_with_catalog(
+        dir: &tempfile::TempDir,
+        providers: HashMap<String, Arc<dyn Provider>>,
+        personas: HashMap<String, PersonaConfig>,
+        default_persona: Option<&str>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(TunnelRegistry::new()),
+            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            loops: Arc::new(AgentRegistry::new(
+                None,
+                providers.clone(),
+                personas.clone(),
+                HashMap::new(),
+            )),
+            providers,
+            personas,
+            default_persona: default_persona.map(ToString::to_string),
             skills_dir: None,
             artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
     }
 
     #[test]
-    fn default_model_prefers_the_configured_default() {
+    fn resolve_persona_prefers_the_requested_name() {
         let dir = tempdir().unwrap();
-        let state = state_with_models(&dir, &["alpha", "beta"], Some("beta"));
-        assert_eq!(state.default_model().unwrap(), "beta");
+        let state = state_with_personas(
+            &dir,
+            &["alpha", "beta"],
+            &[("coder", "beta"), ("reviewer", "alpha")],
+            Some("reviewer"),
+        );
+        let (persona, model) = persona_for(&state, "coder");
+        assert_eq!(persona.model, "beta");
+        assert_eq!(model, "beta");
     }
 
     #[test]
-    fn default_model_ignores_a_configured_default_that_is_not_a_provider() {
+    fn resolve_persona_uses_the_default_when_none_is_requested() {
         let dir = tempdir().unwrap();
-        let state = state_with_models(&dir, &["alpha"], Some("ghost"));
-        assert_eq!(state.default_model().unwrap(), "alpha");
+        let state = state_with_personas(
+            &dir,
+            &["alpha", "beta"],
+            &[("coder", "beta"), ("reviewer", "alpha")],
+            Some("reviewer"),
+        );
+        let (_name, persona, _provider) = state.resolve_persona(&None).unwrap();
+        assert_eq!(persona.model, "alpha", "the default persona wins");
     }
 
     #[test]
-    fn default_model_falls_back_to_the_default_key() {
+    fn resolve_persona_without_a_default_is_no_persona() {
         let dir = tempdir().unwrap();
-        let state = state_with_models(&dir, &["alpha", "default"], None);
-        assert_eq!(state.default_model().unwrap(), "default");
+        let state = state_with_personas(&dir, &["alpha"], &[("coder", "alpha")], None);
+        assert!(matches!(
+            state.resolve_persona(&None),
+            Err(ApiError::NoPersona)
+        ));
     }
 
     #[test]
-    fn default_model_falls_back_to_the_first_sorted_provider() {
+    fn resolve_persona_rejects_an_unknown_requested_name() {
         let dir = tempdir().unwrap();
-        let state = state_with_models(&dir, &["zebra", "alpha"], None);
-        assert_eq!(state.default_model().unwrap(), "alpha");
+        let state = state_with_personas(&dir, &["alpha"], &[("coder", "alpha")], Some("coder"));
+        let requested = Some("ghost".to_string());
+        assert!(matches!(
+            state.resolve_persona(&requested),
+            Err(ApiError::PersonaNotFound { persona }) if persona == "ghost"
+        ));
     }
 
     #[test]
-    fn default_model_without_providers_is_no_model() {
+    fn resolve_persona_rejects_an_unknown_default() {
         let dir = tempdir().unwrap();
-        let state = state_with_models(&dir, &[], None);
-        assert!(matches!(state.default_model(), Err(ApiError::NoModel)));
+        let state = state_with_personas(&dir, &["alpha"], &[("coder", "alpha")], Some("ghost"));
+        assert!(matches!(
+            state.resolve_persona(&None),
+            Err(ApiError::PersonaNotFound { persona }) if persona == "ghost"
+        ));
+    }
+
+    #[test]
+    fn resolve_persona_rejects_a_persona_whose_model_has_no_provider() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &[], &[("coder", "ghost")], Some("coder"));
+        assert!(matches!(
+            state.resolve_persona(&None),
+            Err(ApiError::PersonaModelNotFound { persona, model })
+                if persona == "coder" && model == "ghost"
+        ));
     }
 
     #[tokio::test]
@@ -1312,7 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn recover_starts_loops_for_sessions_with_a_configured_model() {
         let dir = tempdir().unwrap();
-        let state = state_with_models(&dir, &["test"], None);
+        let state = state_with_personas(&dir, &["test"], &[("coder", "test")], None);
         let mut ghost = session("ghost");
         ghost.model = "ghost".into();
         state.store.create_session(&session("s1")).await.unwrap();
@@ -1368,7 +1568,9 @@ mod tests {
                 git_ref: None,
                 dir: "/tmp/x".into(),
                 model: "test".into(),
+                persona: Some("coder".into()),
                 permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
                 state: SessionState::WaitingForInput,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
@@ -1785,19 +1987,37 @@ mod tests {
     /// A fake provider that holds the first delta back for `delay`, so a test
     /// can connect to the events stream while a turn is still in flight.
     async fn fake_provider_with_delay(delay: Duration) -> SocketAddr {
+        fake_provider_with_delay_and_requests(delay, Arc::new(AtomicUsize::new(0)))
+            .await
+            .0
+    }
+
+    /// The fake provider's address plus a counter of chat requests it has
+    /// started, so a test can switch a persona while a turn is in flight.
+    async fn fake_provider_with_delay_and_requests(
+        delay: Duration,
+        requests: Arc<AtomicUsize>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
         use axum::routing::post;
 
-        let app =
-            axum::Router::new().route("/v1/chat/completions", post(move || completions(delay)));
+        let requests_for_server = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let requests = requests_for_server.clone();
+                async move { completions(delay, requests).await }
+            }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        addr
+        (addr, requests)
     }
 
-    async fn completions(delay: Duration) -> axum::response::Response {
+    async fn completions(delay: Duration, requests: Arc<AtomicUsize>) -> axum::response::Response {
+        requests.fetch_add(1, Ordering::Relaxed);
         let stream = futures_util::stream::unfold(0u8, move |step| async move {
             match step {
                 0 => {
@@ -1821,10 +2041,14 @@ mod tests {
     }
 
     fn openai_provider(addr: SocketAddr) -> Arc<dyn Provider> {
+        openai_provider_with_model(addr, "test")
+    }
+
+    fn openai_provider_with_model(addr: SocketAddr, model: &str) -> Arc<dyn Provider> {
         let resolved = ResolvedModel {
             config: ModelConfig {
                 provider: "openai".into(),
-                name: "test".into(),
+                name: model.into(),
                 base_url: Some(format!("http://{addr}")),
                 api_key: "x".into(),
                 price_input_per_mtok: 0.0,
@@ -1852,8 +2076,17 @@ mod tests {
                 HashMap::new(),
             )),
             providers: HashMap::from([("test".to_string(), openai_provider(provider_addr))]),
-            subagents: HashMap::new(),
-            default_model: None,
+            personas: HashMap::from([(
+                "test".to_string(),
+                PersonaConfig {
+                    model: "test".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: String::new(),
+                    system_prompt: None,
+                },
+            )]),
+            default_persona: Some("test".into()),
             skills_dir: None,
             artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
@@ -1865,7 +2098,7 @@ mod tests {
             .json(&json!({
                 "node": "n1",
                 "dir": "/tmp/x",
-                "model": "test",
+                "persona": "test",
                 "prompt": "hello"
             }))
             .send()
@@ -2012,6 +2245,665 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_derives_model_permission_and_allowed_tools_from_its_persona() {
+        let provider_addr = fake_provider().await;
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(TunnelRegistry::new()),
+            store: store.clone(),
+            loops: Arc::new(AgentRegistry::new(
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )),
+            providers: HashMap::from([("test".to_string(), openai_provider(provider_addr))]),
+            personas: HashMap::from([(
+                "reviewer".to_string(),
+                PersonaConfig {
+                    model: "test".into(),
+                    permission: Permission::ReadOnly,
+                    allowed_tools: "file/read, grep".into(),
+                    description: "Reviews without touching".into(),
+                    system_prompt: None,
+                },
+            )]),
+            default_persona: Some("reviewer".into()),
+            skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
+        });
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        // No persona named: the default persona resolves, and the request's
+        // permission field no longer exists on the wire.
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/tmp/x",
+                "prompt": "hello"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session: Value = response.json().await.unwrap();
+        assert_eq!(session["model"], "test");
+        assert_eq!(session["permission"], "read_only");
+        assert_eq!(session["allowed_tools"], "file/read, grep");
+        assert_eq!(
+            session["persona"], "reviewer",
+            "the default persona is stored on the session"
+        );
+
+        // The loop starts and idles once the turn completes.
+        let id = session["id"].as_str().unwrap().to_string();
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let stored = store.get_session(&id).await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_persona_prompt_reaches_the_loop_as_the_system_prompt() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let systems = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider::new(systems.clone(), "test"));
+        let personas = HashMap::from([(
+            "coder".to_string(),
+            PersonaConfig {
+                model: "test".into(),
+                permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
+                description: "Makes changes".into(),
+                system_prompt: Some("You are the coder persona.".into()),
+            },
+        )]);
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(TunnelRegistry::new()),
+            store: store.clone(),
+            loops: Arc::new(AgentRegistry::new(
+                None,
+                HashMap::new(),
+                personas.clone(),
+                HashMap::new(),
+            )),
+            providers: HashMap::from([("test".to_string(), provider)]),
+            personas,
+            default_persona: Some("coder".into()),
+            skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
+        });
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/tmp/x",
+                "prompt": "hello"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session: Value = response.json().await.unwrap();
+        assert_eq!(session["persona"], "coder");
+
+        wait_for(
+            "the persona prompt to reach the provider's system prompt",
+            {
+                let systems = systems.clone();
+                move || {
+                    let systems = systems.clone();
+                    async move {
+                        let recorded = systems.lock().unwrap();
+                        recorded
+                            .iter()
+                            .any(|system| system.contains("You are the coder persona."))
+                    }
+                }
+            },
+        )
+        .await;
+
+        let recorded = systems.lock().unwrap();
+        let system = recorded.first().expect("a system prompt was recorded");
+        assert!(system.contains("You are the coder persona."), "{system}");
+        assert!(!system.contains("You are Bosun"), "{system}");
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_replaces_the_stored_session_fields_and_records_the_event() {
+        let dir = tempdir().unwrap();
+        let state = state_with_catalog(
+            &dir,
+            HashMap::from([
+                (
+                    "test".to_string(),
+                    Arc::new(DummyProvider) as Arc<dyn Provider>,
+                ),
+                (
+                    "cheap".to_string(),
+                    Arc::new(DummyProvider) as Arc<dyn Provider>,
+                ),
+            ]),
+            HashMap::from([
+                (
+                    "coder".to_string(),
+                    persona_config("test", Permission::ReadWrite, "*", None),
+                ),
+                (
+                    "reviewer".to_string(),
+                    persona_config("cheap", Permission::ReadOnly, "file/read, grep", None),
+                ),
+            ]),
+            Some("coder"),
+        );
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("s1")).await.unwrap();
+
+        let response = client
+            .post(format!("http://{addr}/sessions/s1/persona"))
+            .json(&json!({ "persona": "reviewer" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let stored = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(stored.persona.as_deref(), Some("reviewer"));
+        assert_eq!(stored.model, "cheap");
+        assert_eq!(stored.permission, Permission::ReadOnly);
+        assert_eq!(stored.allowed_tools, "file/read, grep");
+
+        let session: Value = client
+            .get(format!("http://{addr}/sessions/s1"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["persona"], "reviewer");
+        assert_eq!(session["model"], "cheap");
+
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/s1/events?after=0"))
+                .send()
+                .await
+                .unwrap(),
+            |frames| {
+                let has_persona = frames.iter().any(|frame| {
+                    frame.data["event"]["kind"] == "persona"
+                        && frame.data["event"]["persona"] == "reviewer"
+                });
+                let has_permission = frames.iter().any(|frame| {
+                    frame.data["event"]["kind"] == "permission"
+                        && frame.data["event"]["permission"] == "read_only"
+                });
+                has_persona && has_permission
+            },
+        )
+        .await;
+        let kinds: Vec<&str> = frames
+            .iter()
+            .filter_map(|frame| frame.data["event"]["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["persona", "permission"]);
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_to_an_unknown_persona_is_refused_and_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let state = state_with_catalog(
+            &dir,
+            HashMap::from([(
+                "test".to_string(),
+                Arc::new(DummyProvider) as Arc<dyn Provider>,
+            )]),
+            HashMap::from([(
+                "coder".to_string(),
+                persona_config("test", Permission::ReadWrite, "*", None),
+            )]),
+            Some("coder"),
+        );
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("s1")).await.unwrap();
+
+        let response = client
+            .post(format!("http://{addr}/sessions/s1/persona"))
+            .json(&json!({ "persona": "ghost" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("persona ghost is not configured"), "{text}");
+
+        let stored = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(stored.persona.as_deref(), Some("coder"));
+        assert_eq!(stored.model, "test");
+        assert_eq!(stored.permission, Permission::ReadWrite);
+        assert!(
+            store.events_after("s1", 0).await.unwrap().is_empty(),
+            "a refused switch records nothing"
+        );
+
+        // A missing session 404s even when the persona exists.
+        let response = client
+            .post(format!("http://{addr}/sessions/ghost/persona"))
+            .json(&json!({ "persona": "coder" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_next_model_call_after_a_persona_switch_uses_the_new_persona() {
+        let dir = tempdir().unwrap();
+        let coder_systems = Arc::new(Mutex::new(Vec::new()));
+        let reviewer_systems = Arc::new(Mutex::new(Vec::new()));
+        let providers: HashMap<String, Arc<dyn Provider>> = HashMap::from([
+            (
+                "test".to_string(),
+                Arc::new(RecordingProvider::new(coder_systems.clone(), "test"))
+                    as Arc<dyn Provider>,
+            ),
+            (
+                "beta".to_string(),
+                Arc::new(RecordingProvider::new(reviewer_systems.clone(), "beta"))
+                    as Arc<dyn Provider>,
+            ),
+        ]);
+        let personas = HashMap::from([
+            (
+                "coder".to_string(),
+                persona_config(
+                    "test",
+                    Permission::ReadWrite,
+                    "*",
+                    Some("You are the coder persona."),
+                ),
+            ),
+            (
+                "reviewer".to_string(),
+                persona_config(
+                    "beta",
+                    Permission::ReadOnly,
+                    "file/read, grep",
+                    Some("You are the reviewer persona."),
+                ),
+            ),
+        ]);
+        let state = state_with_catalog(&dir, providers, personas, Some("coder"));
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/tmp/x",
+                "prompt": "hello"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session: Value = response.json().await.unwrap();
+        let id = session["id"].as_str().unwrap().to_string();
+
+        wait_for("the first model call to run under the coder persona", {
+            let store = store.clone();
+            let id = id.clone();
+            move || {
+                let store = store.clone();
+                let id = id.clone();
+                async move {
+                    let calls = store.model_calls(&id).await.unwrap();
+                    calls.len() == 1 && calls[0].model == "test"
+                }
+            }
+        })
+        .await;
+        {
+            let recorded = coder_systems.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|system| system.contains("You are the coder persona.")),
+                "the coder provider saw its own system prompt"
+            );
+        }
+
+        let response = client
+            .post(format!("http://{addr}/sessions/{id}/persona"))
+            .json(&json!({ "persona": "reviewer" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let stored = store.get_session(&id).await.unwrap().unwrap();
+        assert_eq!(stored.model, "beta");
+        assert_eq!(stored.permission, Permission::ReadOnly);
+
+        let response = client
+            .post(format!("http://{addr}/sessions/{id}/messages"))
+            .json(&json!({ "content": "continue" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the second model call to run under the reviewer persona", {
+            let store = store.clone();
+            let id = id.clone();
+            move || {
+                let store = store.clone();
+                let id = id.clone();
+                async move {
+                    let calls = store.model_calls(&id).await.unwrap();
+                    calls.len() == 2 && calls[1].model == "beta"
+                }
+            }
+        })
+        .await;
+        let recorded = reviewer_systems.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|system| system.contains("You are the reviewer persona.")),
+            "the reviewer provider saw its own system prompt"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|system| system.contains("You are the coder persona.")),
+            "the switch replaced the old persona's system prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_mid_turn_does_not_abort_the_running_turn() {
+        let dir = tempdir().unwrap();
+        let slow_requests = Arc::new(AtomicUsize::new(0));
+        let (slow_addr, slow_requests_observed) =
+            fake_provider_with_delay_and_requests(Duration::from_millis(500), slow_requests).await;
+        let fast_addr = fake_provider().await;
+        let providers: HashMap<String, Arc<dyn Provider>> = HashMap::from([
+            (
+                "test".to_string(),
+                openai_provider_with_model(slow_addr, "test"),
+            ),
+            (
+                "beta".to_string(),
+                openai_provider_with_model(fast_addr, "beta"),
+            ),
+        ]);
+        let personas = HashMap::from([
+            (
+                "coder".to_string(),
+                persona_config("test", Permission::ReadWrite, "*", None),
+            ),
+            (
+                "reviewer".to_string(),
+                persona_config("beta", Permission::ReadOnly, "*", None),
+            ),
+        ]);
+        let state = state_with_catalog(&dir, providers, personas, Some("coder"));
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/tmp/x",
+                "prompt": "hello"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session: Value = response.json().await.unwrap();
+        let id = session["id"].as_str().unwrap().to_string();
+
+        // The slow provider holds its first delta, so the request is still in
+        // flight when the switch lands.
+        wait_for("the slow turn's request to reach the provider", || {
+            let observed = slow_requests_observed.clone();
+            async move { observed.load(Ordering::Relaxed) >= 1 }
+        })
+        .await;
+
+        let response = client
+            .post(format!("http://{addr}/sessions/{id}/persona"))
+            .json(&json!({ "persona": "reviewer" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The running turn is not aborted: it finishes under the model it
+        // started with and the session reaches waiting_for_input.
+        wait_for("the in-flight turn to finish", {
+            let store = store.clone();
+            let id = id.clone();
+            move || {
+                let store = store.clone();
+                let id = id.clone();
+                async move {
+                    let stored = store.get_session(&id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+        let calls = store.model_calls(&id).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].model, "test",
+            "the running turn keeps the model it started under"
+        );
+
+        let response = client
+            .post(format!("http://{addr}/sessions/{id}/messages"))
+            .json(&json!({ "content": "continue" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the next turn to run under the switched model", {
+            let store = store.clone();
+            let id = id.clone();
+            move || {
+                let store = store.clone();
+                let id = id.clone();
+                async move {
+                    let calls = store.model_calls(&id).await.unwrap();
+                    calls.len() == 2 && calls[1].model == "beta"
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_toggles_the_executor_permission_only_when_it_differs() {
+        // A stub executor whose /permission handler records every body it
+        // receives, reached through a registered tunnel like a node's.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = {
+            use axum::extract::State as AxumState;
+            use axum::routing::post as axum_post;
+
+            async fn handle_permission(
+                AxumState(seen): AxumState<Arc<Mutex<Vec<String>>>>,
+                body: axum::body::Bytes,
+            ) -> Json<serde_json::Value> {
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                Json(json!({}))
+            }
+            axum::Router::new()
+                .route("/permission", axum_post(handle_permission))
+                .with_state(seen.clone())
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
+        let (cp_tunnel, _) = Tunnel::new(cp_side);
+        let (node_tunnel, mut opens) = Tunnel::new(node_side);
+        let tunnels = Arc::new(TunnelRegistry::new());
+        tunnels.register("s1", cp_tunnel);
+        tokio::spawn(async move {
+            while let Some(event) = opens.recv().await {
+                let tunnel = node_tunnel.clone();
+                tokio::spawn(async move {
+                    let mut backend = TcpStream::connect(backend).await.unwrap();
+                    let mut logical = tunnel.attach(event.conn_id, event.rx).unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut backend, &mut logical).await;
+                });
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels,
+            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            loops: Arc::new(AgentRegistry::new(
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )),
+            providers: HashMap::from([(
+                "m".to_string(),
+                Arc::new(DummyProvider) as Arc<dyn Provider>,
+            )]),
+            personas: HashMap::from([
+                (
+                    "coder".to_string(),
+                    persona_config("m", Permission::ReadWrite, "*", None),
+                ),
+                (
+                    "reviewer".to_string(),
+                    persona_config("m", Permission::ReadOnly, "*", None),
+                ),
+                (
+                    "architect".to_string(),
+                    persona_config("m", Permission::ReadWrite, "*", None),
+                ),
+            ]),
+            default_persona: Some("coder".into()),
+            skills_dir: None,
+            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
+        });
+        let store = state.store.clone();
+        state.store.create_session(&session("s1")).await.unwrap();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        // coder (read_write) -> reviewer (read_only): the executor toggles.
+        let response = client
+            .post(format!("http://{addr}/sessions/s1/persona"))
+            .json(&json!({ "persona": "reviewer" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [r#"{"permission":"read_only"}"#],
+            "the executor receives the new read-only permission"
+        );
+
+        // reviewer (read_only) -> architect (read_write): the executor toggles.
+        let response = client
+            .post(format!("http://{addr}/sessions/s1/persona"))
+            .json(&json!({ "persona": "architect" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            store
+                .get_session("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .persona
+                .as_deref(),
+            Some("architect")
+        );
+        {
+            let bodies = seen.lock().unwrap();
+            assert_eq!(
+                *bodies,
+                [
+                    r#"{"permission":"read_only"}"#,
+                    r#"{"permission":"read_write"}"#
+                ]
+            );
+        }
+
+        // architect (read_write) -> coder (read_write): the permission does
+        // not differ, so the executor is not touched again.
+        let response = client
+            .post(format!("http://{addr}/sessions/s1/persona"))
+            .json(&json!({ "persona": "coder" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "a same-permission switch never reaches the executor"
+        );
+        assert_eq!(
+            store
+                .get_session("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .persona
+                .as_deref(),
+            Some("coder")
+        );
+    }
+
+    #[tokio::test]
     async fn events_stream_replays_after_a_sequence() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
@@ -2098,8 +2990,17 @@ mod tests {
                 HashMap::new(),
             )),
             providers: HashMap::from([("test".to_string(), openai_provider(provider_addr))]),
-            subagents: HashMap::new(),
-            default_model: None,
+            personas: HashMap::from([(
+                "test".to_string(),
+                PersonaConfig {
+                    model: "test".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: String::new(),
+                    system_prompt: None,
+                },
+            )]),
+            default_persona: Some("test".into()),
             skills_dir: None,
             artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
@@ -2111,7 +3012,7 @@ mod tests {
             .json(&json!({
                 "node": "n1",
                 "dir": "/tmp/x",
-                "model": "test",
+                "persona": "test",
                 "prompt": "hello"
             }))
             .send()
@@ -2206,7 +3107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_with_an_unconfigured_model_rejects_before_the_node_sees_a_command() {
+    async fn clone_with_an_unconfigured_persona_rejects_before_the_node_sees_a_command() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
         state
@@ -2220,14 +3121,14 @@ mod tests {
             .json(&json!({
                 "node": "n1",
                 "repo_url": "https://example.com/repo",
-                "model": "ghost"
+                "persona": "ghost"
             }))
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let text = response.text().await.unwrap();
-        assert!(text.contains("model ghost is not configured"), "{text}");
+        assert!(text.contains("persona ghost is not configured"), "{text}");
         assert!(
             !state.commands.pending("n1"),
             "the node must never receive a command"
@@ -2236,7 +3137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dev_with_an_unconfigured_model_rejects_before_the_node_sees_a_command() {
+    async fn dev_with_an_unconfigured_persona_rejects_before_the_node_sees_a_command() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
         state
@@ -2250,14 +3151,14 @@ mod tests {
             .json(&json!({
                 "node": "n1",
                 "dir": "/tmp/x",
-                "model": "ghost"
+                "persona": "ghost"
             }))
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let text = response.text().await.unwrap();
-        assert!(text.contains("model ghost is not configured"), "{text}");
+        assert!(text.contains("persona ghost is not configured"), "{text}");
         assert!(
             !state.commands.pending("n1"),
             "the node must never receive a command"
@@ -2266,7 +3167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_without_any_model_rejects_before_the_node_sees_a_command() {
+    async fn clone_without_any_persona_rejects_before_the_node_sees_a_command() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
         state
@@ -2286,7 +3187,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let text = response.text().await.unwrap();
-        assert!(text.contains("no model configured"), "{text}");
+        assert!(text.contains("no persona configured"), "{text}");
         assert!(
             !state.commands.pending("n1"),
             "the node must never receive a command"

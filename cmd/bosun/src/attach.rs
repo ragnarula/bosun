@@ -216,6 +216,10 @@ fn event_lines(event: &Event) -> Vec<Line> {
             kind: LineKind::Status,
             text: format!("permission: {}", permission_name(*permission)),
         }],
+        Event::Persona { persona } => vec![Line {
+            kind: LineKind::Status,
+            text: format!("persona: {persona}"),
+        }],
         Event::ModelCall {
             model,
             kind,
@@ -950,20 +954,45 @@ async fn submit_input(
     // transcript returns to the newest rows even after a manual scroll-up.
     app.follow = true;
     let content = std::mem::take(&mut app.state.input);
-    match content.as_str() {
-        "/exit" => Ok(Action::Exit),
-        "/permission" => {
-            toggle_permission(app, client, cp_url, session_id).await;
+    match persona_switch_target(&content) {
+        Some(persona) => {
+            app.history_submit(&content);
+            switch_persona(app, client, cp_url, session_id, &persona).await;
             Ok(Action::Continue)
         }
-        _ => {
-            if !content.is_empty() {
-                app.history_submit(&content);
-                send_message(app, client, cp_url, session_id, &content).await;
+        None => match content.as_str() {
+            "/exit" => Ok(Action::Exit),
+            "/permission" => {
+                toggle_permission(app, client, cp_url, session_id).await;
+                Ok(Action::Continue)
             }
-            Ok(Action::Continue)
-        }
+            "/persona" => {
+                app.state.push_line(Line {
+                    kind: LineKind::Status,
+                    text: "usage: /persona <name>".into(),
+                });
+                Ok(Action::Continue)
+            }
+            _ => {
+                if !content.is_empty() {
+                    app.history_submit(&content);
+                    send_message(app, client, cp_url, session_id, &content).await;
+                }
+                Ok(Action::Continue)
+            }
+        },
     }
+}
+
+/// The persona named by a `/persona <name>` input. A bare `/persona` or any
+/// other input returns None, so a stray `/persona xyzzy` never reaches the
+/// model as a chat message.
+fn persona_switch_target(content: &str) -> Option<String> {
+    let name = content.strip_prefix("/persona ")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 async fn send_message(
@@ -1059,6 +1088,39 @@ async fn toggle_permission(
             kind: LineKind::Status,
             text: format!("permission change failed: {error}"),
         }),
+    }
+}
+
+async fn switch_persona(
+    app: &mut App,
+    client: &reqwest::Client,
+    cp_url: &str,
+    session_id: &str,
+    persona: &str,
+) {
+    let send = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        client
+            .post(format!("{cp_url}/sessions/{session_id}/persona"))
+            .json(&serde_json::json!({ "persona": persona }))
+            .send(),
+    )
+    .await;
+    let result = match send {
+        Ok(result) => result.and_then(reqwest::Response::error_for_status),
+        Err(_) => {
+            app.state.push_line(Line {
+                kind: LineKind::Status,
+                text: "request timed out".into(),
+            });
+            return;
+        }
+    };
+    if let Err(error) = result {
+        app.state.push_line(Line {
+            kind: LineKind::Status,
+            text: format!("persona switch failed: {error}"),
+        });
     }
 }
 
@@ -1487,6 +1549,53 @@ mod tests {
         assert_eq!(state.permission, Permission::ReadOnly);
     }
 
+    #[test]
+    fn persona_events_render_as_a_status_line() {
+        let persona = Event::Persona {
+            persona: "reviewer".into(),
+        };
+        assert_eq!(
+            event_lines(&persona),
+            vec![Line {
+                kind: LineKind::Status,
+                text: "persona: reviewer".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn persona_switch_target_extracts_the_persona_name() {
+        assert_eq!(
+            persona_switch_target("/persona reviewer").as_deref(),
+            Some("reviewer")
+        );
+        assert_eq!(
+            persona_switch_target("/persona   reviewer  ").as_deref(),
+            Some("reviewer"),
+            "the name is trimmed"
+        );
+        assert_eq!(
+            persona_switch_target("/persona"),
+            None,
+            "a bare command names nothing"
+        );
+        assert_eq!(
+            persona_switch_target("/persona "),
+            None,
+            "a command with only whitespace names nothing"
+        );
+        assert_eq!(
+            persona_switch_target("/personax reviewer"),
+            None,
+            "a lookalike word is not the command"
+        );
+        assert_eq!(
+            persona_switch_target("switch to reviewer"),
+            None,
+            "plain text is not the command"
+        );
+    }
+
     fn test_session() -> Session {
         Session {
             id: "s1".into(),
@@ -1495,7 +1604,9 @@ mod tests {
             git_ref: None,
             dir: "/tmp".into(),
             model: "m".into(),
+            persona: None,
             permission: Permission::ReadWrite,
+            allowed_tools: "*".into(),
             state: SessionState::WaitingForInput,
             created_at_secs: 0,
             prompt: None,

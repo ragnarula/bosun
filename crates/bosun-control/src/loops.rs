@@ -13,7 +13,7 @@ use bosun_agent::agent_loop::LoopEvent;
 use bosun_agent::agent_loop::LoopHandle;
 use bosun_agent::agent_loop::spawn_loop;
 use bosun_agent::provider::Provider;
-use bosun_common::config::SubagentConfig;
+use bosun_common::config::PersonaConfig;
 use bosun_store::store::Store;
 use tokio::sync::broadcast;
 use tracing::debug;
@@ -35,10 +35,11 @@ pub struct AgentRegistry {
     live: RwLock<HashMap<String, broadcast::Sender<String>>>,
     /// Skills injected by the control plane, passed to every started loop.
     pub skills_dir: Option<PathBuf>,
-    /// Providers for subagent models, keyed by model name.
+    /// Providers for persona models, keyed by model name.
     pub providers: HashMap<String, Arc<dyn Provider>>,
-    /// Configured subagent types, keyed by type name.
-    pub subagent_configs: HashMap<String, SubagentConfig>,
+    /// Configured personas, keyed by persona name. The loop resolves the
+    /// legacy `spawn_subagent` tool's persona from here.
+    pub personas: HashMap<String, PersonaConfig>,
     /// Per-million-token prices keyed by model name: (input, output).
     pub prices: HashMap<String, (f64, f64)>,
 }
@@ -47,7 +48,7 @@ impl AgentRegistry {
     pub fn new(
         skills_dir: Option<PathBuf>,
         providers: HashMap<String, Arc<dyn Provider>>,
-        subagent_configs: HashMap<String, SubagentConfig>,
+        personas: HashMap<String, PersonaConfig>,
         prices: HashMap<String, (f64, f64)>,
     ) -> Self {
         Self {
@@ -55,7 +56,7 @@ impl AgentRegistry {
             live: RwLock::new(HashMap::new()),
             skills_dir,
             providers,
-            subagent_configs,
+            personas,
             prices,
         }
     }
@@ -84,8 +85,9 @@ impl AgentRegistry {
             delta_sink: Arc::new(LiveSink { tx: sender }),
             max_window_messages: MAX_WINDOW_MESSAGES,
             injected_skills_dir: self.skills_dir.clone(),
-            subagent_configs: self.subagent_configs.clone(),
+            personas: self.personas.clone(),
             providers: self.providers.clone(),
+            prices: self.prices.clone(),
             price_input_per_mtok,
             price_output_per_mtok,
         };
@@ -206,7 +208,9 @@ mod tests {
                 git_ref: None,
                 dir: "/work".into(),
                 model: "mock-model".into(),
+                persona: None,
                 permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
                 state: SessionState::Creating,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
@@ -273,7 +277,9 @@ mod tests {
                 git_ref: None,
                 dir: "/work".into(),
                 model: "mock-model".into(),
+                persona: None,
                 permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
                 state: SessionState::Creating,
                 created_at_secs: 1_700_000_000,
                 prompt: None,

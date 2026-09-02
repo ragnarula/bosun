@@ -6,8 +6,10 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use thiserror::Error;
 
 use crate::session::Permission;
+use crate::tool::ALL_TOOLS;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -19,8 +21,8 @@ pub struct ControlConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
     pub models: HashMap<String, ModelConfig>,
-    pub subagents: HashMap<String, SubagentConfig>,
-    pub default_model: Option<String>,
+    pub personas: HashMap<String, PersonaConfig>,
+    pub default_persona: Option<String>,
     pub update: UpdateConfig,
 }
 
@@ -37,6 +39,78 @@ impl ControlConfig {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("artifacts"))
     }
+
+    /// Boot validation of the persona catalog. A persona's `model` must name
+    /// a configured model, its `allowed_tools` must be `"*"` or canonical
+    /// tool names, and a set `default_persona` must name a persona. The error
+    /// carries one message per problem found, so a boot failure reports them
+    /// all at once.
+    pub fn validate_personas(&self) -> Result<(), PersonaConfigError> {
+        let mut problems = Vec::new();
+        let mut names: Vec<&String> = self.personas.keys().collect();
+        names.sort();
+        for name in names {
+            let persona = &self.personas[name];
+            if !self.models.contains_key(&persona.model) {
+                problems.push(format!(
+                    "persona {name} references model {} which is not configured",
+                    persona.model
+                ));
+            }
+            if let Err(error) = crate::tool::parse_allowed_tools(&persona.allowed_tools) {
+                problems.push(format!(
+                    "persona {name} allows unknown tool(s): {}",
+                    error.unknown.join(", ")
+                ));
+            }
+        }
+        if let Some(default) = &self.default_persona
+            && !self.personas.contains_key(default)
+        {
+            problems.push(format!(
+                "default_persona {default} is not a configured persona"
+            ));
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(PersonaConfigError { problems })
+        }
+    }
+
+    /// Reads each persona's prompt body from `<data dir>/personas/<name>.md`
+    /// when the file exists. A persona without a prompt file keeps no system
+    /// prompt, so its sessions fall back to the loop's default system text.
+    pub fn load_persona_prompts(&mut self) -> Result<(), anyhow::Error> {
+        let dir = self.data_dir.join("personas");
+        let mut names: Vec<String> = self.personas.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let path = dir.join(format!("{name}.md"));
+            let persona = self
+                .personas
+                .get_mut(&name)
+                .expect("cloned from the keys above");
+            persona.system_prompt = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read persona prompt from {}", path.display())
+                    });
+                }
+            };
+        }
+        Ok(())
+    }
+}
+
+/// The persona catalog failed validation. `problems` holds one sentence per
+/// problem, so the control plane can report them all at boot.
+#[derive(Debug, Error)]
+#[error("invalid persona configuration:\n{}", self.problems.join("\n"))]
+pub struct PersonaConfigError {
+    pub problems: Vec<String>,
 }
 
 impl Default for ControlConfig {
@@ -48,8 +122,8 @@ impl Default for ControlConfig {
             tls_key: None,
             data_dir: default_data_dir(),
             models: HashMap::new(),
-            subagents: HashMap::new(),
-            default_model: None,
+            personas: HashMap::new(),
+            default_persona: None,
             update: UpdateConfig::default(),
         }
     }
@@ -77,9 +151,28 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SubagentConfig {
+#[serde(deny_unknown_fields)]
+pub struct PersonaConfig {
+    /// The model entry this persona runs sessions on.
     pub model: String,
+    /// The session's permission mode, enforced by its executor.
     pub permission: Permission,
+    /// Which canonical tools the session may use: `"*"` for every tool, or a
+    /// comma/space-separated list of canonical tool names.
+    #[serde(default = "default_allowed_tools")]
+    pub allowed_tools: String,
+    /// What the persona is for, shown to the user when the persona is picked.
+    #[serde(default)]
+    pub description: String,
+    /// The persona's role/behaviour prompt, read from
+    /// `<data dir>/personas/<name>.md` at boot when the file exists; not a
+    /// TOML key. `None` leaves the session on the loop's default system text.
+    #[serde(skip)]
+    pub system_prompt: Option<String>,
+}
+
+fn default_allowed_tools() -> String {
+    ALL_TOOLS.into()
 }
 
 /// The node's auto-update settings.
@@ -212,8 +305,8 @@ mod tests {
         let config: ControlConfig = toml::from_str("").unwrap();
         assert_eq!(config.data_dir, PathBuf::from("data"));
         assert!(config.models.is_empty());
-        assert!(config.subagents.is_empty());
-        assert_eq!(config.default_model, None);
+        assert!(config.personas.is_empty());
+        assert_eq!(config.default_persona, None);
     }
 
     #[test]
@@ -259,9 +352,10 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_models_and_subagents() {
+    fn config_parses_models_and_personas() {
         let config: ControlConfig = toml::from_str(
             r#"
+            default_persona = "coder"
             [models.main]
             provider = "anthropic"
             name = "claude-sonnet-4-5"
@@ -273,16 +367,23 @@ mod tests {
             name = "gpt-4o-mini"
             api_key = "sk-test"
 
-            [subagents.coder]
+            [personas.coder]
             model = "main"
             permission = "read_write"
+            allowed_tools = "*"
+            description = "Makes changes directly"
+
+            [personas.reviewer]
+            model = "cheap"
+            permission = "read_only"
+
             "#,
         )
         .unwrap();
         assert_eq!(config.data_dir, PathBuf::from("data"));
         assert_eq!(config.models.len(), 2);
-        assert_eq!(config.subagents.len(), 1);
-        assert_eq!(config.default_model, None);
+        assert_eq!(config.personas.len(), 2);
+        assert_eq!(config.default_persona.as_deref(), Some("coder"));
 
         let main = &config.models["main"];
         assert_eq!(main.provider, "anthropic");
@@ -295,9 +396,214 @@ mod tests {
         assert_eq!(cheap.name, "gpt-4o-mini");
         assert_eq!(cheap.base_url, None);
 
-        let coder = &config.subagents["coder"];
+        let coder = &config.personas["coder"];
         assert_eq!(coder.model, "main");
         assert_eq!(coder.permission, Permission::ReadWrite);
+        assert_eq!(coder.allowed_tools, "*");
+        assert_eq!(coder.description, "Makes changes directly");
+
+        let reviewer = &config.personas["reviewer"];
+        assert_eq!(reviewer.model, "cheap");
+        assert_eq!(reviewer.permission, Permission::ReadOnly);
+        assert_eq!(reviewer.allowed_tools, "*");
+        assert_eq!(reviewer.description, "");
+        assert_eq!(
+            reviewer.system_prompt, None,
+            "prompts come from files, not TOML"
+        );
+    }
+
+    #[test]
+    fn persona_allowed_tools_defaults_to_star() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            [models.main]
+            provider = "anthropic"
+            name = "claude-sonnet-4-5"
+            api_key = "x"
+
+            [personas.coder]
+            model = "main"
+            permission = "read_write"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.personas["coder"].allowed_tools, "*");
+    }
+
+    #[test]
+    fn validate_personas_accepts_a_valid_catalog() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            default_persona = "coder"
+            [models.main]
+            provider = "anthropic"
+            name = "claude-sonnet-4-5"
+            api_key = "x"
+
+            [personas.coder]
+            model = "main"
+            permission = "read_write"
+            allowed_tools = "shell, file/read, git"
+
+            [personas.looker]
+            model = "main"
+            permission = "read_only"
+
+            "#,
+        )
+        .unwrap();
+        assert!(config.validate_personas().is_ok());
+    }
+
+    #[test]
+    fn validate_personas_rejects_an_unknown_model() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            [personas.coder]
+            model = "ghost"
+            permission = "read_write"
+            "#,
+        )
+        .unwrap();
+        let err = config.validate_personas().unwrap_err();
+        assert_eq!(
+            err.problems,
+            ["persona coder references model ghost which is not configured"]
+        );
+    }
+
+    #[test]
+    fn validate_personas_rejects_unknown_allowed_tools() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            [models.main]
+            provider = "anthropic"
+            name = "claude-sonnet-4-5"
+            api_key = "x"
+
+            [personas.coder]
+            model = "main"
+            permission = "read_write"
+            allowed_tools = "shell, websurf"
+            "#,
+        )
+        .unwrap();
+        let err = config.validate_personas().unwrap_err();
+        assert_eq!(
+            err.problems,
+            ["persona coder allows unknown tool(s): websurf"]
+        );
+    }
+
+    #[test]
+    fn validate_personas_rejects_an_unknown_default_persona() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            default_persona = "ghost"
+            [models.main]
+            provider = "anthropic"
+            name = "claude-sonnet-4-5"
+            api_key = "x"
+
+            [personas.coder]
+            model = "main"
+            permission = "read_write"
+
+            "#,
+        )
+        .unwrap();
+        let err = config.validate_personas().unwrap_err();
+        assert_eq!(
+            err.problems,
+            ["default_persona ghost is not a configured persona"]
+        );
+    }
+
+    #[test]
+    fn validate_personas_reports_every_problem() {
+        let config: ControlConfig = toml::from_str(
+            r#"
+            default_persona = "missing"
+            [personas.coder]
+            model = "ghost"
+            permission = "read_write"
+            allowed_tools = "websurf"
+
+            "#,
+        )
+        .unwrap();
+        let err = config.validate_personas().unwrap_err();
+        assert_eq!(err.problems.len(), 3);
+    }
+
+    #[test]
+    fn validate_personas_accepts_no_personas() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert!(config.validate_personas().is_ok());
+    }
+
+    #[test]
+    fn persona_prompts_are_loaded_from_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let personas_dir = dir.path().join("personas");
+        std::fs::create_dir_all(&personas_dir).unwrap();
+        std::fs::write(personas_dir.join("coder.md"), "You are the coder.").unwrap();
+        std::fs::write(personas_dir.join("reviewer.md"), "You review.").unwrap();
+
+        let mut config: ControlConfig = toml::from_str(&format!(
+            r#"
+            data_dir = "{}"
+
+            [personas.coder]
+            model = "main"
+            permission = "read_write"
+
+            [personas.reviewer]
+            model = "main"
+            permission = "read_only"
+
+            [personas.bare]
+            model = "main"
+            permission = "read_write"
+            "#,
+            dir.path().display()
+        ))
+        .unwrap();
+        assert_eq!(config.personas["coder"].system_prompt, None);
+
+        config.load_persona_prompts().unwrap();
+
+        assert_eq!(
+            config.personas["coder"].system_prompt.as_deref(),
+            Some("You are the coder.")
+        );
+        assert_eq!(
+            config.personas["reviewer"].system_prompt.as_deref(),
+            Some("You review.")
+        );
+        assert_eq!(
+            config.personas["bare"].system_prompt, None,
+            "a persona without a prompt file keeps no system prompt"
+        );
+    }
+
+    #[test]
+    fn persona_prompts_without_a_personas_dir_stay_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: ControlConfig = toml::from_str(&format!(
+            r#"
+            data_dir = "{}"
+
+            [personas.coder]
+            model = "main"
+            permission = "read_write"
+            "#,
+            dir.path().display()
+        ))
+        .unwrap();
+        config.load_persona_prompts().unwrap();
+        assert_eq!(config.personas["coder"].system_prompt, None);
     }
 
     #[test]

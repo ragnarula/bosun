@@ -73,7 +73,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   git_ref TEXT,
   dir TEXT NOT NULL,
   model TEXT NOT NULL,
+  persona TEXT,
   permission TEXT NOT NULL,
+  allowed_tools TEXT NOT NULL DEFAULT '*',
   state TEXT NOT NULL,
   created_at_secs INTEGER NOT NULL,
   prompt TEXT
@@ -130,6 +132,21 @@ impl Store {
             .context("failed to disable foreign keys")?;
         conn.execute_batch(SCHEMA)
             .context("failed to create tables")?;
+        // Additive migrations for databases created by an older schema. The
+        // column list is checked first, so the migration does not depend on
+        // the wording of SQLite's duplicate-column error. Old rows then mean
+        // what the defaults say: '*' for allowed_tools, no persona.
+        if !column_exists(&conn, "sessions", "allowed_tools")? {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT '*'",
+                [],
+            )
+            .context("failed to add the allowed_tools column")?;
+        }
+        if !column_exists(&conn, "sessions", "persona")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN persona TEXT", [])
+                .context("failed to add the persona column")?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -164,8 +181,8 @@ impl Store {
             let permission = serde_json::to_string(&session.permission)?;
             let state = serde_json::to_string(&session.state)?;
             conn.execute(
-                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, permission, state, created_at_secs, prompt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     session.id,
                     session.node,
@@ -173,7 +190,9 @@ impl Store {
                     session.git_ref,
                     session.dir,
                     session.model,
+                    session.persona,
                     permission,
+                    session.allowed_tools,
                     state,
                     session.created_at_secs,
                     session.prompt,
@@ -190,7 +209,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, permission, state, created_at_secs, prompt
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt
                      FROM sessions WHERE id = ?1",
                 )
                 .context("failed to prepare session query")?;
@@ -207,7 +226,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, permission, state, created_at_secs, prompt
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt
                      FROM sessions ORDER BY id",
                 )
                 .context("failed to prepare session list query")?;
@@ -259,6 +278,54 @@ impl Store {
                 &Event::Permission { permission },
             )?;
             tx.commit().context("failed to commit permission change")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Applies a persona switch: the session's persona, model, permission and
+    /// allowed-tools spec are replaced in one transaction, so the event
+    /// stream and the sessions table never diverge. The `persona` event is
+    /// always emitted; when the new permission differs from the stored one,
+    /// the matching `Event::Permission` is emitted in the same transaction.
+    /// Callers must not append either event separately.
+    pub async fn switch_persona(
+        &self,
+        id: &str,
+        persona: &str,
+        model: &str,
+        permission: Permission,
+        allowed_tools: &str,
+    ) -> Result<(), StoreError> {
+        let persona = persona.to_string();
+        let model = model.to_string();
+        let allowed_tools = allowed_tools.to_string();
+        self.with_session(id, move |conn, session_id| {
+            let permission_json = serde_json::to_string(&permission)?;
+            let tx = transaction(conn)?;
+            let previous: String = tx
+                .query_row(
+                    "SELECT permission FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to read the stored permission")?;
+            tx.execute(
+                "UPDATE sessions SET persona = ?1, model = ?2, permission = ?3, allowed_tools = ?4
+                 WHERE id = ?5",
+                params![persona, model, permission_json, allowed_tools, session_id],
+            )
+            .context("failed to update the session persona")?;
+            append_event(&tx, session_id, "persona", &Event::Persona { persona })?;
+            if previous != permission_json {
+                append_event(
+                    &tx,
+                    session_id,
+                    "permission",
+                    &Event::Permission { permission },
+                )?;
+            }
+            tx.commit().context("failed to commit persona change")?;
             Ok(())
         })
         .await
@@ -633,6 +700,25 @@ fn ensure_session_exists(conn: &rusqlite::Connection, id: &str) -> Result<(), an
     }
 }
 
+/// Whether `column` is one of `table`'s columns, for additive migrations.
+fn column_exists(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, anyhow::Error> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .context("failed to prepare the table_info query")?;
+    let mut rows = stmt.query([]).context("failed to query table_info")?;
+    while let Some(row) = rows.next().context("failed to read table_info row")? {
+        let name: String = row.get("name").context("table_info has no name column")?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
     let permission: String = row.get("permission")?;
     let state: String = row.get("state")?;
@@ -643,7 +729,9 @@ fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
         git_ref: row.get("git_ref")?,
         dir: row.get("dir")?,
         model: row.get("model")?,
+        persona: row.get("persona")?,
         permission: serde_json::from_str(&permission).context("failed to parse permission")?,
+        allowed_tools: row.get("allowed_tools")?,
         state: serde_json::from_str(&state).context("failed to parse state")?,
         created_at_secs: row.get("created_at_secs")?,
         prompt: row.get("prompt")?,
@@ -667,7 +755,9 @@ mod tests {
             git_ref: Some("main".to_string()),
             dir: "/work/repo".to_string(),
             model: "claude".to_string(),
+            persona: Some("coder".to_string()),
             permission: Permission::ReadWrite,
+            allowed_tools: "shell, file/read".to_string(),
             state: SessionState::Running,
             created_at_secs: 1_700_000_000,
             prompt: Some("finish the feature".to_string()),
@@ -681,7 +771,9 @@ mod tests {
         assert_eq!(actual.git_ref, expected.git_ref);
         assert_eq!(actual.dir, expected.dir);
         assert_eq!(actual.model, expected.model);
+        assert_eq!(actual.persona, expected.persona);
         assert_eq!(actual.permission, expected.permission);
+        assert_eq!(actual.allowed_tools, expected.allowed_tools);
         assert_eq!(actual.state, expected.state);
         assert_eq!(actual.created_at_secs, expected.created_at_secs);
         assert_eq!(actual.prompt, expected.prompt);
@@ -777,6 +869,93 @@ mod tests {
         assert!(
             matches!(&events[1].1, Event::Permission { permission } if *permission == Permission::ReadOnly)
         );
+    }
+
+    #[tokio::test]
+    async fn switch_persona_replaces_the_persona_fields_in_one_row() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        store
+            .switch_persona(
+                "a",
+                "reviewer",
+                "cheap",
+                Permission::ReadOnly,
+                "file/read, grep",
+            )
+            .await
+            .unwrap();
+
+        let stored = store.get_session("a").await.unwrap().unwrap();
+        assert_eq!(stored.persona.as_deref(), Some("reviewer"));
+        assert_eq!(stored.model, "cheap");
+        assert_eq!(stored.permission, Permission::ReadOnly);
+        assert_eq!(stored.allowed_tools, "file/read, grep");
+        assert_eq!(
+            stored.state,
+            session("a").state,
+            "a switch touches only the persona fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_persona_emits_a_persona_event_and_a_permission_event_on_change() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        store
+            .switch_persona("a", "reviewer", "cheap", Permission::ReadOnly, "file/read")
+            .await
+            .unwrap();
+
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].1,
+            Event::Persona { persona } if persona == "reviewer"
+        ));
+        assert!(matches!(
+            &events[1].1,
+            Event::Permission { permission } if *permission == Permission::ReadOnly
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_persona_with_the_same_permission_emits_no_permission_event() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        store
+            .switch_persona("a", "architect", "claude", Permission::ReadWrite, "*")
+            .await
+            .unwrap();
+
+        let stored = store.get_session("a").await.unwrap().unwrap();
+        assert_eq!(stored.persona.as_deref(), Some("architect"));
+        assert_eq!(stored.permission, Permission::ReadWrite);
+
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].1,
+            Event::Persona { persona } if persona == "architect"
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_persona_on_a_missing_session_is_session_not_found() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        let error = store
+            .switch_persona("ghost", "reviewer", "cheap", Permission::ReadOnly, "*")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::SessionNotFound { id } if id == "ghost"));
     }
 
     #[tokio::test]
@@ -1112,6 +1291,91 @@ mod tests {
         // A failed write must not leave any rows behind.
         assert!(store.messages("missing", true).await.unwrap().is_empty());
         assert!(store.events_after("missing", 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_allowed_tools_column_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   node TEXT NOT NULL,
+                   repo_url TEXT,
+                   git_ref TEXT,
+                   dir TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   permission TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   created_at_secs INTEGER NOT NULL,
+                   prompt TEXT
+                 );
+                 INSERT INTO sessions (id, node, dir, model, permission, state, created_at_secs, prompt)
+                 VALUES ('old', 'node-1', '/work', 'claude', '\"read_write\"', '\"waiting_for_input\"', 1700000000, NULL);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("old").await.unwrap().unwrap();
+        assert_eq!(
+            session.allowed_tools, "*",
+            "a pre-persona row means every tool is allowed"
+        );
+        assert_eq!(
+            session.persona, None,
+            "a pre-persona row has no persona and falls back to the default prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_persona_column_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // The mid-S1 shape: the allowed_tools column exists, persona does
+            // not yet.
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   node TEXT NOT NULL,
+                   repo_url TEXT,
+                   git_ref TEXT,
+                   dir TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   permission TEXT NOT NULL,
+                   allowed_tools TEXT NOT NULL DEFAULT '*',
+                   state TEXT NOT NULL,
+                   created_at_secs INTEGER NOT NULL,
+                   prompt TEXT
+                 );
+                 INSERT INTO sessions (id, node, dir, model, permission, state, created_at_secs, prompt)
+                 VALUES ('old', 'node-1', '/work', 'claude', '\"read_write\"', '\"waiting_for_input\"', 1700000000, NULL);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("old").await.unwrap().unwrap();
+        assert_eq!(session.allowed_tools, "*");
+        assert_eq!(session.persona, None);
+    }
+
+    #[tokio::test]
+    async fn reopening_an_up_to_date_database_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.create_session(&session("s1")).await.unwrap();
+        }
+        // A second open must not fail trying to re-add existing columns.
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(session.persona.as_deref(), Some("coder"));
     }
 
     #[tokio::test]

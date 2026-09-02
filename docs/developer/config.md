@@ -18,13 +18,17 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `node_timeout_secs` | `30` | Polls older than this mark a node down |
 | `tls_cert` | none | PEM certificate chain. When set with `tls_key`, the control plane serves HTTPS |
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
-| `data_dir` | `data` | Directory for the SQLite store and injected skills |
+| `data_dir` | `data` | Directory for the SQLite store, injected skills, and persona prompt files |
 | `update.artifacts_dir` | `<data_dir>/artifacts` | Directory holding one update binary per platform, named `bosun.<target-triple>` |
-| `models` | none | Named model entries (see `ModelConfig` below) |
-| `subagents` | none | Named subagent types (see `SubagentConfig` below) |
-| `default_model` | none | Model sessions use when the request does not name one. Falls back to `default`, then the first model |
+| `models` | none | Named model entries (see `ModelConfig` below). Sessions never name one directly; a persona's `model` does |
+| `personas` | none | Named personas (see `PersonaConfig` below) |
+| `default_persona` | none | Persona sessions use when the request does not name one |
 
-A model entry:
+At boot the control plane validates the persona catalog: every persona's
+`model` must name a configured model entry, its `allowed_tools` must be `"*"`
+or canonical tool names, and a set `default_persona` must name a persona.
+
+A model entry is the provider binding a persona's `model` names:
 
 | Field | Meaning |
 |---|---|
@@ -35,8 +39,45 @@ A model entry:
 | `price_input_per_mtok` | Cost per million input tokens, used by metering |
 | `price_output_per_mtok` | Cost per million output tokens, used by metering |
 
-A subagent entry pairs a model with a permission mode: `model` names a configured
-model, `permission` is `read-only` or `read-write`.
+A persona pairs a model entry with the session's effective surface:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `model` | required | Names a configured model entry |
+| `permission` | required | `read_only` or `read_write`, enforced by the session's executor |
+| `allowed_tools` | `"*"` | `"*"` for every canonical tool, or a comma/space-separated list of canonical tool names |
+| `description` | `""` | What the persona is for |
+
+A persona's role/behaviour prompt lives outside the TOML: when
+`<data dir>/personas/<name>.md` exists, its text is read at boot and becomes
+the persona's system prompt for sessions under it. Without a file the session
+runs on the built-in default system text. The personas directory is created at
+boot like the skills directory; the prompt files themselves are optional.
+
+`bosun clone` and `bosun dev` take `--persona <name>`; the persona's model,
+permission, and allowed-tool set are resolved onto the session at creation
+(the persona name is stored on the session), and a session without `--persona`
+uses `default_persona`. Tool calls outside the allowed set are refused
+control-plane-side; the executor enforces the permission. An `allowed_tools`
+value that no longer parses fails the session's turn closed instead of
+widening the tool set. The old `subagents`/`default_model` surface and
+`--model` / `--permission` flags are replaced by personas.
+
+### Switching a session's persona live
+
+A session's persona can be switched mid-session with
+`POST /sessions/{id}/persona` and a body of `{ "persona": "<name>" }`, from
+the terminal client with `/persona <name>` in `bosun open`, or from the web
+pane's session view. The switch replaces the stored session's persona, model,
+permission, and allowed-tool spec in one transaction and records a `persona`
+event (plus a `permission` event when the permission differs) on the session's
+event stream. It applies from the next turn — an in-flight turn finishes under
+the persona it started with. When the new persona's permission differs, the
+executor's permission toggles live through the same `/permission` mechanism a
+manual permission change uses; the executor toggle is best-effort, and the
+stored session permission is authoritative. An unknown persona is refused with
+`persona <name> is not configured` and nothing changes. This is the root
+persona; the tree-wide child rules arrive with the tree itself.
 
 See `crates/bosun-common/src/config.rs` for the current fields and defaults.
 

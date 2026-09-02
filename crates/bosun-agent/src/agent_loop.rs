@@ -11,15 +11,18 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use bosun_common::config::SubagentConfig;
+use anyhow::Context;
+use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Block;
 use bosun_common::session::Message;
 use bosun_common::session::Role;
+use bosun_common::session::Session;
 use bosun_common::session::SessionState;
 use bosun_common::tool::ToolDelta;
 use bosun_common::tool::ToolSpec;
 use bosun_common::tool::canonical_tools;
+use bosun_common::tool::parse_allowed_tools;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use serde_json::Value;
@@ -106,14 +109,51 @@ pub struct LoopDeps {
     pub max_window_messages: usize,
     /// The control plane's injected skills directory, when one is configured.
     pub injected_skills_dir: Option<PathBuf>,
-    /// Configured subagent types, keyed by type name.
-    pub subagent_configs: HashMap<String, SubagentConfig>,
-    /// Providers for subagent models, keyed by model name.
+    /// Configured personas, keyed by persona name. The legacy
+    /// `spawn_subagent` tool resolves its persona here; sprint 004's later
+    /// stories replace that tool with real child sessions.
+    pub personas: HashMap<String, PersonaConfig>,
+    /// Providers for persona models, keyed by model name.
     pub providers: HashMap<String, Arc<dyn crate::provider::Provider>>,
+    /// Per-model metering prices keyed by model name: (input, output). A
+    /// model without an entry is metered at the start-time prices below.
+    pub prices: HashMap<String, (f64, f64)>,
     /// Price per million input tokens, used to meter model-call cost.
     pub price_input_per_mtok: f64,
     /// Price per million output tokens, used to meter model-call cost.
     pub price_output_per_mtok: f64,
+}
+
+/// The provider and prices one model call runs under: resolved from the
+/// session's current model at turn start, so a persona switch changes the
+/// provider on the next turn without restarting the loop.
+struct TurnModel {
+    provider: Arc<dyn crate::provider::Provider>,
+    price_input_per_mtok: f64,
+    price_output_per_mtok: f64,
+}
+
+impl LoopDeps {
+    /// The configured provider for `model`, or the loop's own start-time
+    /// provider when the control plane has no entry for it (legacy sessions
+    /// and tests). Prices follow the same lookup.
+    fn turn_model(&self, model: &str) -> TurnModel {
+        let provider = self
+            .providers
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| self.provider.clone());
+        let (price_input_per_mtok, price_output_per_mtok) = self
+            .prices
+            .get(model)
+            .copied()
+            .unwrap_or((self.price_input_per_mtok, self.price_output_per_mtok));
+        TurnModel {
+            provider,
+            price_input_per_mtok,
+            price_output_per_mtok,
+        }
+    }
 }
 
 /// One model call's cost in dollars: the per-million-token prices times the
@@ -350,7 +390,22 @@ async fn run_turn_inner(
     skills_cache: &mut Option<SessionSkills>,
     signal: &Arc<InterruptSignal>,
 ) -> anyhow::Result<TurnOutcome> {
-    let messages: Vec<Message> = maybe_compact(deps, session_id, signal)
+    let session = deps
+        .store
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+    let permission = session.permission;
+    // Stored data can be edited behind boot validation, so an unparsable
+    // allow-list fails the turn closed instead of silently widening the tool
+    // surface to every tool.
+    let allowed_tools = parse_allowed_tools(&session.allowed_tools)
+        .with_context(|| format!("session {session_id} allowed_tools are invalid"))?;
+    // The provider and prices are resolved from the session's current model
+    // at the start of every turn, so a persona switch applies to the next
+    // model call without restarting the loop.
+    let turn = deps.turn_model(&session.model);
+    let messages: Vec<Message> = maybe_compact(deps, &turn, session_id, signal)
         .await?
         .into_iter()
         .map(|(_, message)| message)
@@ -362,12 +417,6 @@ async fn run_turn_inner(
         })
         .collect();
 
-    let session = deps
-        .store
-        .get_session(session_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-    let permission = session.permission;
     // The working-copy skill list is fetched once per session and cached, so
     // a turn does not round-trip to the node for it. The on-demand `skill`
     // read still goes to the executor when the model asks for it.
@@ -396,54 +445,48 @@ async fn run_turn_inner(
     let skills: &[Skill] = &cached.merged;
     let tools: Vec<ToolSpec> = canonical_tools(permission)
         .into_iter()
+        .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
         .filter(|tool| {
-            // spawn_subagent is advertised only when subagent types are
-            // configured, so a control plane without subagents never offers it.
-            tool.name != "spawn_subagent" || !deps.subagent_configs.is_empty()
+            // spawn_subagent is the sprint-002 nested-loop tool, kept as a
+            // shim until the sprint 004 spawn story replaces it with child
+            // sessions; it is advertised only when personas are configured.
+            tool.name != "spawn_subagent" || !deps.personas.is_empty()
         })
         .collect();
 
-    let system = system_prompt(todos, skills);
-    let mut stream = deps.provider.chat_stream(ProviderCall {
-        model: deps.provider.model(),
+    let system = system_prompt(persona_system_prompt(deps, &session), todos, skills);
+    let mut stream = turn.provider.chat_stream(ProviderCall {
+        model: turn.provider.model(),
         max_tokens: 4096,
         system: &system,
         messages,
         tools,
     })?;
 
-    let (text, tool_calls, stopped) = match collect_stream(
-        &mut stream,
-        deps,
-        session_id,
-        signal,
-        deps.provider.model(),
-        deps.provider.name(),
-    )
-    .await?
-    {
-        StreamEnd::Collected {
-            text,
-            tool_calls,
-            stopped,
-        } => (text, tool_calls, stopped),
-        StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
-        StreamEnd::Failed(error) => {
-            error!(
-                msg = "provider stream failed",
-                session_id = %session_id,
-                provider = %deps.provider.name(),
-                error = %error.display_chain()
-            );
-            return Ok(TurnOutcome::Failed);
-        }
-    };
+    let (text, tool_calls, stopped) =
+        match collect_stream(&mut stream, deps, session_id, signal, &turn).await? {
+            StreamEnd::Collected {
+                text,
+                tool_calls,
+                stopped,
+            } => (text, tool_calls, stopped),
+            StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
+            StreamEnd::Failed(error) => {
+                error!(
+                    msg = "provider stream failed",
+                    session_id = %session_id,
+                    provider = %turn.provider.name(),
+                    error = %error.display_chain()
+                );
+                return Ok(TurnOutcome::Failed);
+            }
+        };
 
     if !stopped {
         error!(
             msg = "provider stream ended without a stop event",
             session_id = %session_id,
-            provider = %deps.provider.name()
+            provider = %turn.provider.name()
         );
         return Ok(TurnOutcome::Failed);
     }
@@ -478,6 +521,36 @@ async fn run_turn_inner(
         deps.store
             .append_tool_call(session_id, &id, &name, &args)
             .await?;
+
+        // The session's allowed-tool set is the second half of its effective
+        // surface (the executor enforces the permission); a call outside it is
+        // refused without reaching the executor. A nameless call falls through
+        // to the unknown-tool branch below.
+        if !name.is_empty() && !tool_allowed(&allowed_tools, &name) {
+            warn!(
+                msg = "tool call refused: not allowed for this session",
+                session_id = %session_id,
+                tool = %name,
+                call_id = %id
+            );
+            let content = json!({ "error": format!("tool {name} is not allowed") });
+            deps.store
+                .complete_tool_call(session_id, &id, &content, true)
+                .await?;
+            deps.store
+                .append_message(
+                    session_id,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error: true,
+                        content,
+                    },
+                )
+                .await?;
+            continue;
+        }
 
         match name.as_str() {
             "" => {
@@ -602,18 +675,17 @@ async fn run_turn_inner(
                     )
                     .await?;
             }
+            // Legacy spawn_subagent shim, superseded by the sprint 004 spawn
+            // story: resolves its target from the persona catalog and runs a
+            // nested loop under that persona's model and permission.
             "spawn_subagent" => {
-                let subagent_type = args["subagent_type"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
+                let persona_name = args["persona"].as_str().unwrap_or_default().to_string();
                 let instructions = args["instructions"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                let Some(config) = deps.subagent_configs.get(&subagent_type) else {
-                    let content =
-                        json!({ "error": format!("unknown subagent type {subagent_type}") });
+                let Some(persona) = deps.personas.get(&persona_name) else {
+                    let content = json!({ "error": format!("unknown persona {persona_name}") });
                     deps.store
                         .complete_tool_call(session_id, &id, &content, true)
                         .await?;
@@ -631,9 +703,9 @@ async fn run_turn_inner(
                         .await?;
                     continue;
                 };
-                let Some(provider) = deps.providers.get(&config.model).cloned() else {
+                if !deps.providers.contains_key(&persona.model) {
                     let content =
-                        json!({ "error": format!("no provider for model {}", config.model) });
+                        json!({ "error": format!("no provider for model {}", persona.model) });
                     deps.store
                         .complete_tool_call(session_id, &id, &content, true)
                         .await?;
@@ -656,7 +728,7 @@ async fn run_turn_inner(
                         session_id,
                         Role::Assistant,
                         &Block::Subagent {
-                            subagent_type: subagent_type.clone(),
+                            subagent_type: persona_name.clone(),
                             status: "started".into(),
                             text: instructions.clone(),
                         },
@@ -665,9 +737,8 @@ async fn run_turn_inner(
                 match run_subagent(
                     deps,
                     session_id,
-                    &subagent_type,
-                    config,
-                    provider,
+                    &persona_name,
+                    persona,
                     &instructions,
                     signal,
                 )
@@ -679,7 +750,7 @@ async fn run_turn_inner(
                                 session_id,
                                 Role::Assistant,
                                 &Block::Subagent {
-                                    subagent_type: subagent_type.clone(),
+                                    subagent_type: persona_name.clone(),
                                     status: "done".into(),
                                     text: summary.clone(),
                                 },
@@ -766,8 +837,7 @@ async fn collect_stream(
     deps: &Arc<LoopDeps>,
     session_id: &str,
     signal: &Arc<InterruptSignal>,
-    model: &str,
-    provider: &str,
+    turn: &TurnModel,
 ) -> Result<StreamEnd, anyhow::Error> {
     let mut text = String::new();
     let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
@@ -797,16 +867,16 @@ async fn collect_stream(
                     deps.store
                         .append_model_call(
                             session_id,
-                            model,
-                            provider,
+                            turn.provider.model(),
+                            turn.provider.name(),
                             "completion",
                             Some(input_tokens),
                             Some(output_tokens),
                             Some(model_call_cost(
                                 Some(input_tokens),
                                 Some(output_tokens),
-                                deps.price_input_per_mtok,
-                                deps.price_output_per_mtok,
+                                turn.price_input_per_mtok,
+                                turn.price_output_per_mtok,
                             )),
                         )
                         .await?;
@@ -988,35 +1058,62 @@ fn parse_tool_calls(
         .collect()
 }
 
+/// Whether an allowed-tools parse result (`None` = every tool) permits `name`.
+fn tool_allowed(allowed_tools: &Option<Vec<String>>, name: &str) -> bool {
+    match allowed_tools {
+        None => true,
+        Some(names) => names.iter().any(|n| n == name),
+    }
+}
+
 /// Runs the subagent's nested loop: its own window, its own tool list (node
-/// tools only), its own model and permission. Every streamed message and tool
-/// call is written to the session store as a Subagent block, so the parent's
-/// transcript shows the subagent's work. Returns the subagent's accumulated
-/// text as the summary the parent reports to its model.
+/// tools only, restricted to the persona's allow-list), its own model and
+/// permission. Every streamed message and tool call is written to the session
+/// store as a Subagent block, so the parent's transcript shows the subagent's
+/// work. Returns the subagent's accumulated text as the summary the parent
+/// reports to its model.
 async fn run_subagent(
     deps: &Arc<LoopDeps>,
     session_id: &str,
-    subagent_type: &str,
-    config: &SubagentConfig,
-    provider: Arc<dyn crate::provider::Provider>,
+    persona_name: &str,
+    persona: &PersonaConfig,
     instructions: &str,
     interrupt: &Arc<InterruptSignal>,
 ) -> Result<String, anyhow::Error> {
+    let turn = deps.turn_model(&persona.model);
     // The preamble rides in the first user message, the same way the parent's
     // system prompt would, so the subagent needs no separate system text.
     let mut window = vec![Message {
         role: Role::User,
         block: Block::Text {
             text: format!(
-                "You are a subagent of type {subagent_type} working on the task below. \
+                "You are a subagent of type {persona_name} working on the task below. \
                  You share the session's working copy. Make the requested change directly \
                  using your tools. Do not ask questions; finish on your own.\n\n{instructions}"
             ),
         },
     }];
     // Node-side tools only: the subagent never asks the user, rewrites the
-    // session todo list, loads skills, or spawns further subagents.
-    let tools: Vec<ToolSpec> = canonical_tools(config.permission)
+    // session todo list, loads skills, or spawns further subagents. Its
+    // persona's allow-list applies on top of that. An unparsable allow-list
+    // refuses the subagent's tool surface instead of widening it to every
+    // tool; the caller reports the failure to the parent.
+    let persona_tools = match parse_allowed_tools(&persona.allowed_tools) {
+        Ok(tools) => tools,
+        Err(error) => {
+            let detail = error.to_string();
+            error!(
+                msg = "subagent refused: persona allowed_tools are invalid",
+                session_id = %session_id,
+                persona = %persona_name,
+                error = %detail
+            );
+            return Err(anyhow::anyhow!(
+                "persona {persona_name} allowed_tools are invalid: {detail}"
+            ));
+        }
+    };
+    let tools: Vec<ToolSpec> = canonical_tools(persona.permission)
         .into_iter()
         .filter(|tool| {
             !matches!(
@@ -1024,52 +1121,45 @@ async fn run_subagent(
                 "ask" | "todowrite" | "skill" | "spawn_subagent"
             )
         })
+        .filter(|tool| tool_allowed(&persona_tools, &tool.name))
         .collect();
     let mut summary = String::new();
 
     for _ in 0..MAX_SUBAGENT_TURNS {
-        let mut stream = provider.chat_stream(ProviderCall {
-            model: &config.model,
+        let mut stream = turn.provider.chat_stream(ProviderCall {
+            model: turn.provider.model(),
             max_tokens: MAX_TOKENS,
             system: "",
             messages: window.clone(),
             tools: tools.clone(),
         })?;
 
-        let (text, tool_calls, stopped) = match collect_stream(
-            &mut stream,
-            deps,
-            session_id,
-            interrupt,
-            &config.model,
-            provider.name(),
-        )
-        .await?
-        {
-            StreamEnd::Collected {
-                text,
-                tool_calls,
-                stopped,
-            } => (text, tool_calls, stopped),
-            StreamEnd::Interrupted => return Err(anyhow::anyhow!("subagent interrupted")),
-            StreamEnd::Failed(error) => {
-                error!(
-                    msg = "subagent provider stream failed",
-                    session_id = %session_id,
-                    subagent_type = %subagent_type,
-                    provider = %provider.name(),
-                    error = %error.display_chain()
-                );
-                return Err(error);
-            }
-        };
+        let (text, tool_calls, stopped) =
+            match collect_stream(&mut stream, deps, session_id, interrupt, &turn).await? {
+                StreamEnd::Collected {
+                    text,
+                    tool_calls,
+                    stopped,
+                } => (text, tool_calls, stopped),
+                StreamEnd::Interrupted => return Err(anyhow::anyhow!("subagent interrupted")),
+                StreamEnd::Failed(error) => {
+                    error!(
+                        msg = "subagent provider stream failed",
+                        session_id = %session_id,
+                        persona = %persona_name,
+                        provider = %turn.provider.name(),
+                        error = %error.display_chain()
+                    );
+                    return Err(error);
+                }
+            };
 
         if !stopped {
             error!(
                 msg = "subagent provider stream ended without a stop event",
                 session_id = %session_id,
-                subagent_type = %subagent_type,
-                provider = %provider.name()
+                persona = %persona_name,
+                provider = %turn.provider.name()
             );
             return Err(anyhow::anyhow!(
                 "subagent provider stream ended without a stop event"
@@ -1087,7 +1177,7 @@ async fn run_subagent(
                     session_id,
                     Role::Assistant,
                     &Block::Subagent {
-                        subagent_type: subagent_type.to_string(),
+                        subagent_type: persona_name.to_string(),
                         status: "message".into(),
                         text,
                     },
@@ -1096,7 +1186,7 @@ async fn run_subagent(
         }
 
         let calls: Vec<(String, String, Value)> =
-            parse_tool_calls(tool_calls, session_id, Some(subagent_type));
+            parse_tool_calls(tool_calls, session_id, Some(persona_name));
 
         if calls.is_empty() {
             return Ok(summary.trim().to_string());
@@ -1116,7 +1206,7 @@ async fn run_subagent(
                     session_id,
                     Role::Assistant,
                     &Block::Subagent {
-                        subagent_type: subagent_type.to_string(),
+                        subagent_type: persona_name.to_string(),
                         status: "tool".into(),
                         text: format!("{name} {args}"),
                     },
@@ -1126,6 +1216,41 @@ async fn run_subagent(
                 .append_tool_call(session_id, &id, &name, &args)
                 .await?;
 
+            if !tool_allowed(&persona_tools, &name) {
+                warn!(
+                    msg = "subagent tool call refused: not allowed for the persona",
+                    session_id = %session_id,
+                    persona = %persona_name,
+                    tool = %name,
+                    call_id = %id
+                );
+                let content = json!({ "error": format!("tool {name} is not allowed") });
+                deps.store
+                    .complete_tool_call(session_id, &id, &content, true)
+                    .await?;
+                window.push(Message {
+                    role: Role::User,
+                    block: Block::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        is_error: true,
+                        content: content.clone(),
+                    },
+                });
+                deps.store
+                    .append_message(
+                        session_id,
+                        Role::User,
+                        &Block::Subagent {
+                            subagent_type: persona_name.to_string(),
+                            status: "tool_result".into(),
+                            text: content.to_string(),
+                        },
+                    )
+                    .await?;
+                continue;
+            }
+
             let run_id = Uuid::new_v4().to_string();
             let Some(outcome) = run_tool_call(
                 deps,
@@ -1134,7 +1259,7 @@ async fn run_subagent(
                 &name,
                 args,
                 interrupt,
-                Some(subagent_type),
+                Some(persona_name),
             )
             .await?
             else {
@@ -1157,7 +1282,7 @@ async fn run_subagent(
                     session_id,
                     Role::User,
                     &Block::Subagent {
-                        subagent_type: subagent_type.to_string(),
+                        subagent_type: persona_name.to_string(),
                         status: "tool_result".into(),
                         text: outcome.content.to_string(),
                     },
@@ -1169,7 +1294,7 @@ async fn run_subagent(
     warn!(
         msg = "subagent exceeded its turn limit",
         session_id = %session_id,
-        subagent_type = %subagent_type
+        persona = %persona_name
     );
     Err(anyhow::anyhow!("subagent exceeded its turn limit"))
 }
@@ -1181,6 +1306,7 @@ async fn run_subagent(
 /// left untouched and the full window is returned.
 async fn maybe_compact(
     deps: &Arc<LoopDeps>,
+    turn: &TurnModel,
     session_id: &str,
     signal: &Arc<InterruptSignal>,
 ) -> anyhow::Result<Vec<(i64, Message)>> {
@@ -1194,7 +1320,7 @@ async fn maybe_compact(
     let tail_last_id = window[split - 1].0;
 
     let Some((text, input_tokens, output_tokens)) =
-        summarize_tail(deps, session_id, tail, signal).await
+        summarize_tail(turn, session_id, tail, signal).await
     else {
         return Ok(window);
     };
@@ -1206,16 +1332,16 @@ async fn maybe_compact(
     deps.store
         .append_model_call(
             session_id,
-            deps.provider.model(),
-            deps.provider.name(),
+            turn.provider.model(),
+            turn.provider.name(),
             "compaction",
             input_tokens,
             output_tokens,
             Some(model_call_cost(
                 input_tokens,
                 output_tokens,
-                deps.price_input_per_mtok,
-                deps.price_output_per_mtok,
+                turn.price_input_per_mtok,
+                turn.price_output_per_mtok,
             )),
         )
         .await?;
@@ -1232,7 +1358,7 @@ async fn maybe_compact(
 /// token counts when the stream ended with a Stop; returns None on a stream
 /// error, a missing Stop, or an interrupt, logging the reason.
 async fn summarize_tail(
-    deps: &Arc<LoopDeps>,
+    turn: &TurnModel,
     session_id: &str,
     tail: &[(i64, Message)],
     signal: &Arc<InterruptSignal>,
@@ -1249,8 +1375,8 @@ async fn summarize_tail(
         role: Role::User,
         block: Block::Text { text: prompt },
     }];
-    let mut stream = match deps.provider.chat_stream(ProviderCall {
-        model: deps.provider.model(),
+    let mut stream = match turn.provider.chat_stream(ProviderCall {
+        model: turn.provider.model(),
         max_tokens: MAX_TOKENS,
         system: "",
         messages,
@@ -1261,7 +1387,7 @@ async fn summarize_tail(
             warn!(
                 msg = "summarizer request failed",
                 session_id = %session_id,
-                provider = %deps.provider.name(),
+                provider = %turn.provider.name(),
                 error = %error.display_chain()
             );
             return None;
@@ -1295,7 +1421,7 @@ async fn summarize_tail(
                     warn!(
                         msg = "summarizer stream failed",
                         session_id = %session_id,
-                        provider = %deps.provider.name(),
+                        provider = %turn.provider.name(),
                         error = %error.display_chain()
                     );
                     return None;
@@ -1318,7 +1444,7 @@ async fn summarize_tail(
         warn!(
             msg = "summarizer stream ended without a stop event",
             session_id = %session_id,
-            provider = %deps.provider.name()
+            provider = %turn.provider.name()
         );
         return None;
     }
@@ -1351,13 +1477,34 @@ fn render_block(block: &Block) -> String {
     }
 }
 
-fn system_prompt(todos: &[Value], skills: &[Skill]) -> String {
-    let mut prompt = String::from(
-        "You are Bosun, an autonomous software engineering agent. \
-         You work in a session working copy. Use the provided tools to inspect \
-         and modify code. Prefer the simplest change that works. Keep replies \
-         concise and literal. Ask the user only when a decision requires them.",
-    );
+/// The session's persona prompt body, when the session names a configured
+/// persona that has one. A session without a persona (or whose persona is no
+/// longer configured) runs on the default system text below.
+fn persona_system_prompt<'a>(deps: &'a LoopDeps, session: &Session) -> Option<&'a str> {
+    let name = session.persona.as_deref()?;
+    match deps.personas.get(name) {
+        Some(persona) => persona.system_prompt.as_deref(),
+        None => {
+            warn!(
+                msg = "session persona is not configured; using the default system prompt",
+                session_id = %session.id,
+                persona = %name
+            );
+            None
+        }
+    }
+}
+
+const DEFAULT_SYSTEM_PROMPT: &str = "You are Bosun, an autonomous software engineering agent. \
+     You work in a session working copy. Use the provided tools to inspect \
+     and modify code. Prefer the simplest change that works. Keep replies \
+     concise and literal. Ask the user only when a decision requires them.";
+
+/// Builds the system prompt: the persona's role text when it has one (the
+/// built-in default otherwise), then the session's live context — skill
+/// advertisements and the todo list.
+fn system_prompt(persona: Option<&str>, todos: &[Value], skills: &[Skill]) -> String {
+    let mut prompt = persona.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string();
     if !skills.is_empty() {
         prompt.push_str("\n\nSkills available in this session:");
         for skill in skills {
@@ -1381,9 +1528,11 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use bosun_common::config::PersonaConfig;
     use bosun_common::session::Permission;
     use bosun_common::session::Session;
     use bosun_common::session::SessionState;
+    use bosun_common::tool::ALL_TOOLS;
     use bosun_common::tool::ToolDelta;
     use bosun_store::store::Store;
     use bosun_test_support::wait_for;
@@ -1409,10 +1558,28 @@ mod tests {
             git_ref: None,
             dir: "/work".to_string(),
             model: "mock-model".to_string(),
+            persona: None,
             permission: Permission::ReadWrite,
+            allowed_tools: ALL_TOOLS.to_string(),
             state: SessionState::Creating,
             created_at_secs: 1_700_000_000,
             prompt: None,
+        }
+    }
+
+    /// A session whose persona allows only `names`.
+    fn session_allowing(id: &str, names: &str) -> Session {
+        Session {
+            allowed_tools: names.to_string(),
+            ..session(id)
+        }
+    }
+
+    /// A session that names `persona` as the one it runs under.
+    fn session_under_persona(id: &str, persona: &str) -> Session {
+        Session {
+            persona: Some(persona.to_string()),
+            ..session(id)
         }
     }
 
@@ -1513,6 +1680,40 @@ mod tests {
                 }
             });
             Ok(stream.boxed())
+        }
+    }
+
+    /// Reports a distinct model name while delegating to a scripted provider,
+    /// so a test can tell which model the loop resolved by the name it
+    /// records on its model calls.
+    struct ModelNamedProvider {
+        inner: ScriptedProvider,
+        model: String,
+    }
+
+    impl ModelNamedProvider {
+        fn new(scripts: Vec<Vec<StreamEvent>>, model: &str) -> Self {
+            Self {
+                inner: ScriptedProvider::new(scripts),
+                model: model.to_string(),
+            }
+        }
+    }
+
+    impl Provider for ModelNamedProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn model(&self) -> &str {
+            &self.model
+        }
+
+        fn chat_stream<'a>(
+            &'a self,
+            call: ProviderCall<'a>,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+            self.inner.chat_stream(call)
         }
     }
 
@@ -1690,21 +1891,22 @@ mod tests {
             delta_sink: sink,
             max_window_messages,
             injected_skills_dir: None,
-            subagent_configs: HashMap::new(),
+            personas: HashMap::new(),
             providers: HashMap::new(),
+            prices: HashMap::new(),
             price_input_per_mtok,
             price_output_per_mtok,
         }
     }
 
-    /// A deps with configured subagent types and their providers; existing
-    /// tests never fill the window, so compaction stays off.
-    fn test_deps_with_subagents(
+    /// A deps with configured personas and their providers; existing tests
+    /// never fill the window, so compaction stays off.
+    fn test_deps_with_personas(
         store: &Store,
         provider: Arc<dyn Provider>,
         tools: Arc<MockTools>,
         sink: Arc<CollectSink>,
-        subagent_configs: HashMap<String, SubagentConfig>,
+        personas: HashMap<String, PersonaConfig>,
         providers: HashMap<String, Arc<dyn Provider>>,
     ) -> LoopDeps {
         LoopDeps {
@@ -1714,10 +1916,29 @@ mod tests {
             delta_sink: sink,
             max_window_messages: usize::MAX,
             injected_skills_dir: None,
-            subagent_configs,
+            personas,
             providers,
+            prices: HashMap::new(),
             price_input_per_mtok: 0.0,
             price_output_per_mtok: 0.0,
+        }
+    }
+
+    fn persona(model: &str, permission: Permission) -> PersonaConfig {
+        PersonaConfig {
+            model: model.to_string(),
+            permission,
+            allowed_tools: ALL_TOOLS.to_string(),
+            description: String::new(),
+            system_prompt: None,
+        }
+    }
+
+    /// A persona whose system prompt reads `prompt`.
+    fn persona_with_prompt(model: &str, permission: Permission, prompt: &str) -> PersonaConfig {
+        PersonaConfig {
+            system_prompt: Some(prompt.to_string()),
+            ..persona(model, permission)
         }
     }
 
@@ -2965,6 +3186,730 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowed_tools_restrict_the_advertised_schema() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session_allowing("s-allow", "file/read, grep, glob"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-allow".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        let names: Vec<&str> = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, ["file/read", "grep", "glob"]);
+        assert!(
+            !names.contains(&"spawn_subagent"),
+            "an allow-list without spawn_subagent does not advertise it"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_call_to_a_disallowed_tool_is_refused_without_dispatch() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session_allowing("s-refuse", "file/read"))
+            .await
+            .unwrap();
+
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"rm -rf /"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-refuse".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-refuse").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("s-refuse", false).await.unwrap();
+        let refused = messages.iter().find(
+            |(_, message)| matches!(&message.block, Block::ToolResult { id, .. } if id == "call-1"),
+        );
+        let (is_error, content) = match refused.map(|(_, message)| &message.block) {
+            Some(Block::ToolResult {
+                is_error, content, ..
+            }) => (*is_error, content.clone()),
+            _ => panic!("the refused call must record a tool result"),
+        };
+        assert!(is_error);
+        assert_eq!(content, json!({ "error": "tool shell is not allowed" }));
+
+        assert!(
+            !tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.name == "shell"),
+            "a disallowed tool call never reaches the executor"
+        );
+
+        let tool_calls = store.tool_calls("s-refuse").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert!(tool_calls[0].is_error);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_session_allowed_tools_fails_the_turn_closed() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session_allowing("s-bad-allow", "shell, websurf"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-bad-allow".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to interrupt after the failed turn", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-bad-allow").await.unwrap().unwrap();
+                stored.state == SessionState::Interrupted
+            }
+        })
+        .await;
+
+        assert!(
+            provider.captured_calls().is_empty(),
+            "the turn must not reach the provider when the allow-list is unparsable"
+        );
+        assert!(
+            store.model_calls("s-bad-allow").await.unwrap().is_empty(),
+            "no model call is recorded for a turn that never started"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_session_runs_under_its_personas_system_prompt() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session_under_persona("s-persona", "reviewer"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "reviewer".to_string(),
+                persona_with_prompt(
+                    "mock-model",
+                    Permission::ReadWrite,
+                    "You are a meticulous reviewer. Never edit files.",
+                ),
+            )]),
+            HashMap::new(),
+        ));
+        let handle = spawn_loop("s-persona".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            calls[0]
+                .system
+                .contains("You are a meticulous reviewer. Never edit files."),
+            "the persona's prompt is the system prompt's role layer: {}",
+            calls[0].system
+        );
+        assert!(
+            !calls[0].system.contains("You are Bosun"),
+            "the persona's prompt replaces the built-in default role text: {}",
+            calls[0].system
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_persona_without_a_prompt_keeps_the_default_role_text() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session_under_persona("s-plain-persona", "coder"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::new(),
+        ));
+        let handle = spawn_loop("s-plain-persona".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            calls[0].system.contains("You are Bosun"),
+            "a persona without a prompt file leaves the default role text: {}",
+            calls[0].system
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn the_persona_prompt_composes_with_the_dynamic_todo_list() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session_under_persona("s-todo-persona", "coder"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("todowrite".into()),
+                    args_delta: r#"{"items":[{"id":"1","content":"write tests","status":"todo"}]}"#
+                        .into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("working on it".into()),
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona_with_prompt(
+                    "mock-model",
+                    Permission::ReadWrite,
+                    "You are the coder persona.",
+                ),
+            )]),
+            HashMap::new(),
+        ));
+        let handle = spawn_loop("s-todo-persona".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for(
+            "the second turn's system prompt to carry the persona text and the todo list",
+            {
+                let provider = provider.clone();
+                move || {
+                    let provider = provider.clone();
+                    async move {
+                        let calls = provider.captured_calls();
+                        calls.len() == 2
+                            && calls[1].system.contains("You are the coder persona.")
+                            && calls[1].system.contains("Current todo list")
+                    }
+                }
+            },
+        )
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(calls[0].system.contains("You are the coder persona."));
+        assert!(
+            !calls[0].system.contains("Current todo list"),
+            "the first turn has no todos yet"
+        );
+        assert!(calls[1].system.contains("0. [todo] write tests"));
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_applies_to_the_next_turn() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut switched = session_under_persona("s-switch", "coder");
+        switched.model = "model-a".into();
+        store.create_session(&switched).await.unwrap();
+
+        let coder = persona_with_prompt(
+            "model-a",
+            Permission::ReadWrite,
+            "You are the coder persona.",
+        );
+        let mut reviewer = persona_with_prompt(
+            "model-b",
+            Permission::ReadOnly,
+            "You are the reviewer persona.",
+        );
+        reviewer.allowed_tools = "file/read".into();
+        let coder_provider = Arc::new(ModelNamedProvider::new(
+            one_text_script("coder turn"),
+            "model-a",
+        ));
+        let reviewer_provider = Arc::new(ModelNamedProvider::new(
+            one_text_script("reviewer turn"),
+            "model-b",
+        ));
+        let personas = HashMap::from([
+            ("coder".to_string(), coder.clone()),
+            ("reviewer".to_string(), reviewer.clone()),
+        ]);
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            coder_provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            personas,
+            HashMap::from([
+                (
+                    "model-a".to_string(),
+                    coder_provider.clone() as Arc<dyn Provider>,
+                ),
+                (
+                    "model-b".to_string(),
+                    reviewer_provider.clone() as Arc<dyn Provider>,
+                ),
+            ]),
+        ));
+        let handle = spawn_loop("s-switch".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the first turn to run under the coder persona", || {
+            let store = store.clone();
+            async move {
+                let calls = store.model_calls("s-switch").await.unwrap();
+                calls.len() == 1 && calls[0].model == "model-a"
+            }
+        })
+        .await;
+        let first = store.model_calls("s-switch").await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].model, "model-a");
+
+        let coder_calls = coder_provider.inner.captured_calls();
+        assert_eq!(coder_calls.len(), 1);
+        assert!(
+            coder_calls[0].system.contains("You are the coder persona."),
+            "{}",
+            coder_calls[0].system
+        );
+        assert!(
+            coder_calls[0].tools.iter().any(|tool| tool.name == "shell"),
+            "the coder persona's read-write tool schema is advertised"
+        );
+
+        // The switch lands between turns: the stored session fields move to
+        // the reviewer persona, and the next wake runs under its model.
+        store
+            .switch_persona(
+                "s-switch",
+                "reviewer",
+                "model-b",
+                Permission::ReadOnly,
+                "file/read",
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the second turn to run under the reviewer persona", || {
+            let store = store.clone();
+            async move {
+                let calls = store.model_calls("s-switch").await.unwrap();
+                calls.len() == 2 && calls[1].model == "model-b"
+            }
+        })
+        .await;
+
+        let reviewer_calls = reviewer_provider.inner.captured_calls();
+        assert_eq!(reviewer_calls.len(), 1);
+        assert!(
+            reviewer_calls[0]
+                .system
+                .contains("You are the reviewer persona."),
+            "{}",
+            reviewer_calls[0].system
+        );
+        assert_eq!(
+            reviewer_calls[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            ["file/read"],
+            "the reviewer's tool schema is rebuilt from its allowed_tools"
+        );
+        assert!(
+            coder_provider.inner.captured_calls().len() == 1,
+            "the switched-away provider sees no further calls"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_mid_turn_does_not_abort_the_running_turn() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut switched = session_under_persona("s-mid-switch", "coder");
+        switched.model = "model-a".into();
+        store.create_session(&switched).await.unwrap();
+
+        // Each streamed item sleeps, so the first turn stays in flight long
+        // enough for the switch to land mid-stream.
+        let delay = Duration::from_millis(300);
+        let coder_provider = Arc::new(ModelNamedProvider {
+            inner: ScriptedProvider::with_delay(
+                vec![vec![
+                    StreamEvent::TextDelta("working".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ]],
+                delay,
+            ),
+            model: "model-a".into(),
+        });
+        let reviewer_provider = Arc::new(ModelNamedProvider::new(
+            one_text_script("reviewed"),
+            "model-b",
+        ));
+        let mut coder = persona("model-a", Permission::ReadWrite);
+        coder.system_prompt = Some("You are the coder persona.".into());
+        let mut reviewer = persona("model-b", Permission::ReadOnly);
+        reviewer.system_prompt = Some("You are the reviewer persona.".into());
+        reviewer.allowed_tools = "file/read".into();
+        let personas = HashMap::from([
+            ("coder".to_string(), coder),
+            ("reviewer".to_string(), reviewer),
+        ]);
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            coder_provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            personas,
+            HashMap::from([
+                (
+                    "model-a".to_string(),
+                    coder_provider.clone() as Arc<dyn Provider>,
+                ),
+                (
+                    "model-b".to_string(),
+                    reviewer_provider.clone() as Arc<dyn Provider>,
+                ),
+            ]),
+        ));
+        let handle = spawn_loop("s-mid-switch".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the first turn's request to start streaming", {
+            let coder_provider = coder_provider.clone();
+            move || {
+                let coder_provider = coder_provider.clone();
+                async move { coder_provider.inner.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        store
+            .switch_persona(
+                "s-mid-switch",
+                "reviewer",
+                "model-b",
+                Permission::ReadOnly,
+                "file/read",
+            )
+            .await
+            .unwrap();
+
+        // The in-flight turn is not aborted: it finishes under the model it
+        // started with, and the session reaches waiting_for_input.
+        wait_for("the in-flight turn to finish", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("s-mid-switch").await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+        let calls = store.model_calls("s-mid-switch").await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].model, "model-a",
+            "the running turn keeps the model it started under"
+        );
+        assert_eq!(
+            store
+                .get_session("s-mid-switch")
+                .await
+                .unwrap()
+                .unwrap()
+                .persona
+                .as_deref(),
+            Some("reviewer"),
+            "the stored session already carries the switch"
+        );
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the next turn to run under the reviewer model", || {
+            let store = store.clone();
+            async move {
+                let calls = store.model_calls("s-mid-switch").await.unwrap();
+                calls.len() == 2 && calls[1].model == "model-b"
+            }
+        })
+        .await;
+        let reviewer_calls = reviewer_provider.inner.captured_calls();
+        assert_eq!(reviewer_calls.len(), 1);
+        assert!(
+            reviewer_calls[0]
+                .system
+                .contains("You are the reviewer persona."),
+            "{}",
+            reviewer_calls[0].system
+        );
+
+        handle.stop();
+    }
+
+    /// One text turn, for providers whose exact script does not matter.
+    fn one_text_script(text: &str) -> Vec<Vec<StreamEvent>> {
+        vec![vec![
+            StreamEvent::TextDelta(text.into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]
+    }
+
+    #[tokio::test]
+    async fn a_subagent_persona_with_unparsable_allowed_tools_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        // The parent runs on its own model so its provider stays distinct from
+        // the subagent persona's provider under the same mock model.
+        let mut parent_session = session("s-subagent-bad");
+        parent_session.model = "parent-model".into();
+        store.create_session(&parent_session).await.unwrap();
+
+        let mut coder = persona("mock-model", Permission::ReadWrite);
+        coder.allowed_tools = "websurf".into();
+        let subagent_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("should never run".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn_subagent".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps_with_personas(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([("coder".to_string(), coder)]),
+            HashMap::from([
+                (
+                    "parent-model".to_string(),
+                    provider.clone() as Arc<dyn Provider>,
+                ),
+                (
+                    "mock-model".to_string(),
+                    subagent_provider.clone() as Arc<dyn Provider>,
+                ),
+            ]),
+        ));
+        let handle = spawn_loop("s-subagent-bad".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-subagent-bad").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("s-subagent-bad", false).await.unwrap();
+        assert!(
+            messages.iter().any(|(_, message)| {
+                message.role == Role::User
+                    && matches!(
+                        &message.block,
+                        Block::ToolResult { id, name, is_error, content } if id == "call-1"
+                            && name == "spawn_subagent"
+                            && *is_error
+                            && content == &json!({ "error": "subagent failed" })
+                    )
+            }),
+            "the refused subagent records an error result"
+        );
+
+        assert!(
+            subagent_provider.captured_calls().is_empty(),
+            "a persona with an unparsable allow-list never reaches the provider"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn two_tool_calls_in_one_turn_dispatch_in_order_with_distinct_run_ids() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -3448,7 +4393,7 @@ mod tests {
                     index: 0,
                     id: Some("call-1".into()),
                     name: Some("spawn_subagent".into()),
-                    args_delta: r#"{"subagent_type":"coder","instructions":"add a test"}"#.into(),
+                    args_delta: r#"{"persona":"coder","instructions":"add a test"}"#.into(),
                 },
                 StreamEvent::Stop {
                     input_tokens: 3,
@@ -3470,17 +4415,14 @@ mod tests {
                 },
             ],
         ]));
-        let deps = Arc::new(test_deps_with_subagents(
+        let deps = Arc::new(test_deps_with_personas(
             &store,
             provider.clone(),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
             HashMap::from([(
                 "coder".to_string(),
-                SubagentConfig {
-                    model: "mock-model".into(),
-                    permission: Permission::ReadWrite,
-                },
+                persona("mock-model", Permission::ReadWrite),
             )]),
             HashMap::from([(
                 "mock-model".to_string(),
@@ -3588,7 +4530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_subagent_type_reports_an_error_result() {
+    async fn an_unknown_persona_reports_an_error_result() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
@@ -3602,7 +4544,7 @@ mod tests {
                     index: 0,
                     id: Some("call-1".into()),
                     name: Some("spawn_subagent".into()),
-                    args_delta: r#"{"subagent_type":"nope","instructions":"do it"}"#.into(),
+                    args_delta: r#"{"persona":"nope","instructions":"do it"}"#.into(),
                 },
                 StreamEvent::Stop {
                     input_tokens: 2,
@@ -3617,17 +4559,14 @@ mod tests {
                 },
             ],
         ]));
-        let deps = Arc::new(test_deps_with_subagents(
+        let deps = Arc::new(test_deps_with_personas(
             &store,
             provider.clone(),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
             HashMap::from([(
                 "coder".to_string(),
-                SubagentConfig {
-                    model: "mock-model".into(),
-                    permission: Permission::ReadWrite,
-                },
+                persona("mock-model", Permission::ReadWrite),
             )]),
             HashMap::new(),
         ));
@@ -3649,7 +4588,7 @@ mod tests {
             !messages
                 .iter()
                 .any(|(_, message)| matches!(&message.block, Block::Subagent { .. })),
-            "no subagent activity is recorded for an unknown type"
+            "no subagent activity is recorded for an unknown persona"
         );
         assert!(
             messages
@@ -3660,9 +4599,9 @@ mod tests {
                         Block::ToolResult { id, name, is_error, content } if id == "call-1"
                             && name == "spawn_subagent"
                             && *is_error
-                            && content == &json!({ "error": "unknown subagent type nope" })
+                            && content == &json!({ "error": "unknown persona nope" })
                     )),
-            "the unknown type call records an error result"
+            "the unknown persona call records an error result"
         );
 
         let tool_calls = store.tool_calls("s-subagent-miss").await.unwrap();
@@ -3672,7 +4611,7 @@ mod tests {
         assert!(tool_calls[0].is_error);
         assert_eq!(
             tool_calls[0].result,
-            Some(json!({ "error": "unknown subagent type nope" }))
+            Some(json!({ "error": "unknown persona nope" }))
         );
 
         handle.stop();

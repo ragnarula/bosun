@@ -94,13 +94,17 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
              data_dir = \"{}\"\n\
              tls_cert = \"{}\"\n\
              tls_key = \"{}\"\n\
-             default_model = \"test\"\n\
+             default_persona = \"test\"\n\
              \n\
              [models.test]\n\
              provider = \"openai\"\n\
              name = \"test\"\n\
              base_url = \"http://127.0.0.1:1\"\n\
-             api_key = \"x\"\n",
+             api_key = \"x\"\n\
+             \n\
+             [personas.test]\n\
+             model = \"test\"\n\
+             permission = \"read_write\"\n",
             root.join("cp-data").display(),
             cert_path.display(),
             key_path.display()
@@ -258,13 +262,17 @@ async fn dev_session_in_existing_directory_end_to_end() {
              data_dir = \"{}\"\n\
              tls_cert = \"{}\"\n\
              tls_key = \"{}\"\n\
-             default_model = \"test\"\n\
+             default_persona = \"test\"\n\
              \n\
              [models.test]\n\
              provider = \"openai\"\n\
              name = \"test\"\n\
              base_url = \"http://127.0.0.1:1\"\n\
-             api_key = \"x\"\n",
+             api_key = \"x\"\n\
+             \n\
+             [personas.test]\n\
+             model = \"test\"\n\
+             permission = \"read_write\"\n",
             root.join("cp-data").display(),
             cert_path.display(),
             key_path.display()

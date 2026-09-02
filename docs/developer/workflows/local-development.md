@@ -8,13 +8,21 @@ This guide covers running Bosun locally for development.
 cargo run -p bosun -- serve --config cmd/bosun/settings/serve.toml
 ```
 
-The control plane reads its config from `--config`. See [config.md](../config.md) for the fields. A control plane needs at least one configured model; set `[models.default]` in the config and export the key it references, for example:
+The control plane reads its config from `--config`. See [config.md](../config.md) for the fields. A control plane needs at least one configured model and one persona; set `[models.default]`, `[personas.coder]`, and `default_persona` in the config and export the key the model references, for example:
 
 ```toml
 [models.default]
 provider = "anthropic"
 name = "claude-sonnet-4-5"
 api_key = "env:ANTHROPIC_API_KEY"
+
+[personas.coder]
+model = "default"
+permission = "read_write"
+allowed_tools = "*"
+description = "Makes changes directly"
+
+default_persona = "coder"
 ```
 
 ## Node
@@ -53,9 +61,11 @@ cargo run -p bosun -- open <id>
 
 `bosun open` attaches interactively: it renders the live transcript, sends
 messages from an input line, interrupts the current turn with ctrl-c, toggles
-permission with ctrl-p, and reconnects after a disconnection. With no session id
-it lists sessions to pick from. The web pane lives at the control-plane root
-(`http://127.0.0.1:8090/`).
+permission with ctrl-p, switches persona with `/persona <name>`, and
+reconnects after a disconnection. With no session id it lists sessions to pick
+from. The web pane lives at the control-plane root (`http://127.0.0.1:8090/`),
+where a session's view can also switch its persona. The switch applies from
+the next turn; the session's event stream records it.
 
 With no message, a new session idles at `waiting_for_input`; with
 `--message <prompt>` the first turn starts immediately. The control plane runs

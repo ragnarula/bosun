@@ -204,10 +204,10 @@ pub struct CloneRequest {
     pub repo_url: String,
     #[serde(rename = "ref")]
     pub git_ref: Option<String>,
+    /// Persona the session runs under; the control plane's `default_persona`
+    /// is used when none is given.
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub permission: Option<Permission>,
+    pub persona: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
 }
@@ -225,10 +225,10 @@ pub struct NodeCloneRequest {
 pub struct DevRequest {
     pub node: String,
     pub dir: PathBuf,
+    /// Persona the session runs under; the control plane's `default_persona`
+    /// is used when none is given.
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub permission: Option<Permission>,
+    pub persona: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
 }
@@ -264,30 +264,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clone_request_defaults_model_and_permission() {
+    fn clone_request_defaults_persona_and_prompt() {
         let request: CloneRequest =
             serde_json::from_str(r#"{"node":"node-1","repo_url":"https://example.com/repo"}"#)
                 .unwrap();
-        assert_eq!(request.model, None);
-        assert_eq!(request.permission, None);
+        assert_eq!(request.persona, None);
         assert_eq!(request.prompt, None);
     }
 
     #[test]
-    fn clone_request_parses_an_explicit_permission() {
+    fn clone_request_parses_an_explicit_persona() {
         let request: CloneRequest = serde_json::from_str(
-            r#"{"node":"node-1","repo_url":"https://example.com/repo","permission":"read_write"}"#,
+            r#"{"node":"node-1","repo_url":"https://example.com/repo","persona":"coder"}"#,
         )
         .unwrap();
-        assert_eq!(request.permission, Some(Permission::ReadWrite));
+        assert_eq!(request.persona.as_deref(), Some("coder"));
     }
 
     #[test]
-    fn dev_request_defaults_model_and_permission() {
+    fn dev_request_defaults_persona_and_prompt() {
         let request: DevRequest =
             serde_json::from_str(r#"{"node":"node-1","dir":"/work/repo"}"#).unwrap();
-        assert_eq!(request.model, None);
-        assert_eq!(request.permission, None);
+        assert_eq!(request.persona, None);
         assert_eq!(request.prompt, None);
     }
 
@@ -298,6 +296,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.prompt.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn dev_request_parses_an_explicit_persona() {
+        let request: DevRequest =
+            serde_json::from_str(r#"{"node":"node-1","dir":"/work/repo","persona":"reviewer"}"#)
+                .unwrap();
+        assert_eq!(request.persona.as_deref(), Some("reviewer"));
     }
 
     #[test]

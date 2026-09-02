@@ -2,6 +2,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::tool::ALL_TOOLS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
@@ -27,10 +29,23 @@ pub struct Session {
     pub git_ref: Option<String>,
     pub dir: String,
     pub model: String,
+    /// The persona this session runs under, resolved by name at creation.
+    /// None for sessions created before personas existed; they keep the
+    /// default system prompt.
+    #[serde(default)]
+    pub persona: Option<String>,
     pub permission: Permission,
+    /// The persona's allowed-tools spec, resolved onto the session at
+    /// creation: `"*"` for every canonical tool, or a list of tool names.
+    #[serde(default = "default_allowed_tools")]
+    pub allowed_tools: String,
     pub state: SessionState,
     pub created_at_secs: i64,
     pub prompt: Option<String>,
+}
+
+fn default_allowed_tools() -> String {
+    ALL_TOOLS.into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +118,9 @@ pub enum Event {
     },
     Permission {
         permission: Permission,
+    },
+    Persona {
+        persona: String,
     },
     ModelCall {
         model: String,
@@ -260,6 +278,9 @@ mod tests {
             Event::Permission {
                 permission: Permission::ReadWrite,
             },
+            Event::Persona {
+                persona: "reviewer".into(),
+            },
             Event::ModelCall {
                 model: "claude".into(),
                 provider: "anthropic".into(),
@@ -289,6 +310,13 @@ mod tests {
         assert_eq!(json["kind"], "permission");
         assert_eq!(json["permission"], "read_write");
 
+        let json = serde_json::to_value(Event::Persona {
+            persona: "reviewer".into(),
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "persona");
+        assert_eq!(json["persona"], "reviewer");
+
         let json = serde_json::to_value(Event::ModelCall {
             model: "claude".into(),
             provider: "anthropic".into(),
@@ -308,5 +336,43 @@ mod tests {
         assert_round_trips(&message(Block::Summary {
             text: "done".into(),
         }));
+    }
+
+    #[test]
+    fn session_round_trips_persona_and_allowed_tools() {
+        let session = Session {
+            id: "s1".into(),
+            node: "n1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: "/work".into(),
+            model: "main".into(),
+            persona: Some("reviewer".into()),
+            permission: Permission::ReadOnly,
+            allowed_tools: "file/read, git".into(),
+            state: SessionState::WaitingForInput,
+            created_at_secs: 1_700_000_000,
+            prompt: None,
+        };
+        assert_round_trips(&session);
+    }
+
+    #[test]
+    fn session_without_persona_or_allowed_tools_defaults() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": "s1",
+            "node": "n1",
+            "repo_url": null,
+            "git_ref": null,
+            "dir": "/work",
+            "model": "main",
+            "permission": "read_write",
+            "state": "waiting_for_input",
+            "created_at_secs": 1_700_000_000,
+            "prompt": null,
+        }))
+        .unwrap();
+        assert_eq!(session.persona, None);
+        assert_eq!(session.allowed_tools, "*");
     }
 }

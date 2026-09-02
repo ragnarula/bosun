@@ -8,8 +8,8 @@ listen_addr = "127.0.0.1:8090"
 # [update]
 # artifacts_dir = "/opt/bosun/artifacts"
 
-# Models are configured once here; sessions choose one by name. The api_key
-# may be a literal or an `env:VAR` reference read at boot.
+# Models are the provider entries personas bind to by name. The api_key may be
+# a literal or an `env:VAR` reference read at boot.
 # [models.default]
 # provider = "anthropic"
 # name = "claude-sonnet-4-5"
@@ -17,14 +17,18 @@ listen_addr = "127.0.0.1:8090"
 # price_input_per_mtok = 3
 # price_output_per_mtok = 15
 
-# [models.small]
-# provider = "openai"
-# name = "gpt-5-mini"
-# api_key = "env:OPENAI_API_KEY"
-
-# default_model = "default"
-
-# Subagent types pair a model with a permission mode.
-# [subagents.coder]
+# Personas are what sessions run under: a model binding, a permission mode,
+# and the tools the session may use ("*" for every canonical tool, or a list
+# of canonical tool names).
+# [personas.coder]
 # model = "default"
-# permission = "read-write"
+# permission = "read_write"
+# allowed_tools = "*"
+# description = "Makes changes directly"
+
+# A persona's role/behaviour prompt is optional: drop a file named
+# <data dir>/personas/<persona name>.md and its text becomes that persona's
+# system prompt. Without a file the session uses the built-in default.
+
+# The persona sessions use when none is given.
+# default_persona = "coder"

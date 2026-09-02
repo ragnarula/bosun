@@ -133,12 +133,9 @@ struct CloneArgs {
     repo_url: String,
     /// Git ref to check out. Defaults to the remote default branch.
     git_ref: Option<String>,
-    /// Model to run the session with. Defaults to the control plane's default.
+    /// Persona to run the session with. Defaults to the control plane's default persona.
     #[arg(long)]
-    model: Option<String>,
-    /// Tool permission: read-only or read-write. Defaults to read-write.
-    #[arg(long)]
-    permission: Option<String>,
+    persona: Option<String>,
     /// First instruction for the session.
     #[arg(long)]
     message: Option<String>,
@@ -152,12 +149,9 @@ struct DevArgs {
     /// Node whose directories to browse.
     #[arg(long)]
     node: String,
-    /// Model to run the session with. Defaults to the control plane's default.
+    /// Persona to run the session with. Defaults to the control plane's default persona.
     #[arg(long)]
-    model: Option<String>,
-    /// Tool permission: read-only or read-write. Defaults to read-write.
-    #[arg(long)]
-    permission: Option<String>,
+    persona: Option<String>,
     /// First instruction for the session.
     #[arg(long)]
     message: Option<String>,
@@ -298,8 +292,10 @@ fn cp_client() -> anyhow::Result<reqwest::Client> {
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     setup_logging(args.log_filter.as_deref())?;
-    let config: ControlConfig =
+    let mut config: ControlConfig =
         load_config(&args.config).context("failed to load control-plane config")?;
+    // The error's Display lists every problem on its own line.
+    config.validate_personas()?;
     info!(
         listen_addr = %config.listen_addr,
         node_timeout_secs = config.node_timeout_secs,
@@ -318,6 +314,20 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&skills_dir)
         .await
         .with_context(|| format!("failed to create skills directory {}", skills_dir.display()))?;
+    // Prompt files are optional, but the directory exists so an operator knows
+    // where to drop `<persona name>.md` files.
+    let personas_dir = config.data_dir.join("personas");
+    tokio::fs::create_dir_all(&personas_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create personas directory {}",
+                personas_dir.display()
+            )
+        })?;
+    config
+        .load_persona_prompts()
+        .context("failed to load persona prompts")?;
     let store = Store::open(&config.data_dir.join("store.db")).with_context(|| {
         format!(
             "failed to open the session store at {}",
@@ -353,6 +363,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     if providers.is_empty() {
         warn!("no models configured; sessions cannot run");
     }
+    if config.personas.is_empty() {
+        warn!("no personas configured; sessions cannot run");
+    }
 
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(
@@ -366,12 +379,12 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         loops: Arc::new(AgentRegistry::new(
             Some(skills_dir.clone()),
             providers.clone(),
-            config.subagents.clone(),
+            config.personas.clone(),
             prices,
         )),
         providers,
-        subagents: config.subagents,
-        default_model: config.default_model,
+        personas: config.personas,
+        default_persona: config.default_persona,
         skills_dir: Some(skills_dir),
         artifacts: Arc::new(ArtifactStore::new(artifacts_dir)),
     });
@@ -557,19 +570,13 @@ fn node_rows(now: SystemTime, health: &[NodeHealth]) -> Vec<String> {
 
 async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
-    let permission = args
-        .permission
-        .as_deref()
-        .map(parse_permission)
-        .transpose()?;
 
     let client = cp_client()?;
     let request = CloneRequest {
         node: args.node.clone(),
         repo_url: args.repo_url,
         git_ref: args.git_ref,
-        model: args.model,
-        permission,
+        persona: args.persona,
         prompt: args.message,
     };
     let response = client
@@ -624,11 +631,6 @@ impl fmt::Display for Choice {
 
 async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
-    let permission = args
-        .permission
-        .as_deref()
-        .map(parse_permission)
-        .transpose()?;
     let client = cp_client()?;
     let mut current: Option<PathBuf> = None;
 
@@ -666,8 +668,7 @@ async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
                     &cp_url,
                     &args.node,
                     &dir,
-                    args.model.clone(),
-                    permission,
+                    args.persona.clone(),
                     args.message.clone(),
                 )
                 .await?;
@@ -718,15 +719,13 @@ async fn spawn_dev(
     cp_url: &str,
     node: &str,
     dir: &Path,
-    model: Option<String>,
-    permission: Option<Permission>,
+    persona: Option<String>,
     prompt: Option<String>,
 ) -> anyhow::Result<()> {
     let request = DevRequest {
         node: node.to_string(),
         dir: dir.to_path_buf(),
-        model,
-        permission,
+        persona,
         prompt,
     };
     let response = client
@@ -1147,6 +1146,71 @@ mod tests {
         );
         assert!(parse_permission("admin").is_err());
         assert!(parse_permission("").is_err());
+    }
+
+    #[test]
+    fn clone_and_dev_parse_persona_instead_of_model_and_permission() {
+        let clone = Cli::try_parse_from([
+            "bosun",
+            "clone",
+            "--node",
+            "node-1",
+            "--persona",
+            "reviewer",
+            "https://example.com/repo",
+        ])
+        .expect("--persona should parse");
+        let Command::Clone(args) = clone.command else {
+            panic!("expected the clone command");
+        };
+        assert_eq!(args.persona.as_deref(), Some("reviewer"));
+        assert!(args.git_ref.is_none());
+
+        let dev = Cli::try_parse_from(["bosun", "dev", "--node", "node-1", "--persona", "coder"])
+            .expect("--persona should parse");
+        let Command::Dev(args) = dev.command else {
+            panic!("expected the dev command");
+        };
+        assert_eq!(args.persona.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn clone_and_dev_reject_the_old_model_and_permission_flags() {
+        assert!(
+            Cli::try_parse_from([
+                "bosun",
+                "clone",
+                "--node",
+                "node-1",
+                "--model",
+                "main",
+                "https://example.com/repo",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bosun",
+                "clone",
+                "--node",
+                "node-1",
+                "--permission",
+                "read-only",
+                "https://example.com/repo",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bosun",
+                "dev",
+                "--node",
+                "node-1",
+                "--permission",
+                "read-write",
+            ])
+            .is_err()
+        );
     }
 
     /// A version strictly newer than `version`: the patch bumped and the

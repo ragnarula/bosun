@@ -233,14 +233,8 @@
         </div>
         <div id="dir-entries"></div>
       </div>
-      <label>Model
-        <input id="form-model" type="text" placeholder="default model">
-      </label>
-      <label>Permission
-        <select id="form-permission">
-          <option value="read_write">read-write</option>
-          <option value="read_only">read-only</option>
-        </select>
+      <label>Persona
+        <input id="form-persona" type="text" placeholder="default persona">
       </label>
       <label>Prompt
         <textarea id="form-prompt" rows="3" placeholder="optional first instruction"></textarea>
@@ -265,12 +259,15 @@
       <span class="id" id="view-id"></span>
       <span class="muted" id="view-node"></span>
       <span class="muted" id="view-model"></span>
+      <span class="badge" id="view-persona"></span>
       <span class="badge" id="view-permission"></span>
       <span class="badge state" id="view-state"></span>
     </div>
     <div class="view-actions">
       <button id="btn-interrupt" type="button">Interrupt</button>
       <button id="btn-permission" type="button">Switch to read-only</button>
+      <input id="persona-name" type="text" placeholder="persona name" size="14">
+      <button id="btn-persona" type="button">Switch persona</button>
       <button id="btn-stop" type="button">Stop</button>
       <button id="btn-close" type="button">Close</button>
     </div>
@@ -303,17 +300,19 @@ const btnDirUp = $('btn-dir-up');
 const btnDirUse = $('btn-dir-use');
 const btnDirClose = $('btn-dir-close');
 const dirEntries = $('dir-entries');
-const formModel = $('form-model');
-const formPermission = $('form-permission');
+const formPersona = $('form-persona');
 const formPrompt = $('form-prompt');
 const view = $('session-view');
 const viewId = $('view-id');
 const viewNode = $('view-node');
 const viewModel = $('view-model');
+const viewPersona = $('view-persona');
 const viewPermission = $('view-permission');
 const viewState = $('view-state');
 const btnInterrupt = $('btn-interrupt');
 const btnPermission = $('btn-permission');
+const personaName = $('persona-name');
+const btnPersona = $('btn-persona');
 const btnStop = $('btn-stop');
 const btnClose = $('btn-close');
 const transcript = $('transcript');
@@ -571,10 +570,9 @@ newSessionForm.addEventListener('submit', async (event) => {
   const body = {
     node: formNode.value,
     dir: formDir.value.trim(),
-    permission: formPermission.value,
   };
-  const model = formModel.value.trim();
-  if (model) body.model = model;
+  const persona = formPersona.value.trim();
+  if (persona) body.persona = persona;
   const prompt = formPrompt.value.trim();
   if (prompt) body.prompt = prompt;
   try {
@@ -640,6 +638,7 @@ function updateHeader(session) {
   viewId.textContent = session.id;
   viewNode.textContent = session.node;
   viewModel.textContent = session.model;
+  viewPersona.textContent = session.persona || '';
   updatePermissionBadge(session.permission);
   viewState.textContent = session.state;
 }
@@ -666,6 +665,21 @@ btnPermission.addEventListener('click', async () => {
     });
   } catch (error) {
     showStatus('permission: ' + error.message);
+  }
+});
+
+btnPersona.addEventListener('click', async () => {
+  const name = personaName.value.trim();
+  if (!name) {
+    showStatus('persona: type a persona name first');
+    return;
+  }
+  try {
+    await post('/sessions/' + encodeURIComponent(current) + '/persona', { persona: name });
+    personaName.value = '';
+    await fetchSession(current);
+  } catch (error) {
+    showStatus('persona: ' + error.message);
   }
 });
 
@@ -836,6 +850,9 @@ function handleEvent(event) {
       break;
     case 'permission':
       updatePermissionBadge(event.permission);
+      break;
+    case 'persona':
+      appendLine('state', '* persona: ' + event.persona);
       break;
     case 'model_call':
       renderModelCall(event);

@@ -5,6 +5,9 @@ use serde_json::json;
 
 use crate::session::Permission;
 
+/// A persona's `allowed_tools` value that allows every canonical tool.
+pub const ALL_TOOLS: &str = "*";
+
 /// One canonical tool, as advertised to providers. `schema` is the JSON Schema
 /// of the parameters object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +93,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "spawn_subagent".into(),
-            description: "Hand work to a subagent of a configured type, synchronously. Its activity appears in the transcript and its summary is returned.".into(),
-            schema: json!({"type":"object","properties":{"subagent_type":{"type":"string"},"instructions":{"type":"string"}},"required":["subagent_type","instructions"]}),
+            description: "Hand work to a subagent under a configured persona, synchronously. Its activity appears in the transcript and its summary is returned.".into(),
+            schema: json!({"type":"object","properties":{"persona":{"type":"string"},"instructions":{"type":"string"}},"required":["persona","instructions"]}),
         },
     ];
 
@@ -101,6 +104,51 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             .into_iter()
             .filter(|tool| !matches!(tool.name.as_str(), "shell" | "file/write" | "edit"))
             .collect(),
+    }
+}
+
+/// An `allowed_tools` value named tools that are not canonical. Carries the
+/// unknown names so boot validation can report them and a session can refuse
+/// to run rather than silently widen its tool set.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown tool name(s): {}", self.unknown.join(", "))]
+pub struct UnknownToolsError {
+    pub unknown: Vec<String>,
+}
+
+/// Parses a persona's `allowed_tools` value into the tool names it allows.
+/// `"*"` allows every canonical tool (`Ok(None)`); anything else is a list of
+/// canonical names split on commas and whitespace. Unknown names come back as
+/// errors so a typo fails boot validation instead of silently narrowing the
+/// tool set; duplicates are dropped.
+pub fn parse_allowed_tools(value: &str) -> Result<Option<Vec<String>>, UnknownToolsError> {
+    if value.trim() == ALL_TOOLS {
+        return Ok(None);
+    }
+    let canonical: Vec<String> = canonical_tools(Permission::ReadWrite)
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    let mut names = Vec::new();
+    let mut unknown = Vec::new();
+    for raw in value.split([',', ' ', '\t', '\n']) {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if names.iter().any(|n| n == name) || unknown.iter().any(|n| n == name) {
+            continue;
+        }
+        if canonical.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        } else {
+            unknown.push(name.to_string());
+        }
+    }
+    if unknown.is_empty() {
+        Ok(Some(names))
+    } else {
+        Err(UnknownToolsError { unknown })
     }
 }
 
@@ -160,5 +208,51 @@ mod tests {
         let tools = canonical_tools(Permission::ReadWrite);
         let shell = tools.iter().find(|tool| tool.name == "shell").unwrap();
         assert_eq!(shell.schema["required"], json!(["command"]));
+    }
+
+    #[test]
+    fn star_allowed_tools_parses_to_no_restriction() {
+        assert!(matches!(parse_allowed_tools("*"), Ok(None)));
+        assert!(matches!(parse_allowed_tools(" * "), Ok(None)));
+        assert_eq!(ALL_TOOLS, "*");
+    }
+
+    #[test]
+    fn allowed_tools_splits_on_commas_and_whitespace() {
+        let parsed = parse_allowed_tools("shell, file/read  grep\nglob").unwrap();
+        assert_eq!(
+            parsed.unwrap(),
+            ["shell", "file/read", "grep", "glob"],
+            "names keep their given order"
+        );
+    }
+
+    #[test]
+    fn allowed_tools_drops_duplicates() {
+        let parsed = parse_allowed_tools("shell shell, shell").unwrap();
+        assert_eq!(parsed.unwrap(), ["shell"]);
+    }
+
+    #[test]
+    fn empty_allowed_tools_allows_nothing() {
+        for value in ["", "   ", ","] {
+            let parsed = parse_allowed_tools(value).unwrap();
+            assert_eq!(parsed.unwrap(), Vec::<String>::new(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn allowed_tools_rejects_unknown_names_in_order() {
+        let err = parse_allowed_tools("shell, websurf, file/read, nope").unwrap_err();
+        assert_eq!(err.unknown, ["websurf", "nope"]);
+        assert_eq!(err.to_string(), "unknown tool name(s): websurf, nope");
+    }
+
+    #[test]
+    fn every_canonical_name_is_accepted_as_allowed() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let spec: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        let parsed = parse_allowed_tools(&spec.join(" ")).unwrap();
+        assert_eq!(parsed.unwrap().len(), tools.len());
     }
 }
