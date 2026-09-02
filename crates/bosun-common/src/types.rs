@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -38,8 +37,6 @@ pub struct PollRequest {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
-    pub target_triple: String,
-    #[serde(default)]
     pub update_status: UpdateStatus,
 }
 
@@ -55,7 +52,9 @@ pub enum UpdateStatus {
     Failed(String),
     Ahead,
     Disabled,
-    NoArtifact,
+    /// The node could not update to the announced version because the release
+    /// feed serves no archive for it.
+    NoRelease,
 }
 
 impl fmt::Display for UpdateStatus {
@@ -66,7 +65,7 @@ impl fmt::Display for UpdateStatus {
             UpdateStatus::Failed(reason) => write!(f, "failed: {reason}"),
             UpdateStatus::Ahead => write!(f, "ahead"),
             UpdateStatus::Disabled => write!(f, "disabled"),
-            UpdateStatus::NoArtifact => write!(f, "no-artifact"),
+            UpdateStatus::NoRelease => write!(f, "no-release"),
         }
     }
 }
@@ -76,28 +75,6 @@ pub struct PollResponse {
     pub command: Option<NodeCommand>,
     #[serde(default)]
     pub version: String,
-    #[serde(default = "default_true")]
-    pub artifact_available: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// The control plane's update manifest: every artifact currently in its
-/// artifacts directory, keyed by the target triple the artifact was built for.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Manifest {
-    pub version: String,
-    pub artifacts: HashMap<String, Artifact>,
-}
-
-/// One platform's update binary. The client verifies the sha256 of what it
-/// downloads against this before replacing its running binary.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct Artifact {
-    pub sha256: String,
-    pub size: u64,
 }
 
 /// A command the control plane hands a node to execute. The `id` is echoed
@@ -329,15 +306,12 @@ mod tests {
             status: NodeStatus::Up,
             result: None,
             version: "0.9.0".into(),
-            target_triple: "aarch64-apple-darwin".into(),
             update_status: UpdateStatus::UpToDate,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["version"], "0.9.0");
-        assert_eq!(json["target_triple"], "aarch64-apple-darwin");
         let decoded: PollRequest = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.version, "0.9.0");
-        assert_eq!(decoded.target_triple, "aarch64-apple-darwin");
     }
 
     #[test]
@@ -345,13 +319,6 @@ mod tests {
         let request: PollRequest =
             serde_json::from_str(r#"{"node_name":"node-1","status":"up","result":null}"#).unwrap();
         assert_eq!(request.version, "");
-    }
-
-    #[test]
-    fn poll_request_from_an_old_node_has_no_target_triple() {
-        let request: PollRequest =
-            serde_json::from_str(r#"{"node_name":"node-1","status":"up","result":null}"#).unwrap();
-        assert_eq!(request.target_triple, "");
     }
 
     #[test]
@@ -368,7 +335,6 @@ mod tests {
             status: NodeStatus::Up,
             result: None,
             version: "0.9.0".into(),
-            target_triple: "aarch64-apple-darwin".into(),
             update_status: UpdateStatus::Failed("checksum mismatch".into()),
         };
         let json = serde_json::to_value(&request).unwrap();
@@ -388,7 +354,7 @@ mod tests {
             UpdateStatus::Failed("download failed".into()),
             UpdateStatus::Ahead,
             UpdateStatus::Disabled,
-            UpdateStatus::NoArtifact,
+            UpdateStatus::NoRelease,
         ] {
             let json = serde_json::to_value(&status).unwrap();
             let decoded: UpdateStatus = serde_json::from_value(json).unwrap();
@@ -406,63 +372,25 @@ mod tests {
         );
         assert_eq!(UpdateStatus::Ahead.to_string(), "ahead");
         assert_eq!(UpdateStatus::Disabled.to_string(), "disabled");
-        assert_eq!(UpdateStatus::NoArtifact.to_string(), "no-artifact");
+        assert_eq!(UpdateStatus::NoRelease.to_string(), "no-release");
     }
 
     #[test]
-    fn manifest_round_trips_target_hashes_and_sizes() {
-        let manifest = Manifest {
-            version: "0.5.5".into(),
-            artifacts: HashMap::from([(
-                "aarch64-apple-darwin".to_string(),
-                Artifact {
-                    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-                        .into(),
-                    size: 42,
-                },
-            )]),
-        };
-        let json = serde_json::to_value(&manifest).unwrap();
-        assert_eq!(json["version"], "0.5.5");
-        assert_eq!(
-            json["artifacts"]["aarch64-apple-darwin"]["sha256"],
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-        assert_eq!(json["artifacts"]["aarch64-apple-darwin"]["size"], 42);
-        let decoded: Manifest = serde_json::from_value(json).unwrap();
-        assert_eq!(decoded.artifacts.len(), 1);
-    }
-
-    #[test]
-    fn manifest_accepts_an_empty_artifacts_map() {
-        let manifest: Manifest =
-            serde_json::from_str(r#"{"version":"0.5.5","artifacts":{}}"#).unwrap();
-        assert!(manifest.artifacts.is_empty());
-    }
-
-    #[test]
-    fn poll_response_round_trips_version_and_artifact_availability() {
+    fn poll_response_round_trips_the_version() {
         let response = PollResponse {
             command: None,
             version: "0.5.5".into(),
-            artifact_available: true,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["version"], "0.5.5");
-        assert_eq!(json["artifact_available"], true);
         let decoded: PollResponse = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.version, "0.5.5");
-        assert!(decoded.artifact_available);
     }
 
     #[test]
-    fn poll_response_from_an_old_control_plane_defaults_to_available() {
+    fn poll_response_from_an_old_control_plane_defaults_the_version() {
         let response: PollResponse = serde_json::from_str(r#"{"command":null}"#).unwrap();
         assert_eq!(response.version, "");
-        assert!(
-            response.artifact_available,
-            "an old control plane is treated as having the artifact"
-        );
     }
 
     #[test]

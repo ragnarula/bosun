@@ -1,9 +1,11 @@
 //! The CLI's update commands: self-update, and demanding an update from a
-//! named node. The self-update fetches the control plane's artifact for this
-//! platform, verifies it, and installs it over the running binary; it does
-//! not restart itself, the next invocation runs the new binary. A demanded
-//! node update is only enqueued — the control plane fills in its version and
-//! the node applies it on its next poll.
+//! named node. The self-update reads the control plane's announced version
+//! off an existing control-plane route, downloads the released binary for
+//! that version and this platform from the release feed, verifies it, and
+//! installs it over the running binary; it does not restart itself, the next
+//! invocation runs the new binary. A demanded node update is only enqueued —
+//! the control plane fills in its version and the node applies it on its next
+//! poll.
 
 use std::cmp::Ordering;
 #[cfg(any(windows, test))]
@@ -11,25 +13,29 @@ use std::ffi::OsStr;
 use std::path::Path;
 #[cfg(any(windows, test))]
 use std::path::PathBuf;
-#[cfg(any(windows, test))]
 use std::time::Duration;
 
 use anyhow::Context;
 use bosun_common::target::TARGET;
 use bosun_common::types::NodeUpdateRequest;
+use bosun_common::types::X_BOSUN_VERSION;
 use bosun_common::update::UpdateError;
-use bosun_common::update::download_artifact;
-use bosun_common::update::fetch_manifest;
+use bosun_common::update::fetch_release_artifact;
 #[cfg(any(windows, test))]
 use bosun_common::update::move_target_to_previous;
 #[cfg(any(windows, test))]
 use bosun_common::update::rename_staged_to_target;
+use bosun_common::update::resolve_update_base_url;
 #[cfg(unix)]
 use bosun_common::update::swap_binary;
 use bosun_common::update::verify_binary_version;
 use bosun_common::version::VERSION;
 use bosun_common::version::compare;
 use tracing::info;
+
+/// How long the version probe waits for the control plane to answer before
+/// the update gives up on an unreachable control plane.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Env var naming the staged file a Windows CLI update finalizer must
 /// install. The `CLI_` prefix keeps these markers distinct from the node's
@@ -74,16 +80,57 @@ fn gate(cli_version: &str, cp_version: &str, force: bool) -> Result<Gate, Update
     }
 }
 
-/// Updates the running binary from the control plane. The swap happens in
-/// this process on Unix; on Windows a finalizer copy of this binary installs
-/// the staged file after this process exits.
+/// Updates the running binary to the control plane's announced version,
+/// fetched from the release feed: the `BOSUN_UPDATE_BASE_URL` mirror when
+/// set, else GitHub Releases. The swap happens in this process on Unix; on
+/// Windows a finalizer copy of this binary installs the staged file after
+/// this process exits.
 pub(crate) async fn run_update(
     client: &reqwest::Client,
     cp_url: &str,
     force: bool,
 ) -> Result<(), UpdateError> {
     let current = std::env::current_exe().context("failed to find the running binary")?;
-    apply_update(client, cp_url, &current, force).await
+    // The CLI config stores no update base URL, so the env override and the
+    // GitHub default decide the feed.
+    let base_url = resolve_update_base_url(None);
+    apply_update(client, cp_url, &base_url, &current, force).await
+}
+
+/// The version the control plane announces on its nodes response header. The
+/// control plane serves no update assets; it only announces its version, so
+/// the self-update reads the header off an existing route and fetches the
+/// announced binary from the release feed. The reachability error says what
+/// the update depends on, because a control plane that cannot be reached
+/// leaves the CLI with no target version.
+async fn control_plane_version(
+    client: &reqwest::Client,
+    cp_url: &str,
+) -> Result<String, UpdateError> {
+    let url = format!("{}/nodes", cp_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .timeout(VERSION_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to reach the control plane at {cp_url}: bosun update syncs this CLI to the control plane's version, so the control plane must be reachable"
+            )
+        })?;
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("the control plane at {cp_url} returned an error"))?;
+    let version = response
+        .headers()
+        .get(X_BOSUN_VERSION)
+        .and_then(|value| value.to_str().ok())
+        .with_context(|| {
+            format!(
+                "the control plane at {cp_url} did not announce its version on the {url} response"
+            )
+        })?;
+    Ok(version.to_string())
 }
 
 /// Demands an update from each named node: enqueues an `Update` command that
@@ -125,39 +172,35 @@ fn enqueued_message(node: &str) -> String {
     format!("update command queued for node {node}; the outcome appears in \"bosun nodes\"")
 }
 
-/// Fetches the manifest, gates on the versions, downloads and verifies the
-/// artifact, and installs it at `target`. Testable against a stub server and
-/// a fake target path. The gate runs before the artifact lookup, so equal
-/// versions or an ahead-without-`--force` CLI report their own outcome even
-/// when no artifact exists for this platform.
+/// Reads the control plane's announced version, gates on the versions, fetches
+/// and verifies the matching release artifact, and installs it at `target`.
+/// Testable against stub servers and a fake target path. The gate runs before
+/// the release fetch, so equal versions or an ahead-without-`--force` CLI
+/// report their own outcome even when the release feed serves no artifact for
+/// this version.
 async fn apply_update(
     client: &reqwest::Client,
     cp_url: &str,
+    base_url: &str,
     target: &Path,
     force: bool,
 ) -> Result<(), UpdateError> {
-    let manifest = fetch_manifest(client, cp_url).await?;
-    if gate(VERSION, &manifest.version, force)? == Gate::UpToDate {
+    let cp_version = control_plane_version(client, cp_url).await?;
+    if gate(VERSION, &cp_version, force)? == Gate::UpToDate {
         println!("already up to date at version {VERSION}");
         return Ok(());
     }
-    let artifact = manifest
-        .artifacts
-        .get(TARGET)
-        .ok_or_else(|| UpdateError::NoArtifact {
-            target: TARGET.to_string(),
-        })?;
     let dir = target
         .parent()
         .context("the update target has no parent directory")?;
     info!(
         target = %TARGET,
-        version = %manifest.version,
-        "cli update: downloading artifact"
+        version = %cp_version,
+        "cli update: downloading the release archive"
     );
-    let staged = download_artifact(client, cp_url, dir, TARGET, artifact).await?;
+    let staged = fetch_release_artifact(client, base_url, &cp_version, TARGET, dir).await?;
     let outcome = async {
-        verify_binary_version(&staged, &manifest.version).await?;
+        verify_binary_version(&staged, &cp_version).await?;
         install(target, &staged)?;
         Ok::<(), UpdateError>(())
     }
@@ -166,10 +209,7 @@ async fn apply_update(
         let _ = std::fs::remove_file(&staged);
     }
     outcome?;
-    println!(
-        "updated bosun to {}; the next invocation runs the new binary",
-        manifest.version
-    );
+    println!("updated bosun to {cp_version}; the next invocation runs the new binary");
     Ok(())
 }
 
@@ -307,13 +347,22 @@ fn clear_markers() {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     use axum::Json;
+    use axum::Router;
+    use axum::body::Body;
     use axum::extract::Path as AxumPath;
     use axum::extract::State;
+    use axum::http::HeaderValue;
     use axum::http::StatusCode;
+    use axum::http::Uri;
+    use axum::response::IntoResponse;
+    use axum::response::Response;
+    use axum::routing::get;
     use axum::routing::post;
     use serde_json::Value;
     use sha2::Digest;
@@ -321,13 +370,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-
-    fn artifact(content: &[u8]) -> bosun_common::types::Artifact {
-        bosun_common::types::Artifact {
-            sha256: format!("{:x}", Sha256::digest(content)),
-            size: content.len() as u64,
-        }
-    }
 
     /// A version strictly newer than `version`: the patch bumped and the
     /// prerelease dropped, so a zero patch or a prerelease `version` cannot
@@ -437,47 +479,138 @@ mod tests {
         content.into_bytes()
     }
 
-    async fn update_server(version: &str, content: &[u8]) -> u16 {
-        use std::sync::Arc;
+    /// The archive a cargo-dist release ships for the current target: a
+    /// `.tar.xz` holding the binary at `bosun-<target>/bosun`.
+    #[cfg(unix)]
+    fn release_archive(binary: &[u8]) -> Vec<u8> {
+        use std::io::Cursor;
 
-        use axum::Json;
-        use axum::Router;
-        use axum::extract::State;
-        use axum::routing::get;
+        let mut uncompressed = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut uncompressed);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(binary.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    format!("bosun-{TARGET}/bosun"),
+                    Cursor::new(binary),
+                )
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut compressed = Vec::new();
+        lzma_rs::xz_compress(&mut Cursor::new(&uncompressed), &mut compressed).unwrap();
+        compressed
+    }
 
+    /// The archive file name a cargo-dist release ships for the current
+    /// target.
+    #[cfg(unix)]
+    fn release_archive_name() -> String {
+        format!("bosun-{TARGET}.tar.xz")
+    }
+
+    /// The two release assets a fetch needs for `version` on the current
+    /// target, keyed by request path in cargo-dist's layout: the archive and
+    /// its per-asset sha256.
+    #[cfg(unix)]
+    fn release_routes(version: &str, binary: &[u8]) -> HashMap<String, Vec<u8>> {
+        let name = release_archive_name();
+        let archive_path = format!("/v{version}/{name}");
+        let archive = release_archive(binary);
+        let digest = format!("{:x}", Sha256::digest(&archive));
+        HashMap::from([
+            (
+                format!("{archive_path}.sha256"),
+                format!("{digest} *{name}\n").into_bytes(),
+            ),
+            (archive_path, archive),
+        ])
+    }
+
+    /// A control plane that answers its nodes route with `version` on the
+    /// version header and records the paths it served. `None` serves no
+    /// header. The body deliberately does not carry the version: the flow
+    /// must read the header only.
+    #[cfg(unix)]
+    async fn control_plane(version: Option<&str>) -> (String, Arc<Mutex<Vec<String>>>) {
         #[derive(Clone)]
         struct ServerState {
-            manifest: bosun_common::types::Manifest,
-            content: Arc<Vec<u8>>,
+            paths: Arc<Mutex<Vec<String>>>,
+            version: Option<String>,
         }
 
-        async fn serve_manifest(
-            State(state): State<ServerState>,
-        ) -> Json<bosun_common::types::Manifest> {
-            Json(state.manifest)
+        async fn serve_nodes(State(state): State<ServerState>, uri: Uri) -> Response {
+            state.paths.lock().unwrap().push(uri.path().to_string());
+            let mut response = Response::new(Body::from("the body is not read"));
+            if let Some(version) = &state.version {
+                response.headers_mut().insert(
+                    bosun_common::types::X_BOSUN_VERSION,
+                    HeaderValue::from_str(version).unwrap(),
+                );
+            }
+            response
         }
 
-        async fn serve_artifact(State(state): State<ServerState>) -> Vec<u8> {
-            (*state.content).clone()
-        }
-
+        let paths = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
-            .route("/update/manifest", get(serve_manifest))
-            .route("/update/artifact/{target}", get(serve_artifact))
+            .route("/nodes", get(serve_nodes))
             .with_state(ServerState {
-                manifest: bosun_common::types::Manifest {
-                    version: version.to_string(),
-                    artifacts: HashMap::from([(TARGET.to_string(), artifact(content))]),
-                },
-                content: Arc::new(content.to_vec()),
+                paths: paths.clone(),
+                version: version.map(str::to_string),
             });
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        addr.port()
+        (format!("http://127.0.0.1:{}", addr.port()), paths)
+    }
+
+    /// A release feed serving `routes` and recording how many requests it
+    /// answered. Everything unserved is a 404, so a request for a wrong asset
+    /// or version fails the flow loudly.
+    #[cfg(unix)]
+    async fn release_feed(routes: HashMap<String, Vec<u8>>) -> (String, Arc<AtomicUsize>) {
+        #[derive(Clone)]
+        struct ServerState {
+            routes: Arc<HashMap<String, Vec<u8>>>,
+            requests: Arc<AtomicUsize>,
+        }
+
+        async fn serve_asset(
+            State(state): State<ServerState>,
+            AxumPath(path): AxumPath<String>,
+        ) -> Response {
+            state.requests.fetch_add(1, AtomicOrdering::Relaxed);
+            let body = state
+                .routes
+                .get(&path)
+                .or_else(|| state.routes.get(&format!("/{path}")))
+                .cloned();
+            match body {
+                Some(body) => body.into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/{*path}", get(serve_asset))
+            .with_state(ServerState {
+                routes: Arc::new(routes),
+                requests: requests.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), requests)
     }
 
     fn assert_target_untouched(dir: &tempfile::TempDir) {
@@ -502,21 +635,27 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let version = newer_version();
         let content = write_version_script(dir.path(), &version);
-        let port = update_server(&version, &content).await;
+        let (cp_url, cp_paths) = control_plane(Some(&version)).await;
+        let (feed_url, feed_requests) = release_feed(release_routes(&version, &content)).await;
 
-        apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            false,
-        )
-        .await
-        .expect("the update should apply");
+        apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect("the update should apply");
 
         assert_eq!(std::fs::read(&target).unwrap(), content);
         assert_eq!(
             std::fs::read(dir.path().join("bosun.previous")).unwrap(),
             b"old"
+        );
+        assert_eq!(
+            *cp_paths.lock().unwrap(),
+            ["/nodes"],
+            "the update must probe only the nodes route, never a /update/* endpoint"
+        );
+        assert_eq!(
+            feed_requests.load(AtomicOrdering::Relaxed),
+            2,
+            "the update must fetch the checksum file and the archive from the release feed"
         );
     }
 
@@ -528,18 +667,16 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let version = older_version();
         let content = write_version_script(dir.path(), &version);
-        let port = update_server(&version, &content).await;
+        let (cp_url, cp_paths) = control_plane(Some(&version)).await;
+        let (feed_url, feed_requests) = release_feed(release_routes(&version, &content)).await;
 
-        apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            true,
-        )
-        .await
-        .expect("--force should allow the downgrade");
+        apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, true)
+            .await
+            .expect("--force should allow the downgrade");
 
         assert_eq!(std::fs::read(&target).unwrap(), content);
+        assert_eq!(*cp_paths.lock().unwrap(), ["/nodes"]);
+        assert_eq!(feed_requests.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[cfg(unix)]
@@ -548,80 +685,66 @@ mod tests {
         let dir = tempdir().unwrap();
         let target = dir.path().join("bosun");
         std::fs::write(&target, b"old").unwrap();
-        let port = update_server_without_artifact(&older_version()).await;
+        let version = older_version();
+        let (cp_url, cp_paths) = control_plane(Some(&version)).await;
+        let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        let err = apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            false,
-        )
-        .await
-        .expect_err("a downgrade without --force must be refused");
+        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect_err("a downgrade without --force must be refused");
 
         assert!(matches!(err, UpdateError::DowngradeRequiresForce { .. }));
+        assert_eq!(*cp_paths.lock().unwrap(), ["/nodes"]);
+        assert_eq!(
+            feed_requests.load(AtomicOrdering::Relaxed),
+            0,
+            "the gate must refuse before any release fetch starts"
+        );
         assert_target_untouched(&dir);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn apply_update_is_a_no_op_when_versions_match() {
+    async fn apply_update_is_a_no_op_when_versions_match_even_without_a_release() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("bosun");
         std::fs::write(&target, b"old").unwrap();
-        let content = write_version_script(dir.path(), VERSION);
-        let port = update_server(VERSION, &content).await;
+        let (cp_url, cp_paths) = control_plane(Some(VERSION)).await;
+        let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            false,
-        )
-        .await
-        .expect("an equal version is a no-op");
+        apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect("equal versions must short-circuit before the release fetch");
 
+        assert_eq!(*cp_paths.lock().unwrap(), ["/nodes"]);
+        assert_eq!(
+            feed_requests.load(AtomicOrdering::Relaxed),
+            0,
+            "an equal version must not fetch the release feed"
+        );
         assert_target_untouched(&dir);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn apply_update_is_a_no_op_when_versions_match_even_without_an_artifact() {
+    async fn apply_update_reports_a_release_missing_from_the_feed() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("bosun");
         std::fs::write(&target, b"old").unwrap();
-        let port = update_server_without_artifact(VERSION).await;
+        let version = newer_version();
+        let (cp_url, _cp_paths) = control_plane(Some(&version)).await;
+        let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            false,
-        )
-        .await
-        .expect("equal versions must short-circuit before the artifact lookup");
+        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect_err("a version the release feed does not serve must fail the update");
 
-        assert_target_untouched(&dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn apply_update_errors_without_an_artifact_for_this_platform() {
-        let dir = tempdir().unwrap();
-        let target = dir.path().join("bosun");
-        std::fs::write(&target, b"old").unwrap();
-        let port = update_server_without_artifact(&newer_version()).await;
-
-        let err = apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            false,
-        )
-        .await
-        .expect_err("a missing artifact must fail the update");
-
-        assert!(matches!(err, UpdateError::NoArtifact { .. }));
+        assert!(matches!(err, UpdateError::NoRelease { .. }));
+        assert_eq!(
+            feed_requests.load(AtomicOrdering::Relaxed),
+            1,
+            "the missing checksum must fail before the archive download"
+        );
         assert_target_untouched(&dir);
     }
 
@@ -633,18 +756,15 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let claimed = newer_version();
         let content = write_version_script(dir.path(), VERSION);
-        let port = update_server(&claimed, &content).await;
+        let (cp_url, _cp_paths) = control_plane(Some(&claimed)).await;
+        let (feed_url, feed_requests) = release_feed(release_routes(&claimed, &content)).await;
 
-        let err = apply_update(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &target,
-            false,
-        )
-        .await
-        .expect_err("the staged binary must report the manifest version");
+        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect_err("the staged binary must report the control plane's version");
 
         assert!(matches!(err, UpdateError::VersionMismatch { .. }));
+        assert_eq!(feed_requests.load(AtomicOrdering::Relaxed), 2);
         assert_target_untouched(&dir);
     }
 
@@ -654,54 +774,80 @@ mod tests {
         let dir = tempdir().unwrap();
         let target = dir.path().join("bosun");
         std::fs::write(&target, b"old").unwrap();
-        let content = write_version_script(dir.path(), "0.0.0");
-        let port = update_server("banana", &content).await;
+        let (cp_url, _cp_paths) = control_plane(Some("banana")).await;
+        let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
+
+        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect_err("an unparsable control-plane version must fail the update");
+
+        assert!(matches!(err, UpdateError::UnparsableVersion { .. }));
+        assert_eq!(
+            feed_requests.load(AtomicOrdering::Relaxed),
+            0,
+            "the gate must refuse before any release fetch starts"
+        );
+        assert_target_untouched(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_update_fails_when_the_control_plane_announces_no_version() {
+        use bosun_common::error::ErrorExt;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("bosun");
+        std::fs::write(&target, b"old").unwrap();
+        let (cp_url, _cp_paths) = control_plane(None).await;
+        let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
+
+        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
+            .await
+            .expect_err("a control plane without the version header must fail the update");
+
+        assert!(matches!(err, UpdateError::Internal(_)));
+        let chain = err.display_chain();
+        assert!(
+            chain.contains("did not announce its version"),
+            "the error must name the missing header: {chain}"
+        );
+        assert_eq!(feed_requests.load(AtomicOrdering::Relaxed), 0);
+        assert_target_untouched(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_update_fails_clearly_when_the_control_plane_is_unreachable() {
+        use bosun_common::error::ErrorExt;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("bosun");
+        std::fs::write(&target, b"old").unwrap();
+        // Reserve a loopback port and release it, so the version probe has
+        // nothing to reach.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cp_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
 
         let err = apply_update(
             &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
+            &cp_url,
+            "http://127.0.0.1:1",
             &target,
             false,
         )
         .await
-        .expect_err("an unparsable control-plane version must fail the update");
+        .expect_err("an unreachable control plane must fail the update");
 
-        assert!(matches!(err, UpdateError::UnparsableVersion { .. }));
+        assert!(matches!(err, UpdateError::Internal(_)));
+        let chain = err.display_chain();
+        assert!(
+            chain.contains("failed to reach the control plane")
+                && chain.contains("must be reachable")
+                && chain.contains("bosun update syncs this CLI to the control plane's version"),
+            "the error must say why the control plane must be reachable: {chain}"
+        );
         assert_target_untouched(&dir);
-    }
-
-    async fn update_server_without_artifact(version: &str) -> u16 {
-        use axum::Json;
-        use axum::Router;
-        use axum::extract::State;
-        use axum::routing::get;
-
-        #[derive(Clone)]
-        struct ServerState {
-            manifest: bosun_common::types::Manifest,
-        }
-
-        async fn serve_manifest(
-            State(state): State<ServerState>,
-        ) -> Json<bosun_common::types::Manifest> {
-            Json(state.manifest)
-        }
-
-        let app = Router::new()
-            .route("/update/manifest", get(serve_manifest))
-            .with_state(ServerState {
-                manifest: bosun_common::types::Manifest {
-                    version: version.to_string(),
-                    artifacts: HashMap::new(),
-                },
-            });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        addr.port()
     }
 
     #[tokio::test]

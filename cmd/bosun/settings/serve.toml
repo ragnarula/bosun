@@ -3,11 +3,6 @@ listen_addr = "127.0.0.1:8090"
 # node_timeout_secs = 30
 # data_dir = "data"
 
-# Update binaries live one per platform, named bosun.<target-triple>. Defaults
-# to <data_dir>/artifacts.
-# [update]
-# artifacts_dir = "/opt/bosun/artifacts"
-
 # Models are configured once here; sessions choose one by name. The api_key
 # may be a literal or an `env:VAR` reference read at boot.
 # [models.default]

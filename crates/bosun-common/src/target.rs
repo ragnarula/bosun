@@ -1,6 +1,7 @@
 /// The rustc target triple this binary was compiled for, set by `build.rs`
-/// from Cargo's `TARGET` build-script variable. cargo-dist names artifacts by
-/// the same triples, so this is the manifest key and the artifact-file suffix.
+/// from Cargo's `TARGET` build-script variable. cargo-dist names release
+/// archives by the same triples, so this also names the archive a client
+/// fetches.
 pub const TARGET: &str = env!("BOSUN_TARGET");
 
 #[cfg(test)]
