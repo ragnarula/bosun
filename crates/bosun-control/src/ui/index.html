@@ -194,6 +194,31 @@
     padding: 9px 11px;
     font: inherit;
   }
+  @media (max-width: 640px) {
+    header.top { flex-wrap: wrap; padding: 10px 12px; }
+    main { padding: 0 12px 16px; }
+    #status { padding: 3px 12px 7px; }
+    button { min-height: 40px; padding: 8px 14px; }
+    #new-session-form input, #new-session-form select, #new-session-form textarea,
+    .input-row textarea { font-size: 16px; }
+    tbody tr.clickable { -webkit-tap-highlight-color: transparent; }
+    tbody tr.clickable:active { background: var(--panel-2); }
+    tbody tr.clickable td { padding-top: 12px; padding-bottom: 12px; }
+    #dir-entries .dir-entry {
+      min-height: 44px;
+      padding: 5px 8px;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #dir-entries .dir-entry:active { background: var(--border); }
+    .view-header { flex-wrap: wrap; padding: 10px 12px; }
+    .view-actions { flex-wrap: wrap; }
+    .dir-browser-head { flex-wrap: wrap; }
+    #transcript { padding: 12px 14px; }
+    .input-row { padding: 12px 14px; }
+  }
+  @media (max-width: 560px) {
+    .col-model, .col-permission { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -252,7 +277,7 @@
     </form>
     <table>
       <thead>
-        <tr><th>Id</th><th>Node</th><th>Model</th><th>State</th><th>Permission</th></tr>
+        <tr><th>Id</th><th>Node</th><th class="col-model">Model</th><th>State</th><th class="col-permission">Permission</th></tr>
       </thead>
       <tbody id="sessions-body"></tbody>
     </table>
@@ -321,6 +346,7 @@ const input = $('input');
 const btnSend = $('btn-send');
 
 let nodes = [];
+let nodeOptionsSignature = null;
 let sessions = [];
 let current = null;   // the open session id
 let es = null;        // the open EventSource
@@ -382,6 +408,10 @@ function renderNodes() {
 }
 
 function renderNodeOptions() {
+  const signature = nodes.map((node) => node.name + (node.up ? 'up' : 'down')).join(',');
+  if (signature === nodeOptionsSignature) return;
+  nodeOptionsSignature = signature;
+  const selected = formNode.value;
   formNode.textContent = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
@@ -393,6 +423,13 @@ function renderNodeOptions() {
     option.textContent = node.name + (node.up ? '' : ' (down)');
     formNode.appendChild(option);
   }
+  if (!selected) return;
+  if (nodes.some((node) => node.name === selected)) {
+    formNode.value = selected;
+    return;
+  }
+  // The picked node vanished: reuse the change listener to drop the stale dir pick.
+  formNode.dispatchEvent(new Event('change'));
 }
 
 function shortId(id) {
@@ -411,9 +448,13 @@ function renderSessions() {
     row.title = session.id;
     row.appendChild(cell(shortId(session.id)));
     row.appendChild(cell(session.node));
-    row.appendChild(cell(session.model));
+    const model = cell(session.model);
+    model.className = 'col-model';
+    row.appendChild(model);
     row.appendChild(cell(session.state));
-    row.appendChild(cell(session.permission));
+    const permission = cell(session.permission);
+    permission.className = 'col-permission';
+    row.appendChild(permission);
     row.addEventListener('click', () => openSession(session.id));
     sessionsBody.appendChild(row);
   }
@@ -470,7 +511,13 @@ async function refreshSessions() {
 
 newSessionBtn.addEventListener('click', () => {
   newSessionForm.hidden = !newSessionForm.hidden;
-  if (!newSessionForm.hidden) formNode.focus();
+  if (!newSessionForm.hidden) {
+    if (window.matchMedia('(max-width: 640px)').matches) {
+      newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      formNode.focus();
+    }
+  }
 });
 
 // A picked directory belongs to one node; switch nodes, drop the pick.
