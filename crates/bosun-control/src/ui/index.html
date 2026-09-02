@@ -233,6 +233,10 @@
   #transcript hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
   #transcript .md-li { margin: 2px 0; }
   #transcript .md-marker { color: var(--muted); }
+  #transcript .j-key { color: var(--accent); }
+  #transcript .j-str { color: var(--user); }
+  #transcript .j-num { color: var(--ok); }
+  #transcript .j-lit { color: var(--muted); }
   .input-row {
     display: flex;
     gap: 10px;
@@ -831,8 +835,9 @@ function appendLine(kind, text) {
 const INLINE_TOOL_LIMIT = 240;
 
 // Tool traffic shows as a one-line summary and expands to the raw payload on
-// request, so assistant text is not buried under long tool output.
-function appendToolLine(kind, prefix, payload, suffix) {
+// request, so assistant text is not buried under long tool output. A `json`
+// payload expands as pretty-printed, colour-coded structure.
+function appendToolLine(kind, prefix, payload, suffix, json) {
   const flat = payload.replace(/\s+/g, ' ').trim();
   const clipped = clipAt(flat, INLINE_TOOL_LIMIT);
   if (clipped === null) {
@@ -861,8 +866,14 @@ function appendToolLine(kind, prefix, payload, suffix) {
       return;
     }
     if (!revealed) {
-      full.textContent = prefix + payload + suffix;
       revealed = true;
+      if (json) {
+        full.appendChild(document.createTextNode(prefix));
+        renderJson(full, payload);
+        full.appendChild(document.createTextNode(suffix));
+      } else {
+        full.textContent = prefix + payload + suffix;
+      }
     }
     full.hidden = false;
     summary.hidden = true;
@@ -875,6 +886,93 @@ function appendToolLine(kind, prefix, payload, suffix) {
   line.appendChild(fold);
   transcript.appendChild(line);
   scrollToBottom();
+}
+
+// Pretty-prints a JSON-looking string, or null when it is not JSON.
+function prettyJson(text) {
+  const trimmed = text.trim();
+  if (trimmed[0] !== '{' && trimmed[0] !== '[') return null;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch (error) {
+    return null;
+  }
+}
+
+// Splits a JSON string into coloured tokens. Valid JSON only needs four kinds
+// of highlight: property names, string values, numbers, and true/false/null.
+function jsonTokens(text) {
+  const tokens = [];
+  let plain = '';
+  const numberChar = /[0-9.eE+\-]/;
+  const letter = /[A-Za-z]/;
+  const flush = () => {
+    if (plain !== '') {
+      tokens.push({ text: plain, cls: '' });
+      plain = '';
+    }
+  };
+  const push = (text, cls) => {
+    flush();
+    tokens.push({ text, cls });
+  };
+  let i = 0;
+  while (i < text.length) {
+    const char = text[i];
+    if (char === '"') {
+      let end = i + 1;
+      while (end < text.length) {
+        if (text[end] === '\\') {
+          end += 2;
+          continue;
+        }
+        if (text[end] === '"') break;
+        end += 1;
+      }
+      let next = end + 1;
+      while (next < text.length && (text[next] === ' ' || text[next] === '\t')) next += 1;
+      const isKey = text[next] === ':';
+      push(text.slice(i, end + 1), isKey ? 'j-key' : 'j-str');
+      i = end + 1;
+      continue;
+    }
+    if (char === '-' || (char >= '0' && char <= '9')) {
+      let end = i + 1;
+      while (end < text.length && numberChar.test(text[end])) end += 1;
+      push(text.slice(i, end), 'j-num');
+      i = end;
+      continue;
+    }
+    if (letter.test(char)) {
+      let matched = false;
+      for (const literal of ['true', 'false', 'null']) {
+        if (text.startsWith(literal, i)) {
+          push(literal, 'j-lit');
+          i += literal.length;
+          matched = true;
+          break;
+        }
+      }
+      if (matched) continue;
+    }
+    plain += char;
+    i += 1;
+  }
+  flush();
+  return tokens;
+}
+
+function renderJson(parent, text) {
+  for (const token of jsonTokens(text)) {
+    if (token.cls === '') {
+      parent.appendChild(document.createTextNode(token.text));
+      continue;
+    }
+    const span = document.createElement('span');
+    span.className = token.cls;
+    span.textContent = token.text;
+    parent.appendChild(span);
+  }
 }
 
 // The first `max` code points of `text`, or null when none are cut.
@@ -1150,16 +1248,37 @@ function renderMessage(message) {
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
       break;
     case 'tool_call':
-      appendToolLine('mono', '→ ' + block.name + '(', JSON.stringify(block.args), ')');
+      appendToolLine(
+        'mono',
+        '→ ' + block.name + '(',
+        JSON.stringify(block.args == null ? {} : block.args, null, 2),
+        ')',
+        true
+      );
       break;
     case 'tool_result': {
-      const content =
-        typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+      const content = block.content;
+      let payload;
+      let json = false;
+      if (typeof content === 'string') {
+        payload = content;
+        const pretty = prettyJson(payload);
+        if (pretty !== null) {
+          payload = pretty;
+          json = true;
+        }
+      } else if (content !== null) {
+        payload = JSON.stringify(content, null, 2);
+        json = true;
+      } else {
+        payload = 'null';
+      }
       appendToolLine(
         block.is_error ? 'mono error' : 'mono',
         '← ' + block.name + ': ',
-        content,
-        ''
+        payload,
+        '',
+        json
       );
       break;
     }
