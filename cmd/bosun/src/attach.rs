@@ -185,7 +185,7 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     let prefix = if *is_error { "error: " } else { "" };
                     vec![Line {
                         kind: LineKind::ToolResult,
-                        text: format!("{prefix}{name} {}", inline_value(content)),
+                        text: format!("{prefix}{name} {}", output_text(content)),
                     }]
                 }
                 Block::Ask {
@@ -254,13 +254,39 @@ fn permission_name(permission: Permission) -> &'static str {
     }
 }
 
-/// Renders a tool-call arg or result value on one line, cutting long text.
+/// Renders a tool-call arg value on one line, cutting long text.
 fn inline_value(value: &Value) -> String {
     let text = match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     };
     clip(&text, MAX_INLINE_CHARS)
+}
+
+/// Renders a tool result, cutting long text. A result is the JSON the tool
+/// returned; strings stay raw and structure flattens to `key: value` and
+/// `- item` lines, so the content reads directly rather than as escaped JSON.
+fn output_text(value: &Value) -> String {
+    clip(&readable(value), MAX_INLINE_CHARS)
+}
+
+fn readable(value: &Value) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| format!("- {}", readable(item)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, item)| format!("{key}: {}", readable(item)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -1090,6 +1116,32 @@ mod tests {
             vec!["one", "abcde", "fghij", "two"]
         );
         assert_eq!(wrap_text("ab", 5), vec!["ab"]);
+    }
+
+    #[test]
+    fn tool_results_render_json_content_as_readable_lines() {
+        assert_eq!(output_text(&json!("plain")), "plain");
+        assert_eq!(
+            output_text(&json!({ "stdout": "hi", "stderr": "", "exit_code": 0 })),
+            "exit_code: 0\nstderr: \nstdout: hi"
+        );
+        assert_eq!(output_text(&json!({ "content": "a\nb" })), "content: a\nb");
+        assert_eq!(
+            output_text(&json!({ "paths": ["a", "b"] })),
+            "paths: - a\n- b"
+        );
+        assert_eq!(
+            output_text(&json!([{ "line": 1, "path": "a.rs", "text": "fn" }])),
+            "- line: 1\npath: a.rs\ntext: fn"
+        );
+    }
+
+    #[test]
+    fn tool_results_are_cut_to_the_inline_limit() {
+        let long = "x".repeat(MAX_INLINE_CHARS + 10);
+        let rendered = output_text(&json!({ "content": long }));
+        assert_eq!(rendered.chars().count(), MAX_INLINE_CHARS + 1);
+        assert!(rendered.ends_with('…'));
     }
 
     fn row_texts(rows: &[(LineKind, Vec<Span<'static>>)]) -> Vec<String> {
