@@ -1,4 +1,4 @@
-# Sprint 004 — Personas and the agent tree
+# Sprint 005 — Personas and the agent tree
 
 Sessions become a tree of agents. A persona — a model plus a system prompt, permission, and tool allowlist — is the unit of configuration; the user picks one for a session, and any agent in the tree may spawn child sessions under other personas. Subagents are full sessions: they run their own loop and executor on the parent's working copy, store their own transcript, and appear in `bosun list`. The user interacts only with the root of the tree; every child is watch-only. Tool calls travel one multiplexed tunnel per node instead of one per session.
 
