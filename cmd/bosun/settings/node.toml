@@ -6,5 +6,8 @@ node_name = "node-1"
 browse_roots = ["."]
 
 # The node auto-updates to the control plane's version when one is available.
+# The archive is fetched from GitHub Releases; point base_url at a mirror
+# serving the same layout when the node cannot reach GitHub.
 # [update]
 # enabled = false
+# base_url = "https://mirror.example/bosun"

@@ -75,7 +75,7 @@ pub(crate) fn update_command_action(
 #[allow(clippy::too_many_arguments)] // the demanded update needs the poll loop's whole update machinery
 pub(crate) fn handle_update_command(
     client: &reqwest::Client,
-    cp_url: &str,
+    update_base_url: &str,
     id: u64,
     version: &str,
     force: bool,
@@ -106,11 +106,11 @@ pub(crate) fn handle_update_command(
     }
     *last_outcome.lock().unwrap() = None;
     let client = client.clone();
-    let cp_url = cp_url.to_string();
+    let update_base_url = update_base_url.to_string();
     let expected_version = version.to_string();
     let outcome = last_outcome.clone();
     *update_task = Some(tokio::spawn(async move {
-        if let Err(error) = apply(&client, &cp_url, &expected_version, force).await {
+        if let Err(error) = apply(&client, &update_base_url, &expected_version, force).await {
             let status = status_from_error(&error);
             error!(error = %error.display_chain(), "demanded node update failed");
             *outcome.lock().unwrap() = Some(status);
@@ -277,7 +277,7 @@ mod tests {
         let mut update_task = None;
         let result = handle_update_command(
             &reqwest::Client::new(),
-            "http://cp:8090",
+            "http://feed:8090",
             42,
             &older_than(VERSION),
             false,
@@ -298,7 +298,7 @@ mod tests {
         let mut update_task = None;
         let result = handle_update_command(
             &reqwest::Client::new(),
-            "http://cp:8090",
+            "http://feed:8090",
             7,
             &older_than(VERSION),
             true,
@@ -318,7 +318,7 @@ mod tests {
         let mut update_task = Some(tokio::spawn(std::future::pending::<()>()));
         let result = handle_update_command(
             &reqwest::Client::new(),
-            "http://cp:8090",
+            "http://feed:8090",
             7,
             &older_than(VERSION),
             true,
@@ -338,7 +338,7 @@ mod tests {
         let mut update_task = None;
         let result = handle_update_command(
             &reqwest::Client::new(),
-            "http://cp:8090",
+            "http://feed:8090",
             7,
             VERSION,
             false,
@@ -366,7 +366,7 @@ mod tests {
         let mut update_task = None;
         let result = handle_update_command(
             &reqwest::Client::new(),
-            "http://cp:8090",
+            "http://feed:8090",
             7,
             VERSION,
             true,

@@ -36,7 +36,6 @@ use bosun_common::types::X_BOSUN_VERSION;
 use bosun_common::version::VERSION;
 use bosun_common::version::compare;
 use bosun_control::api::AppState;
-use bosun_control::artifacts::ArtifactStore;
 use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
 use bosun_control::registry::NodeHealth;
@@ -86,7 +85,9 @@ enum Command {
     Config(ConfigArgs),
     /// Stop a session and remove it from the node.
     Stop(StopArgs),
-    /// Update the local binary from the connected control plane.
+    /// Update this binary to the control plane's version, or demand updates
+    /// from nodes. The self-update fetches its binary from the release feed:
+    /// BOSUN_UPDATE_BASE_URL when set, else GitHub Releases.
     Update(UpdateArgs),
     /// Run an executor server for one session.
     Executor(ExecutorArgs),
@@ -334,15 +335,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             config.data_dir.display()
         )
     })?;
-    let artifacts_dir = config.artifacts_dir();
-    tokio::fs::create_dir_all(&artifacts_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create artifacts directory {}",
-                artifacts_dir.display()
-            )
-        })?;
 
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     let mut prices: HashMap<String, (f64, f64)> = HashMap::new();
@@ -386,7 +378,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         personas: config.personas,
         default_persona: config.default_persona,
         skills_dir: Some(skills_dir),
-        artifacts: Arc::new(ArtifactStore::new(artifacts_dir)),
     });
     bosun_control::api::recover(&state).await;
     let app = bosun_control::api::router(state);
@@ -494,6 +485,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             manager,
             tls_config,
             config.update.enabled,
+            config.update.base_url.clone(),
             bosun_node::poll::UPDATE_RETRY_DELAY,
         ) => Ok(()),
         _ = shutdown_signal() => Ok(()),

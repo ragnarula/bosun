@@ -39,7 +39,6 @@ use bosun_common::types::CloneRequest;
 use bosun_common::types::CommandResult;
 use bosun_common::types::DevRequest;
 use bosun_common::types::DirListing;
-use bosun_common::types::Manifest;
 use bosun_common::types::NodeCommand;
 use bosun_common::types::NodeUpdateRequest;
 use bosun_common::types::PollRequest;
@@ -58,13 +57,10 @@ use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::oneshot;
-use tokio_util::io::ReaderStream;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
 
-use crate::artifacts::ArtifactError;
-use crate::artifacts::ArtifactStore;
 use crate::commands::CommandQueue;
 use crate::loops::AgentRegistry;
 use crate::registry::NodeHealth;
@@ -96,9 +92,6 @@ pub enum ApiError {
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
 
-    #[error("artifact for target {target} was not found")]
-    ArtifactNotFound { target: String },
-
     #[error("no persona configured")]
     NoPersona,
 
@@ -121,14 +114,6 @@ impl From<StoreError> for ApiError {
     }
 }
 
-impl From<ArtifactError> for ApiError {
-    fn from(error: ArtifactError) -> Self {
-        match error {
-            ArtifactError::Internal(error) => ApiError::Internal(error),
-        }
-    }
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, text) = match &self {
@@ -142,9 +127,7 @@ impl IntoResponse for ApiError {
             ApiError::NodeRejected { .. } | ApiError::NodeUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
-            ApiError::SessionNotFound { .. } | ApiError::ArtifactNotFound { .. } => {
-                (StatusCode::NOT_FOUND, Some(self.to_string()))
-            }
+            ApiError::SessionNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
 
@@ -170,8 +153,6 @@ pub struct AppState {
     pub default_persona: Option<String>,
     /// Skills injected into every session from the control plane's data dir.
     pub skills_dir: Option<PathBuf>,
-    /// Per-platform update binaries served from the artifacts directory.
-    pub artifacts: Arc<ArtifactStore>,
 }
 
 impl AppState {
@@ -276,8 +257,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/dev", post(dev))
         .route("/nodes/{name}/dirs", get(dirs))
         .route("/nodes/{name}/update", post(node_update))
-        .route("/update/manifest", get(manifest))
-        .route("/update/artifact/{target}", get(artifact))
         .route("/stop", post(stop))
         .route("/tunnel/session/{id}", get(tunnel))
         .fallback(not_found)
@@ -317,63 +296,10 @@ async fn poll(
         state.commands.report(&poll.node_name, result);
     }
     let command = state.commands.next(&poll.node_name).await;
-    let artifact_available = match state.artifacts.manifest().await {
-        Ok(manifest) => manifest.artifacts.contains_key(&poll.target_triple),
-        Err(error) => {
-            warn!(
-                node = %poll.node_name,
-                target = %poll.target_triple,
-                error = %error.display_chain(),
-                "failed to read the artifacts manifest"
-            );
-            false
-        }
-    };
     Json(PollResponse {
         command,
         version: bosun_common::version::VERSION.to_string(),
-        artifact_available,
     })
-}
-
-/// The update manifest: the control plane's version plus one sha256 and size
-/// per artifact currently in the artifacts directory.
-#[instrument(skip(state))]
-async fn manifest(State(state): State<Arc<AppState>>) -> Result<Json<Manifest>, ApiError> {
-    Ok(Json(state.artifacts.manifest().await?))
-}
-
-/// Streams one artifact's bytes: `bosun.<target-triple>` from the artifacts
-/// directory.
-#[instrument(skip(state))]
-async fn artifact(
-    State(state): State<Arc<AppState>>,
-    AxumPath(target): AxumPath<String>,
-) -> Result<Response, ApiError> {
-    let path =
-        state
-            .artifacts
-            .artifact_path(&target)
-            .ok_or_else(|| ApiError::ArtifactNotFound {
-                target: target.clone(),
-            })?;
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::ArtifactNotFound { target });
-        }
-        Err(error) => {
-            return Err(ApiError::Internal(
-                anyhow::Error::new(error)
-                    .context(format!("failed to open artifact for target {target}")),
-            ));
-        }
-    };
-    Ok((
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        Body::from_stream(ReaderStream::new(file)),
-    )
-        .into_response())
 }
 
 #[instrument(skip(state))]
@@ -1166,7 +1092,6 @@ mod tests {
             personas: HashMap::new(),
             default_persona: None,
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
     }
 
@@ -1338,7 +1263,6 @@ mod tests {
                 .collect(),
             default_persona: default_persona.map(ToString::to_string),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
     }
 
@@ -1388,7 +1312,6 @@ mod tests {
             personas,
             default_persona: default_persona.map(ToString::to_string),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         })
     }
 
@@ -1683,9 +1606,6 @@ mod tests {
     #[tokio::test]
     async fn poll_response_carries_the_control_plane_version() {
         let dir = tempdir().unwrap();
-        let artifacts = dir.path().join("artifacts");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"bin").unwrap();
         let state = test_state(&dir);
         let addr = serve(state.clone()).await;
         let client = reqwest::Client::new();
@@ -1708,7 +1628,6 @@ mod tests {
                 "node_name": "node-1",
                 "status": "up",
                 "version": "0.5.5",
-                "target_triple": "aarch64-unknown-linux-musl",
                 "result": null
             }))
             .send()
@@ -1724,7 +1643,6 @@ mod tests {
         );
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["version"], bosun_common::version::VERSION);
-        assert_eq!(body["artifact_available"], true);
     }
 
     #[tokio::test]
@@ -1830,152 +1748,6 @@ mod tests {
             .unwrap();
         assert_eq!(nodes[0]["update_status"]["failed"], "checksum mismatch");
         assert_eq!(nodes[1]["update_status"], "disabled");
-    }
-
-    /// A poll against `state` with the given target triple, answered promptly
-    /// by a queued command.
-    async fn poll_with_target(
-        state: &Arc<AppState>,
-        addr: SocketAddr,
-        node: &str,
-        target: Option<&str>,
-    ) -> Value {
-        let client = reqwest::Client::new();
-        let (reply, _reply_rx) = oneshot::channel();
-        state.commands.enqueue(
-            node,
-            NodeCommand::Stop {
-                id: 1,
-                session_id: "s1".into(),
-            },
-            Some(reply),
-        );
-        let mut poll = json!({
-            "node_name": node,
-            "status": "up",
-            "version": "0.5.5",
-            "result": null
-        });
-        if let Some(target) = target {
-            poll["target_triple"] = target.into();
-        }
-        client
-            .post(format!("http://{addr}/poll"))
-            .json(&poll)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn poll_reports_artifact_available_from_the_manifest() {
-        let dir = tempdir().unwrap();
-        let artifacts = dir.path().join("artifacts");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"bin").unwrap();
-        let state = test_state(&dir);
-        let addr = serve(state.clone()).await;
-
-        let available =
-            poll_with_target(&state, addr, "node-a", Some("aarch64-unknown-linux-musl")).await;
-        assert_eq!(available["artifact_available"], true);
-
-        let missing =
-            poll_with_target(&state, addr, "node-b", Some("x86_64-unknown-linux-musl")).await;
-        assert_eq!(missing["artifact_available"], false);
-    }
-
-    #[tokio::test]
-    async fn poll_from_a_node_without_a_target_triple_finds_no_artifact() {
-        let dir = tempdir().unwrap();
-        let state = test_state(&dir);
-        let addr = serve(state.clone()).await;
-
-        let body = poll_with_target(&state, addr, "node-a", None).await;
-        assert_eq!(body["artifact_available"], false);
-    }
-
-    #[tokio::test]
-    async fn manifest_endpoint_lists_artifacts_with_hashes() {
-        let dir = tempdir().unwrap();
-        let artifacts = dir.path().join("artifacts");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"hello").unwrap();
-        let state = test_state(&dir);
-        let addr = serve(state.clone()).await;
-        let client = reqwest::Client::new();
-
-        let body: Value = client
-            .get(format!("http://{addr}/update/manifest"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(body["version"], bosun_common::version::VERSION);
-        assert_eq!(
-            body["artifacts"]["aarch64-unknown-linux-musl"]["sha256"],
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-        assert_eq!(body["artifacts"]["aarch64-unknown-linux-musl"]["size"], 5);
-    }
-
-    #[tokio::test]
-    async fn artifact_endpoint_serves_the_binary() {
-        let dir = tempdir().unwrap();
-        let artifacts = dir.path().join("artifacts");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        std::fs::write(artifacts.join("bosun.aarch64-unknown-linux-musl"), b"hello").unwrap();
-        let state = test_state(&dir);
-        let addr = serve(state.clone()).await;
-        let client = reqwest::Client::new();
-
-        let response = client
-            .get(format!(
-                "http://{addr}/update/artifact/aarch64-unknown-linux-musl"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response.bytes().await.unwrap();
-        assert_eq!(&bytes[..], b"hello");
-    }
-
-    #[tokio::test]
-    async fn artifact_endpoint_404s_for_a_missing_target() {
-        let dir = tempdir().unwrap();
-        let state = test_state(&dir);
-        let addr = serve(state.clone()).await;
-        let client = reqwest::Client::new();
-
-        let response = client
-            .get(format!(
-                "http://{addr}/update/artifact/x86_64-unknown-linux-musl"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn artifact_endpoint_404s_for_a_target_that_cannot_name_a_file() {
-        let dir = tempdir().unwrap();
-        let state = test_state(&dir);
-        let addr = serve(state.clone()).await;
-        let client = reqwest::Client::new();
-
-        let response = client
-            .get(format!("http://{addr}/update/artifact/..%2F..%2Fetc"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A fake OpenAI-compatible provider: answers every chat completion with
@@ -2088,7 +1860,6 @@ mod tests {
             )]),
             default_persona: Some("test".into()),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -2273,7 +2044,6 @@ mod tests {
             )]),
             default_persona: Some("reviewer".into()),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -2344,7 +2114,6 @@ mod tests {
             personas,
             default_persona: Some("coder".into()),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -2827,7 +2596,6 @@ mod tests {
             ]),
             default_persona: Some("coder".into()),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let store = state.store.clone();
         state.store.create_session(&session("s1")).await.unwrap();
@@ -3002,7 +2770,6 @@ mod tests {
             )]),
             default_persona: Some("test".into()),
             skills_dir: None,
-            artifacts: Arc::new(ArtifactStore::new(dir.path().join("artifacts"))),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();

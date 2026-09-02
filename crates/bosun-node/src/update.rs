@@ -11,8 +11,7 @@ use bosun_common::types::UpdateStatus;
 use bosun_common::update::UpdateError;
 #[cfg(any(windows, test))]
 use bosun_common::update::copy_staged_to_target;
-use bosun_common::update::download_artifact;
-use bosun_common::update::fetch_manifest;
+use bosun_common::update::fetch_release_artifact;
 #[cfg(any(windows, test))]
 use bosun_common::update::move_target_to_previous;
 use bosun_common::update::previous_path;
@@ -65,16 +64,12 @@ pub enum RollbackError {
     Internal(#[from] anyhow::Error),
 }
 
-/// Whether the node should fetch and apply the control plane's binary:
-/// updates enabled, an artifact for this platform, and the control plane
-/// strictly ahead of the node.
-pub fn should_update(
-    node_version: &str,
-    cp_version: &str,
-    enabled: bool,
-    artifact_available: bool,
-) -> bool {
-    if !enabled || !artifact_available {
+/// Whether the node should fetch and apply the released binary at the control
+/// plane's version: updates enabled and the control plane strictly ahead of
+/// the node. The node cannot know a release exists until it fetches, so
+/// availability plays no part in the decision.
+pub fn should_update(node_version: &str, cp_version: &str, enabled: bool) -> bool {
+    if !enabled {
         return false;
     }
     matches!(compare(cp_version, node_version), Some(Ordering::Greater))
@@ -82,15 +77,15 @@ pub fn should_update(
 
 /// The status the node reports in its next poll: the last update attempt's
 /// outcome while one is pending, Updating while a task runs, otherwise the
-/// steady state from the versions, the update flag, and artifact
-/// availability. A disabled node reports Disabled even when ahead, and an
-/// idle node behind the control plane reports UpToDate because the poll loop
-/// starts an update from the very response that shows it behind.
+/// steady state from the versions and the update flag. A disabled node
+/// reports Disabled even when ahead, and an idle node behind the control
+/// plane reports UpToDate because the poll loop starts an update from the
+/// very response that shows it behind. A fetch that finds no release reports
+/// NoRelease through the failure outcome.
 pub fn update_status(
     node_version: &str,
     cp_version: &str,
     enabled: bool,
-    artifact_available: bool,
     in_flight: bool,
     outcome: Option<&UpdateStatus>,
 ) -> UpdateStatus {
@@ -106,7 +101,6 @@ pub fn update_status(
     match compare(cp_version, node_version) {
         Some(Ordering::Less) => UpdateStatus::Ahead,
         Some(Ordering::Equal) | None => UpdateStatus::UpToDate,
-        Some(Ordering::Greater) if !artifact_available => UpdateStatus::NoArtifact,
         Some(Ordering::Greater) => UpdateStatus::UpToDate,
     }
 }
@@ -132,13 +126,19 @@ fn gate_downgrade(
 /// attempt failed.
 pub fn status_from_error(error: &UpdateError) -> UpdateStatus {
     match error {
-        UpdateError::NoArtifact { .. } => UpdateStatus::NoArtifact,
         UpdateError::SizeMismatch { .. } => UpdateStatus::Failed("size mismatch".into()),
         UpdateError::ChecksumMismatch => UpdateStatus::Failed("checksum mismatch".into()),
         UpdateError::VersionMismatch { .. } => UpdateStatus::Failed("version mismatch".into()),
         UpdateError::DowngradeRequiresForce { .. } => UpdateStatus::Ahead,
         UpdateError::UnparsableVersion { .. } => {
             UpdateStatus::Failed("invalid control plane version".into())
+        }
+        UpdateError::NoRelease { .. } => UpdateStatus::NoRelease,
+        UpdateError::MalformedChecksum { .. } => {
+            UpdateStatus::Failed("invalid release checksum file".into())
+        }
+        UpdateError::ExtractionFailed { .. } => {
+            UpdateStatus::Failed("failed to extract the release archive".into())
         }
         UpdateError::Internal(error) => UpdateStatus::Failed(error.to_string()),
     }
@@ -183,30 +183,24 @@ fn record_target(target: &Path) {
     let _ = RECORDED_TARGET.set(target.to_path_buf());
 }
 
-/// Downloads, verifies, and restarts into the control plane's binary. A
-/// control plane ahead of the node applies regardless; a lower version is
-/// refused unless `allow_downgrade` is set. Returns only on failure: on Unix
-/// the swap and execve happen in this process, on Windows the staged binary
-/// is spawned and installs itself after this process exits.
+/// Downloads, verifies, and restarts into the released binary at the control
+/// plane's announced version, fetched from the release feed at
+/// `update_base_url`. A control plane ahead of the node applies regardless; a
+/// lower version is refused unless `allow_downgrade` is set. Returns only on
+/// failure: on Unix the swap and execve happen in this process, on Windows
+/// the staged binary is spawned and installs itself after this process exits.
 #[instrument(skip_all)]
 pub async fn apply(
     client: &reqwest::Client,
-    cp_url: &str,
+    update_base_url: &str,
     expected_version: &str,
     allow_downgrade: bool,
 ) -> Result<(), UpdateError> {
-    let manifest = fetch_manifest(client, cp_url).await?;
     gate_downgrade(
         bosun_common::version::VERSION,
-        &manifest.version,
+        expected_version,
         allow_downgrade,
     )?;
-    let artifact = manifest
-        .artifacts
-        .get(bosun_common::target::TARGET)
-        .ok_or_else(|| UpdateError::NoArtifact {
-            target: bosun_common::target::TARGET.to_string(),
-        })?;
     let current = std::env::current_exe().context("failed to find the running binary")?;
     let target = update_target(recorded_target(), &current);
     let dir = target
@@ -215,10 +209,16 @@ pub async fn apply(
     info!(
         target = %bosun_common::target::TARGET,
         version = %expected_version,
-        "node update: downloading artifact"
+        "node update: downloading the release archive"
     );
-    let staged =
-        download_artifact(client, cp_url, dir, bosun_common::target::TARGET, artifact).await?;
+    let staged = fetch_release_artifact(
+        client,
+        update_base_url,
+        expected_version,
+        bosun_common::target::TARGET,
+        dir,
+    )
+    .await?;
     let outcome = async {
         verify_binary_version(&staged, expected_version).await?;
         launch_update(&target, &staged)?;
@@ -702,36 +702,33 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::test_feed::ArchiveBehavior;
+    use crate::test_feed::serve as serve_feed;
 
     #[test]
-    fn should_update_when_behind_enabled_and_artifact_available() {
-        assert!(should_update("0.5.4", "0.5.5", true, true));
+    fn should_update_when_behind_and_enabled() {
+        assert!(should_update("0.5.4", "0.5.5", true));
     }
 
     #[test]
     fn no_update_when_versions_match() {
-        assert!(!should_update("0.5.5", "0.5.5", true, true));
+        assert!(!should_update("0.5.5", "0.5.5", true));
     }
 
     #[test]
     fn no_update_when_the_node_is_ahead() {
-        assert!(!should_update("0.6.0", "0.5.5", true, true));
+        assert!(!should_update("0.6.0", "0.5.5", true));
     }
 
     #[test]
     fn no_update_when_updates_are_disabled() {
-        assert!(!should_update("0.5.4", "0.5.5", false, true));
-    }
-
-    #[test]
-    fn no_update_without_an_artifact() {
-        assert!(!should_update("0.5.4", "0.5.5", true, false));
+        assert!(!should_update("0.5.4", "0.5.5", false));
     }
 
     #[test]
     fn no_update_when_versions_do_not_parse() {
-        assert!(!should_update("banana", "0.5.5", true, true));
-        assert!(!should_update("0.5.4", "", true, true));
+        assert!(!should_update("banana", "0.5.5", true));
+        assert!(!should_update("0.5.4", "", true));
     }
 
     #[test]
@@ -754,136 +751,56 @@ mod tests {
         assert_eq!(gate_downgrade("0.5.5", "banana", false).unwrap(), ());
     }
 
-    /// A control plane whose manifest advertises `version` and whose artifact
-    /// bytes fail verification, so an apply gets past the gate and the
-    /// download without ever restarting the process. Counts artifact
-    /// requests, so a test can assert the gate fired before the download.
-    async fn downgrade_server(
-        version: &str,
-    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering as AtomicOrdering;
-
-        use axum::Json;
-        use axum::Router;
-        use axum::extract::State;
-        use axum::routing::get;
-        use bosun_common::types::Artifact;
-        use bosun_common::types::Manifest;
-
-        #[derive(Clone)]
-        struct ServerState {
-            manifest: Manifest,
-            content: Arc<Vec<u8>>,
-            requests: Arc<AtomicUsize>,
-        }
-
-        async fn serve_manifest(State(state): State<ServerState>) -> Json<Manifest> {
-            Json(state.manifest)
-        }
-
-        async fn serve_artifact(State(state): State<ServerState>) -> Vec<u8> {
-            state.requests.fetch_add(1, AtomicOrdering::Relaxed);
-            (*state.content).clone()
-        }
-
-        let requests = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route("/update/manifest", get(serve_manifest))
-            .route("/update/artifact/{target}", get(serve_artifact))
-            .with_state(ServerState {
-                manifest: Manifest {
-                    version: version.to_string(),
-                    artifacts: HashMap::from([(
-                        bosun_common::target::TARGET.to_string(),
-                        Artifact {
-                            sha256: "0".repeat(64),
-                            size: 8,
-                        },
-                    )]),
-                },
-                content: Arc::new(b"mismatch".to_vec()),
-                requests: requests.clone(),
-            });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (addr.port(), requests)
-    }
-
     #[tokio::test]
     async fn apply_refuses_a_downgrade_without_allow_before_downloading() {
-        use std::sync::atomic::Ordering as AtomicOrdering;
-
         let version = bosun_test_support::older_than(bosun_common::version::VERSION);
-        let (port, requests) = downgrade_server(&version).await;
+        let feed = serve_feed(&version, ArchiveBehavior::Mismatch).await;
+        let base_url = feed.base_url();
 
-        let err = apply(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &version,
-            false,
-        )
-        .await
-        .expect_err("a downgrade without allow must be refused");
+        let err = apply(&reqwest::Client::new(), &base_url, &version, false)
+            .await
+            .expect_err("a downgrade without allow must be refused");
 
         assert!(matches!(err, UpdateError::DowngradeRequiresForce { .. }));
         assert_eq!(
-            requests.load(AtomicOrdering::Relaxed),
+            feed.requests(),
             0,
-            "the gate must refuse before any download starts"
+            "the gate must refuse before any fetch starts"
         );
     }
 
     #[tokio::test]
     async fn apply_allows_a_forced_downgrade_to_download() {
-        use std::sync::atomic::Ordering as AtomicOrdering;
-
         let version = bosun_test_support::older_than(bosun_common::version::VERSION);
-        let (port, requests) = downgrade_server(&version).await;
+        let feed = serve_feed(&version, ArchiveBehavior::Mismatch).await;
+        let base_url = feed.base_url();
 
-        let err = apply(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &version,
-            true,
-        )
-        .await
-        .expect_err("the mismatched artifact must fail the download");
+        let err = apply(&reqwest::Client::new(), &base_url, &version, true)
+            .await
+            .expect_err("the mismatched release must fail the download");
 
         assert!(matches!(err, UpdateError::ChecksumMismatch));
         assert_eq!(
-            requests.load(AtomicOrdering::Relaxed),
-            1,
-            "a forced downgrade must get past the gate and download"
+            feed.requests(),
+            2,
+            "a forced downgrade must get past the gate and fetch the archive and its checksum"
         );
     }
 
     #[tokio::test]
     async fn apply_downloads_a_newer_version_without_allow() {
-        use std::sync::atomic::Ordering as AtomicOrdering;
-
         let version = bosun_test_support::newer_than(bosun_common::version::VERSION);
-        let (port, requests) = downgrade_server(&version).await;
+        let feed = serve_feed(&version, ArchiveBehavior::Mismatch).await;
+        let base_url = feed.base_url();
 
-        let err = apply(
-            &reqwest::Client::new(),
-            &format!("http://127.0.0.1:{port}"),
-            &version,
-            false,
-        )
-        .await
-        .expect_err("the mismatched artifact must fail the download");
+        let err = apply(&reqwest::Client::new(), &base_url, &version, false)
+            .await
+            .expect_err("the mismatched release must fail the download");
 
         assert!(matches!(err, UpdateError::ChecksumMismatch));
         assert_eq!(
-            requests.load(AtomicOrdering::Relaxed),
-            1,
+            feed.requests(),
+            2,
             "an upgrade must not be blocked by the downgrade gate"
         );
     }
@@ -892,7 +809,7 @@ mod tests {
     fn status_reports_the_last_outcome_over_everything_else() {
         let outcome = UpdateStatus::Failed("checksum mismatch".into());
         assert_eq!(
-            update_status("0.5.4", "0.5.5", true, true, true, Some(&outcome)),
+            update_status("0.5.4", "0.5.5", true, true, Some(&outcome)),
             outcome
         );
     }
@@ -900,7 +817,7 @@ mod tests {
     #[test]
     fn status_is_updating_while_a_task_is_in_flight() {
         assert_eq!(
-            update_status("0.5.4", "0.5.5", true, true, true, None),
+            update_status("0.5.4", "0.5.5", true, true, None),
             UpdateStatus::Updating
         );
     }
@@ -908,11 +825,11 @@ mod tests {
     #[test]
     fn status_is_disabled_when_updates_are_off_even_when_ahead() {
         assert_eq!(
-            update_status("0.5.5", "0.5.4", false, true, false, None),
+            update_status("0.5.5", "0.5.4", false, false, None),
             UpdateStatus::Disabled
         );
         assert_eq!(
-            update_status("0.6.0", "0.5.5", false, true, false, None),
+            update_status("0.6.0", "0.5.5", false, false, None),
             UpdateStatus::Disabled
         );
     }
@@ -920,27 +837,19 @@ mod tests {
     #[test]
     fn status_is_ahead_when_the_node_is_newer() {
         assert_eq!(
-            update_status("0.6.0", "0.5.5", true, true, false, None),
+            update_status("0.6.0", "0.5.5", true, false, None),
             UpdateStatus::Ahead
-        );
-    }
-
-    #[test]
-    fn status_is_no_artifact_when_behind_without_an_artifact() {
-        assert_eq!(
-            update_status("0.5.4", "0.5.5", true, false, false, None),
-            UpdateStatus::NoArtifact
         );
     }
 
     #[test]
     fn status_is_up_to_date_when_behind_and_idle_or_equal() {
         assert_eq!(
-            update_status("0.5.4", "0.5.5", true, true, false, None),
+            update_status("0.5.4", "0.5.5", true, false, None),
             UpdateStatus::UpToDate
         );
         assert_eq!(
-            update_status("0.5.5", "0.5.5", true, true, false, None),
+            update_status("0.5.5", "0.5.5", true, false, None),
             UpdateStatus::UpToDate
         );
     }
@@ -948,23 +857,17 @@ mod tests {
     #[test]
     fn status_is_up_to_date_when_versions_do_not_parse() {
         assert_eq!(
-            update_status("banana", "0.5.5", true, true, false, None),
+            update_status("banana", "0.5.5", true, false, None),
             UpdateStatus::UpToDate
         );
         assert_eq!(
-            update_status("0.5.5", "", true, true, false, None),
+            update_status("0.5.5", "", true, false, None),
             UpdateStatus::UpToDate
         );
     }
 
     #[test]
     fn status_from_error_maps_each_variant() {
-        assert_eq!(
-            status_from_error(&UpdateError::NoArtifact {
-                target: "x86_64-unknown-linux-musl".into(),
-            }),
-            UpdateStatus::NoArtifact
-        );
         assert_eq!(
             status_from_error(&UpdateError::SizeMismatch {
                 expected: 10,
@@ -995,6 +898,25 @@ mod tests {
                 version: "banana".into(),
             }),
             UpdateStatus::Failed("invalid control plane version".into())
+        );
+        assert_eq!(
+            status_from_error(&UpdateError::NoRelease {
+                version: "0.6.0".into(),
+                url: "https://example.invalid/v0.6.0/archive".into(),
+            }),
+            UpdateStatus::NoRelease
+        );
+        assert_eq!(
+            status_from_error(&UpdateError::MalformedChecksum {
+                url: "https://example.invalid/checksum".into(),
+            }),
+            UpdateStatus::Failed("invalid release checksum file".into())
+        );
+        assert_eq!(
+            status_from_error(&UpdateError::ExtractionFailed {
+                reason: "corrupt archive".into(),
+            }),
+            UpdateStatus::Failed("failed to extract the release archive".into())
         );
         assert!(matches!(
             status_from_error(&UpdateError::Internal(anyhow::anyhow!("boom"))),

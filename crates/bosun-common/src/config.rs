@@ -23,7 +23,6 @@ pub struct ControlConfig {
     pub models: HashMap<String, ModelConfig>,
     pub personas: HashMap<String, PersonaConfig>,
     pub default_persona: Option<String>,
-    pub update: UpdateConfig,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -31,15 +30,6 @@ fn default_data_dir() -> PathBuf {
 }
 
 impl ControlConfig {
-    /// The directory holding one update binary per platform, named
-    /// `bosun.<target-triple>`. Defaults to `<data dir>/artifacts`.
-    pub fn artifacts_dir(&self) -> PathBuf {
-        self.update
-            .artifacts_dir
-            .clone()
-            .unwrap_or_else(|| self.data_dir.join("artifacts"))
-    }
-
     /// Boot validation of the persona catalog. A persona's `model` must name
     /// a configured model, its `allowed_tools` must be `"*"` or canonical
     /// tool names, and a set `default_persona` must name a persona. The error
@@ -124,17 +114,8 @@ impl Default for ControlConfig {
             models: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
-            update: UpdateConfig::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct UpdateConfig {
-    /// Where per-platform update binaries live, when not the default of
-    /// `<data dir>/artifacts`.
-    pub artifacts_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,11 +162,18 @@ fn default_allowed_tools() -> String {
 pub struct NodeUpdateConfig {
     /// Whether the node applies the control plane's version on its own.
     pub enabled: bool,
+    /// Base URL of the release feed the node fetches update archives from,
+    /// overriding the `BOSUN_UPDATE_BASE_URL` mirror and the GitHub Releases
+    /// default.
+    pub base_url: Option<String>,
 }
 
 impl Default for NodeUpdateConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            base_url: None,
+        }
     }
 }
 
@@ -307,42 +295,6 @@ mod tests {
         assert!(config.models.is_empty());
         assert!(config.personas.is_empty());
         assert_eq!(config.default_persona, None);
-    }
-
-    #[test]
-    fn update_artifacts_dir_defaults_to_data_dir_artifacts() {
-        let config: ControlConfig = toml::from_str("").unwrap();
-        assert_eq!(config.artifacts_dir(), PathBuf::from("data/artifacts"));
-    }
-
-    #[test]
-    fn update_artifacts_dir_follows_data_dir_by_default() {
-        let config: ControlConfig = toml::from_str("data_dir = \"/var/bosun\"").unwrap();
-        assert_eq!(
-            config.artifacts_dir(),
-            PathBuf::from("/var/bosun/artifacts")
-        );
-    }
-
-    #[test]
-    fn empty_update_table_defaults_artifacts_dir() {
-        let config: ControlConfig = toml::from_str("[update]").unwrap();
-        assert_eq!(config.artifacts_dir(), PathBuf::from("data/artifacts"));
-    }
-
-    #[test]
-    fn update_artifacts_dir_overrides_the_default() {
-        let config: ControlConfig = toml::from_str(
-            r#"
-            [update]
-            artifacts_dir = "/opt/bosun/artifacts"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            config.artifacts_dir(),
-            PathBuf::from("/opt/bosun/artifacts")
-        );
     }
 
     #[test]
@@ -650,6 +602,28 @@ mod tests {
     fn node_update_can_be_disabled() {
         let config: NodeConfig = toml::from_str("[update]\nenabled = false").unwrap();
         assert!(!config.update.enabled);
+    }
+
+    #[test]
+    fn node_update_defaults_base_url_to_none() {
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.update.base_url, None);
+    }
+
+    #[test]
+    fn node_update_parses_a_base_url_override() {
+        let config: NodeConfig = toml::from_str(
+            r#"
+            [update]
+            enabled = true
+            base_url = "https://mirror.example/bosun"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.update.base_url.as_deref(),
+            Some("https://mirror.example/bosun")
+        );
     }
 
     #[test]
