@@ -4,6 +4,8 @@ Bosun runs its own agent sessions. The agent loop lives on the control plane, to
 
 Status: **complete**. All eleven stories are implemented and tested.
 
+> The subagent model recorded here — subagent types `{ name, model, permission }` and the `spawn_subagent` tool in S8 — is superseded by sprint 005: personas and real child sessions replace it. See `005-agent-tree.md` and its ADR `../adrs/2026-09-03-agent-tree.md`.
+
 ## Confirmed decisions
 
 - The agent loop runs on the control plane per session. Nodes execute tools. Session history lives in a SQLite store on the control plane.

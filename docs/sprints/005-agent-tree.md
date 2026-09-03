@@ -2,7 +2,7 @@
 
 Sessions become a tree of agents. A persona — a model plus a system prompt, permission, and tool allowlist — is the unit of configuration; the user picks one for a session, and any agent in the tree may spawn child sessions under other personas. Subagents are full sessions: they run their own loop and executor on the parent's working copy, store their own transcript, and appear in `bosun list`. The user interacts only with the root of the tree; every child is watch-only. Tool calls travel one multiplexed tunnel per node instead of one per session.
 
-Status: **planned**.
+Status: **complete**. All ten stories are implemented and tested.
 
 ## Confirmed decisions
 
@@ -32,7 +32,7 @@ Status: **planned**.
 
 ## User stories in implementation order
 
-- [ ] **S1 — Persona registry**
+- [x] **S1 — Persona registry**
 
 As a user, I want to configure personas once on the control plane and pick one when I start a session, so the session runs under the model, system prompt, permission, and tool set I chose.
 
@@ -41,7 +41,7 @@ As a user, I want to configure personas once on the control plane and pick one w
 - `bosun clone`/`bosun dev` take `--persona`; the choice is stored on the session and the session's executor is spawned with the persona's permission and allowed-tool set.
 - The persona catalog is resolved live by name at session start and at spawn; an unknown persona is a clear error.
 
-- [ ] **S2 — Persona switch on the root**
+- [x] **S2 — Persona switch on the root**
 
 As a user, I want to switch the root session's persona mid-session, so I can change role, model, or safety mid-task without losing the thread.
 
@@ -50,7 +50,7 @@ As a user, I want to switch the root session's persona mid-session, so I can cha
 - When the new persona's permission differs, the executor's permission toggles live through `/permission`; the stored session permission follows.
 - A switch to an unknown persona is refused with a clear error; a switch applies to the root only and never to running children.
 
-- [ ] **S3 — Sessions form a tree**
+- [x] **S3 — Sessions form a tree**
 
 As a developer, I want sessions to carry parent and owner links and for child sessions to be first-class store rows, so any agent can run as a session with the existing lifecycle.
 
@@ -59,7 +59,7 @@ As a developer, I want sessions to carry parent and owner links and for child se
 - `bosun list` and the sessions API group children under their owner; children are joinable and read-only over the API.
 - The interrupt cause (user or crash) is recorded on the session so stop semantics can differ.
 
-- [ ] **S4 — Spawn and report**
+- [x] **S4 — Spawn and report**
 
 As a user, I want the session agent to hand a task to a child session under a chosen persona and get back a report, so work routes to the right model and prompt without leaving the session.
 
@@ -70,7 +70,7 @@ As a user, I want the session agent to hand a task to a child session under a ch
 - Note: until S6 delivers ask gating, a child that calls `ask` hangs — `ask` is still advertised to children, and no parent-answer path exists yet.
 - Note: until S8 owns the stop cascade, a completed child keeps its executor, node session record, and tunnel until the tree is stopped, so a long-lived tree accumulates live executors.
 
-- [ ] **S5 — Authored events and the manifest**
+- [x] **S5 — Authored events and the manifest**
 
 As a developer, I want the parent loop to receive child events and track outstanding children, so supervision is event-driven and nothing is forgotten.
 
@@ -81,7 +81,7 @@ As a developer, I want the parent loop to receive child events and track outstan
 - The loop tests add an event-injection seam so child events are delivered in a scripted order.
 - Note: building the manifest scans the parent's full archived thread for each child's last authored message — cheap while transcripts are small; revisit with a per-child lookup if archives grow.
 
-- [ ] **S6 — Ask gating and user surfacing**
+- [x] **S6 — Ask gating and user surfacing**
 
 As a user, I want only questions worth asking to reach me, answered or denied by the agents that know the answer, so I am not interrupted by every worker's doubt.
 
@@ -92,7 +92,7 @@ As a user, I want only questions worth asking to reach me, answered or denied by
 
 Routing is mechanical in the control plane, not model-mediated. Surfacing a question records a durable `pending_asks` store row (the raising session, the DIRECT child whose question it raised, that question's ORIGIN leaf, the surfaced question, and the surfaced Ask block's message id — the block itself may be compacted away); the answer path never wakes the root model. The row names the direct child at every level — the session the raiser can actually message — so a cancel via `message_child` always clears the row; the origin leaf is the routing target a user's answer is appended to. A root has one pending ask at a time, and a child it names must itself be waiting on an unanswered question (`ask` with a `child_id` is refused otherwise, and a second surface while one is pending is refused). `POST /sessions/{id}/messages` distinguishes an answer (default) from a redirect (`redirect: true`). An answer with no pending binding, or with the binding's origin leaf gone, is an ordinary root message. A redirect never clears the binding: the root model wakes with the surfaced ask still in its thread and decides — messaging the child the row names via `message_child` cancels the pending ask and clears the binding, ending the turn without messaging it holds, so a later answer still routes. The terminal client sends redirects with Ctrl-R, the web pane with a Redirect button.
 
-- [ ] **S7 — Recursive tree and watch-only clients**
+- [x] **S7 — Recursive tree and watch-only clients**
 
 As a user, I want any agent to be able to delegate and for the tree to be visible and inspectable, so deep work composes and I always know what is running.
 
@@ -107,7 +107,7 @@ Deep answers flow by leaf-addressing, with one durable binding per surfaced ques
 
 A session that spawns supervises: a child whose wake finishes while it still has live children of its own does not report and stop — it waits in `waiting_for_input` like a root waits for the user, is woken by its children's authored events, and reports to its parent only once nothing it spawned can still act or holds an unhandled event. Without this a mid-tree session that delegated would stop at once and never see its children's reports or asks.
 
-- [ ] **S8 — Interrupt, crash, and stop**
+- [x] **S8 — Interrupt, crash, and stop**
 
 As a user, I want interrupt and stop to behave predictably across the tree and a crash to lose nothing, so I can halt work and recover by hand.
 
@@ -118,7 +118,7 @@ As a user, I want interrupt and stop to behave predictably across the tree and a
 - Note: a control-plane crash between the node starting a child's executor and the child row existing can orphan an executor on the node.
 - Note: a crash between a child appending its event and the parent's loop being woken loses the ephemeral wake — the event itself is durable in the parent's thread, and the parent sees it on its next wake, so the loss is a delay, not data loss; revisit whether the parent should rescan for unhandled events after a crash.
 
-- [ ] **S9 — One tunnel per node**
+- [x] **S9 — One tunnel per node**
 
 As a node operator, I want the node to hold a single connection to the control plane for all its sessions, so a tree of sessions does not multiply connections.
 
@@ -127,7 +127,7 @@ As a node operator, I want the node to hold a single connection to the control p
 - Tunnel reconnect keeps every session's executor running; a dropped tunnel restores all of a node's sessions on reconnect.
 - Flow control stays per logical connection; a protocol violation tears down the node tunnel, and sessions reconnect together.
 
-- [ ] **S10 — Repo standards scan**
+- [x] **S10 — Repo standards scan**
 
 As a user, I want every agent in a session to know the repo's governing documents exist, so work follows the standards the repo sets without every agent guessing.
 
