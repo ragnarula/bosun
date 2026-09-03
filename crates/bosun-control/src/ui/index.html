@@ -161,6 +161,12 @@
   #transcript .state { color: var(--muted); font-size: 12px; }
   #transcript .summary { color: var(--muted); font-style: italic; }
   #transcript .child-report { color: var(--muted); padding-left: 18px; }
+  #transcript .child-link {
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   #transcript .model-call {
     color: var(--muted);
     opacity: 0.65;
@@ -184,6 +190,7 @@
     background: var(--panel);
     border-top: 1px solid var(--border);
   }
+  .input-row[hidden] { display: none; }
   .input-row textarea {
     flex: 1;
     resize: vertical;
@@ -261,6 +268,7 @@
       <span class="muted" id="view-model"></span>
       <span class="badge" id="view-persona"></span>
       <span class="badge" id="view-permission"></span>
+      <span class="badge" id="view-watch" hidden>watch-only</span>
       <span class="badge state" id="view-state"></span>
     </div>
     <div class="view-actions">
@@ -273,7 +281,7 @@
     </div>
   </header>
   <div id="transcript"></div>
-  <div class="input-row">
+  <div class="input-row" id="input-row">
     <textarea id="input" rows="3" placeholder="Message (Enter to send, Shift+Enter for a new line; while a question is on screen, sending answers it)"></textarea>
     <button id="btn-send" type="button">Send</button>
     <button id="btn-redirect" type="button" title="Send as a new instruction instead of answering the question on screen">Redirect</button>
@@ -309,7 +317,9 @@ const viewNode = $('view-node');
 const viewModel = $('view-model');
 const viewPersona = $('view-persona');
 const viewPermission = $('view-permission');
+const viewWatch = $('view-watch');
 const viewState = $('view-state');
+const inputRow = $('input-row');
 const btnInterrupt = $('btn-interrupt');
 const btnPermission = $('btn-permission');
 const personaName = $('persona-name');
@@ -406,18 +416,33 @@ function renderSessions() {
     sessionsBody.appendChild(emptyRow(5, 'no sessions'));
     return;
   }
+  // Render the tree: each root row is followed by its children, nested under
+  // the session that spawned them at any depth.
+  const byParent = new Map();
   for (const session of sessions) {
-    const row = document.createElement('tr');
-    row.className = 'clickable';
-    row.title = session.id;
-    row.appendChild(cell(shortId(session.id)));
-    row.appendChild(cell(session.node));
-    row.appendChild(cell(session.model));
-    row.appendChild(cell(session.state));
-    row.appendChild(cell(session.permission));
-    row.addEventListener('click', () => openSession(session.id));
-    sessionsBody.appendChild(row);
+    const parent = session.parent_id || '';
+    if (!byParent.has(parent)) byParent.set(parent, []);
+    byParent.get(parent).push(session);
   }
+  const renderLevel = (parentId, depth) => {
+    const children = (byParent.get(parentId) || []).sort((a, b) =>
+      a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+    );
+    for (const session of children) {
+      const row = document.createElement('tr');
+      row.className = 'clickable';
+      row.title = session.id;
+      row.appendChild(cell('  '.repeat(depth) + shortId(session.id)));
+      row.appendChild(cell(session.node));
+      row.appendChild(cell(session.model));
+      row.appendChild(cell(session.state));
+      row.appendChild(cell(session.permission));
+      row.addEventListener('click', () => openSession(session.id));
+      sessionsBody.appendChild(row);
+      renderLevel(session.id, depth + 1);
+    }
+  };
+  renderLevel('', 0);
 }
 
 async function post(url, body) {
@@ -611,7 +636,7 @@ function openSession(id) {
   es.onerror = () => {
     showStatus('events: stream lost, reconnecting');
   };
-  input.focus();
+  if (!inputRow.hidden) input.focus();
 }
 
 function closeSession() {
@@ -643,6 +668,16 @@ function updateHeader(session) {
   viewPersona.textContent = session.persona || '';
   updatePermissionBadge(session.permission);
   viewState.textContent = session.state;
+  // A child session is watch-only: its transcript and state render live, but
+  // the pane offers no input path and no user actions toward it.
+  const watchOnly = !!session.parent_id;
+  viewWatch.hidden = !watchOnly;
+  inputRow.hidden = watchOnly;
+  btnInterrupt.disabled = watchOnly;
+  btnPermission.disabled = watchOnly;
+  personaName.disabled = watchOnly;
+  btnPersona.disabled = watchOnly;
+  btnStop.disabled = watchOnly;
 }
 
 function updatePermissionBadge(permission) {
@@ -827,12 +862,27 @@ function renderMessage(message) {
     case 'summary':
       appendLine('summary', '[summary] ' + block.text);
       break;
-    case 'child_event':
-      appendLine(
-        'child-report',
-        '[child ' + block.child_id + ' ' + (block.event_kind || 'report') + '] ' + block.text
-      );
+    case 'child_event': {
+      // Child activity renders as one line whose child id expands into that
+      // child's own thread (watch-only): clicking it attaches the view.
+      const line = document.createElement('div');
+      line.className = 'line child-report';
+      const head = document.createElement('span');
+      head.textContent = '[child ';
+      line.appendChild(head);
+      const link = document.createElement('span');
+      link.className = 'child-link';
+      link.textContent = block.child_id;
+      link.title = 'expand child ' + block.child_id + ' (watch-only)';
+      link.addEventListener('click', () => openSession(block.child_id));
+      line.appendChild(link);
+      const tail = document.createElement('span');
+      tail.textContent = ' ' + (block.event_kind || 'report') + '] ' + block.text;
+      line.appendChild(tail);
+      transcript.appendChild(line);
+      scrollToBottom();
       break;
+    }
     default:
       appendLine('unknown', JSON.stringify(block));
       break;

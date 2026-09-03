@@ -711,7 +711,7 @@ async fn stop(
 struct AddMessageRequest {
     content: String,
     /// A new instruction rather than an answer: while a surfaced child ask
-    /// is pending, an answer routes mechanically to the bound child, and a
+    /// is pending, an answer routes mechanically to the origin leaf, and a
     /// redirect wakes the root model to decide the pending ask's fate. With
     /// no pending ask the flag changes nothing.
     #[serde(default)]
@@ -732,25 +732,25 @@ async fn add_message(
     };
     ensure_root(&session)?;
     // An answer to a surfaced child ask is routed by the control plane, not
-    // by the root model: the text goes verbatim to the bound child and that
-    // child's loop is woken, exactly like a `message_child` message, while
-    // the root is left out of the turn entirely.
+    // by the root model: the text goes verbatim to the origin leaf and that
+    // leaf's loop is woken, exactly like a `message_child` message, while the
+    // root is left out of the turn entirely.
     if !req.redirect {
         match state.store.route_answer(&id, &req.content).await? {
-            RouteAnswer::Routed { child_id } => {
-                state.loops.send(&child_id, LoopEvent::ParentMessage);
+            RouteAnswer::Routed { leaf_id } => {
+                state.loops.send(&leaf_id, LoopEvent::ParentMessage);
                 info!(
                     session_id = %id,
-                    child_id = %child_id,
-                    "routed the user's answer to the bound child"
+                    leaf_id = %leaf_id,
+                    "routed the user's answer to the origin leaf"
                 );
                 return Ok(StatusCode::NO_CONTENT);
             }
-            RouteAnswer::ChildGone { child_id } => {
+            RouteAnswer::LeafGone { leaf_id } => {
                 warn!(
                     session_id = %id,
-                    child_id = %child_id,
-                    "the pending ask's child is gone; treating the answer as a root message"
+                    leaf_id = %leaf_id,
+                    "the pending ask's origin leaf is gone; treating the answer as a root message"
                 );
             }
             // A message with no pending ask is an ordinary root message.
@@ -2827,6 +2827,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_actions_are_refused_on_a_grandchild_like_on_any_child() {
+        // The watch-only guards gate on parent_id, so they hold at any depth:
+        // messages, interrupts, permission and persona changes, and stops all
+        // refuse a grandchild session exactly as they refuse a child.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-watch")).await.unwrap();
+        store
+            .create_session(&child_session("child-watch", "root-watch"))
+            .await
+            .unwrap();
+        let mut grandchild = child_session("grand-watch", "child-watch");
+        grandchild.owner_id = "root-watch".into();
+        store.create_session(&grandchild).await.unwrap();
+        let state = state_with_catalog(
+            &dir,
+            HashMap::from([(
+                "test".to_string(),
+                Arc::new(DummyProvider) as Arc<dyn Provider>,
+            )]),
+            HashMap::new(),
+            None,
+        );
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let url = |path: &str| format!("http://{addr}{path}");
+
+        let bodies: Vec<(String, Option<serde_json::Value>)> = vec![
+            (
+                "/sessions/grand-watch/messages".to_string(),
+                Some(json!({ "content": "hi" })),
+            ),
+            ("/sessions/grand-watch/interrupt".to_string(), None),
+            (
+                "/sessions/grand-watch/permission".to_string(),
+                Some(json!({ "permission": "read_only" })),
+            ),
+            (
+                "/sessions/grand-watch/persona".to_string(),
+                Some(json!({ "persona": "coder" })),
+            ),
+            (
+                "/stop".to_string(),
+                Some(json!({ "session_id": "grand-watch" })),
+            ),
+        ];
+        for (path, body) in bodies {
+            let mut request = client.post(url(&path));
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let text = response.text().await.unwrap();
+            assert!(
+                text.contains("watch-only"),
+                "{path} refused as watch-only: {text}"
+            );
+        }
+        assert!(
+            store.get_session("grand-watch").await.unwrap().is_some(),
+            "a refused stop leaves the grandchild in place"
+        );
+    }
+
+    #[tokio::test]
     async fn a_user_answer_to_a_surfaced_child_ask_routes_to_the_child_without_a_root_model_call() {
         let answer = "yes, push to main";
         let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
@@ -2971,6 +3037,243 @@ mod tests {
                 Block::Text { text } if text == answer
             )),
             "the answer is not addressed to the root's thread"
+        );
+        assert!(
+            store.get_pending_ask(&root_id).await.unwrap().is_none(),
+            "the binding is cleared once the ask is answered"
+        );
+    }
+
+    /// Builds a control-plane state whose root, its child, and that child's
+    /// own child each run a loop against their own scripted provider: three
+    /// sessions, three models, three fake providers. The leaf's thread starts
+    /// with an assignment, so waking the leaf makes it ask. Returns the state,
+    /// the store, and the root, mid, and leaf ids.
+    async fn state_with_tree(
+        dir: &tempfile::TempDir,
+        root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        mid_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        leaf_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+    ) -> (Arc<AppState>, Store, String, String, String) {
+        let root_addr = scripted_provider(root_scripts).await;
+        let mid_addr = scripted_provider(mid_scripts).await;
+        let leaf_addr = scripted_provider(leaf_scripts).await;
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut root = session("root-s7api");
+        root.model = "root-model".into();
+        root.persona = None;
+        let mut mid = child_session("mid-s7api", "root-s7api");
+        mid.model = "mid-model".into();
+        mid.persona = None;
+        let mut leaf = child_session("leaf-s7api", "mid-s7api");
+        leaf.model = "leaf-model".into();
+        leaf.persona = None;
+        leaf.owner_id = "root-s7api".into();
+        store.create_session(&root).await.unwrap();
+        store.create_session(&mid).await.unwrap();
+        store.create_session(&leaf).await.unwrap();
+        store
+            .append_message(
+                &leaf.id,
+                Role::User,
+                &Block::Text {
+                    text: "implement the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let providers = HashMap::from([
+            (
+                "root-model".to_string(),
+                openai_provider_with_model(root_addr, "root-model"),
+            ),
+            (
+                "mid-model".to_string(),
+                openai_provider_with_model(mid_addr, "mid-model"),
+            ),
+            (
+                "leaf-model".to_string(),
+                openai_provider_with_model(leaf_addr, "leaf-model"),
+            ),
+        ]);
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let loops = Arc::new(AgentRegistry::new(
+            None,
+            providers.clone(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        for (id, model) in [
+            ("root-s7api", "root-model"),
+            ("mid-s7api", "mid-model"),
+            ("leaf-s7api", "leaf-model"),
+        ] {
+            loops.start(
+                id,
+                store.clone(),
+                providers[model].clone(),
+                tunnels.clone(),
+                model,
+            );
+        }
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels,
+            store: store.clone(),
+            loops,
+            providers,
+            personas: HashMap::new(),
+            default_persona: None,
+            skills_dir: None,
+        });
+        (state, store, root.id, mid.id, leaf.id)
+    }
+
+    #[tokio::test]
+    async fn a_user_answer_at_depth_routes_to_the_grandchild_leaf_without_any_model_relay() {
+        let answer = "yes, push to main";
+        // The root surfaces the question it read from its child, naming that
+        // child; the binding row keeps the child's direct identity for the
+        // root to act on and the origin leaf two levels down for the answer.
+        // The root's only later turn reacts to the completion reports.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![tool_call_fragment(
+                    "call-1",
+                    "ask",
+                    r#"{"message":"may I push?","options":["yes","no"],"child_id":"mid-s7api"}"#,
+                )],
+                vec![text_chunk("noted the report")],
+            ])));
+        // The mid-level session re-raises the leaf's question to its parent,
+        // then later handles the leaf's completion report.
+        let mid_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![tool_call_fragment(
+                    "call-1",
+                    "ask",
+                    r#"{"message":"may I push?","options":["yes","no"],"child_id":"leaf-s7api"}"#,
+                )],
+                vec![text_chunk("recorded the result")],
+            ])));
+        let leaf_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![tool_call_fragment(
+                    "call-1",
+                    "ask",
+                    r#"{"message":"may I push?","options":["yes","no"]}"#,
+                )],
+                vec![text_chunk("pushed to main")],
+            ])));
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, mid_id, leaf_id) =
+            state_with_tree(&dir, root_scripts, mid_scripts, leaf_scripts).await;
+        // The leaf's assignment is in its thread; waking it makes it ask, and
+        // the surface chain climbs to the root on its own.
+        state.loops.wake(&leaf_id);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        wait_for("the chain to surface at the root", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask(&root_id).await.unwrap().is_some()
+                        && store.model_calls(&root_id).await.unwrap().len() == 1
+                }
+            }
+        })
+        .await;
+        let pending = store
+            .get_pending_ask(&root_id)
+            .await
+            .unwrap()
+            .expect("a pending ask");
+        assert_eq!(
+            pending.child_id, mid_id,
+            "the row names the root's direct child, the session the root can message to cancel"
+        );
+        assert_eq!(
+            pending.origin_leaf, leaf_id,
+            "the row carries the origin leaf the user's answer routes to"
+        );
+
+        // The user answers; the answer routes verbatim to the leaf and no
+        // model at any level is spent relaying it.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/messages"))
+            .json(&json!({ "content": answer }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the leaf to resume and the reports to climb the tree", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            let mid_id = mid_id.clone();
+            let leaf_id = leaf_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                let mid_id = mid_id.clone();
+                let leaf_id = leaf_id.clone();
+                async move {
+                    let root = store.get_session(&root_id).await.unwrap().unwrap();
+                    let mid = store.get_session(&mid_id).await.unwrap().unwrap();
+                    let leaf = store.get_session(&leaf_id).await.unwrap().unwrap();
+                    root.state == SessionState::WaitingForInput
+                        && store.model_calls(&root_id).await.unwrap().len() == 2
+                        && mid.state == SessionState::Stopped
+                        && store.model_calls(&mid_id).await.unwrap().len() == 2
+                        && leaf.state == SessionState::Stopped
+                        && store.model_calls(&leaf_id).await.unwrap().len() == 2
+                }
+            }
+        })
+        .await;
+
+        // The answer reached the leaf verbatim; the root ran exactly the
+        // surface turn and the report-reaction turn, and never messaged a
+        // child to relay the answer.
+        let leaf_messages = store.messages(&leaf_id, false).await.unwrap();
+        let leaf_texts: Vec<&str> = leaf_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leaf_texts,
+            ["implement the change", answer, "pushed to main"],
+            "the answer is the leaf's next message, verbatim"
+        );
+        let root_calls = store.model_calls(&root_id).await.unwrap();
+        assert_eq!(
+            root_calls.len(),
+            2,
+            "the answer routing spent no root model turn"
+        );
+        let root_tool_calls = store.tool_calls(&root_id).await.unwrap();
+        assert!(
+            !root_tool_calls
+                .iter()
+                .any(|call| call.name == "message_child"),
+            "the root never relayed the answer: {root_tool_calls:?}"
+        );
+        let mid_tool_calls = store.tool_calls(&mid_id).await.unwrap();
+        assert!(
+            !mid_tool_calls
+                .iter()
+                .any(|call| call.name == "message_child"),
+            "the mid-level session never relayed the answer: {mid_tool_calls:?}"
         );
         assert!(
             store.get_pending_ask(&root_id).await.unwrap().is_none(),

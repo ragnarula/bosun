@@ -221,6 +221,7 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     child_id,
                     kind,
                     text,
+                    ..
                 } => vec![Line {
                     kind: LineKind::ChildEvent,
                     text: format!("child {child_id} {}: {text}", child_event_verb(*kind)),
@@ -451,12 +452,16 @@ pub struct App {
     history_pos: usize,
     /// The draft being edited before arrow-key recall replaced it.
     draft: String,
+    /// A child session is watch-only: its transcript and state render live,
+    /// but nothing this client sends reaches it, so no input is offered.
+    watch_only: bool,
 }
 
 impl App {
     pub fn new(session: Session) -> Self {
         let permission = session.permission;
         let session_state = session.state;
+        let watch_only = session.parent_id.is_some();
         Self {
             session,
             state: ClientState::new(permission, session_state),
@@ -468,6 +473,7 @@ impl App {
             history: Vec::new(),
             history_pos: 0,
             draft: String::new(),
+            watch_only,
         }
     }
 
@@ -561,9 +567,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(transcript, output);
 
     let input = chunks[2];
-    let (text, tail_len) = input_row(&app.state.input, input.width.saturating_sub(2) as usize);
-    let input_widget = Paragraph::new(text)
-        .block(
+    let interactive = !app.watch_only;
+    let inner_width = input.width.saturating_sub(2) as usize;
+    let input_widget = if interactive {
+        let (text, _tail_len) = input_row(&app.state.input, inner_width);
+        Paragraph::new(text).block(
             TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
@@ -571,9 +579,27 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     Style::default().fg(Color::DarkGray),
                 )),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(TuiLine::from(Span::styled(
+            "watch-only: this session is a child; it renders here but accepts no input. esc/^C/^Q quit · pgup/pgdn scroll",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    "watching — child sessions accept no input",
+                    Style::default().fg(Color::DarkGray),
+                )),
+        )
+        .wrap(Wrap { trim: false })
+    };
     frame.render_widget(input_widget, input);
-    frame.set_cursor_position((input.x + 1 + 2 + tail_len as u16, input.y + 1));
+    if interactive {
+        let (_, tail_len) = input_row(&app.state.input, inner_width);
+        frame.set_cursor_position((input.x + 1 + 2 + tail_len as u16, input.y + 1));
+    }
 }
 
 fn status_line(app: &App) -> TuiLine<'static> {
@@ -584,12 +610,14 @@ fn status_line(app: &App) -> TuiLine<'static> {
     } else {
         "connecting"
     };
+    let mode = if app.watch_only { " · watch-only" } else { "" };
     TuiLine::from(vec![
         Span::styled("session", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {id} · {} · ", app.session.model)),
         Span::styled(state, Style::default().fg(Color::Cyan)),
         Span::raw(format!(" · {} · ", permission_name(app.state.permission))),
         Span::styled(connection, Style::default().fg(Color::DarkGray)),
+        Span::styled(mode, Style::default().fg(Color::Yellow)),
     ])
 }
 
@@ -909,6 +937,35 @@ async fn handle_key(
     session_id: &str,
     key: KeyEvent,
 ) -> anyhow::Result<Action> {
+    if app.watch_only {
+        // Watch-only attach sends nothing: scroll keys work, everything else
+        // is ignored, and the exit keys quit instead of interrupting a child
+        // the API would refuse to interrupt anyway.
+        return match key.code {
+            KeyCode::Esc => Ok(Action::Exit),
+            KeyCode::Char('c' | 'q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Ok(Action::Exit)
+            }
+            KeyCode::PageUp => {
+                app.follow = false;
+                app.scroll = app.scroll.saturating_sub(app.viewport.max(1) as usize);
+                Ok(Action::Continue)
+            }
+            KeyCode::PageDown => {
+                app.follow = false;
+                app.scroll = app.scroll.saturating_add(app.viewport.max(1) as usize);
+                if app.scroll >= app.max_scroll {
+                    app.follow = true;
+                }
+                Ok(Action::Continue)
+            }
+            KeyCode::End => {
+                app.follow = true;
+                Ok(Action::Continue)
+            }
+            _ => Ok(Action::Continue),
+        };
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             interrupt(app, client, cp_url, session_id).await;
@@ -1521,6 +1578,7 @@ mod tests {
                     child_id: "explorer-1".into(),
                     kind: ChildEventKind::Report,
                     text: "found it".into(),
+                    origin: None,
                 },
             },
         };
@@ -1706,6 +1764,102 @@ mod tests {
         assert!(
             bottom.contains("line 59"),
             "the view must follow to the newest row: {bottom:?}"
+        );
+    }
+
+    /// A child session: watch-only, with a root that owns it.
+    fn child_test_session() -> Session {
+        let mut child = test_session();
+        child.parent_id = Some("root-1".into());
+        child.owner_id = "root-1".into();
+        child
+    }
+
+    #[test]
+    fn watch_only_attach_renders_the_watch_notice_and_no_input_prompt() {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+        let mut app = App::new(child_test_session());
+        assert!(app.watch_only, "a child session attaches watch-only");
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let status = buffer_row_text(buffer, 0, 90);
+        assert!(
+            status.contains("watch-only"),
+            "the status names the mode: {status}"
+        );
+        // Layout: status row 0, output rows 1..=6, input 7..=9. The input box
+        // holds the watch notice, never a "> " prompt.
+        let footer = buffer_row_text(buffer, 8, 90);
+        assert!(
+            footer.contains("accepts no input"),
+            "the input box explains the watch mode: {footer}"
+        );
+        assert!(
+            !footer.contains("> "),
+            "watch-only attach offers no input prompt: {footer}"
+        );
+
+        let app = App::new(test_session());
+        assert!(!app.watch_only, "a root session attaches interactively");
+    }
+
+    #[tokio::test]
+    async fn watch_only_attach_sends_nothing_and_quits_on_the_exit_keys() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(child_test_session());
+        app.state.input = "typed before attach".into();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "child-1",
+            key(KeyCode::Char('h')),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert_eq!(
+            app.state.input, "typed before attach",
+            "typing mutates nothing in watch mode"
+        );
+        let lines_before = app.state.lines.len();
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "child-1",
+            key(KeyCode::Enter),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert_eq!(
+            app.state.lines.len(),
+            lines_before,
+            "Enter sends no message in watch mode"
+        );
+        let action = handle_key(&mut app, &client, "http://x", "child-1", key(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert_eq!(action, Action::Exit, "Esc quits a watch-only attach");
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut app = App::new(child_test_session());
+        let action = handle_key(&mut app, &client, "http://x", "child-1", control_c)
+            .await
+            .unwrap();
+        assert_eq!(
+            action,
+            Action::Exit,
+            "^C quits instead of interrupting a child"
+        );
+        assert!(
+            app.state.lines.is_empty(),
+            "no interrupt request is issued in watch mode: {:?}",
+            app.state.lines
         );
     }
 

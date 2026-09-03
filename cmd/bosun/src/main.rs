@@ -788,24 +788,46 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `bosun list` table: roots in id order with their children indented
-/// beneath them. Children are grouped by owner (the tree root), so every
-/// session in one tree renders under the row that owns it. The id column is
-/// wide enough for the two-space tree indent plus a session id, so indenting
-/// a child cannot push the later columns out of line.
+/// The `bosun list` table: roots in id order with the whole tree beneath each
+/// one. Sessions are grouped by parent, so children nest under the session
+/// that spawned them at any depth; the indent widens one level at a time and
+/// the id column is sized for the deepest row, so indenting never pushes the
+/// later columns out of line.
 fn session_rows(sessions: &[Session]) -> Vec<String> {
-    // 36 characters for a session id plus the two reserved for the indent.
-    let mut lines = vec![format!(
-        "{:<38}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
-        "id", "node", "source", "ref", "persona", "status"
-    )];
+    let by_id: HashMap<&str, &Session> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+    let depth_of = |session: &Session| {
+        let mut depth = 0;
+        let mut current = session;
+        while let Some(parent_id) = current.parent_id.as_deref()
+            && let Some(parent) = by_id.get(parent_id)
+        {
+            depth += 1;
+            current = parent;
+        }
+        depth
+    };
+    let mut children_of: HashMap<&str, Vec<&Session>> = HashMap::new();
+    for session in sessions {
+        if let Some(parent_id) = session.parent_id.as_deref() {
+            children_of.entry(parent_id).or_default().push(session);
+        }
+    }
+    for children in children_of.values_mut() {
+        children.sort_by_key(|s| s.id.as_str());
+    }
+    let mut roots: Vec<&Session> = sessions.iter().filter(|s| s.parent_id.is_none()).collect();
+    roots.sort_by_key(|s| s.id.as_str());
+    // 36 characters fit a UUID; deeper rows add their indent on top.
+    let deepest = sessions.iter().map(depth_of).max().unwrap_or(0);
+    let id_width = 36 + 2 * (deepest + 1);
+
     let row = |session: &Session, indent: &str| {
         let source = session
             .repo_url
             .clone()
             .unwrap_or_else(|| session.dir.clone());
         format!(
-            "{:<38}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
+            "{:<id_width$}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
             format!("{indent}{}", session.id),
             session.node,
             source,
@@ -814,18 +836,29 @@ fn session_rows(sessions: &[Session]) -> Vec<String> {
             state_name(session.state)
         )
     };
-    let mut roots: Vec<&Session> = sessions.iter().filter(|s| s.parent_id.is_none()).collect();
-    roots.sort_by_key(|s| s.id.as_str());
+    let mut lines = vec![format!(
+        "{:<id_width$}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
+        "id", "node", "source", "ref", "persona", "status"
+    )];
+    fn push_children(
+        lines: &mut Vec<String>,
+        children_of: &HashMap<&str, Vec<&Session>>,
+        row: &dyn Fn(&Session, &str) -> String,
+        parent_id: &str,
+        depth: usize,
+    ) {
+        let indent = "  ".repeat(depth);
+        let Some(children) = children_of.get(parent_id) else {
+            return;
+        };
+        for child in children {
+            lines.push(row(child, &indent));
+            push_children(lines, children_of, row, &child.id, depth + 1);
+        }
+    }
     for root in roots {
         lines.push(row(root, ""));
-        let mut children: Vec<&Session> = sessions
-            .iter()
-            .filter(|s| s.parent_id.is_some() && s.owner_id == root.id)
-            .collect();
-        children.sort_by_key(|s| s.id.as_str());
-        for child in children {
-            lines.push(row(child, "  "));
-        }
+        push_children(&mut lines, &children_of, &row, &root.id, 1);
     }
     lines
 }
@@ -1212,6 +1245,86 @@ mod tests {
         };
         assert_eq!(id_of(&rows[1]), "a");
         assert_eq!(id_of(&rows[2]), "b");
+    }
+
+    #[test]
+    fn session_rows_nest_grandchildren_under_the_session_that_spawned_them() {
+        // root-1 spawns child-1, which spawns grand-1; grand-2 is child-2's
+        // own child under the same root. Every level indents one step under
+        // its parent, not flat under the owner.
+        let mut child_1 = child_session("child-1", "root-1");
+        child_1.state = SessionState::Running;
+        let mut child_2 = child_session("child-2", "root-1");
+        child_2.state = SessionState::Running;
+        let mut grand_1 = child_session("grand-1", "child-1");
+        grand_1.parent_id = Some("child-1".into());
+        grand_1.owner_id = "root-1".into();
+        grand_1.state = SessionState::Running;
+        let mut grand_2 = child_session("grand-2", "child-2");
+        grand_2.parent_id = Some("child-2".into());
+        grand_2.owner_id = "root-1".into();
+        grand_2.state = SessionState::WaitingForInput;
+
+        let sessions = vec![child_1, child_2, root_session("root-1"), grand_1, grand_2];
+        let rows = session_rows(&sessions);
+        assert_eq!(rows.len(), 6, "the header plus all five sessions");
+        let root = rows[1].to_string();
+        let child_1_row = rows[2].to_string();
+        let grand_1_row = rows[3].to_string();
+        let child_2_row = rows[4].to_string();
+        let grand_2_row = rows[5].to_string();
+        assert!(!root.starts_with("  "), "a root is not indented: {root}");
+        assert!(
+            child_1_row.starts_with("  child-1"),
+            "a child indents one level: {child_1_row}"
+        );
+        assert!(
+            grand_1_row.starts_with("    grand-1"),
+            "a grandchild indents under its parent: {grand_1_row}"
+        );
+        assert!(
+            child_2_row.starts_with("  child-2"),
+            "the second branch indents under the same root: {child_2_row}"
+        );
+        assert!(
+            grand_2_row.starts_with("    grand-2"),
+            "each branch nests under its own parent: {grand_2_row}"
+        );
+        let text = rows.join("\n");
+        assert!(
+            text.find("root-1") < text.find("child-1")
+                && text.find("child-1") < text.find("grand-1")
+                && text.find("root-1") < text.find("child-2")
+                && text.find("child-2") < text.find("grand-2"),
+            "siblings and their descendants render in id order under the root: {text}"
+        );
+    }
+
+    #[test]
+    fn session_rows_keep_columns_aligned_across_grandchild_indents() {
+        let root_id = "r".repeat(36);
+        let child_id = "c".repeat(36);
+        let grand_id = "g".repeat(36);
+        let mut root = root_session(&root_id);
+        root.node = "node-a".into();
+        let mut child = child_session(&child_id, &root_id);
+        child.node = "node-b".into();
+        let mut grand = child_session(&grand_id, &child_id);
+        grand.node = "node-c".into();
+        grand.owner_id = root_id.clone();
+
+        let rows = session_rows(&[root, child, grand]);
+        assert_eq!(rows.len(), 4);
+        let node_at = |row: &str| {
+            row.find("node")
+                .expect("the node column is present on every row")
+        };
+        assert_eq!(
+            (node_at(&rows[0]), node_at(&rows[1])),
+            (node_at(&rows[2]), node_at(&rows[3])),
+            "deep indents must not shift the later columns: {}",
+            rows.join("\n")
+        );
     }
 
     #[test]

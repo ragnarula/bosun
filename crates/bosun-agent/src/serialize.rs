@@ -107,6 +107,7 @@ fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
                 child_id,
                 kind,
                 text,
+                ..
             },
         ) => {
             json!({ "type": "text", "text": authored_event_text(child_id, *kind, text) })
@@ -170,6 +171,7 @@ fn openai_message(message: &Message, ask_recipient: AskRecipient) -> Value {
                 child_id,
                 kind,
                 text,
+                ..
             },
         ) => {
             json!({ "role": message.role.as_str(), "content": authored_event_text(child_id, *kind, text) })
@@ -220,10 +222,10 @@ fn authored_event_text(child_id: &str, kind: ChildEventKind, text: &str) -> Stri
 
 /// An ask as provider text. The recipient is who the question is for: the
 /// user when the thread belongs to a root session, the session's parent when
-/// it belongs to a child session. A bound ask names the child whose question
-/// it carries, so the session reading it knows whose question awaits an
-/// answer; a recorded answer is included, so a later wake sees the question
-/// was resolved.
+/// it belongs to a child session. A raised ask names the direct child whose
+/// question it carries, so the session reading it knows which child it can
+/// message to answer, deny, or cancel the question; a recorded answer is
+/// included, so a later wake sees the question was resolved.
 fn ask_text(
     recipient: AskRecipient,
     child_id: Option<&str>,
@@ -306,6 +308,7 @@ mod tests {
                     child_id: "child-1".into(),
                     kind: ChildEventKind::Report,
                     text: "sub done".into(),
+                    origin: None,
                 },
             },
             Message {
@@ -467,6 +470,7 @@ mod tests {
                 child_id: "child-1".into(),
                 kind,
                 text: text.into(),
+                origin: None,
             },
         };
 

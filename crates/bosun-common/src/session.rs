@@ -115,12 +115,14 @@ pub enum Block {
     Ask {
         message: String,
         options: Vec<String>,
-        /// The child whose question this ask carries: when a root surfaces a
-        /// child's question instead of answering it, the ask binds to that
-        /// child so the user's answer is attributed to it and routes back to
-        /// it. None for a question the session asks on its own behalf. Skipped
-        /// when None, so an unbound ask serializes byte-identically to the
-        /// pre-binding transcript format.
+        /// The direct child whose question this ask carries: a session that
+        /// surfaced a child's question waits with this block at the end of
+        /// its thread, and its model reads the name to know which child it
+        /// can message to answer, deny, or cancel the question. The origin
+        /// leaf the answer routes to lives on the pending-ask binding, not
+        /// here. None for a question the session asks on its own behalf.
+        /// Skipped when None, so an unbound ask serializes byte-identically
+        /// to the pre-binding transcript format.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child_id: Option<String>,
         answer: Option<String>,
@@ -138,6 +140,18 @@ pub enum Block {
         #[serde(rename = "event_kind")]
         kind: ChildEventKind,
         text: String,
+        /// The origin leaf of an ask event: the session whose own question the
+        /// event carries — the authoring session itself when it asked its own
+        /// question, or the origin leaf of the question it re-raised when it
+        /// surfaced a child's question upward. The authoring loop stamps it
+        /// mechanically; the model never supplies it. Reports and failures
+        /// carry no question, so the field is None there. A parent binds a
+        /// surfaced question to this preserved leaf, so the answer routes to
+        /// the true origin no matter how the raise chain interleaves. Skipped
+        /// when None, so a report or failure serializes byte-identically to
+        /// the pre-origin transcript format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
 }
 
@@ -309,6 +323,7 @@ mod tests {
                 child_id: "child-1".into(),
                 kind: ChildEventKind::Report,
                 text: "finished the change".into(),
+                origin: None,
             },
         ] {
             assert_round_trips(&block);
@@ -415,12 +430,14 @@ mod tests {
             child_id: "child-1".into(),
             kind: ChildEventKind::Report,
             text: "done".into(),
+            origin: None,
         })
         .unwrap();
         assert_eq!(json["kind"], "child_event");
         assert_eq!(json["child_id"], "child-1");
         assert_eq!(json["event_kind"], "report");
         assert_eq!(json["text"], "done");
+        assert!(json.get("origin").is_none(), "a report carries no origin");
     }
 
     #[test]

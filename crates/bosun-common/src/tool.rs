@@ -68,7 +68,7 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ask".into(),
-            description: "Ask a question with optional choices that ends the turn and waits for an answer. At the root the question reaches the user. In a child session it reaches your parent instead: the parent answers, denies with a reason, or passes the question up, and you wait for the parent's message. To pass a child session's question up to the user, call ask with the child's id from your manifest as child_id and the question as message; the user's answer is routed back to that child automatically. While a surfaced question awaits the user's answer you may ask nothing else: message that child to cancel its pending question first.".into(),
+            description: "Ask a question with optional choices that ends the turn and waits for an answer. At the root the question reaches the user. In a child session it reaches your parent instead: the parent answers, denies with a reason, or passes the question up, and you wait for the parent's message. To pass one of your child sessions' questions upward, call ask with the child's id from your manifest as child_id and the question as message: the surfaced ask names that child — the session you can message to answer or cancel it — and the user's answer is routed automatically to the session that originally asked, so the answer is never paraphrased on its way back. While a question you raised awaits an answer you may ask nothing else: message the child whose question you raised to cancel it first.".into(),
             schema: json!({"type":"object","properties":{"message":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"child_id":{"type":"string"}},"required":["message"]}),
         },
         ToolSpec {
@@ -98,7 +98,7 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "message_child".into(),
-            description: "Send a message to one of your child sessions, named in your live-children manifest. A child waiting for input has asked you a question: answer it or deny it with a reason here, and the child resumes from its own thread. If you surfaced a child's question to the user and the user redirects instead of answering, message the bound child to cancel its pending question. You can also use it to ask a working child for detail or to redirect it.".into(),
+            description: "Send a message to one of your child sessions, named in your live-children manifest. A child waiting for input has asked you a question: answer it or deny it with a reason here, and the child resumes from its own thread. If you surfaced a child's question to the user and the user redirects instead of answering, message that child to cancel its pending question. You can also use it to ask a working child for detail or to redirect it.".into(),
             schema: json!({"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}),
         },
     ];

@@ -58,30 +58,37 @@ pub struct ToolCall {
     pub is_error: bool,
 }
 
-/// A root session's pending bound ask: the child whose surfaced question is
-/// awaiting the user's answer. `ask_message_id` is the id of the surfaced
-/// Ask block in the root's own thread, so the answer can be recorded on it.
-/// The row outlives compaction, which archives the Ask block without deleting
-/// it.
+/// A session's pending raised ask, one per session that raised: the session
+/// that surfaced a question awaits its answer. The row names the DIRECT child
+/// whose question the session raised, at every level: the one-pending-raise
+/// gate's refusal names that child, `message_child` to it clears the row, and
+/// its next authored event proves the question closed and clears the row too.
+/// `origin_leaf` is the session whose own question the raise carries — where
+/// a user's answer routes — which at the root is not the direct child when
+/// the question was re-raised up a chain. `ask_message_id` is the surfaced
+/// Ask block's row in the raiser's own thread, so the answer can be recorded
+/// on it. The row outlives compaction, which archives the Ask block without
+/// deleting it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAsk {
     pub session_id: String,
     pub child_id: String,
+    pub origin_leaf: String,
     pub question: String,
     pub ask_message_id: i64,
 }
 
-/// What routing a user's answer to a pending bound ask did.
+/// What routing a user's answer to a pending raised ask did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteAnswer {
-    /// No binding was pending; the answer was not routed to a child.
+    /// No raised ask was pending; the answer was not routed to a session.
     NoBinding,
-    /// The answer was appended to the bound child's thread; the caller must
-    /// wake that child's loop.
-    Routed { child_id: String },
-    /// The binding's child session is gone; the binding was cleared and the
-    /// answer was not routed.
-    ChildGone { child_id: String },
+    /// The answer was appended to the origin leaf's thread; the caller must
+    /// wake that leaf's loop.
+    Routed { leaf_id: String },
+    /// The origin leaf is gone; the stale binding was cleared and the answer
+    /// was not routed.
+    LeafGone { leaf_id: String },
 }
 
 /// The sessions table is the source of truth for sessions; the node registry
@@ -130,6 +137,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE TABLE IF NOT EXISTS pending_asks (
   session_id TEXT PRIMARY KEY,
   child_id TEXT NOT NULL,
+  origin_leaf TEXT NOT NULL,
   question TEXT NOT NULL,
   ask_message_id INTEGER NOT NULL
 );
@@ -205,6 +213,19 @@ impl Store {
         if !column_exists(&conn, "sessions", "interrupt_cause")? {
             conn.execute("ALTER TABLE sessions ADD COLUMN interrupt_cause TEXT", [])
                 .context("failed to add the interrupt_cause column")?;
+        }
+        if !column_exists(&conn, "pending_asks", "origin_leaf")? {
+            // Rows written before the origin column held the origin leaf in
+            // child_id, so the leaf is copied over. The direct child such a
+            // row raised is not recoverable, but the column's job — naming
+            // where a user's answer routes — is what child_id held.
+            conn.execute("ALTER TABLE pending_asks ADD COLUMN origin_leaf TEXT", [])
+                .context("failed to add the origin_leaf column")?;
+            conn.execute(
+                "UPDATE pending_asks SET origin_leaf = child_id WHERE origin_leaf IS NULL",
+                [],
+            )
+            .context("failed to backfill the origin_leaf column")?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -750,8 +771,9 @@ impl Store {
         .await
     }
 
-    /// The session's pending bound ask: the child whose surfaced question is
-    /// awaiting the user's answer, when one is.
+    /// The session's pending raised ask — the direct child whose question it
+    /// surfaced, that question's origin leaf, and the surfaced Ask block's
+    /// row — when one is.
     pub async fn get_pending_ask(
         &self,
         session_id: &str,
@@ -762,27 +784,31 @@ impl Store {
         .await
     }
 
-    /// Records that the root surfaced `question` from `child_id` as an Ask
-    /// block in its own thread at `ask_message_id`. There is one pending ask
-    /// per root, so recording again replaces the earlier one.
+    /// Records that the session raised `question` as an Ask block in its own
+    /// thread at `ask_message_id`, bound to the direct child `child_id` whose
+    /// question it raised and to that question's `origin_leaf`. There is one
+    /// raised ask per session, so recording again replaces the earlier one.
     pub async fn set_pending_ask(
         &self,
         session_id: &str,
         child_id: &str,
+        origin_leaf: &str,
         question: &str,
         ask_message_id: i64,
     ) -> Result<(), StoreError> {
         let child_id = child_id.to_string();
+        let origin_leaf = origin_leaf.to_string();
         let question = question.to_string();
         self.with_session(session_id, move |conn, session_id| {
             conn.execute(
-                "INSERT INTO pending_asks (session_id, child_id, question, ask_message_id)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO pending_asks (session_id, child_id, origin_leaf, question, ask_message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(session_id) DO UPDATE SET
                    child_id = excluded.child_id,
+                   origin_leaf = excluded.origin_leaf,
                    question = excluded.question,
                    ask_message_id = excluded.ask_message_id",
-                params![session_id, child_id, question, ask_message_id],
+                params![session_id, child_id, origin_leaf, question, ask_message_id],
             )
             .context("failed to store the pending ask")?;
             Ok(())
@@ -790,9 +816,10 @@ impl Store {
         .await
     }
 
-    /// Drops the session's pending bound ask, when one is. Called when the
-    /// ask is answered or when the root model takes the pending ask over by
-    /// messaging its child.
+    /// Drops the session's pending raised ask, when one is. Called when the
+    /// ask is answered, when the raised child's next authored event proves
+    /// its question closed, or when the session's model takes the raised ask
+    /// over by messaging its raised child.
     pub async fn clear_pending_ask(&self, session_id: &str) -> Result<(), StoreError> {
         self.with_session(session_id, move |conn, session_id| {
             conn.execute(
@@ -805,12 +832,15 @@ impl Store {
         .await
     }
 
-    /// Routes a user's answer to the child whose surfaced ask is pending for
-    /// this session, in one transaction: the text is appended verbatim to the
-    /// child's thread, the answer is recorded on the surfaced Ask block, and
-    /// the binding is cleared. Routing and clearing in one transaction means
-    /// a crash cannot route the answer twice. Waking the child's loop is the
-    /// caller's to do after a [`RouteAnswer::Routed`].
+    /// Routes a user's answer to the origin leaf whose raised ask is pending
+    /// for this session, in one transaction: the text is appended verbatim to
+    /// the leaf's thread, the answer is recorded on the surfaced Ask block,
+    /// and the binding is cleared. Routing and clearing in one transaction
+    /// means a crash cannot route the answer twice. Waking the leaf's loop is
+    /// the caller's to do after a [`RouteAnswer::Routed`]. The row's direct
+    /// child — the session the raiser messages to cancel — is not the answer
+    /// target when the question was re-raised up a chain, so routing follows
+    /// the row's origin leaf.
     pub async fn route_answer(
         &self,
         session_id: &str,
@@ -822,14 +852,15 @@ impl Store {
             let Some(binding) = read_pending_ask(&tx, session_id)? else {
                 return Ok(RouteAnswer::NoBinding);
             };
-            let child_exists: bool = tx
+            let leaf_id = binding.origin_leaf;
+            let leaf_exists: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-                    [&binding.child_id],
+                    [&leaf_id],
                     |row| row.get(0),
                 )
-                .context("failed to check the bound child session")?;
-            if !child_exists {
+                .context("failed to check the origin leaf session")?;
+            if !leaf_exists {
                 tx.execute(
                     "DELETE FROM pending_asks WHERE session_id = ?1",
                     [session_id],
@@ -837,13 +868,11 @@ impl Store {
                 .context("failed to clear a stale pending ask")?;
                 tx.commit()
                     .context("failed to commit the stale-ask clear")?;
-                return Ok(RouteAnswer::ChildGone {
-                    child_id: binding.child_id,
-                });
+                return Ok(RouteAnswer::LeafGone { leaf_id });
             }
             insert_message(
                 &tx,
-                &binding.child_id,
+                &leaf_id,
                 &Message {
                     role: Role::User,
                     block: Block::Text {
@@ -858,9 +887,7 @@ impl Store {
             )
             .context("failed to clear the pending ask")?;
             tx.commit().context("failed to commit the routed answer")?;
-            Ok(RouteAnswer::Routed {
-                child_id: binding.child_id,
-            })
+            Ok(RouteAnswer::Routed { leaf_id })
         })
         .await
     }
@@ -880,7 +907,7 @@ impl Store {
             tx.execute("DELETE FROM model_calls WHERE session_id = ?1", [&id])
                 .context("failed to delete session model calls")?;
             tx.execute(
-                "DELETE FROM pending_asks WHERE session_id = ?1 OR child_id = ?1",
+                "DELETE FROM pending_asks WHERE session_id = ?1 OR child_id = ?1 OR origin_leaf = ?1",
                 [&id],
             )
             .context("failed to delete the session's pending asks")?;
@@ -941,21 +968,22 @@ fn insert_message(
     Ok(message_id)
 }
 
-/// The session's pending bound ask row, when it has one.
+/// The session's pending raised ask row, when it has one.
 fn read_pending_ask(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Option<PendingAsk>, anyhow::Error> {
     let row = conn.query_row(
-        "SELECT session_id, child_id, question, ask_message_id
+        "SELECT session_id, child_id, origin_leaf, question, ask_message_id
          FROM pending_asks WHERE session_id = ?1",
         [session_id],
         |row| {
             Ok(PendingAsk {
                 session_id: row.get(0)?,
                 child_id: row.get(1)?,
-                question: row.get(2)?,
-                ask_message_id: row.get(3)?,
+                origin_leaf: row.get(2)?,
+                question: row.get(3)?,
+                ask_message_id: row.get(4)?,
             })
         },
     );
@@ -1895,6 +1923,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pending_ask_without_the_origin_leaf_column_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // The pre-split shape: pending_asks exists without origin_leaf,
+            // and its child_id holds the origin leaf the answer routes to.
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   node TEXT NOT NULL,
+                   repo_url TEXT,
+                   git_ref TEXT,
+                   dir TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   persona TEXT,
+                   permission TEXT NOT NULL,
+                   allowed_tools TEXT NOT NULL DEFAULT '*',
+                   state TEXT NOT NULL,
+                   created_at_secs INTEGER NOT NULL,
+                   prompt TEXT,
+                   parent_id TEXT,
+                   owner_id TEXT,
+                   interrupt_cause TEXT
+                 );
+                 INSERT INTO sessions (id, node, dir, model, permission, state, created_at_secs, owner_id)
+                 VALUES ('root-1', 'node-1', '/work', 'claude', '\"read_write\"', '\"waiting_for_input\"', 1700000000, 'root-1');
+                 CREATE TABLE pending_asks (
+                   session_id TEXT PRIMARY KEY,
+                   child_id TEXT NOT NULL,
+                   question TEXT NOT NULL,
+                   ask_message_id INTEGER NOT NULL
+                 );
+                 INSERT INTO pending_asks (session_id, child_id, question, ask_message_id)
+                 VALUES ('root-1', 'the-leaf', 'may I push?', 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let pending = store.get_pending_ask("root-1").await.unwrap().unwrap();
+        assert_eq!(
+            pending.origin_leaf, "the-leaf",
+            "a pre-split row's child_id was its origin leaf, so the migration copies it over"
+        );
+    }
+
+    #[tokio::test]
     async fn reopening_an_up_to_date_database_is_a_no_op() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.db");
@@ -1974,14 +2050,17 @@ mod tests {
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-1")).await.unwrap();
         store
-            .create_session(&child_session("child-1", "root-1"))
+            .create_session(&child_session("mid-1", "root-1"))
             .await
             .unwrap();
+        let mut leaf = child_session("leaf-1", "mid-1");
+        leaf.owner_id = "root-1".into();
+        store.create_session(&leaf).await.unwrap();
         let first = store
             .append_message(
                 "root-1",
                 Role::Assistant,
-                &surfaced_ask("child-1", "may I push?"),
+                &surfaced_ask("mid-1", "may I push?"),
             )
             .await
             .unwrap();
@@ -1989,7 +2068,7 @@ mod tests {
             .append_message(
                 "root-1",
                 Role::Assistant,
-                &surfaced_ask("child-1", "may I merge?"),
+                &surfaced_ask("mid-1", "may I merge?"),
             )
             .await
             .unwrap();
@@ -1997,19 +2076,26 @@ mod tests {
         assert!(store.get_pending_ask("root-1").await.unwrap().is_none());
 
         store
-            .set_pending_ask("root-1", "child-1", "may I push?", first)
+            .set_pending_ask("root-1", "mid-1", "leaf-1", "may I push?", first)
             .await
             .unwrap();
         let pending = store.get_pending_ask("root-1").await.unwrap().unwrap();
         assert_eq!(pending.session_id, "root-1");
-        assert_eq!(pending.child_id, "child-1");
+        assert_eq!(
+            pending.child_id, "mid-1",
+            "the row names the direct child the raiser can message"
+        );
+        assert_eq!(
+            pending.origin_leaf, "leaf-1",
+            "the row names the origin leaf the answer routes to"
+        );
         assert_eq!(pending.question, "may I push?");
         assert_eq!(pending.ask_message_id, first);
 
         // A root surfaces one question at a time: a second surface replaces
         // the first binding.
         store
-            .set_pending_ask("root-1", "child-1", "may I merge?", second)
+            .set_pending_ask("root-1", "mid-1", "leaf-1", "may I merge?", second)
             .await
             .unwrap();
         let pending = store.get_pending_ask("root-1").await.unwrap().unwrap();
@@ -2021,18 +2107,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_answer_appends_the_answer_to_the_child_records_it_on_the_ask_and_clears_the_binding()
+    async fn route_answer_appends_the_answer_to_the_origin_leaf_records_it_on_the_ask_and_clears_the_binding()
      {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-1")).await.unwrap();
         store
-            .create_session(&child_session("child-1", "root-1"))
+            .create_session(&child_session("mid-1", "root-1"))
             .await
             .unwrap();
+        let mut leaf = child_session("leaf-1", "mid-1");
+        leaf.owner_id = "root-1".into();
+        store.create_session(&leaf).await.unwrap();
         store
             .append_message(
-                "child-1",
+                "leaf-1",
                 Role::User,
                 &Block::Text {
                     text: "implement the change".into(),
@@ -2040,16 +2129,20 @@ mod tests {
             )
             .await
             .unwrap();
+        // The root surfaced the question of its direct child mid-1, which had
+        // re-raised the leaf's own question, so the row names mid-1 as the
+        // child the root can message and leaf-1 as the origin the answer
+        // routes to.
         let ask_id = store
             .append_message(
                 "root-1",
                 Role::Assistant,
-                &surfaced_ask("child-1", "may I push?"),
+                &surfaced_ask("mid-1", "may I push?"),
             )
             .await
             .unwrap();
         store
-            .set_pending_ask("root-1", "child-1", "may I push?", ask_id)
+            .set_pending_ask("root-1", "mid-1", "leaf-1", "may I push?", ask_id)
             .await
             .unwrap();
 
@@ -2060,18 +2153,28 @@ mod tests {
         assert_eq!(
             routed,
             RouteAnswer::Routed {
-                child_id: "child-1".into()
+                leaf_id: "leaf-1".into()
             }
         );
 
-        // The answer lands verbatim in the child's thread as its next user
-        // message, exactly as a `message_child` message would.
-        let child_messages = store.messages("child-1", false).await.unwrap();
-        let (_, last) = child_messages.last().unwrap();
+        // The answer lands verbatim in the origin leaf's thread as its next
+        // user message, exactly as a `message_child` message would; the
+        // mid-level session's thread is untouched.
+        let leaf_messages = store.messages("leaf-1", false).await.unwrap();
+        let (_, last) = leaf_messages.last().unwrap();
         assert_eq!(last.role, Role::User);
         assert!(
             matches!(&last.block, Block::Text { text } if text == "yes, push to main"),
-            "the answer is the child's next message: {child_messages:?}"
+            "the answer is the leaf's next message: {leaf_messages:?}"
+        );
+        assert!(
+            !store
+                .messages("mid-1", false)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::Text { text } if text == "yes, push to main")),
+            "the answer bypasses the mid-level session that re-raised it"
         );
 
         // The answer is recorded on the surfaced Ask block and the binding is
@@ -2084,7 +2187,7 @@ mod tests {
                     child_id: Some(child_id),
                     answer,
                     ..
-                } if child_id == "child-1" => Some(answer),
+                } if child_id == "mid-1" => Some(answer),
                 _ => None,
             })
             .expect("the surfaced ask block exists");
@@ -2111,29 +2214,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_answer_to_a_gone_child_clears_the_stale_binding() {
+    async fn route_answer_to_a_gone_origin_leaf_clears_the_stale_binding() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("mid-1", "root-1"))
+            .await
+            .unwrap();
         let ask_id = store
             .append_message(
                 "root-1",
                 Role::Assistant,
-                &surfaced_ask("gone-child", "may I push?"),
+                &surfaced_ask("mid-1", "may I push?"),
             )
             .await
             .unwrap();
-        // The bound child was stopped between the surface and the answer, so
-        // its binding names a session that no longer exists.
+        // The origin leaf was stopped between the surface and the answer, so
+        // the binding routes to a session that no longer exists while the
+        // direct child it names is still there.
         store
-            .set_pending_ask("root-1", "gone-child", "may I push?", ask_id)
+            .set_pending_ask("root-1", "mid-1", "gone-leaf", "may I push?", ask_id)
             .await
             .unwrap();
 
         assert_eq!(
             store.route_answer("root-1", "yes").await.unwrap(),
-            RouteAnswer::ChildGone {
-                child_id: "gone-child".into()
+            RouteAnswer::LeafGone {
+                leaf_id: "gone-leaf".into()
             }
         );
         assert!(
@@ -2148,7 +2256,13 @@ mod tests {
         );
         assert!(
             matches!(&root_messages[0].1.block, Block::Ask { answer: None, .. }),
-            "the surfaced ask of a gone child keeps no answer"
+            "the surfaced ask of a gone leaf keeps no answer"
+        );
+        assert!(
+            !store.messages("mid-1", false).await.unwrap().iter().any(
+                |(_, message)| matches!(&message.block, Block::Text { text } if text == "yes")
+            ),
+            "the answer is not routed to the direct child as a substitute"
         );
     }
 
@@ -2194,30 +2308,48 @@ mod tests {
         let store = Store::open(&path).unwrap();
         store.create_session(&session("root-1")).await.unwrap();
         store
-            .create_session(&child_session("child-1", "root-1"))
+            .create_session(&child_session("mid-1", "root-1"))
             .await
             .unwrap();
+        let mut leaf = child_session("leaf-1", "mid-1");
+        leaf.owner_id = "root-1".into();
+        store.create_session(&leaf).await.unwrap();
         let ask_id = store
             .append_message(
                 "root-1",
                 Role::Assistant,
-                &surfaced_ask("child-1", "may I push?"),
+                &surfaced_ask("mid-1", "may I push?"),
             )
             .await
             .unwrap();
         store
-            .set_pending_ask("root-1", "child-1", "may I push?", ask_id)
+            .set_pending_ask("root-1", "mid-1", "leaf-1", "may I push?", ask_id)
+            .await
+            .unwrap();
+        let mid_ask_id = store
+            .append_message(
+                "mid-1",
+                Role::Assistant,
+                &surfaced_ask("leaf-1", "may I push?"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_pending_ask("mid-1", "leaf-1", "leaf-1", "may I push?", mid_ask_id)
             .await
             .unwrap();
 
-        // Stopping the bound child clears the root's binding: an answer to a
-        // stopped child must not route into the void.
-        store.remove_session("child-1").await.unwrap();
+        // Stopping the origin leaf clears every binding that routes to it:
+        // the root's row that names it as the origin, and the mid-level row
+        // that raised it directly. An answer to a stopped leaf must not route
+        // into the void.
+        store.remove_session("leaf-1").await.unwrap();
         assert!(store.get_pending_ask("root-1").await.unwrap().is_none());
+        assert!(store.get_pending_ask("mid-1").await.unwrap().is_none());
 
         // Stopping the root clears its own binding too.
         store
-            .set_pending_ask("root-1", "child-1", "may I push?", ask_id)
+            .set_pending_ask("root-1", "mid-1", "leaf-1", "may I push?", ask_id)
             .await
             .unwrap();
         store.remove_session("root-1").await.unwrap();
