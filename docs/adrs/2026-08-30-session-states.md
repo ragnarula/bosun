@@ -3,6 +3,8 @@
 **Date:** 2026-08-30
 **Author:** Raghav
 
+> Relaxed by sprint 005 (S8, `../sprints/005-agent-tree.md`) for the crash cause: a crash-interrupted session may run a re-decision turn after boot recovery, woken by its children's failure reports, where this ADR says no turn starts until the user sends a message. User-interrupted sessions still hold until the user acts. The final ADR for sprint 005 records this.
+
 ## Context
 
 The MVP reported a session as either `running` or stopped, where "running" meant the opencode server answered. Sprint 002's session has an agent loop, an executor, and a user who must answer questions. "Running" is no longer one thing, and the client and the web pane must show a state the user can act on.

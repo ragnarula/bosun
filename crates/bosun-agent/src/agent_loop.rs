@@ -65,19 +65,24 @@ pub enum LoopEvent {
     /// A turn should run: a user message or a child's authored event was
     /// appended to this session's thread.
     Wake,
+    /// The user sent a message to this session: the message was appended to
+    /// this session's thread. Starts a turn even when the session is
+    /// interrupted, which is how the owner of a tree resumes it.
+    UserMessage,
     /// A parent's `message_child` directed at this session: the message was
     /// appended to this session's thread. Starts a turn even when the session
-    /// is stopped, which is how a stopped child resumes.
+    /// is stopped or interrupted, which is how a child resumes.
     ParentMessage,
     Interrupt,
 }
 
 /// Why a wake is queued while a turn is in flight. The kind is kept so a
-/// stopped session can still be woken by a parent message while plain wakes
-/// on it run nothing.
+/// stopped or interrupted session can still be woken by a user message or a
+/// parent message while plain wakes on it run nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WakeKind {
     Turn,
+    UserMessage,
     ParentMessage,
 }
 
@@ -286,6 +291,7 @@ pub fn spawn_loop(session_id: String, deps: Arc<LoopDeps>) -> LoopHandle {
                     None => match rx.recv().await {
                         None => break,
                         Some(LoopEvent::Wake) => WakeKind::Turn,
+                        Some(LoopEvent::UserMessage) => WakeKind::UserMessage,
                         Some(LoopEvent::ParentMessage) => WakeKind::ParentMessage,
                         // This arm is only reachable while no turn is in
                         // flight: handle_wake owns the channel (and cancels
@@ -391,17 +397,24 @@ async fn handle_wake(
     pending: &mut VecDeque<WakeKind>,
     wake: WakeKind,
 ) -> anyhow::Result<()> {
-    // A plain wake on a session that has already stopped must not start
-    // another turn: nothing but a parent message wakes a stopped session, and
-    // a stray wake would run a second completion and author a second event to
-    // the parent. A parent message resumes a stopped child, so it is let
-    // through.
+    // A plain wake on a session that has already stopped, or that a user
+    // interrupt parked, must not start another turn: a stray wake would run a
+    // second completion and author a second event to the parent, or resume a
+    // child the user stopped. A crash-interrupted session is let through: its
+    // children's failure reports wake it so it can re-decide them after a
+    // crash. A user message or a parent's message_child is always let through
+    // — those are the resume paths for an interrupted owner and an
+    // interrupted or stopped child.
     let stored = deps.store.get_session(session_id).await?;
-    if stored
-        .as_ref()
-        .is_some_and(|session| session.state == SessionState::Stopped)
-        && wake == WakeKind::Turn
-    {
+    let blocked = stored.as_ref().is_some_and(|session| match wake {
+        WakeKind::Turn => {
+            session.state == SessionState::Stopped
+                || (session.state == SessionState::Interrupted
+                    && session.interrupt_cause != Some(InterruptCause::Crash))
+        }
+        WakeKind::UserMessage | WakeKind::ParentMessage => false,
+    });
+    if blocked {
         return Ok(());
     }
     deps.store
@@ -469,6 +482,13 @@ async fn handle_wake(
                             );
                             pending.push_back(WakeKind::ParentMessage);
                         }
+                        Some(LoopEvent::UserMessage) => {
+                            debug!(
+                                msg = "queuing a user message that arrived mid-turn",
+                                session_id = %session_id
+                            );
+                            pending.push_back(WakeKind::UserMessage);
+                        }
                         None => return Ok(()),
                     },
                 }
@@ -491,8 +511,15 @@ async fn handle_wake(
                 .await?
                 .is_empty()
                 {
-                    author_child_event(deps, session_id, ChildEventKind::Report, text, None)
-                        .await?;
+                    author_child_event(
+                        &deps.store,
+                        deps.mailbox.as_deref(),
+                        session_id,
+                        ChildEventKind::Report,
+                        text,
+                        None,
+                    )
+                    .await?;
                     deps.store
                         .set_state(session_id, SessionState::Stopped)
                         .await?;
@@ -514,7 +541,8 @@ async fn handle_wake(
             // question in context.
             TurnOutcome::AskedUser { question, origin } if is_child && !interrupted => {
                 author_child_event(
-                    deps,
+                    &deps.store,
+                    deps.mailbox.as_deref(),
                     session_id,
                     ChildEventKind::Ask,
                     question,
@@ -533,13 +561,26 @@ async fn handle_wake(
                 return Ok(());
             }
             // A turn that fails on its own interrupts the session as a crash:
-            // no user request stopped it. A turn that ended under a user
+            // no user request stopped it. A child that crashed reports the
+            // failure to its parent, which re-decides it — resume it with
+            // message_child, or abandon it. A turn that ended under a user
             // interrupt already recorded its cause when the interrupt landed,
             // so a plain state write keeps it.
             TurnOutcome::Failed if !interrupted => {
                 deps.store
                     .mark_interrupted(session_id, InterruptCause::Crash)
                     .await?;
+                if is_child {
+                    author_child_event(
+                        &deps.store,
+                        deps.mailbox.as_deref(),
+                        session_id,
+                        ChildEventKind::Failure,
+                        CRASH_FAILURE_TEXT.to_string(),
+                        None,
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
             TurnOutcome::ToolCalls | TurnOutcome::Interrupted | TurnOutcome::Failed => {
@@ -552,24 +593,31 @@ async fn handle_wake(
     }
 }
 
-/// Authors a child's event into its parent's thread — a completion report or
-/// a question to the parent; failure notices arrive in a later sprint through
-/// the same channel — and wakes the parent's loop. `origin` is the origin
-/// leaf an ask event carries (None for reports and failures). The append can
-/// fail when the parent is gone; the child's own state is the caller's to
-/// set. When the parent has an unresolved raised ask bound to this child, the
-/// child's event proves that question is closed — a child authors nothing
-/// while its question awaits an answer — so the parent's pending row is
-/// cleared and the parent may raise again.
-async fn author_child_event(
-    deps: &Arc<LoopDeps>,
+/// The text a child authors to its parent when a crash interrupts it. The
+/// parent reads the failure event and re-decides the child: resume it with
+/// `message_child`, or abandon it.
+pub const CRASH_FAILURE_TEXT: &str =
+    "a crash stopped my turn and I am stopped; resume me or abandon me";
+
+/// Authors a child's event into its parent's thread — a completion report, a
+/// question to the parent, or a failure notice — and wakes the parent's loop.
+/// `origin` is the origin leaf an ask event carries (None for reports and
+/// failures). The append can fail when the parent is gone; the child's own
+/// state is the caller's to set. When the parent has an unresolved raised ask
+/// bound to this child, the child's event proves that question is closed — a
+/// child authors nothing while its question awaits an answer — so the
+/// parent's pending row is cleared and the parent may raise again. The
+/// control plane calls this from boot recovery to report crash-interrupted
+/// children; the loop calls it from a child's own wake.
+pub async fn author_child_event(
+    store: &bosun_store::store::Store,
+    mailbox: Option<&dyn LoopMailbox>,
     child_id: &str,
     kind: ChildEventKind,
     text: String,
     origin: Option<String>,
 ) -> anyhow::Result<()> {
-    let Some(parent_id) = deps
-        .store
+    let Some(parent_id) = store
         .get_session(child_id)
         .await?
         .and_then(|session| session.parent_id)
@@ -581,8 +629,7 @@ async fn author_child_event(
     // keeps the next request alternating — after a tool result the event
     // simply follows another user-role message. The block kind still renders
     // it as the child's words.
-    if let Err(error) = deps
-        .store
+    if let Err(error) = store
         .append_message(
             &parent_id,
             Role::User,
@@ -603,9 +650,9 @@ async fn author_child_event(
         );
         return Ok(());
     }
-    if let Ok(Some(pending)) = deps.store.get_pending_ask(&parent_id).await
+    if let Ok(Some(pending)) = store.get_pending_ask(&parent_id).await
         && pending.child_id == child_id
-        && let Err(error) = deps.store.clear_pending_ask(&parent_id).await
+        && let Err(error) = store.clear_pending_ask(&parent_id).await
     {
         warn!(
             msg = "failed to clear the parent's resolved raised ask",
@@ -614,7 +661,7 @@ async fn author_child_event(
             error = %error.display_chain()
         );
     }
-    if let Some(mailbox) = &deps.mailbox {
+    if let Some(mailbox) = mailbox {
         mailbox.send(&parent_id, LoopEvent::Wake);
     }
     info!(
@@ -11189,5 +11236,512 @@ mod tests {
         root_handle.stop();
         mid_handle.stop();
         leaf_handle.stop();
+    }
+
+    /// A child row in the state a stop leaves it in: interrupted by the user.
+    fn user_interrupted_child(id: &str, parent: &str) -> Session {
+        let mut child = child_session_of(id, parent);
+        child.state = SessionState::Interrupted;
+        child.interrupt_cause = Some(InterruptCause::User);
+        child
+    }
+
+    /// A child row in the state boot recovery leaves it in: interrupted by a
+    /// crash.
+    fn crash_interrupted_child(id: &str, parent: &str) -> Session {
+        let mut child = child_session_of(id, parent);
+        child.state = SessionState::Interrupted;
+        child.interrupt_cause = Some(InterruptCause::Crash);
+        child
+    }
+
+    #[tokio::test]
+    async fn a_user_interrupted_child_ignores_plain_wakes_and_resumes_on_a_parent_message() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-guard")).await.unwrap();
+        store
+            .create_session(&user_interrupted_child("child-guard", "root-guard"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-guard",
+                Role::User,
+                &Block::Text {
+                    text: "make the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A second script would run a whole turn if a wake were let through;
+        // the assertions prove none ran.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("made the change after all".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("an auto-resumed turn ran".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let mailbox = Arc::new(TestMailbox::new());
+        let handle = spawn_loop(
+            "child-guard".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("child-guard", handle.sender.clone());
+
+        // The user's stop holds: a plain wake — the kind a child's own
+        // children or a stray event would send — starts no turn and the
+        // child authors nothing to its parent.
+        handle.send(LoopEvent::Wake);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let stored = store.get_session("child-guard").await.unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::Interrupted,
+            "a plain wake does not resume a user-interrupted child"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            0,
+            "a plain wake runs no model call on a user-interrupted child"
+        );
+        assert!(
+            store
+                .messages("root-guard", false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a user-interrupted child authors no event to its parent"
+        );
+
+        // The parent's message_child is the resume path: the message lands in
+        // the child's thread and the child completes its work.
+        store
+            .append_message(
+                "child-guard",
+                Role::User,
+                &Block::Text {
+                    text: "please continue".into(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::ParentMessage);
+        wait_for("the resumed child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-guard").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+        let messages = store.messages("child-guard", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "make the change",
+                "please continue",
+                "made the change after all"
+            ],
+            "the interrupted child resumes from its archived thread"
+        );
+        let parent_messages = store.messages("root-guard", false).await.unwrap();
+        assert_eq!(
+            parent_messages
+                .iter()
+                .filter(|(_, message)| matches!(
+                    &message.block,
+                    Block::ChildEvent {
+                        child_id,
+                        kind: ChildEventKind::Report,
+                        ..
+                    } if child_id == "child-guard"
+                ))
+                .count(),
+            1,
+            "the resumed child reports once"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_crash_interrupted_session_still_handles_a_wake_from_its_childrens_failures() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut root = session("root-crashwake");
+        root.state = SessionState::Interrupted;
+        root.interrupt_cause = Some(InterruptCause::Crash);
+        store.create_session(&root).await.unwrap();
+        store
+            .create_session(&crash_interrupted_child(
+                "child-crashwake",
+                "root-crashwake",
+            ))
+            .await
+            .unwrap();
+        // The child's failure report is in the root's thread, the way boot
+        // recovery leaves it; the wake that follows must reach the crashed
+        // root so it can re-decide the child.
+        deliver_child_event(
+            &store,
+            "root-crashwake",
+            "child-crashwake",
+            ChildEventKind::Failure,
+            CRASH_FAILURE_TEXT,
+        )
+        .await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("resuming the child".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let handle = spawn_loop(
+            "root-crashwake".into(),
+            Arc::new(test_deps(
+                &store,
+                provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            )),
+        );
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the crashed root's re-decision turn to run", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-crashwake").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+                    && store.model_calls("root-crashwake").await.unwrap().len() == 1
+            }
+        })
+        .await;
+        let stored = store.get_session("root-crashwake").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "the recorded cause survives the re-decision wake"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_whose_turn_fails_authors_a_failure_event_to_its_parent() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-fail")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-fail", "root-fail"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-fail",
+                Role::User,
+                &Block::Text {
+                    text: "make the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The child's stream ends without a Stop, so its turn fails.
+        let child_provider = Arc::new(ScriptedProvider::new(vec![vec![StreamEvent::TextDelta(
+            "partial".into(),
+        )]]));
+        let root_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("abandoned the failed child".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let mailbox = Arc::new(TestMailbox::new());
+        let child_handle = spawn_loop(
+            "child-fail".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let root_handle = spawn_loop(
+            "root-fail".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("child-fail", child_handle.sender.clone());
+        mailbox.register("root-fail", root_handle.sender.clone());
+
+        child_handle.send(LoopEvent::Wake);
+
+        // The failed child is parked as a crash interruption, and its parent
+        // woke to its authored failure and decided not to resume it.
+        wait_for("the failure to reach the parent's thread", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-fail").await.unwrap().unwrap();
+                stored.state == SessionState::Interrupted
+                    && store.model_calls("root-fail").await.unwrap().len() == 1
+            }
+        })
+        .await;
+        let stored = store.get_session("child-fail").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "a turn that fails on its own is a crash interruption"
+        );
+        let parent_messages = store.messages("root-fail", false).await.unwrap();
+        let failures: Vec<(&str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Failure,
+                    text,
+                    ..
+                } => Some((child_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failures,
+            [("child-fail", CRASH_FAILURE_TEXT)],
+            "the failed child authors one failure event to its parent"
+        );
+        let child_messages = store.messages("child-fail", false).await.unwrap();
+        assert_eq!(
+            child_messages.len(),
+            1,
+            "the child's thread holds only its assignment: {child_messages:?}"
+        );
+        assert_eq!(child_messages[0].1.role, Role::User);
+        assert!(
+            matches!(&child_messages[0].1.block, Block::Text { text } if text == "make the change"),
+            "the failed turn commits nothing to the child's transcript"
+        );
+
+        child_handle.stop();
+        root_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_parent_that_receives_crash_failures_resumes_one_child_and_abandons_another() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut root = session("root-red");
+        root.state = SessionState::WaitingForInput;
+        store.create_session(&root).await.unwrap();
+        store
+            .create_session(&crash_interrupted_child("child-red-a", "root-red"))
+            .await
+            .unwrap();
+        store
+            .create_session(&crash_interrupted_child("child-red-b", "root-red"))
+            .await
+            .unwrap();
+
+        // Both children report their crashes the way boot recovery reports
+        // them; the parent wakes once per report and decides each.
+        deliver_child_event(
+            &store,
+            "root-red",
+            "child-red-a",
+            ChildEventKind::Failure,
+            CRASH_FAILURE_TEXT,
+        )
+        .await;
+        deliver_child_event(
+            &store,
+            "root-red",
+            "child-red-b",
+            ChildEventKind::Failure,
+            CRASH_FAILURE_TEXT,
+        )
+        .await;
+
+        let mailbox = Arc::new(TestMailbox::new());
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"child-red-a","text":"resume the review"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("child a resumed".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("child b abandoned".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("child a's report noted".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let resumed_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("the review is done".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let root_handle = spawn_loop(
+            "root-red".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let resumed_handle = spawn_loop(
+            "child-red-a".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                resumed_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-red", root_handle.sender.clone());
+        mailbox.register("child-red-a", resumed_handle.sender.clone());
+
+        root_handle.send(LoopEvent::Wake);
+        root_handle.send(LoopEvent::Wake);
+
+        let calls = root_provider.clone();
+        let store_for_wait = store.clone();
+        wait_for(
+            "the resumed child to finish and the parent to react to both reports",
+            move || {
+                let store = store_for_wait.clone();
+                let calls = calls.clone();
+                async move {
+                    let root = store.get_session("root-red").await.unwrap().unwrap();
+                    let resumed = store.get_session("child-red-a").await.unwrap().unwrap();
+                    let abandoned = store.get_session("child-red-b").await.unwrap().unwrap();
+                    root.state == SessionState::WaitingForInput
+                        && calls.captured_calls().len() == 4
+                        && resumed.state == SessionState::Stopped
+                        && abandoned.state == SessionState::Interrupted
+                }
+            },
+        )
+        .await;
+
+        // The resumed child ran to completion; the abandoned one stayed
+        // parked with no model call of its own.
+        let resumed = store.get_session("child-red-a").await.unwrap().unwrap();
+        assert_eq!(resumed.state, SessionState::Stopped);
+        assert_eq!(
+            resumed_provider.captured_calls().len(),
+            1,
+            "the resumed child ran exactly the turn its parent's message started"
+        );
+        let abandoned = store.get_session("child-red-b").await.unwrap().unwrap();
+        assert_eq!(abandoned.state, SessionState::Interrupted);
+        assert_eq!(
+            abandoned.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "an abandoned crash child stays interrupted with its cause"
+        );
+        let abandoned_messages = store.messages("child-red-b", false).await.unwrap();
+        assert!(
+            abandoned_messages.is_empty(),
+            "an abandoned child is never woken"
+        );
+
+        // The parent's thread holds both failures and the resumed child's
+        // completion report: resume-versus-abandon was decided from the
+        // authored events.
+        let parent_messages = store.messages("root-red", false).await.unwrap();
+        let child_events: Vec<(&str, ChildEventKind)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent { child_id, kind, .. } => Some((child_id.as_str(), *kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_events,
+            [
+                ("child-red-a", ChildEventKind::Failure),
+                ("child-red-b", ChildEventKind::Failure),
+                ("child-red-a", ChildEventKind::Report),
+            ],
+            "two failures reported, one child resumed and reported back"
+        );
+        let resumed_messages = store.messages("child-red-a", false).await.unwrap();
+        let texts: Vec<&str> = resumed_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["resume the review", "the review is done"],
+            "the parent's message resumed the child from its archived thread"
+        );
+
+        root_handle.stop();
+        resumed_handle.stop();
     }
 }

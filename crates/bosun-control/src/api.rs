@@ -25,12 +25,15 @@ use axum::response::sse::KeepAlive;
 use axum::response::sse::Sse;
 use axum::routing::get;
 use axum::routing::post;
+use bosun_agent::agent_loop::CRASH_FAILURE_TEXT;
 use bosun_agent::agent_loop::LoopEvent;
 use bosun_agent::agent_loop::LoopMailbox;
+use bosun_agent::agent_loop::author_child_event;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Block;
+use bosun_common::session::ChildEventKind;
 use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
 use bosun_common::session::Permission;
@@ -194,9 +197,16 @@ impl AppState {
     }
 }
 
-/// Control-plane boot recovery: sessions that were mid-flight when the
-/// process died become `Interrupted`, and every surviving session's loop is
-/// re-spawned so it rehydrates from the store and waits for the user.
+/// Control-plane boot recovery. Sessions that were mid-flight when the
+/// process died become `Interrupted` with a crash cause; every surviving
+/// session's loop is re-spawned so it rehydrates from the store; and each
+/// crash-interrupted child authors a failure event to its parent, so the
+/// parent's loop — whether it was itself crashed or merely waiting — wakes
+/// and re-decides the child: resume it with `message_child`, or abandon it.
+/// A child the user interrupted authors nothing: its cause is `User`, and it
+/// stays stopped until the user acts. The failures are authored only after
+/// every loop is running, so the wakes that carry them are never lost to a
+/// loop that has not started yet.
 pub async fn recover(state: &AppState) {
     let sessions = match state.store.list_sessions().await {
         Ok(sessions) => sessions,
@@ -208,6 +218,7 @@ pub async fn recover(state: &AppState) {
             return;
         }
     };
+    let mut crashed_children = Vec::new();
     for session in &sessions {
         if matches!(
             session.state,
@@ -223,13 +234,19 @@ pub async fn recover(state: &AppState) {
                     error = %error.display_chain(),
                     "failed to mark the session interrupted"
                 );
+                continue;
             }
             info!(
                 session_id = %session.id,
                 from = ?session.state,
                 "session interrupted by control-plane restart"
             );
+            if session.parent_id.is_some() {
+                crashed_children.push(session.id.clone());
+            }
         }
+    }
+    for session in &sessions {
         if state.providers.contains_key(&session.model) {
             state.loops.start(
                 &session.id,
@@ -245,6 +262,20 @@ pub async fn recover(state: &AppState) {
                 "skipping loop: model not configured"
             );
         }
+    }
+    for child_id in &crashed_children {
+        // A missing parent and a refused append are handled inside
+        // `author_child_event`, which returns Ok for both, so nothing is left
+        // to handle here.
+        let _ = author_child_event(
+            &state.store,
+            Some(&*state.loops as &dyn LoopMailbox),
+            child_id,
+            ChildEventKind::Failure,
+            CRASH_FAILURE_TEXT.to_string(),
+            None,
+        )
+        .await;
     }
     info!(count = sessions.len(), "recovered sessions");
 }
@@ -643,8 +674,9 @@ fn parses_as_semver(version: &str) -> bool {
 }
 
 /// Refuses a user action aimed at a child session: children are watch-only,
-/// and messages, interrupts, permission and persona changes, and stops reach
-/// only the tree owner.
+/// and messages, interrupts, permission changes and persona switches reach
+/// only the tree owner. `bosun stop` is not refused: stopping a child
+/// cascades its subtree.
 fn ensure_root(session: &Session) -> Result<(), ApiError> {
     if session.parent_id.is_some() {
         return Err(ApiError::ChildIsWatchOnly {
@@ -654,56 +686,90 @@ fn ensure_root(session: &Session) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The sessions `top` covers — itself first, then every session below it —
+/// in breadth-first order. `top` need not be a tree root: `stop` calls it
+/// with a child id to cascade that child's subtree.
+async fn subtree_sessions(state: &AppState, top: &str) -> Result<Vec<Session>, ApiError> {
+    let mut subtree =
+        vec![
+            state
+                .store
+                .get_session(top)
+                .await?
+                .ok_or_else(|| ApiError::SessionNotFound {
+                    id: top.to_string(),
+                })?,
+        ];
+    let mut index = 0;
+    while index < subtree.len() {
+        let mut children = state.store.child_sessions(&subtree[index].id).await?;
+        subtree.append(&mut children);
+        index += 1;
+    }
+    Ok(subtree)
+}
+
+/// Stops a session and every session below it in its tree. `bosun stop` on
+/// the owner cascades to the whole tree; on a child it cascades that child's
+/// subtree. Each stopped session's executor is torn down on its node, its
+/// loop task and tunnel are dropped, and its rows are removed, so a stopped
+/// subtree is gone — completed children keep no executor behind (S4's note).
+/// Teardown runs leaves-first so the topmost row disappears last.
 #[instrument(skip(state))]
 async fn stop(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StopRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let Some(session) = state.store.get_session(&req.session_id).await? else {
-        return Ok(StatusCode::NO_CONTENT);
+    let subtree = match subtree_sessions(&state, &req.session_id).await {
+        Ok(subtree) => subtree,
+        Err(ApiError::SessionNotFound { .. }) => return Ok(StatusCode::NO_CONTENT),
+        Err(error) => return Err(error),
     };
-    ensure_root(&session)?;
 
-    if state
-        .registry
-        .node(&session.node, SystemTime::now())
-        .is_some()
-    {
-        let command = NodeCommand::Stop {
-            id: state.commands.next_id(),
-            session_id: req.session_id.clone(),
-        };
-        enqueue_and_await(&state, &session.node, command)
-            .await
-            .and_then(|result| match result {
-                CommandResult::Stop { .. } => Ok(()),
-                CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
-                    node: session.node.clone(),
-                    detail: message,
-                }),
-                _ => Err(ApiError::Internal(anyhow::anyhow!(
-                    "node answered stop with a non-stop result"
-                ))),
-            })?;
-    } else {
-        // The node is down: still enqueue the stop so it runs on the node's
-        // next poll. Without it a restarted node would keep this session's
-        // executor and tunnel alive while the control plane forgets the
-        // session, and nothing would ever stop them.
-        let (reply, _reply_rx) = oneshot::channel();
-        state.commands.enqueue(
-            &session.node,
-            NodeCommand::Stop {
+    for session in subtree.iter().rev() {
+        if state
+            .registry
+            .node(&session.node, SystemTime::now())
+            .is_some()
+        {
+            let command = NodeCommand::Stop {
                 id: state.commands.next_id(),
-                session_id: req.session_id.clone(),
-            },
-            Some(reply),
-        );
+                session_id: session.id.clone(),
+            };
+            enqueue_and_await(&state, &session.node, command)
+                .await
+                .and_then(|result| match result {
+                    CommandResult::Stop { .. } => Ok(()),
+                    CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
+                        node: session.node.clone(),
+                        detail: message,
+                    }),
+                    _ => Err(ApiError::Internal(anyhow::anyhow!(
+                        "node answered stop with a non-stop result"
+                    ))),
+                })?;
+        } else {
+            // The node is down: still enqueue the stop so it runs on the
+            // node's next poll. Without it a restarted node would keep this
+            // session's executor and tunnel alive while the control plane
+            // forgets the session, and nothing would ever stop them.
+            let (reply, _reply_rx) = oneshot::channel();
+            state.commands.enqueue(
+                &session.node,
+                NodeCommand::Stop {
+                    id: state.commands.next_id(),
+                    session_id: session.id.clone(),
+                },
+                Some(reply),
+            );
+        }
     }
 
-    state.loops.stop(&req.session_id);
-    state.tunnels.unregister(&req.session_id);
-    state.store.remove_session(&req.session_id).await?;
+    for session in subtree.iter().rev() {
+        state.loops.stop(&session.id);
+        state.tunnels.unregister(&session.id);
+        state.store.remove_session(&session.id).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -761,10 +827,21 @@ async fn add_message(
         .store
         .append_message(&id, Role::User, &Block::Text { text: req.content })
         .await?;
-    state.loops.wake(&id);
+    // A user message resumes an interrupted owner: it is the user acting, so
+    // the wake must reach the loop even while the owner's own interrupt holds.
+    state.loops.send(&id, LoopEvent::UserMessage);
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The interrupt ladder is root-only. While the root's own session is
+/// mid-flight a press stops only it — children keep working; once the root
+/// has nothing in flight, the next press stops every other session in the
+/// owner's tree. The ladder is derived from the root's state: `running` and
+/// `creating` route the press to the root's own loop, which stops it only
+/// when a wake is queued or a turn is in flight — an idle `creating` root
+/// with no queued wake is not stopped — while `waiting_for_input` and
+/// `interrupted` mean the root's own session is already parked, so the press
+/// stops the rest of the tree.
 #[instrument(skip(state))]
 async fn interrupt(
     State(state): State<Arc<AppState>>,
@@ -774,8 +851,64 @@ async fn interrupt(
         return Err(ApiError::SessionNotFound { id });
     };
     ensure_root(&session)?;
-    state.loops.interrupt(&id);
+    if matches!(
+        session.state,
+        SessionState::Running | SessionState::Creating
+    ) {
+        state.loops.interrupt(&id);
+    } else {
+        interrupt_tree(&state, &id).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stops every non-stopped session below `owner` in its tree: each is marked
+/// interrupted by the user and its loop is interrupted, so an in-flight turn
+/// is cancelled and a parked session stays parked. Stopped descendants are
+/// untouched — they already completed and are archived. The collection below
+/// is a snapshot, so each descendant's state is re-read before it is marked:
+/// a child its own loop stopped after the collection is not re-marked. The
+/// marks are written first and the loops interrupted after, so the trailing
+/// interrupt loop cancels any resume a mid-wake parent dispatched after the
+/// mark — a `message_child` that would otherwise start a turn in a child
+/// that is supposed to hold.
+async fn interrupt_tree(state: &AppState, owner: &str) -> Result<(), ApiError> {
+    let mut descendants = Vec::new();
+    let mut stack = vec![owner.to_string()];
+    while let Some(id) = stack.pop() {
+        let children = state.store.child_sessions(&id).await?;
+        for child in children {
+            stack.push(child.id.clone());
+            descendants.push(child);
+        }
+    }
+    for child in &descendants {
+        let Some(child) = state.store.get_session(&child.id).await? else {
+            continue;
+        };
+        if matches!(child.state, SessionState::Stopped) {
+            continue;
+        }
+        state
+            .store
+            .mark_interrupted(&child.id, InterruptCause::User)
+            .await?;
+    }
+    for child in &descendants {
+        let Some(child) = state.store.get_session(&child.id).await? else {
+            continue;
+        };
+        if matches!(child.state, SessionState::Stopped) {
+            continue;
+        }
+        state.loops.interrupt(&child.id);
+        info!(
+            session_id = %child.id,
+            owner_id = %owner,
+            "session stopped by the owner's interrupt"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1661,8 +1794,9 @@ mod tests {
             .await
             .unwrap();
 
-        // interrupt, permission, persona, and stop are user actions, and a
-        // child is watch-only: every one is refused.
+        // interrupt, permission, and persona are user actions, and a child
+        // is watch-only: every one is refused. Stop is not in the set: S8's
+        // cascade lets `bosun stop` remove a child's subtree.
         let refused: Vec<(&str, reqwest::Response)> = vec![
             ("interrupt", {
                 client
@@ -1687,14 +1821,6 @@ mod tests {
                     .await
                     .unwrap()
             }),
-            ("stop", {
-                client
-                    .post(format!("http://{addr}/stop"))
-                    .json(&json!({ "session_id": "child-1" }))
-                    .send()
-                    .await
-                    .unwrap()
-            }),
         ];
         for (action, response) in refused {
             assert_eq!(
@@ -1710,11 +1836,25 @@ mod tests {
             .get_session("child-1")
             .await
             .unwrap()
-            .expect("a refused stop leaves the child stored");
+            .expect("the refused actions left the child stored");
         assert_eq!(child.state, SessionState::Creating, "no action touched it");
         assert_eq!(
             child.interrupt_cause, None,
             "a refused interrupt records no cause"
+        );
+
+        // Stop cascades: stopping this child (which has no subtree of its
+        // own) removes its row.
+        let response = client
+            .post(format!("http://{addr}/stop"))
+            .json(&json!({ "session_id": "child-1" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            store.get_session("child-1").await.unwrap().is_none(),
+            "stopping a child removes its row"
         );
 
         // The owner keeps accepting the same actions.
@@ -2114,6 +2254,56 @@ mod tests {
             .collect::<Vec<_>>();
         frames.push(Ok(SseEvent::default().data("[DONE]")));
         Sse::new(futures_util::stream::iter(frames)).into_response()
+    }
+
+    /// A scripted provider whose first request is held back for `delay`
+    /// before streaming, so a test can interrupt a turn while it is in
+    /// flight; later requests stream at once. `requests` counts every request
+    /// the provider has started.
+    async fn delayed_scripted_provider(
+        scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        delay: Duration,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        use axum::routing::post;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_server = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let scripts = scripts.clone();
+                let requests = requests_for_server.clone();
+                async move {
+                    let request_number = requests.fetch_add(1, Ordering::Relaxed);
+                    let chunks = scripts
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("no script left for the provider call");
+                    let mut frames = chunks
+                        .into_iter()
+                        .map(|chunk| {
+                            Ok::<_, Infallible>(
+                                SseEvent::default()
+                                    .json_data(&chunk)
+                                    .expect("serializing a json value cannot fail"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    frames.push(Ok(SseEvent::default().data("[DONE]")));
+                    if request_number == 0 {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Sse::new(futures_util::stream::iter(frames)).into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, requests)
     }
 
     /// One OpenAI text chunk.
@@ -2829,8 +3019,10 @@ mod tests {
     #[tokio::test]
     async fn user_actions_are_refused_on_a_grandchild_like_on_any_child() {
         // The watch-only guards gate on parent_id, so they hold at any depth:
-        // messages, interrupts, permission and persona changes, and stops all
-        // refuse a grandchild session exactly as they refuse a child.
+        // messages, interrupts, permission and persona changes all refuse a
+        // grandchild session exactly as they refuse a child. Stop is not in
+        // the set: S8's cascade lets `bosun stop` remove a grandchild's
+        // subtree.
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-watch")).await.unwrap();
@@ -2868,10 +3060,6 @@ mod tests {
                 "/sessions/grand-watch/persona".to_string(),
                 Some(json!({ "persona": "coder" })),
             ),
-            (
-                "/stop".to_string(),
-                Some(json!({ "session_id": "grand-watch" })),
-            ),
         ];
         for (path, body) in bodies {
             let mut request = client.post(url(&path));
@@ -2888,7 +3076,24 @@ mod tests {
         }
         assert!(
             store.get_session("grand-watch").await.unwrap().is_some(),
-            "a refused stop leaves the grandchild in place"
+            "the refused actions leave the grandchild in place"
+        );
+
+        // Stopping the grandchild removes it and leaves the ancestor rows.
+        let response = client
+            .post(url("/stop"))
+            .json(&json!({ "session_id": "grand-watch" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            store.get_session("grand-watch").await.unwrap().is_none(),
+            "stopping a grandchild removes its row"
+        );
+        assert!(
+            store.get_session("root-watch").await.unwrap().is_some(),
+            "stopping a grandchild leaves the owner in place"
         );
     }
 
@@ -4617,5 +4822,608 @@ mod tests {
         let text = response.text().await.unwrap();
         assert!(text.contains("ghost is not up"), "{text}");
         assert!(!state.commands.pending("ghost"));
+    }
+
+    /// A tree of two live loops (root and child) whose first turns are held
+    /// in flight for `delay`, plus the store and the loop registry, for the
+    /// interrupt-ladder test.
+    async fn state_with_ladder_tree(
+        dir: &tempfile::TempDir,
+        root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        delay: Duration,
+    ) -> (
+        Arc<AppState>,
+        Store,
+        String,
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let (root_addr, root_requests) = delayed_scripted_provider(root_scripts, delay).await;
+        let (child_addr, child_requests) = delayed_scripted_provider(child_scripts, delay).await;
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut root = session("root-s8l");
+        root.model = "root-model".into();
+        root.persona = None;
+        let mut child = child_session("child-s8l", "root-s8l");
+        child.model = "child-model".into();
+        child.persona = None;
+        store.create_session(&root).await.unwrap();
+        store.create_session(&child).await.unwrap();
+        store
+            .append_message(
+                &root.id,
+                Role::User,
+                &Block::Text {
+                    text: "oversee the review".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                &child.id,
+                Role::User,
+                &Block::Text {
+                    text: "review the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let providers = HashMap::from([
+            (
+                "root-model".to_string(),
+                openai_provider_with_model(root_addr, "root-model"),
+            ),
+            (
+                "child-model".to_string(),
+                openai_provider_with_model(child_addr, "child-model"),
+            ),
+        ]);
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let loops = Arc::new(AgentRegistry::new(
+            None,
+            providers.clone(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        for (id, model) in [("root-s8l", "root-model"), ("child-s8l", "child-model")] {
+            loops.start(
+                id,
+                store.clone(),
+                providers[model].clone(),
+                tunnels.clone(),
+                model,
+            );
+        }
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels,
+            store: store.clone(),
+            loops,
+            providers,
+            personas: HashMap::new(),
+            default_persona: None,
+            skills_dir: None,
+        });
+        (
+            state,
+            store,
+            root.id,
+            child.id,
+            root_requests,
+            child_requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_interrupt_ladder_stops_the_root_first_and_then_the_rest_of_the_tree() {
+        // Root scripts: the interrupted first turn, then a message_child turn
+        // (the re-decision after the user resumes it), its own wrap-up, and
+        // the reaction to the child's report. Child scripts: the interrupted
+        // first turn and the resumed answer.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![text_chunk("working on it")],
+                vec![tool_call_fragment(
+                    "call-1",
+                    "message_child",
+                    r#"{"id":"child-s8l","text":"resume and finish the review"}"#,
+                )],
+                vec![text_chunk("resumed the child")],
+                vec![text_chunk("report noted")],
+            ])));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![text_chunk("reviewing")],
+                vec![text_chunk("the review is finished")],
+            ])));
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, child_id, root_requests, child_requests) =
+            state_with_ladder_tree(&dir, root_scripts, child_scripts, Duration::from_secs(6)).await;
+        // Wake both sessions: the root answers its user message and the child
+        // starts on its assignment, and each stays in flight on the held
+        // first request until the interrupts land.
+        state.loops.wake(&root_id);
+        state.loops.wake(&child_id);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        // Both loops are mid-turn: each provider holds its first request.
+        let store_for_wait = store.clone();
+        let root_requests_for_wait = root_requests.clone();
+        let child_requests_for_wait = child_requests.clone();
+        wait_for("both sessions to be running a turn", move || {
+            let store = store_for_wait.clone();
+            let root_requests = root_requests_for_wait.clone();
+            let child_requests = child_requests_for_wait.clone();
+            async move {
+                let root = store.get_session("root-s8l").await.unwrap().unwrap();
+                let child = store.get_session("child-s8l").await.unwrap().unwrap();
+                root.state == SessionState::Running
+                    && child.state == SessionState::Running
+                    && root_requests.load(Ordering::Relaxed) == 1
+                    && child_requests.load(Ordering::Relaxed) == 1
+            }
+        })
+        .await;
+
+        // First press: the root's own session stops, the child keeps running.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/interrupt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        wait_for("the root to be interrupted by the first press", {
+            let store_for_wait = store.clone();
+            move || {
+                let store = store_for_wait.clone();
+                async move {
+                    let root = store.get_session("root-s8l").await.unwrap().unwrap();
+                    root.state == SessionState::Interrupted
+                }
+            }
+        })
+        .await;
+        let root = store.get_session(&root_id).await.unwrap().unwrap();
+        assert_eq!(
+            root.interrupt_cause,
+            Some(InterruptCause::User),
+            "an interrupt press is recorded as a user stop"
+        );
+        let child = store.get_session(&child_id).await.unwrap().unwrap();
+        assert_eq!(
+            child.state,
+            SessionState::Running,
+            "the first press leaves the children working"
+        );
+
+        // Second press: the root has nothing in flight, so every other
+        // session in the tree stops.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/interrupt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        wait_for("the child to be interrupted by the second press", {
+            let store_for_wait = store.clone();
+            move || {
+                let store = store_for_wait.clone();
+                async move {
+                    let child = store.get_session("child-s8l").await.unwrap().unwrap();
+                    child.state == SessionState::Interrupted
+                        && child.interrupt_cause == Some(InterruptCause::User)
+                }
+            }
+        })
+        .await;
+
+        // The stopped sessions stay stopped: the child's killed turn never
+        // completes and nothing starts another one.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let child = store.get_session(&child_id).await.unwrap().unwrap();
+        assert_eq!(
+            child.state,
+            SessionState::Interrupted,
+            "an interrupted child does not auto-resume"
+        );
+        assert_eq!(
+            child_requests.load(Ordering::Relaxed),
+            1,
+            "the child's killed turn ran no second request"
+        );
+        let root = store.get_session(&root_id).await.unwrap().unwrap();
+        assert_eq!(root.state, SessionState::Interrupted);
+        assert_eq!(root_requests.load(Ordering::Relaxed), 1);
+
+        // The user resumes the root; the root's model re-decides the
+        // interrupted child with message_child, which resumes it from its
+        // archived thread.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/messages"))
+            .json(&json!({ "content": "make sure the review still lands" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the resumed child to finish and the root to settle", {
+            let store_for_wait = store.clone();
+            let root_requests_for_wait = root_requests.clone();
+            let child_requests_for_wait = child_requests.clone();
+            move || {
+                let store = store_for_wait.clone();
+                let root_requests = root_requests_for_wait.clone();
+                let child_requests = child_requests_for_wait.clone();
+                async move {
+                    let root = store.get_session("root-s8l").await.unwrap().unwrap();
+                    let child = store.get_session("child-s8l").await.unwrap().unwrap();
+                    root.state == SessionState::WaitingForInput
+                        && root_requests.load(Ordering::Relaxed) == 4
+                        && child.state == SessionState::Stopped
+                        && child_requests.load(Ordering::Relaxed) == 2
+                }
+            }
+        })
+        .await;
+
+        // The child ran exactly the resumed turn; its thread is the
+        // assignment, the parent's message, and the answer.
+        assert_eq!(store.model_calls(&child_id).await.unwrap().len(), 1);
+        let child_messages = store.messages(&child_id, false).await.unwrap();
+        let texts: Vec<&str> = child_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "review the change",
+                "resume and finish the review",
+                "the review is finished"
+            ],
+            "message_child resumes an interrupted child from its archived thread"
+        );
+        let parent_messages = store.messages(&root_id, false).await.unwrap();
+        assert!(
+            parent_messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::ChildEvent { child_id: id, kind: ChildEventKind::Report, .. } if id == &child_id
+            )),
+            "the resumed child's completion report reaches the root"
+        );
+    }
+
+    /// The tree sweep marks every non-stopped descendant interrupted by the
+    /// user and leaves archived ones untouched: a child that already reached
+    /// `Stopped` keeps its state and records no cause. The owner itself is
+    /// not in the sweep — the interrupt ladder stops it separately.
+    #[tokio::test]
+    async fn interrupt_tree_marks_non_stopped_descendants_and_leaves_archived_ones() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = &state.store;
+        let mut root = session("root-s8t");
+        root.state = SessionState::WaitingForInput;
+        let mut running = child_session("child-s8t-a", "root-s8t");
+        running.state = SessionState::Running;
+        let mut stopped = child_session("child-s8t-b", "root-s8t");
+        stopped.state = SessionState::Stopped;
+        let mut leaf = child_session("leaf-s8t", "root-s8t");
+        leaf.parent_id = Some("child-s8t-a".to_string());
+        leaf.state = SessionState::Running;
+        for session in [&root, &running, &stopped, &leaf] {
+            store.create_session(session).await.unwrap();
+        }
+
+        interrupt_tree(&state, "root-s8t").await.unwrap();
+
+        for id in ["child-s8t-a", "leaf-s8t"] {
+            let child = store.get_session(id).await.unwrap().unwrap();
+            assert_eq!(child.state, SessionState::Interrupted);
+            assert_eq!(child.interrupt_cause, Some(InterruptCause::User));
+        }
+        let stopped = store.get_session("child-s8t-b").await.unwrap().unwrap();
+        assert_eq!(
+            stopped.state,
+            SessionState::Stopped,
+            "an archived child is not re-marked interrupted"
+        );
+        assert_eq!(
+            stopped.interrupt_cause, None,
+            "an archived child records no interrupt cause"
+        );
+        let root = store.get_session("root-s8t").await.unwrap().unwrap();
+        assert_eq!(root.state, SessionState::WaitingForInput);
+    }
+
+    #[tokio::test]
+    async fn recover_reports_crash_interrupted_children_and_the_parent_rededicides_each() {
+        // Pre-boot rows: the whole tree was mid-flight when the control plane
+        // died — root, child-a, and child-b running; child-c had already been
+        // stopped by the user and must author nothing on recovery.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                // The root's re-decision wakes: resume child-a, abandon
+                // child-b, then react to child-a's completion report.
+                vec![tool_call_fragment(
+                    "call-1",
+                    "message_child",
+                    r#"{"id":"child-s8c-a","text":"resume the review"}"#,
+                )],
+                vec![text_chunk("child a resumed")],
+                vec![text_chunk("child b abandoned")],
+                vec![text_chunk("child a's report noted")],
+            ])));
+        let a_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
+            vec![vec![text_chunk("the review is done")]],
+        )));
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        let mut root = session("root-s8c");
+        root.model = "root-model".into();
+        root.persona = None;
+        root.state = SessionState::Running;
+        let mut a = child_session("child-s8c-a", "root-s8c");
+        a.model = "a-model".into();
+        a.persona = None;
+        a.state = SessionState::Running;
+        let mut b = child_session("child-s8c-b", "root-s8c");
+        b.model = "b-model".into();
+        b.persona = None;
+        b.state = SessionState::Running;
+        let mut c = child_session("child-s8c-c", "root-s8c");
+        c.model = "c-model".into();
+        c.persona = None;
+        c.state = SessionState::Interrupted;
+        c.interrupt_cause = Some(InterruptCause::User);
+        store.create_session(&root).await.unwrap();
+        store.create_session(&a).await.unwrap();
+        store.create_session(&b).await.unwrap();
+        store.create_session(&c).await.unwrap();
+        store
+            .append_message(
+                &a.id,
+                Role::User,
+                &Block::Text {
+                    text: "review the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let root_addr = scripted_provider(root_scripts).await;
+        let a_addr = scripted_provider(a_scripts).await;
+        let b_addr = scripted_provider(Arc::new(Mutex::new(VecDeque::new()))).await;
+        let c_addr = scripted_provider(Arc::new(Mutex::new(VecDeque::new()))).await;
+        let providers = HashMap::from([
+            (
+                "root-model".to_string(),
+                openai_provider_with_model(root_addr, "root-model"),
+            ),
+            (
+                "a-model".to_string(),
+                openai_provider_with_model(a_addr, "a-model"),
+            ),
+            (
+                "b-model".to_string(),
+                openai_provider_with_model(b_addr, "b-model"),
+            ),
+            (
+                "c-model".to_string(),
+                openai_provider_with_model(c_addr, "c-model"),
+            ),
+        ]);
+        let state = state_with_catalog(&dir, providers, HashMap::new(), None);
+
+        recover(&state).await;
+
+        // child-a is resumed by the root's re-decision and runs to
+        // completion; child-b is abandoned and stays parked; child-c's user
+        // stop is untouched and authored nothing.
+        wait_for("the root to re-decide each crash child", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let root = store.get_session("root-s8c").await.unwrap().unwrap();
+                    let a = store.get_session("child-s8c-a").await.unwrap().unwrap();
+                    let b = store.get_session("child-s8c-b").await.unwrap().unwrap();
+                    root.state == SessionState::WaitingForInput
+                        && store.model_calls("root-s8c").await.unwrap().len() == 4
+                        && a.state == SessionState::Stopped
+                        && b.state == SessionState::Interrupted
+                }
+            }
+        })
+        .await;
+
+        let a = store.get_session("child-s8c-a").await.unwrap().unwrap();
+        assert_eq!(
+            a.state,
+            SessionState::Stopped,
+            "the crash-interrupted child the parent resumed reports and stops"
+        );
+        assert_eq!(store.model_calls("child-s8c-a").await.unwrap().len(), 1);
+        let b = store.get_session("child-s8c-b").await.unwrap().unwrap();
+        assert_eq!(b.state, SessionState::Interrupted);
+        assert_eq!(
+            b.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "an abandoned crash child stays interrupted"
+        );
+        assert!(
+            store.model_calls("child-s8c-b").await.unwrap().is_empty(),
+            "an abandoned child runs no turn"
+        );
+        let c = store.get_session("child-s8c-c").await.unwrap().unwrap();
+        assert_eq!(c.state, SessionState::Interrupted);
+        assert_eq!(
+            c.interrupt_cause,
+            Some(InterruptCause::User),
+            "a user stop survives the restart"
+        );
+        assert!(store.model_calls("child-s8c-c").await.unwrap().is_empty());
+
+        // The root's thread carries one authored failure per crash child and
+        // none from the user-stopped child, plus the resumed child's report.
+        let parent_messages = store.messages("root-s8c", false).await.unwrap();
+        let child_events: Vec<(&str, ChildEventKind)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent { child_id, kind, .. } => Some((child_id.as_str(), *kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_events,
+            [
+                ("child-s8c-a", ChildEventKind::Failure),
+                ("child-s8c-b", ChildEventKind::Failure),
+                ("child-s8c-a", ChildEventKind::Report),
+            ],
+            "crash children report; the user-stopped child does not"
+        );
+        let failure_text = parent_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Failure,
+                    text,
+                    ..
+                } if child_id == "child-s8c-a" => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("child a's failure event exists");
+        assert_eq!(failure_text, CRASH_FAILURE_TEXT);
+        let resumed_messages = store.messages("child-s8c-a", false).await.unwrap();
+        let texts: Vec<&str> = resumed_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "review the change",
+                "resume the review",
+                "the review is done"
+            ],
+            "the root's message resumed the child from its archived thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_cascades_the_owner_tree_and_a_child_subtree() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        store.create_session(&session("root-s8s")).await.unwrap();
+        store
+            .create_session(&child_session("child-s8s", "root-s8s"))
+            .await
+            .unwrap();
+        let mut grandchild = child_session("grand-s8s", "child-s8s");
+        grandchild.owner_id = "root-s8s".into();
+        store.create_session(&grandchild).await.unwrap();
+        store.create_session(&session("root2-s8s")).await.unwrap();
+        store
+            .create_session(&child_session("child2-s8s", "root2-s8s"))
+            .await
+            .unwrap();
+        // Give the tree loops, so the cascade's loop teardown is visible.
+        let tunnels = state.tunnels.clone();
+        for id in [
+            "root-s8s",
+            "child-s8s",
+            "grand-s8s",
+            "root2-s8s",
+            "child2-s8s",
+        ] {
+            state.loops.start(
+                id,
+                store.clone(),
+                Arc::new(DummyProvider),
+                tunnels.clone(),
+                "test",
+            );
+        }
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        // Stopping the owner stops its whole tree: every subtree member gets
+        // an executor stop on the node (the node is down, so the commands
+        // wait for its next poll), its loop is dropped, and its rows are
+        // removed.
+        let response = client
+            .post(format!("http://{addr}/stop"))
+            .json(&json!({ "session_id": "root-s8s" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for id in ["root-s8s", "child-s8s", "grand-s8s"] {
+            assert!(
+                store.get_session(id).await.unwrap().is_none(),
+                "{id} removed"
+            );
+            assert!(state.loops.subscribe(id).is_none(), "{id} loop stopped");
+        }
+        assert!(
+            store.get_session("root2-s8s").await.unwrap().is_some(),
+            "a sibling tree is untouched"
+        );
+
+        let mut stopped: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            let command = state
+                .commands
+                .next("n1")
+                .await
+                .expect("a stop command per subtree member is queued");
+            let NodeCommand::Stop { session_id, .. } = command else {
+                panic!("the queued command must be a stop");
+            };
+            stopped.push(session_id);
+        }
+        assert_eq!(
+            stopped,
+            ["grand-s8s", "child-s8s", "root-s8s"],
+            "teardown runs leaves-first"
+        );
+
+        // Stopping a child cascades only its subtree.
+        let response = client
+            .post(format!("http://{addr}/stop"))
+            .json(&json!({ "session_id": "child2-s8s" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(store.get_session("child2-s8s").await.unwrap().is_none());
+        assert!(
+            store.get_session("root2-s8s").await.unwrap().is_some(),
+            "stopping a child leaves its owner in place"
+        );
+        let command = state
+            .commands
+            .next("n1")
+            .await
+            .expect("the child subtree's stop command is queued");
+        let NodeCommand::Stop { session_id, .. } = command else {
+            panic!("the queued command must be a stop");
+        };
+        assert_eq!(session_id, "child2-s8s");
     }
 }
