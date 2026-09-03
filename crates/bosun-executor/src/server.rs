@@ -190,11 +190,12 @@ fn router_with_state(state: Arc<ExecutorState>) -> Router {
         .route("/tool/glob", post(tool_glob))
         .route("/tool/git", post(tool_git))
         .route("/tool/webfetch", post(tool_webfetch))
-        // Internal plumbing: the control plane calls these to read skills
-        // from the node's working copy; they are not advertised to models in
-        // the canonical tool list.
+        // Internal plumbing: the control plane calls these to read the
+        // working copy's skills and repo-standard presence; they are not
+        // advertised to models in the canonical tool list.
         .route("/tool/skills", post(tool_skills))
         .route("/tool/skill/read", post(tool_skill_read))
+        .route("/tool/repo_standards", post(tool_repo_standards))
         .route("/tool/{run_id}/cancel", post(cancel))
         .fallback(not_found)
         .with_state(state)
@@ -255,6 +256,7 @@ tool_handler!("git", tool_git);
 tool_handler!("webfetch", tool_webfetch);
 tool_handler!("skills", tool_skills);
 tool_handler!("skill/read", tool_skill_read);
+tool_handler!("repo_standards", tool_repo_standards);
 
 /// Shared dispatcher for the JSON tools. Shell is handled separately because
 /// it returns an SSE stream.
@@ -335,6 +337,9 @@ async fn tool(state: Arc<ExecutorState>, name: &str, req: ToolRequest) -> Respon
                 .map(|content| json!({ "content": content }))
         }
         "skills" => Ok(json!({ "skills": tools::list_skills(&state.session_dir) })),
+        "repo_standards" => Ok(json!({
+            "present": tools::repo_standards_present(&state.session_dir)
+        })),
         "skill/read" => {
             let Some(name) = args.get("name").and_then(Value::as_str) else {
                 return bad_arg("name");
@@ -1282,6 +1287,37 @@ mod tests {
 
         let response = tool_call(&client, &addr, "skill/read", "run-4", json!({})).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn repo_standards_lists_presence_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (addr, _state) = test_app(root, Permission::ReadWrite).await;
+        let client = reqwest::Client::new();
+
+        let response = tool_call(&client, &addr, "repo_standards", "run-1", json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, json!({ "present": [] }), "neither file lists none");
+
+        // One file at the root lists its name; the contents never travel.
+        std::fs::write(root.join("CLAUDE.md"), "claude body").unwrap();
+        let response = tool_call(&client, &addr, "repo_standards", "run-2", json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, json!({ "present": ["CLAUDE.md"] }));
+        assert!(
+            !body.to_string().contains("claude body"),
+            "the response must carry presence, never contents"
+        );
+
+        // Both files list in canonical order.
+        std::fs::write(root.join("AGENTS.md"), "agents body").unwrap();
+        let response = tool_call(&client, &addr, "repo_standards", "run-3", json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, json!({ "present": ["AGENTS.md", "CLAUDE.md"] }));
     }
 
     #[tokio::test]

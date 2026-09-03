@@ -131,8 +131,9 @@ As a node operator, I want the node to hold a single connection to the control p
 
 As a user, I want every agent in a session to know the repo's governing documents exist, so work follows the standards the repo sets without every agent guessing.
 
-- The loop scans the working copy for `AGENTS.md` and `CLAUDE.md` and injects a presence notice into each session's context, for the root and every child.
-- Contents are not injected; an agent reads them on demand with file tools when its task needs them.
+- The working copy lives on the node, so the executor answers an internal `repo_standards` presence call: it lists which of `AGENTS.md` and `CLAUDE.md` exist at the working-copy root, in that order. Presence only — the files' contents never leave the node over this call.
+- The loop fetches the presence list once per session — root and children each on their own first turn, since every session in the tree runs on the same working copy — and caches it in loop state, the same cache shape as the skills list. A failed fetch retries with the skills fetch's bounds and caches an empty list, so a node that is briefly unreachable at first wake costs the session a bounded retry and a run without the notice, never a failed turn.
+- Each turn's system prompt carries the notice when any file is present: `Repo standards present: AGENTS.md, CLAUDE.md. The contents are not in this context; read the files with the file tools when your task needs them.` The notice is composed from the presence list alone: contents are never injected, never fetched by the loop, and never enter stored messages. Persona prompts stay purely about role and behaviour.
 
 ## Out of scope
 

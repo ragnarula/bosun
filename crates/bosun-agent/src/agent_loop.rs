@@ -46,6 +46,7 @@ use crate::skills::fetch_working_skills;
 use crate::skills::merge_skills;
 use crate::skills::read_injected_skill;
 use crate::skills::read_working_skill;
+use crate::standards::fetch_repo_standards;
 
 /// The session's skills, discovered once and reused across turns.
 struct SessionSkills {
@@ -191,14 +192,19 @@ pub struct LoopDeps {
 }
 
 /// State a session's loop keeps across wakes: the todo list, the cached
-/// skill lists, and the newest message id in the last wake's snapshot.
-/// Events newer than that are unhandled and keep their child in the manifest.
-/// The id advances at the start of a wake, so an event is surfaced by exactly
-/// one wake even if that wake fails before completing.
+/// skill and repo-standard lists, and the newest message id in the last
+/// wake's snapshot. Events newer than that are unhandled and keep their
+/// child in the manifest. The id advances at the start of a wake, so an
+/// event is surfaced by exactly one wake even if that wake fails before
+/// completing.
 #[derive(Default)]
 struct LoopState {
     todos: Vec<Value>,
     skills_cache: Option<SessionSkills>,
+    /// The repo-standard files present at the working-copy root, fetched once
+    /// per session like the skills list. None until the first turn has
+    /// fetched; a fetch that fails caches an empty list.
+    repo_standards_cache: Option<Vec<String>>,
     surfaced_through: i64,
 }
 
@@ -851,6 +857,27 @@ async fn run_turn_inner(
     let working_skills: &[Skill] = &cached.working;
     let injected_skills: &[Skill] = &cached.injected;
     let skills: &[Skill] = &cached.merged;
+    // The repo-standard presence list is fetched once per session and cached,
+    // like the skills list: the working copy does not change mid-session, and
+    // the files' contents are read on demand with the file tools, so only the
+    // presence notice enters the system prompt.
+    if state.repo_standards_cache.is_none() {
+        let present = fetch_repo_standards(&*deps.tools, session_id)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(
+                    msg = "failed to fetch repo standards from the node",
+                    session_id = %session_id,
+                    error = %error.display_chain()
+                );
+                Vec::new()
+            });
+        state.repo_standards_cache = Some(present);
+    }
+    let repo_standards = state
+        .repo_standards_cache
+        .as_ref()
+        .expect("populated above");
     let tools: Vec<ToolSpec> = canonical_tools(permission)
         .into_iter()
         .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
@@ -871,6 +898,7 @@ async fn run_turn_inner(
 
     let system = system_prompt(
         persona_system_prompt(deps, &session),
+        repo_standards,
         &state.todos,
         skills,
         live,
@@ -1866,18 +1894,27 @@ fn persona_catalog(deps: &LoopDeps) -> Vec<(String, String)> {
 }
 
 /// Builds the system prompt: the persona's role text when it has one (the
-/// built-in default otherwise), then the session's live context — the persona
-/// catalog for spawn-capable sessions, skill advertisements, the todo list,
-/// and the manifest of children whose state or latest authored event this
-/// wake is reacting to. The system prompt is never stored.
+/// built-in default otherwise), then the session's live context — the
+/// repo-standard files present in the working copy, the persona catalog for
+/// spawn-capable sessions, skill advertisements, the todo list, and the
+/// manifest of children whose state or latest authored event this wake is
+/// reacting to. The system prompt is never stored.
 fn system_prompt(
     persona: Option<&str>,
+    repo_standards: &[String],
     todos: &[Value],
     skills: &[Skill],
     live: &[LiveChild],
     catalog: Option<Vec<(String, String)>>,
 ) -> String {
     let mut prompt = persona.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string();
+    if !repo_standards.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nRepo standards present: {}. The contents are not in this context; \
+             read the files with the file tools when your task needs them.",
+            repo_standards.join(", ")
+        ));
+    }
     if let Some(catalog) = catalog {
         prompt.push_str("\n\nPersonas you may spawn:");
         for (name, description) in catalog {
@@ -2233,12 +2270,16 @@ mod tests {
             args: Value,
             delta: mpsc::UnboundedSender<ToolDelta>,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutcome, ToolError>> + Send>> {
-            let served = self.outcomes.contains_key(&name);
-            let outcome = self
+            // A test's canned outcome wins; unserved internal plumbing calls
+            // are answered with empty results, so a test that does not care
+            // about a fetch neither waits out its retries nor hangs a
+            // blocking-tools turn on it.
+            let served: Option<ToolOutcome> = self
                 .outcomes
                 .get(&name)
                 .cloned()
-                .unwrap_or_else(|| self.outcome.clone());
+                .or_else(|| plumbing_outcome(&name));
+            let outcome = served.clone().unwrap_or_else(|| self.outcome.clone());
             self.calls.lock().unwrap().push(CapturedToolCall {
                 session_id,
                 run_id,
@@ -2246,7 +2287,7 @@ mod tests {
                 args,
             });
             let delta_text = self.delta_text.clone();
-            let block = self.block && !served;
+            let block = self.block && served.is_none();
             Box::pin(async move {
                 if let Some(text) = delta_text {
                     let _ = delta.send(ToolDelta { text });
@@ -2286,6 +2327,21 @@ mod tests {
             content: json!({ "ok": true }),
             is_error: false,
         }
+    }
+
+    /// The empty success outcome for an internal plumbing call the loop makes
+    /// outside the model surface: listing the working copy's skills, and
+    /// fetching the repo-standard presence.
+    fn plumbing_outcome(name: &str) -> Option<ToolOutcome> {
+        let content = match name {
+            "skills" => json!({ "skills": [] }),
+            "repo_standards" => json!({ "present": [] }),
+            _ => return None,
+        };
+        Some(ToolOutcome {
+            content,
+            is_error: false,
+        })
     }
 
     /// Tools that answer the session-start skills round trip instantly: a
@@ -3112,6 +3168,247 @@ mod tests {
         assert_eq!(
             tool_calls[0].result,
             Some(json!({ "error": "skill not found" }))
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn repo_standards_notice_is_fetched_once_per_session_and_cached() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-standards")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("tests pass".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "repo_standards",
+            ToolOutcome {
+                content: json!({ "present": ["AGENTS.md", "CLAUDE.md"] }),
+                is_error: false,
+            },
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-standards".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-standards").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 2, "the shell result starts a second turn");
+        for call in &calls {
+            assert!(
+                call.system
+                    .contains("Repo standards present: AGENTS.md, CLAUDE.md"),
+                "every turn's system prompt carries the presence notice"
+            );
+        }
+
+        // The presence fetch went to the executor once across both turns; the
+        // second turn composes its notice from the cache.
+        {
+            let tool_calls = tools.calls.lock().unwrap();
+            assert_eq!(
+                tool_calls
+                    .iter()
+                    .filter(|call| call.name == "repo_standards")
+                    .count(),
+                1,
+                "the repo-standards presence is fetched once per session, not per turn"
+            );
+        }
+
+        // The notice lives only in the ephemeral system prompt: no stored
+        // message or tool record names the files or the notice.
+        let messages = store.messages("s-standards", false).await.unwrap();
+        for (_, message) in &messages {
+            let text = serde_json::to_string(&message.block).unwrap();
+            assert!(
+                !text.contains("Repo standards"),
+                "a stored message carries the presence notice: {text}"
+            );
+            assert!(
+                !text.contains("AGENTS.md") && !text.contains("CLAUDE.md"),
+                "a stored message names a repo-standard file: {text}"
+            );
+        }
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn repo_standards_notice_reaches_child_sessions() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-parent")).await.unwrap();
+        store
+            .create_session(&child_session_of("s-child", "s-parent"))
+            .await
+            .unwrap();
+
+        // A child runs on the parent's working copy, so its own first turn
+        // fetches the same presence list for its own system prompt.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("child report".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "repo_standards",
+            ToolOutcome {
+                content: json!({ "present": ["CLAUDE.md"] }),
+                is_error: false,
+            },
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-child".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to stop", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-child").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .system
+                .contains("Repo standards present: CLAUDE.md"),
+            "the child's system prompt carries the presence notice"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_failed_repo_standards_fetch_degrades_to_no_notice_without_crashing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-standards-down"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"true"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        // The node does not answer the presence call: the fetch retries its
+        // bounded attempts, then the session runs without a notice.
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "repo_standards",
+            ToolOutcome {
+                content: json!({ "error": "the node has no live tunnel" }),
+                is_error: true,
+            },
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-standards-down".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for(
+            "the session to wait for input despite the failed fetch",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store
+                        .get_session("s-standards-down")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stored.state == SessionState::WaitingForInput
+                }
+            },
+        )
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert!(
+                !call.system.contains("Repo standards present"),
+                "a failed fetch must not leave a presence notice in the system prompt"
+            );
+        }
+
+        // The failed fetch gave up after its bounded retries on the first
+        // turn and cached the empty result: the second turn fetched nothing.
+        let tool_calls = tools.calls.lock().unwrap();
+        assert_eq!(
+            tool_calls
+                .iter()
+                .filter(|call| call.name == "repo_standards")
+                .count(),
+            4,
+            "the presence fetch retries its bounded attempts, once per session"
         );
 
         handle.stop();

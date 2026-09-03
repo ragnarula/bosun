@@ -9,6 +9,6 @@ pub mod provider;
 pub mod serialize;
 pub mod skills;
 pub mod sse;
-
+pub mod standards;
 #[cfg(test)]
 mod test_support;

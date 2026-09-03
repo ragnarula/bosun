@@ -148,6 +148,20 @@ pub fn read_skill(session_dir: &Path, name: &str) -> Result<String, ToolError> {
     })
 }
 
+/// The repo-standard files the executor scans for at the working-copy root,
+/// listed in the order the presence notice advertises them.
+pub const REPO_STANDARD_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// The repo-standard files that exist at the working-copy root, in
+/// [`REPO_STANDARD_FILES`] order. Presence only: the response never carries
+/// the files' contents, which the model reads on demand with `file/read`.
+pub fn repo_standards_present(session_dir: &Path) -> Vec<&'static str> {
+    REPO_STANDARD_FILES
+        .into_iter()
+        .filter(|name| session_dir.join(name).is_file())
+        .collect()
+}
+
 pub fn write_file(session_dir: &Path, path: &str, content: &str) -> Result<(), ToolError> {
     let root = session_dir.canonicalize().with_context(|| {
         format!(
@@ -520,6 +534,30 @@ mod tests {
         // A path with no existing ancestor cannot be resolved.
         let err = resolve_path(root, "a/b/missing.txt").unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }));
+    }
+
+    #[test]
+    fn repo_standards_present_lists_root_files_in_canonical_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(repo_standards_present(root).is_empty());
+
+        // A directory named AGENTS.md is not a standards file.
+        std::fs::create_dir(root.join("AGENTS.md")).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "rules").unwrap();
+        assert_eq!(
+            repo_standards_present(root),
+            vec!["CLAUDE.md"],
+            "only files count, and only at the root"
+        );
+
+        std::fs::remove_dir(root.join("AGENTS.md")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "rules").unwrap();
+        assert_eq!(
+            repo_standards_present(root),
+            vec!["AGENTS.md", "CLAUDE.md"],
+            "both files list in canonical order"
+        );
     }
 
     #[test]
