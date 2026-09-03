@@ -96,6 +96,11 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             description: "Create a child session under a configured persona and hand it a task. Returns the child session's id; the child runs on its own executor and reports back when done.".into(),
             schema: json!({"type":"object","properties":{"persona":{"type":"string"},"instructions":{"type":"string"}},"required":["persona","instructions"]}),
         },
+        ToolSpec {
+            name: "message_child".into(),
+            description: "Send a message to one of your child sessions, named in your live-children manifest, to ask for detail or redirect it. The child resumes from its own thread and reports again.".into(),
+            schema: json!({"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}),
+        },
     ];
 
     match permission {
@@ -175,6 +180,7 @@ mod tests {
                 "webfetch",
                 "skill",
                 "spawn",
+                "message_child",
             ]
         );
         for tool in &tools {
@@ -199,6 +205,7 @@ mod tests {
                 "webfetch",
                 "skill",
                 "spawn",
+                "message_child",
             ]
         );
     }
@@ -208,6 +215,16 @@ mod tests {
         let tools = canonical_tools(Permission::ReadWrite);
         let shell = tools.iter().find(|tool| tool.name == "shell").unwrap();
         assert_eq!(shell.schema["required"], json!(["command"]));
+    }
+
+    #[test]
+    fn message_child_schema_requires_id_and_text() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let message_child = tools
+            .iter()
+            .find(|tool| tool.name == "message_child")
+            .unwrap();
+        assert_eq!(message_child.schema["required"], json!(["id", "text"]));
     }
 
     #[test]

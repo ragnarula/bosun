@@ -3,18 +3,19 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Block;
+use bosun_common::session::ChildEventKind;
 use bosun_common::session::InterruptCause;
 use bosun_common::session::Message;
 use bosun_common::session::Role;
@@ -60,8 +61,30 @@ const SUMMARIZATION_PROMPT: &str = "Summarize the conversation so far. Preserve:
      open questions. Be concise.";
 
 pub enum LoopEvent {
+    /// A turn should run: a user message or a child's authored event was
+    /// appended to this session's thread.
     Wake,
+    /// A parent's `message_child` directed at this session: the message was
+    /// appended to this session's thread. Starts a turn even when the session
+    /// is stopped, which is how a stopped child resumes.
+    ParentMessage,
     Interrupt,
+}
+
+/// Why a wake is queued while a turn is in flight. The kind is kept so a
+/// stopped session can still be woken by a parent message while plain wakes
+/// on it run nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeKind {
+    Turn,
+    ParentMessage,
+}
+
+/// Sends loop events to another session's loop: the control plane routes
+/// through the registry, and tests route through direct handles. None leaves
+/// delivery silent, for a lone loop in tests.
+pub trait LoopMailbox: Send + Sync {
+    fn send(&self, session_id: &str, event: LoopEvent);
 }
 
 pub trait DeltaSink: Send + Sync {
@@ -154,6 +177,33 @@ pub struct LoopDeps {
     /// The control plane's child-session spawner. None disables the `spawn`
     /// tool, which the loop advertises only when a spawner is attached.
     pub spawner: Option<Arc<dyn ChildSpawner>>,
+    /// Delivery of loop events to other sessions' loops: a child's authored
+    /// event wakes its parent, and `message_child` wakes the child it names.
+    /// None disables `message_child` and leaves authored events unwoken, for
+    /// a lone loop in tests.
+    pub mailbox: Option<Arc<dyn LoopMailbox>>,
+}
+
+/// State a session's loop keeps across wakes: the todo list, the cached
+/// skill lists, and the newest message id in the last wake's snapshot.
+/// Events newer than that are unhandled and keep their child in the manifest.
+/// The id advances at the start of a wake, so an event is surfaced by exactly
+/// one wake even if that wake fails before completing.
+#[derive(Default)]
+struct LoopState {
+    todos: Vec<Value>,
+    skills_cache: Option<SessionSkills>,
+    surfaced_through: i64,
+}
+
+/// One child session in the per-wake manifest: id, persona, state, and its
+/// last authored message to this session, when it has authored one.
+#[derive(Debug, Clone)]
+struct LiveChild {
+    id: String,
+    persona: Option<String>,
+    state: SessionState,
+    last_authored: Option<String>,
 }
 
 /// The provider and prices one model call runs under: resolved from the
@@ -222,52 +272,35 @@ pub fn spawn_loop(session_id: String, deps: Arc<LoopDeps>) -> LoopHandle {
     let (sender, mut rx) = mpsc::unbounded_channel::<LoopEvent>();
     let task = tokio::spawn(async move {
         let result = async {
-            let mut todos = Vec::new();
-            // The working-copy skill list is fetched once per session; the
-            // on-demand `skill` read still goes to the node per call.
-            let mut skills_cache: Option<SessionSkills> = None;
-            // Wakes that arrive while a turn is in flight are counted here and
-            // consumed by the next turn, so a user message posted mid-turn is
-            // still processed once the current batch of turns ends.
-            let pending_wakes = Arc::new(AtomicU64::new(0));
+            // Wakes that arrive while a turn is in flight are queued here and
+            // consumed by the next wake, so an event that lands mid-turn is
+            // still processed once the current batch of turns ends. The kind
+            // is kept so a stopped session can still be woken by a parent
+            // message.
+            let mut pending: VecDeque<WakeKind> = VecDeque::new();
+            let mut state = LoopState::default();
             loop {
-                if pending_wakes.load(Ordering::Acquire) > 0 {
-                    handle_wake(
-                        &deps,
-                        &session_id,
-                        &mut todos,
-                        &mut skills_cache,
-                        &mut rx,
-                        &pending_wakes,
-                    )
-                    .await?;
-                    continue;
-                }
-                match rx.recv().await {
-                    None => break,
-                    Some(LoopEvent::Wake) => {
-                        pending_wakes.fetch_add(1, Ordering::AcqRel);
-                        handle_wake(
-                            &deps,
-                            &session_id,
-                            &mut todos,
-                            &mut skills_cache,
-                            &mut rx,
-                            &pending_wakes,
-                        )
-                        .await?;
-                    }
-                    // This arm is only reachable while no turn is in flight:
-                    // handle_wake owns the channel (and cancels the in-flight
-                    // turn) for the whole duration of a turn. An interrupt
-                    // here is not a killed turn, so it is ignored.
-                    Some(LoopEvent::Interrupt) => {
-                        debug!(
-                            msg = "ignoring interrupt: no turn is in flight",
-                            session_id = %session_id
-                        );
-                    }
-                }
+                let wake = match pending.pop_front() {
+                    Some(wake) => wake,
+                    None => match rx.recv().await {
+                        None => break,
+                        Some(LoopEvent::Wake) => WakeKind::Turn,
+                        Some(LoopEvent::ParentMessage) => WakeKind::ParentMessage,
+                        // This arm is only reachable while no turn is in
+                        // flight: handle_wake owns the channel (and cancels
+                        // the in-flight turn) for the whole duration of a
+                        // turn. An interrupt here is not a killed turn, so it
+                        // is ignored.
+                        Some(LoopEvent::Interrupt) => {
+                            debug!(
+                                msg = "ignoring interrupt: no turn is in flight",
+                                session_id = %session_id
+                            );
+                            continue;
+                        }
+                    },
+                };
+                handle_wake(&deps, &session_id, &mut state, &mut rx, &mut pending, wake).await?;
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -343,23 +376,21 @@ enum StreamEnd {
 async fn handle_wake(
     deps: &Arc<LoopDeps>,
     session_id: &str,
-    todos: &mut Vec<Value>,
-    skills_cache: &mut Option<SessionSkills>,
+    state: &mut LoopState,
     rx: &mut mpsc::UnboundedReceiver<LoopEvent>,
-    pending_wakes: &Arc<AtomicU64>,
+    pending: &mut VecDeque<WakeKind>,
+    wake: WakeKind,
 ) -> anyhow::Result<()> {
-    // Consume one pending wake; wakes that arrived mid-turn keep the loop
-    // running after this batch of turns ends.
-    pending_wakes.fetch_sub(1, Ordering::AcqRel);
-
-    // A wake on a session that has already stopped must not start another
-    // turn: nothing wakes a stopped session today, but the resume path will,
-    // and a stray wake would run a second completion and author a second
-    // report to the parent.
+    // A plain wake on a session that has already stopped must not start
+    // another turn: nothing but a parent message wakes a stopped session, and
+    // a stray wake would run a second completion and author a second event to
+    // the parent. A parent message resumes a stopped child, so it is let
+    // through.
     let stored = deps.store.get_session(session_id).await?;
     if stored
         .as_ref()
         .is_some_and(|session| session.state == SessionState::Stopped)
+        && wake == WakeKind::Turn
     {
         return Ok(());
     }
@@ -375,11 +406,33 @@ async fn handle_wake(
         .as_ref()
         .is_some_and(|session| session.parent_id.is_some());
 
+    // The wake's message window is the active thread as it stands now,
+    // shared by every turn of the wake: a turn reads it plus the messages
+    // the wake itself appends, so a child event or user message that lands
+    // mid-wake is invisible to the running turns and surfaces only in its
+    // own queued wake.
+    let mut window = deps.store.messages(session_id, false).await?;
+    // The manifest is built once per wake over the full thread — archived
+    // rows included, so a child's last authored message survives
+    // compaction. It lists the children whose state or latest authored
+    // event this wake's turns are reacting to, and stays fixed for the whole
+    // wake, so a child spawned mid-wake appears from the next wake on.
+    let messages = deps.store.messages(session_id, true).await?;
+    let live = live_children(deps, session_id, state.surfaced_through, &messages).await?;
+    state.surfaced_through = window.last().map(|(id, _)| *id).unwrap_or(0);
+
     let mut interrupted = false;
     loop {
         let signal = Arc::new(InterruptSignal::new());
         let outcome = {
-            let mut turn = Box::pin(run_turn(deps, session_id, todos, skills_cache, &signal));
+            let mut turn = Box::pin(run_turn(
+                deps,
+                session_id,
+                state,
+                &live,
+                &mut window,
+                &signal,
+            ));
             loop {
                 tokio::select! {
                     biased;
@@ -397,7 +450,14 @@ async fn handle_wake(
                                 msg = "queuing a wake that arrived mid-turn",
                                 session_id = %session_id
                             );
-                            pending_wakes.fetch_add(1, Ordering::AcqRel);
+                            pending.push_back(WakeKind::Turn);
+                        }
+                        Some(LoopEvent::ParentMessage) => {
+                            debug!(
+                                msg = "queuing a parent message that arrived mid-turn",
+                                session_id = %session_id
+                            );
+                            pending.push_back(WakeKind::ParentMessage);
                         }
                         None => return Ok(()),
                     },
@@ -407,7 +467,10 @@ async fn handle_wake(
         match outcome {
             TurnOutcome::ToolCalls if !interrupted => {}
             TurnOutcome::Finished { text } if is_child && !interrupted => {
-                finish_child(deps, session_id, text).await?;
+                author_child_event(deps, session_id, ChildEventKind::Report, text).await?;
+                deps.store
+                    .set_state(session_id, SessionState::Stopped)
+                    .await?;
                 return Ok(());
             }
             TurnOutcome::Finished { .. } | TurnOutcome::AskedUser => {
@@ -436,59 +499,113 @@ async fn handle_wake(
     }
 }
 
-/// Ends a completed child's wake: the child authors its final words as one
-/// completion report in its parent's thread and the child session stops. A
-/// root's completed wake instead waits for the user. The report's append can
-/// fail when the parent is gone; the child still stops cleanly.
-async fn finish_child(
+/// Authors a child's event into its parent's thread — a completion report
+/// today; asks and failure notices arrive in later sprints through the same
+/// channel — and wakes the parent's loop. The append can fail when the parent
+/// is gone; the child's own state is the caller's to set.
+async fn author_child_event(
     deps: &Arc<LoopDeps>,
-    session_id: &str,
-    final_text: String,
+    child_id: &str,
+    kind: ChildEventKind,
+    text: String,
 ) -> anyhow::Result<()> {
     let Some(parent_id) = deps
         .store
-        .get_session(session_id)
+        .get_session(child_id)
         .await?
         .and_then(|session| session.parent_id)
     else {
         return Ok(());
     };
-    // The completion report is the child's final words: the text of the turn
-    // that ended the wake, so a child whose final turn is a textless stop
-    // authors an empty report instead of one carrying stale mid-task text.
+    // The event is authored as a user-role message: in the common case the
+    // parent's last message was its own assistant turn, so the user role
+    // keeps the next request alternating — after a tool result the event
+    // simply follows another user-role message. The block kind still renders
+    // it as the child's words.
     if let Err(error) = deps
         .store
         .append_message(
             &parent_id,
-            Role::Assistant,
-            &Block::ChildReport {
-                child_id: session_id.to_string(),
-                text: final_text,
+            Role::User,
+            &Block::ChildEvent {
+                child_id: child_id.to_string(),
+                kind,
+                text,
             },
         )
         .await
     {
         warn!(
-            msg = "failed to append the child report to the parent's thread",
-            session_id = %session_id,
+            msg = "failed to append the child event to the parent's thread",
+            session_id = %child_id,
             parent_id = %parent_id,
             error = %error.display_chain()
         );
+        return Ok(());
     }
-    deps.store
-        .set_state(session_id, SessionState::Stopped)
-        .await?;
+    if let Some(mailbox) = &deps.mailbox {
+        mailbox.send(&parent_id, LoopEvent::Wake);
+    }
+    info!(
+        session_id = %child_id,
+        parent_id = %parent_id,
+        event = kind.as_str(),
+        "child authored an event to its parent"
+    );
     Ok(())
+}
+
+/// The per-wake manifest of the session's children: id, persona, state, and
+/// last authored message. A child is live while it can still act (creating,
+/// running, waiting for input, interrupted) or when its latest authored
+/// event has not been surfaced by a completed wake yet (stopped, newer than
+/// `surfaced_through`). Once a wake has surfaced a stopped child's
+/// completion and the parent did not resume it, the child leaves the
+/// manifest. `messages` is the session's own thread, which the authored
+/// events were appended into.
+async fn live_children(
+    deps: &LoopDeps,
+    session_id: &str,
+    surfaced_through: i64,
+    messages: &[(i64, Message)],
+) -> anyhow::Result<Vec<LiveChild>> {
+    let children = deps.store.child_sessions(session_id).await?;
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut last_authored: HashMap<&str, (i64, &str)> = HashMap::new();
+    for (id, message) in messages {
+        if let Block::ChildEvent { child_id, text, .. } = &message.block {
+            last_authored.insert(child_id.as_str(), (*id, text.as_str()));
+        }
+    }
+    let mut live = Vec::new();
+    for child in children {
+        let authored = last_authored.get(child.id.as_str());
+        let unhandled = authored.is_some_and(|(id, _)| *id > surfaced_through);
+        let can_act = !matches!(child.state, SessionState::Stopped);
+        if !(can_act || unhandled) {
+            continue;
+        }
+        live.push(LiveChild {
+            id: child.id.clone(),
+            persona: child.persona.clone(),
+            state: child.state,
+            last_authored: authored.map(|(_, text)| (*text).to_string()),
+        });
+    }
+    Ok(live)
 }
 
 async fn run_turn(
     deps: &Arc<LoopDeps>,
     session_id: &str,
-    todos: &mut Vec<Value>,
-    skills_cache: &mut Option<SessionSkills>,
+    state: &mut LoopState,
+    live: &[LiveChild],
+    window: &mut Vec<(i64, Message)>,
     signal: &Arc<InterruptSignal>,
 ) -> TurnOutcome {
-    match run_turn_inner(deps, session_id, todos, skills_cache, signal).await {
+    match run_turn_inner(deps, session_id, state, live, window, signal).await {
         Ok(outcome) => outcome,
         Err(error) => {
             error!(
@@ -501,11 +618,33 @@ async fn run_turn(
     }
 }
 
+/// Appends a message to the store and to the wake's working window, so the
+/// wake's later turns read it: the window mirrors the store's active thread
+/// minus the messages other writers appended mid-wake.
+async fn record_in_wake(
+    deps: &LoopDeps,
+    session_id: &str,
+    window: &mut Vec<(i64, Message)>,
+    role: Role,
+    block: &Block,
+) -> anyhow::Result<()> {
+    let id = deps.store.append_message(session_id, role, block).await?;
+    window.push((
+        id,
+        Message {
+            role,
+            block: block.clone(),
+        },
+    ));
+    Ok(())
+}
+
 async fn run_turn_inner(
     deps: &Arc<LoopDeps>,
     session_id: &str,
-    todos: &mut Vec<Value>,
-    skills_cache: &mut Option<SessionSkills>,
+    state: &mut LoopState,
+    live: &[LiveChild],
+    window: &mut Vec<(i64, Message)>,
     signal: &Arc<InterruptSignal>,
 ) -> anyhow::Result<TurnOutcome> {
     let session = deps
@@ -523,22 +662,33 @@ async fn run_turn_inner(
     // at the start of every turn, so a persona switch applies to the next
     // model call without restarting the loop.
     let turn = deps.turn_model(&session.model);
-    let messages: Vec<Message> = maybe_compact(deps, &turn, session_id, signal)
-        .await?
-        .into_iter()
-        .map(|(_, message)| message)
-        .filter(|message| {
-            // An ask tool call has no matching tool result in the transcript:
-            // the Ask block replaces it, so the provider would reject the
-            // dangling tool_use on the next turn.
-            !matches!(&message.block, Block::ToolCall { name, .. } if name == "ask")
-        })
-        .collect();
+    // The wake's own appends since its snapshot are in `window`, so a turn
+    // sees the previous turns' tool traffic but nothing that landed mid-wake
+    // from another writer. `surfaced_through` is the snapshot boundary: it
+    // was fixed when the wake began, so compaction may retire everything at
+    // or below it.
+    let messages: Vec<Message> = maybe_compact(
+        deps,
+        &turn,
+        session_id,
+        signal,
+        window,
+        state.surfaced_through,
+    )
+    .await?
+    .into_iter()
+    .filter(|message| {
+        // An ask tool call has no matching tool result in the transcript:
+        // the Ask block replaces it, so the provider would reject the
+        // dangling tool_use on the next turn.
+        !matches!(&message.block, Block::ToolCall { name, .. } if name == "ask")
+    })
+    .collect();
 
     // The working-copy skill list is fetched once per session and cached, so
     // a turn does not round-trip to the node for it. The on-demand `skill`
     // read still goes to the executor when the model asks for it.
-    if skills_cache.is_none() {
+    if state.skills_cache.is_none() {
         let working = fetch_working_skills(&*deps.tools, session_id)
             .await
             .unwrap_or_else(|error| {
@@ -551,13 +701,13 @@ async fn run_turn_inner(
             });
         let injected = crate::skills::injected_skills(deps.injected_skills_dir.as_deref());
         let merged = merge_skills(working.clone(), injected.clone());
-        *skills_cache = Some(SessionSkills {
+        state.skills_cache = Some(SessionSkills {
             working,
             injected,
             merged,
         });
     }
-    let cached = skills_cache.as_ref().expect("populated above");
+    let cached = state.skills_cache.as_ref().expect("populated above");
     let working_skills: &[Skill] = &cached.working;
     let injected_skills: &[Skill] = &cached.injected;
     let skills: &[Skill] = &cached.merged;
@@ -565,17 +715,28 @@ async fn run_turn_inner(
         .into_iter()
         .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
         .filter(|tool| {
-            // `spawn` (real child sessions) is advertised to root sessions
-            // only, when personas exist and a spawner is attached. Children
-            // spawning their own children arrive in a later sprint.
-            tool.name != "spawn"
-                || (session.parent_id.is_none()
-                    && !deps.personas.is_empty()
-                    && deps.spawner.is_some())
+            // `spawn` (real child sessions) and `message_child` are advertised
+            // to root sessions only, when the machinery that starts or wakes
+            // child loops is attached. Children spawning or messaging their
+            // own children arrive in a later sprint.
+            match tool.name.as_str() {
+                "spawn" => {
+                    session.parent_id.is_none()
+                        && !deps.personas.is_empty()
+                        && deps.spawner.is_some()
+                }
+                "message_child" => session.parent_id.is_none() && deps.mailbox.is_some(),
+                _ => true,
+            }
         })
         .collect();
 
-    let system = system_prompt(persona_system_prompt(deps, &session), todos, skills);
+    let system = system_prompt(
+        persona_system_prompt(deps, &session),
+        &state.todos,
+        skills,
+        live,
+    );
     let mut stream = turn.provider.chat_stream(ProviderCall {
         model: turn.provider.model(),
         max_tokens: 4096,
@@ -613,13 +774,14 @@ async fn run_turn_inner(
     }
 
     if !text.is_empty() {
-        deps.store
-            .append_message(
-                session_id,
-                Role::Assistant,
-                &Block::Text { text: text.clone() },
-            )
-            .await?;
+        record_in_wake(
+            deps,
+            session_id,
+            window,
+            Role::Assistant,
+            &Block::Text { text: text.clone() },
+        )
+        .await?;
     }
 
     let calls: Vec<(String, String, Value)> = parse_tool_calls(tool_calls, session_id);
@@ -632,17 +794,18 @@ async fn run_turn_inner(
         // Commit each tool call to the transcript just before dispatching it,
         // so calls after an ask or a mid-turn interrupt never leave a phantom
         // tool_use without a result.
-        deps.store
-            .append_message(
-                session_id,
-                Role::Assistant,
-                &Block::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                },
-            )
-            .await?;
+        record_in_wake(
+            deps,
+            session_id,
+            window,
+            Role::Assistant,
+            &Block::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                args: args.clone(),
+            },
+        )
+        .await?;
         deps.store
             .append_tool_call(session_id, &id, &name, &args)
             .await?;
@@ -662,18 +825,19 @@ async fn run_turn_inner(
             deps.store
                 .complete_tool_call(session_id, &id, &content, true)
                 .await?;
-            deps.store
-                .append_message(
-                    session_id,
-                    Role::User,
-                    &Block::ToolResult {
-                        id,
-                        name,
-                        is_error: true,
-                        content,
-                    },
-                )
-                .await?;
+            record_in_wake(
+                deps,
+                session_id,
+                window,
+                Role::User,
+                &Block::ToolResult {
+                    id,
+                    name,
+                    is_error: true,
+                    content,
+                },
+            )
+            .await?;
             continue;
         }
 
@@ -687,18 +851,19 @@ async fn run_turn_inner(
                 deps.store
                     .complete_tool_call(session_id, &id, &json!({ "error": "unknown tool" }), true)
                     .await?;
-                deps.store
-                    .append_message(
-                        session_id,
-                        Role::User,
-                        &Block::ToolResult {
-                            id,
-                            name,
-                            is_error: true,
-                            content: json!({ "error": "unknown tool" }),
-                        },
-                    )
-                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error: true,
+                        content: json!({ "error": "unknown tool" }),
+                    },
+                )
+                .await?;
             }
             "ask" => {
                 let message = args["message"].as_str().unwrap_or_default().to_string();
@@ -714,22 +879,23 @@ async fn run_turn_inner(
                 deps.store
                     .complete_tool_call(session_id, &id, &json!({ "asked": true }), false)
                     .await?;
-                deps.store
-                    .append_message(
-                        session_id,
-                        Role::Assistant,
-                        &Block::Ask {
-                            message,
-                            options,
-                            answer: None,
-                        },
-                    )
-                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::Assistant,
+                    &Block::Ask {
+                        message,
+                        options,
+                        answer: None,
+                    },
+                )
+                .await?;
                 return Ok(TurnOutcome::AskedUser);
             }
             "todowrite" => {
                 match args["items"].as_array() {
-                    Some(items) => *todos = items.clone(),
+                    Some(items) => state.todos = items.clone(),
                     None => warn!(
                         msg = "todowrite items are not an array",
                         session_id = %session_id
@@ -738,18 +904,19 @@ async fn run_turn_inner(
                 deps.store
                     .complete_tool_call(session_id, &id, &json!({ "ok": true }), false)
                     .await?;
-                deps.store
-                    .append_message(
-                        session_id,
-                        Role::User,
-                        &Block::ToolResult {
-                            id,
-                            name,
-                            is_error: false,
-                            content: json!({ "ok": true }),
-                        },
-                    )
-                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error: false,
+                        content: json!({ "ok": true }),
+                    },
+                )
+                .await?;
             }
             "skill" => {
                 let skill_name = args["name"].as_str().unwrap_or_default();
@@ -787,18 +954,19 @@ async fn run_turn_inner(
                 deps.store
                     .complete_tool_call(session_id, &id, &content, is_error)
                     .await?;
-                deps.store
-                    .append_message(
-                        session_id,
-                        Role::User,
-                        &Block::ToolResult {
-                            id,
-                            name,
-                            is_error,
-                            content,
-                        },
-                    )
-                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error,
+                        content,
+                    },
+                )
+                .await?;
             }
             // Creates a real child session: the child runs its own loop and
             // executor on this working copy under the target persona. The
@@ -846,18 +1014,67 @@ async fn run_turn_inner(
                 deps.store
                     .complete_tool_call(session_id, &id, &content, is_error)
                     .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error,
+                        content,
+                    },
+                )
+                .await?;
+            }
+            // Resumes or redirects one of this session's children: the
+            // message is appended to the child's thread as its next user
+            // message and the child's loop is woken, so a stopped child
+            // resumes from its archived thread and reports again.
+            "message_child" => {
+                let child_id = args["id"].as_str().unwrap_or_default().to_string();
+                let text = args["text"].as_str().unwrap_or_default().to_string();
+                let outcome = async {
+                    if session.parent_id.is_some() {
+                        anyhow::bail!("message_child is only available to root sessions");
+                    }
+                    let Some(mailbox) = &deps.mailbox else {
+                        anyhow::bail!("message_child is not available");
+                    };
+                    let Some(child) = deps.store.get_session(&child_id).await? else {
+                        anyhow::bail!("no child session {child_id}");
+                    };
+                    if child.parent_id.as_deref() != Some(session.id.as_str()) {
+                        anyhow::bail!("session {child_id} is not a child of this session");
+                    }
+                    deps.store
+                        .append_message(&child_id, Role::User, &Block::Text { text })
+                        .await?;
+                    mailbox.send(&child_id, LoopEvent::ParentMessage);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                let (content, is_error) = match outcome {
+                    Ok(()) => (json!({ "ok": true }), false),
+                    Err(error) => (json!({ "error": error.to_string() }), true),
+                };
                 deps.store
-                    .append_message(
-                        session_id,
-                        Role::User,
-                        &Block::ToolResult {
-                            id,
-                            name,
-                            is_error,
-                            content,
-                        },
-                    )
+                    .complete_tool_call(session_id, &id, &content, is_error)
                     .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error,
+                        content,
+                    },
+                )
+                .await?;
             }
             _ => {
                 let run_id = Uuid::new_v4().to_string();
@@ -875,18 +1092,19 @@ async fn run_turn_inner(
                 deps.store
                     .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
                     .await?;
-                deps.store
-                    .append_message(
-                        session_id,
-                        Role::User,
-                        &Block::ToolResult {
-                            id,
-                            name,
-                            is_error: outcome.is_error,
-                            content: outcome.content,
-                        },
-                    )
-                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error: outcome.is_error,
+                        content: outcome.content,
+                    },
+                )
+                .await?;
             }
         }
     }
@@ -1088,58 +1306,74 @@ fn tool_allowed(allowed_tools: &Option<Vec<String>>, name: &str) -> bool {
     }
 }
 
-/// Compacts the non-archived transcript when it exceeds
-/// `max_window_messages`: the retired tail is summarized by the provider,
-/// archived in the store, and replaced by a Summary message. Returns the
-/// window for the turn. On a summarizer failure or interrupt the store is
-/// left untouched and the full window is returned.
+/// Compacts the wake's working window when it exceeds `max_window_messages`:
+/// the oldest messages are summarized by the provider, archived in the
+/// store, and replaced by a Summary message in the window. Only messages the
+/// wake was woken to process — at or below its snapshot boundary — are
+/// retired: archiving is an id range in the store, and a mid-wake message
+/// from another writer can sit between ids the wake never saw. On a
+/// summarizer failure or interrupt the store is left untouched and the full
+/// window is returned.
 async fn maybe_compact(
     deps: &Arc<LoopDeps>,
     turn: &TurnModel,
     session_id: &str,
     signal: &Arc<InterruptSignal>,
-) -> anyhow::Result<Vec<(i64, Message)>> {
-    let window = deps.store.messages(session_id, false).await?;
-    if window.len() <= deps.max_window_messages {
-        return Ok(window);
+    window: &mut Vec<(i64, Message)>,
+    wake_boundary: i64,
+) -> anyhow::Result<Vec<Message>> {
+    if window.len() > deps.max_window_messages {
+        let keep = deps.max_window_messages / 2;
+        let retireable = window
+            .iter()
+            .take_while(|(id, _)| *id <= wake_boundary)
+            .count();
+        let retire = (window.len() - keep).min(retireable);
+        if retire > 0 {
+            let tail: Vec<(i64, Message)> = window.drain(..retire).collect();
+            let tail_last_id = tail.last().expect("retire is at least one").0;
+            if let Some((text, input_tokens, output_tokens)) =
+                summarize_tail(turn, session_id, &tail, signal).await
+            {
+                let summary = Message {
+                    role: Role::Assistant,
+                    block: Block::Summary { text },
+                };
+                let summary_id = deps
+                    .store
+                    .append_message(session_id, summary.role, &summary.block)
+                    .await?;
+                deps.store.mark_archived(session_id, tail_last_id).await?;
+                deps.store
+                    .append_model_call(
+                        session_id,
+                        turn.provider.model(),
+                        turn.provider.name(),
+                        "compaction",
+                        input_tokens,
+                        output_tokens,
+                        Some(model_call_cost(
+                            input_tokens,
+                            output_tokens,
+                            turn.price_input_per_mtok,
+                            turn.price_output_per_mtok,
+                        )),
+                    )
+                    .await?;
+                window.push((summary_id, summary));
+                info!(
+                    session_id = %session_id,
+                    retired = retire,
+                    "compacted transcript"
+                );
+            } else {
+                // The summarizer failed or was interrupted: put the retired
+                // tail back in place and leave the store untouched.
+                window.splice(0..0, tail);
+            }
+        }
     }
-    let keep = deps.max_window_messages / 2;
-    let split = window.len() - keep;
-    let tail = &window[..split];
-    let tail_last_id = window[split - 1].0;
-
-    let Some((text, input_tokens, output_tokens)) =
-        summarize_tail(turn, session_id, tail, signal).await
-    else {
-        return Ok(window);
-    };
-
-    deps.store
-        .append_message(session_id, Role::Assistant, &Block::Summary { text })
-        .await?;
-    deps.store.mark_archived(session_id, tail_last_id).await?;
-    deps.store
-        .append_model_call(
-            session_id,
-            turn.provider.model(),
-            turn.provider.name(),
-            "compaction",
-            input_tokens,
-            output_tokens,
-            Some(model_call_cost(
-                input_tokens,
-                output_tokens,
-                turn.price_input_per_mtok,
-                turn.price_output_per_mtok,
-            )),
-        )
-        .await?;
-    info!(
-        session_id = %session_id,
-        retired = split,
-        "compacted transcript"
-    );
-    Ok(deps.store.messages(session_id, false).await?)
+    Ok(window.iter().map(|(_, message)| message.clone()).collect())
 }
 
 /// Asks the provider to summarize the retired tail: the instruction plus the
@@ -1258,9 +1492,11 @@ fn render_block(block: &Block) -> String {
             options.join(", ")
         ),
         Block::Summary { text } => format!("summary: {text}"),
-        Block::ChildReport { child_id, text } => {
-            format!("report from child {child_id}: {text}")
-        }
+        Block::ChildEvent {
+            child_id,
+            kind,
+            text,
+        } => format!("{} from child {child_id}: {text}", kind.as_str()),
     }
 }
 
@@ -1289,8 +1525,14 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are Bosun, an autonomous software engin
 
 /// Builds the system prompt: the persona's role text when it has one (the
 /// built-in default otherwise), then the session's live context — skill
-/// advertisements and the todo list.
-fn system_prompt(persona: Option<&str>, todos: &[Value], skills: &[Skill]) -> String {
+/// advertisements, the todo list, and the manifest of children whose state or
+/// latest authored event this wake is reacting to.
+fn system_prompt(
+    persona: Option<&str>,
+    todos: &[Value],
+    skills: &[Skill],
+    live: &[LiveChild],
+) -> String {
     let mut prompt = persona.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string();
     if !skills.is_empty() {
         prompt.push_str("\n\nSkills available in this session:");
@@ -1306,7 +1548,31 @@ fn system_prompt(persona: Option<&str>, todos: &[Value], skills: &[Skill]) -> St
             prompt.push_str(&format!("\n{index}. [{status}] {content}"));
         }
     }
+    if !live.is_empty() {
+        prompt.push_str("\n\nLive children:");
+        for child in live {
+            let persona = child.persona.as_deref().unwrap_or("default");
+            let last = child.last_authored.as_deref().unwrap_or("none");
+            prompt.push_str(&format!(
+                "\n- {} (persona: {persona}, state: {}, last message: {last})",
+                child.id,
+                state_name(child.state)
+            ));
+        }
+    }
     prompt
+}
+
+/// A session state as the manifest renders it: the wire-format names the
+/// store uses.
+fn state_name(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Creating => "creating",
+        SessionState::Running => "running",
+        SessionState::WaitingForInput => "waiting_for_input",
+        SessionState::Interrupted => "interrupted",
+        SessionState::Stopped => "stopped",
+    }
 }
 
 #[cfg(test)]
@@ -1645,6 +1911,19 @@ mod tests {
         }
     }
 
+    /// Tools that answer the session-start skills round trip instantly: a
+    /// failing fetch retries for ~0.8s, which would delay a loop's first
+    /// turn past the interleavings these tests script.
+    fn instant_tools() -> Arc<MockTools> {
+        Arc::new(MockTools::new(default_outcome()).serving(
+            "skills",
+            ToolOutcome {
+                content: json!({ "skills": [] }),
+                is_error: false,
+            },
+        ))
+    }
+
     fn test_deps(
         store: &Store,
         provider: Arc<dyn Provider>,
@@ -1687,6 +1966,7 @@ mod tests {
             price_input_per_mtok,
             price_output_per_mtok,
             spawner: None,
+            mailbox: None,
         }
     }
 
@@ -1713,6 +1993,7 @@ mod tests {
             price_input_per_mtok: 0.0,
             price_output_per_mtok: 0.0,
             spawner: None,
+            mailbox: None,
         }
     }
 
@@ -1730,6 +2011,68 @@ mod tests {
             spawner: Some(spawner),
             ..test_deps_with_personas(store, provider, tools, sink, personas, providers)
         }
+    }
+
+    /// A deps with a loop mailbox attached, for child-event and
+    /// `message_child` tests.
+    fn test_deps_with_mailbox(
+        store: &Store,
+        provider: Arc<dyn Provider>,
+        tools: Arc<MockTools>,
+        sink: Arc<CollectSink>,
+        mailbox: Arc<dyn LoopMailbox>,
+    ) -> LoopDeps {
+        LoopDeps {
+            mailbox: Some(mailbox),
+            ..test_deps(store, provider, tools, sink)
+        }
+    }
+
+    /// Routes loop events to the senders registered under a session id, the
+    /// way the control plane's registry routes them in production.
+    struct TestMailbox {
+        senders: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<LoopEvent>>>>,
+    }
+
+    impl TestMailbox {
+        fn new() -> Self {
+            Self {
+                senders: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn register(&self, session_id: &str, sender: mpsc::UnboundedSender<LoopEvent>) {
+            self.senders
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), sender);
+        }
+    }
+
+    impl LoopMailbox for TestMailbox {
+        fn send(&self, session_id: &str, event: LoopEvent) {
+            if let Some(sender) = self.senders.lock().unwrap().get(session_id) {
+                let _ = sender.send(event);
+            }
+        }
+    }
+
+    /// Appends a child's authored event to the parent's thread the way a
+    /// finishing child would, without running a child loop: the event-injection
+    /// seam loop tests use to deliver child events in a scripted order.
+    async fn deliver_child_event(store: &Store, parent_id: &str, child_id: &str, text: &str) {
+        store
+            .append_message(
+                parent_id,
+                Role::User,
+                &Block::ChildEvent {
+                    child_id: child_id.to_string(),
+                    kind: ChildEventKind::Report,
+                    text: text.to_string(),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     /// The session that spawned `id`; children run on the parent's node and
@@ -4237,7 +4580,11 @@ mod tests {
         let reports: Vec<(&str, &str)> = parent_messages
             .iter()
             .filter_map(|(_, message)| match &message.block {
-                Block::ChildReport { child_id, text } => Some((child_id.as_str(), text.as_str())),
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Report,
+                    text,
+                } => Some((child_id.as_str(), text.as_str())),
                 _ => None,
             })
             .collect();
@@ -4299,7 +4646,11 @@ mod tests {
         let parent_messages = store.messages("parent-2", false).await.unwrap();
         assert_eq!(parent_messages.len(), 1);
         let (child_id, text) = match &parent_messages[0].1.block {
-            Block::ChildReport { child_id, text } => (child_id.as_str(), text.as_str()),
+            Block::ChildEvent {
+                child_id,
+                kind: ChildEventKind::Report,
+                text,
+            } => (child_id.as_str(), text.as_str()),
             _ => panic!("the parent thread must show the child's completion report"),
         };
         assert_eq!(child_id, "child-2");
@@ -4387,7 +4738,11 @@ mod tests {
         let reports: Vec<(&str, &str)> = parent_messages
             .iter()
             .filter_map(|(_, message)| match &message.block {
-                Block::ChildReport { child_id, text } => Some((child_id.as_str(), text.as_str())),
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Report,
+                    text,
+                } => Some((child_id.as_str(), text.as_str())),
                 _ => None,
             })
             .collect();
@@ -4457,8 +4812,9 @@ mod tests {
         })
         .await;
 
-        // Nothing wakes a stopped child today, but the resume path will; a
-        // stray wake must not start another turn or author a second report.
+        // Only a parent's message_child may wake a stopped child (it carries
+        // the message that resumes it); a stray plain wake must not start
+        // another turn or author a second report.
         handle.send(LoopEvent::Wake);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -4477,7 +4833,11 @@ mod tests {
         let reports: Vec<(&str, &str)> = parent_messages
             .iter()
             .filter_map(|(_, message)| match &message.block {
-                Block::ChildReport { child_id, text } => Some((child_id.as_str(), text.as_str())),
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Report,
+                    text,
+                } => Some((child_id.as_str(), text.as_str())),
                 _ => None,
             })
             .collect();
@@ -4641,14 +5001,14 @@ mod tests {
         assert!(
             b_messages.iter().any(|(_, message)| matches!(
                 &message.block,
-                Block::ChildReport { child_id, text } if child_id == "child-b" && text == "b done"
+                Block::ChildEvent { child_id, kind: ChildEventKind::Report, text } if child_id == "child-b" && text == "b done"
             )),
             "child b's report is in the parent's thread"
         );
         assert!(
             !b_messages
                 .iter()
-                .any(|(_, message)| matches!(&message.block, Block::ChildReport { child_id, .. } if child_id == "child-a")),
+                .any(|(_, message)| matches!(&message.block, Block::ChildEvent { child_id, kind: ChildEventKind::Report, .. } if child_id == "child-a")),
             "child a has not reported while still running"
         );
 
@@ -5046,7 +5406,7 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|(_, message)| matches!(&message.block, Block::ChildReport { .. })),
+                .any(|(_, message)| matches!(&message.block, Block::ChildEvent { .. })),
             "no child report is recorded for an unknown persona"
         );
         assert!(
@@ -5143,6 +5503,1706 @@ mod tests {
                             && content == &json!({ "error": "no provider for model ghost-model" })
                     )),
             "the spawn call for a model without a provider records an error result"
+        );
+
+        handle.stop();
+    }
+
+    /// One manifest entry as the system prompt renders it.
+    fn manifest_line(id: &str, persona: &str, state: &str, last: &str) -> String {
+        format!("- {id} (persona: {persona}, state: {state}, last message: {last})")
+    }
+
+    #[tokio::test]
+    async fn a_child_completion_authors_an_event_wakes_the_parent_and_the_manifest_tracks_the_child()
+     {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t1")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-t1", "root-t1"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-t1",
+                Role::User,
+                &Block::Text {
+                    text: "delegate to the child".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("delegated".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("thanks for the report".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("made the change".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let root_handle = spawn_loop(
+            "root-t1".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                Arc::new(MockTools::new(default_outcome())),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-t1".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                Arc::new(MockTools::new(default_outcome())),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-t1", root_handle.sender.clone());
+        mailbox.register("child-t1", child_handle.sender.clone());
+
+        root_handle.send(LoopEvent::Wake);
+
+        wait_for("the parent's first turn to run", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        // While the child is still working, every parent wake carries its
+        // manifest entry: id, persona, state, and no authored message yet.
+        let calls = root_provider.captured_calls();
+        assert!(
+            calls[0]
+                .system
+                .contains(&manifest_line("child-t1", "coder", "creating", "none")),
+            "the first parent turn lists the working child: {}",
+            calls[0].system
+        );
+
+        // The child completes: its loop authors the event into the parent's
+        // thread and wakes the parent's loop through the mailbox.
+        child_handle.send(LoopEvent::Wake);
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-t1").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        wait_for("the child event to wake a second parent turn", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = root_provider.captured_calls();
+        assert!(
+            calls[1]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::User
+                    && matches!(&message.block, Block::ChildEvent { child_id, kind, text }
+                        if child_id == "child-t1"
+                            && *kind == ChildEventKind::Report
+                            && text == "made the change")),
+            "the reaction turn surfaces the child's authored event"
+        );
+        assert!(
+            calls[1].system.contains(&manifest_line(
+                "child-t1",
+                "coder",
+                "stopped",
+                "made the change"
+            )) || calls[1].system.contains(&manifest_line(
+                "child-t1",
+                "coder",
+                "running",
+                "made the change"
+            )),
+            "the reaction turn's manifest still lists the child with its last message: {}",
+            calls[1].system
+        );
+
+        wait_for("the parent to wait for input again", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-t1").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let parent_messages = store.messages("root-t1", false).await.unwrap();
+        let reports: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Report,
+                    text,
+                } if child_id == "child-t1" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            ["made the change"],
+            "the parent's thread holds exactly one authored event"
+        );
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_child_leaves_the_manifest_once_handled_and_not_resumed() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t2")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-t2", "root-t2"))
+            .await
+            .unwrap();
+        // The child completed before this loop starts: it is stopped and its
+        // event sits in the parent's thread, not yet surfaced.
+        store
+            .set_state("child-t2", SessionState::Stopped)
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-t2",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        deliver_child_event(&store, "root-t2", "child-t2", "the work is done").await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("noted".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("all done".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-t2".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the wake that surfaces the event to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            calls[0].system.contains(&manifest_line(
+                "child-t2",
+                "coder",
+                "stopped",
+                "the work is done"
+            )),
+            "the surfacing wake lists the stopped child: {}",
+            calls[0].system
+        );
+
+        // The next wake — a user message — no longer lists the child: the
+        // completion was handled and the parent did not resume it.
+        store
+            .append_message(
+                "root-t2",
+                Role::User,
+                &Block::Text {
+                    text: "any news?".into(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the user message's turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            !calls[1].system.contains("child-t2"),
+            "a handled completion leaves the manifest: {}",
+            calls[1].system
+        );
+        assert!(
+            !calls[1].system.contains("Live children:"),
+            "no live children remain: {}",
+            calls[1].system
+        );
+        let stored = store.get_session("child-t2").await.unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::Stopped,
+            "the child is not resumed by being dropped from the manifest"
+        );
+
+        wait_for("the parent to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-t2").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_event_delivered_mid_turn_is_queued_until_the_turn_ends() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t3")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-t3", "root-t3"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-t3",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+        // The delay keeps the first turn in flight while the child event is
+        // delivered, so the event has to queue and surface afterwards.
+        let provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::TextDelta("working".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("reacted".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+            ],
+            Duration::from_millis(150),
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            sink.clone(),
+        ));
+        let handle = spawn_loop("root-t3".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn to start", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        // The child completes mid-turn: the event is appended to the parent's
+        // thread and the wake is queued, so the in-flight stream is untouched.
+        deliver_child_event(&store, "root-t3", "child-t3", "child done").await;
+        store
+            .set_state("child-t3", SessionState::Stopped)
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn's stream to finish", || async {
+            sink.0.lock().unwrap().iter().any(|text| text == "working")
+        })
+        .await;
+
+        wait_for("the queued wake to run a second turn", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            !calls[0]
+                .messages
+                .iter()
+                .any(|message| matches!(&message.block, Block::ChildEvent { .. })),
+            "the in-flight turn's window predates the mid-turn event"
+        );
+        assert!(
+            calls[1].messages.iter().any(
+                |message| matches!(&message.block, Block::ChildEvent { child_id, text, .. }
+                    if child_id == "child-t3" && text == "child done")
+            ),
+            "the queued wake's turn surfaces the mid-turn event"
+        );
+        assert!(
+            calls[1]
+                .system
+                .contains(&manifest_line("child-t3", "coder", "stopped", "child done")),
+            "the queued wake's manifest lists the child that finished mid-turn: {}",
+            calls[1].system
+        );
+
+        wait_for("the parent to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-t3").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("root-t3", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["start", "working", "reacted"],
+            "the first turn's stream ran to completion before the second turn"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_mid_turn_child_events_is_handled_serially() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t4")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-t4a", "root-t4"))
+            .await
+            .unwrap();
+        store
+            .create_session(&child_session_of("child-t4b", "root-t4"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-t4",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::TextDelta("overseeing".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("both handled".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("nothing left".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+            ],
+            Duration::from_millis(150),
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-t4".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn to start", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        // Both children complete mid-turn: two events and two wakes queue
+        // behind the in-flight turn.
+        deliver_child_event(&store, "root-t4", "child-t4a", "a done").await;
+        store
+            .set_state("child-t4a", SessionState::Stopped)
+            .await
+            .unwrap();
+        deliver_child_event(&store, "root-t4", "child-t4b", "b done").await;
+        store
+            .set_state("child-t4b", SessionState::Stopped)
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("both queued wakes to run turns", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 3, "the two queued wakes ran serially");
+        for call in &calls[1..] {
+            assert!(
+                call.messages.iter().any(|message| matches!(
+                    &message.block,
+                    Block::ChildEvent { child_id, .. }
+                        if child_id == "child-t4a" || child_id == "child-t4b"
+                )),
+                "every queued wake sees the burst events in the thread"
+            );
+        }
+        let first_reaction = &calls[1];
+        assert!(
+            first_reaction.system.contains(&manifest_line(
+                "child-t4a",
+                "coder",
+                "stopped",
+                "a done"
+            )) && first_reaction.system.contains(&manifest_line(
+                "child-t4b",
+                "coder",
+                "stopped",
+                "b done"
+            )),
+            "the first reaction wake lists both stopped children: {}",
+            first_reaction.system
+        );
+        assert!(
+            !calls[2].system.contains("child-t4a") && !calls[2].system.contains("child-t4b"),
+            "children leave the manifest once their completions are handled: {}",
+            calls[2].system
+        );
+
+        wait_for("the parent to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-t4").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        for child in ["child-t4a", "child-t4b"] {
+            let stored = store.get_session(child).await.unwrap().unwrap();
+            assert_eq!(
+                stored.state,
+                SessionState::Stopped,
+                "{child} stays stopped: handling never resumes it"
+            );
+        }
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_mid_wake_child_event_is_invisible_to_the_wake_that_is_running_and_handled_once_in_its_own()
+     {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-mw")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-mw", "root-mw"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-mw",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        // The root's first turn runs a tool; the delay keeps the rest of the
+        // same wake from reading a window until the child event has landed
+        // mid-wake. The root then has one more turn in this wake, which is
+        // the turn that must not see the event.
+        let root_provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some("call-1".into()),
+                        name: Some("shell".into()),
+                        args_delta: r#"{"command":"work"}"#.into(),
+                    },
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("continuing".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("reacting".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("all set".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+            ],
+            Duration::from_millis(200),
+        ));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("mid-wake done".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let root_handle = spawn_loop(
+            "root-mw".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-mw".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-mw", root_handle.sender.clone());
+        mailbox.register("child-mw", child_handle.sender.clone());
+
+        root_handle.send(LoopEvent::Wake);
+
+        wait_for("the root's first turn to start", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        // The child completes while the root's first turn is still in
+        // flight: its event lands mid-wake and its own wake queues behind
+        // the turns of the running wake.
+        child_handle.send(LoopEvent::Wake);
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-mw").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        wait_for("the running wake's turns and the queued wake to run", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+
+        let calls = root_provider.captured_calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the wake and the queued wake ran their turns"
+        );
+        let sees_event = |call: &CapturedCall| {
+            call.messages.iter().any(|message| {
+                matches!(
+                    &message.block,
+                    Block::ChildEvent {
+                        child_id,
+                        kind: ChildEventKind::Report,
+                        text,
+                    } if child_id == "child-mw" && text == "mid-wake done"
+                )
+            })
+        };
+        assert!(
+            !sees_event(&calls[0]) && !sees_event(&calls[1]),
+            "no turn of the wake the event landed in may see it: {:#?}",
+            calls
+                .iter()
+                .take(2)
+                .map(|call| &call.messages)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sees_event(&calls[2]),
+            "the event's own queued wake surfaces the child's report once: {:#?}",
+            calls[2].messages
+        );
+        assert!(
+            calls[2].system.contains(&manifest_line(
+                "child-mw",
+                "coder",
+                "stopped",
+                "mid-wake done"
+            )),
+            "the event's own wake lists the child with the event: {}",
+            calls[2].system
+        );
+
+        // The queued wake handled the completion and did not resume the
+        // child, so the next user wake no longer lists it.
+        store
+            .append_message(
+                "root-mw",
+                Role::User,
+                &Block::Text {
+                    text: "anything else?".into(),
+                },
+            )
+            .await
+            .unwrap();
+        root_handle.send(LoopEvent::Wake);
+        wait_for("the user wake's turn to run", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 4 }
+            }
+        })
+        .await;
+
+        let calls = root_provider.captured_calls();
+        assert!(
+            !calls[3].system.contains("child-mw"),
+            "the child leaves the manifest once its event was handled: {}",
+            calls[3].system
+        );
+
+        let parent_messages = store.messages("root-mw", false).await.unwrap();
+        let reports: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Report,
+                    text,
+                } if child_id == "child-mw" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            ["mid-wake done"],
+            "the parent's thread holds exactly one authored event"
+        );
+
+        wait_for("the root to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-mw").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn compaction_mid_wake_archives_only_the_wake_snapshot_and_never_the_event_that_landed_behind_it()
+     {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-cp")).await.unwrap();
+        // 20 messages: at the window limit, so compaction triggers only once
+        // this wake's own turns have appended past it.
+        for index in 0..10 {
+            store
+                .append_message(
+                    "root-cp",
+                    Role::User,
+                    &Block::Text {
+                        text: format!("user {index}"),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .append_message(
+                    "root-cp",
+                    Role::Assistant,
+                    &Block::Text {
+                        text: format!("assistant {index}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some("call-1".into()),
+                        name: Some("shell".into()),
+                        args_delta: r#"{"command":"work"}"#.into(),
+                    },
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("compacted the tail".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 200,
+                        output_tokens: 20,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("continuing".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("reacting".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+            ],
+            Duration::from_millis(200),
+        ));
+        let deps = Arc::new(test_deps_with_max_window(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            20,
+        ));
+        let handle = spawn_loop("root-cp".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn to start", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        // The child event lands mid-wake, while the first turn is in flight;
+        // the event's wake is queued behind the running wake.
+        deliver_child_event(&store, "root-cp", "child-cp", "done mid-wake").await;
+        handle.send(LoopEvent::Wake);
+
+        // The running wake then continues: its second turn exceeds the
+        // window limit and compacts the snapshot tail, and the queued wake
+        // runs the event's own turn afterwards. Call 1 is the summarizer.
+        wait_for(
+            "the second turn, its compaction, and the queued wake to run",
+            {
+                let provider = provider.clone();
+                move || {
+                    let provider = provider.clone();
+                    async move { provider.captured_calls().len() == 4 }
+                }
+            },
+        )
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 4, "turn, summarizer, second turn, event wake");
+        let sees_event = |call: &CapturedCall| {
+            call.messages.iter().any(|message| {
+                matches!(
+                    &message.block,
+                    Block::ChildEvent {
+                        child_id,
+                        kind: ChildEventKind::Report,
+                        text,
+                    } if child_id == "child-cp" && text == "done mid-wake"
+                )
+            })
+        };
+        assert!(
+            !sees_event(&calls[0]) && !sees_event(&calls[2]),
+            "the compacting wake's turns never see the mid-wake event: {:#?}",
+            calls[2].messages
+        );
+        assert!(
+            calls[1]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::User
+                    && matches!(&message.block, Block::Text { text } if text.contains("assistant 4"))),
+            "the summarizer retires the snapshot tail: {:#?}",
+            calls[1].messages
+        );
+        assert!(
+            sees_event(&calls[3]),
+            "the event surfaces in its own queued wake, unarchived: {:#?}",
+            calls[3].messages
+        );
+
+        let active = store.messages("root-cp", false).await.unwrap();
+        assert!(
+            active.iter().any(|(_, message)| {
+                matches!(&message.block, Block::ChildEvent { child_id, text, .. }
+                    if child_id == "child-cp" && text == "done mid-wake")
+            }),
+            "compaction never archives a mid-wake event before its own wake"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn message_child_resumes_a_stopped_child_which_reports_again() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t5")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-t5", "root-t5"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-t5",
+                Role::User,
+                &Block::Text {
+                    text: "review the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"child-t5","text":"give me more detail"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("thanks".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("good detail".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("first findings".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("here is the detail".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let root_handle = spawn_loop(
+            "root-t5".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                Arc::new(MockTools::new(default_outcome())),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-t5".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                Arc::new(MockTools::new(default_outcome())),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-t5", root_handle.sender.clone());
+        mailbox.register("child-t5", child_handle.sender.clone());
+
+        // The child completes its assignment first: it stops, and its report
+        // wakes the parent. The parent's model then calls message_child on the
+        // stopped child, which is what resumes it.
+        child_handle.send(LoopEvent::Wake);
+        wait_for("the child to stop after its first report", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-t5").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        wait_for("the resumed child to answer and stop again", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-t5").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+                    && store.messages("child-t5", false).await.unwrap().len() == 4
+            }
+        })
+        .await;
+
+        wait_for("the parent's three turns to finish", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+
+        // The child resumed from its archived thread: its transcript is the
+        // assignment, its first answer, the parent's message, and its second
+        // answer, in that order.
+        let child_messages = store.messages("child-t5", false).await.unwrap();
+        let texts: Vec<&str> = child_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "review the change",
+                "first findings",
+                "give me more detail",
+                "here is the detail"
+            ],
+            "the parent's message lands in the child's archived thread"
+        );
+
+        // The parent's thread holds both authored reports, and the parent
+        // recorded a successful message_child result.
+        let parent_messages = store.messages("root-t5", false).await.unwrap();
+        let reports: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Report,
+                    text,
+                } if child_id == "child-t5" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            ["first findings", "here is the detail"],
+            "each completion authors one report into the parent's thread"
+        );
+        assert!(
+            parent_messages.iter().any(|(_, message)| {
+                matches!(
+                    &message.block,
+                    Block::ToolResult { name, is_error, content, .. }
+                        if name == "message_child"
+                            && !is_error
+                            && content == &json!({ "ok": true })
+                )
+            }),
+            "the parent's message_child call records a success result"
+        );
+        assert_eq!(
+            child_provider.captured_calls().len(),
+            2,
+            "the resumed child ran exactly one more turn"
+        );
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn message_child_reaches_a_running_child_which_reads_it_only_after_its_wake_and_stays_in_the_manifest()
+     {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-mr")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-mr", "root-mr"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-mr",
+                Role::User,
+                &Block::Text {
+                    text: "check on the child".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-mr",
+                Role::User,
+                &Block::Text {
+                    text: "review the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        // The child's first turn runs a tool; the delay keeps the child
+        // running while the parent's message lands behind it. The child then
+        // finishes its own wake before reading the message, in the wake the
+        // parent message started.
+        let child_provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some("call-1".into()),
+                        name: Some("shell".into()),
+                        args_delta: r#"{"command":"review"}"#.into(),
+                    },
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("task done".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("here is the detail".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+            ],
+            Duration::from_millis(200),
+        ));
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"child-mr","text":"send a progress update"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("requested".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("done noted".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("detail noted".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("all set".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let root_handle = spawn_loop(
+            "root-mr".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-mr".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-mr", root_handle.sender.clone());
+        mailbox.register("child-mr", child_handle.sender.clone());
+
+        // The child starts its assignment first, so it is running mid-wake
+        // when the parent messages it.
+        child_handle.send(LoopEvent::Wake);
+        wait_for("the child's first turn to start", {
+            let child_provider = child_provider.clone();
+            move || {
+                let child_provider = child_provider.clone();
+                async move { child_provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        root_handle.send(LoopEvent::Wake);
+
+        wait_for(
+            "the child to finish its wake, read the message, and stop again",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("child-mr").await.unwrap().unwrap();
+                    stored.state == SessionState::Stopped
+                        && store.messages("child-mr", false).await.unwrap().len() == 6
+                }
+            },
+        )
+        .await;
+
+        wait_for("the parent to react to both reports", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 4 }
+            }
+        })
+        .await;
+
+        // A user message after the exchange: the answer's wake handled the
+        // child and did not resume it, so the child leaves the manifest.
+        store
+            .append_message(
+                "root-mr",
+                Role::User,
+                &Block::Text {
+                    text: "anything else?".into(),
+                },
+            )
+            .await
+            .unwrap();
+        root_handle.send(LoopEvent::Wake);
+        wait_for("the final user wake's turn to run", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 5 }
+            }
+        })
+        .await;
+
+        // The child read the parent's message only in the wake it started:
+        // its own in-flight wake finished its turns without seeing it.
+        let child_calls = child_provider.captured_calls();
+        assert_eq!(
+            child_calls.len(),
+            3,
+            "task turn, finish turn, and answer turn"
+        );
+        assert!(
+            !child_calls[0]
+                .messages
+                .iter()
+                .chain(child_calls[1].messages.iter())
+                .any(|message| matches!(&message.block, Block::Text { text } if text == "send a progress update")),
+            "the child's running wake never saw the parent's message: {:#?}",
+            child_calls[1].messages
+        );
+        assert!(
+            child_calls[2]
+                .messages
+                .iter()
+                .any(|message| matches!(&message.block, Block::Text { text } if text == "send a progress update")),
+            "the message wake's turn sees the parent's message: {:#?}",
+            child_calls[2].messages
+        );
+
+        // The parent's message landed in the child's archived thread between
+        // the assignment and the child's own words.
+        let child_messages = store.messages("child-mr", false).await.unwrap();
+        let texts: Vec<&str> = child_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "review the change",
+                "send a progress update",
+                "task done",
+                "here is the detail"
+            ],
+            "the message and both answers sit in the child's thread"
+        );
+
+        // The parent tracked the child through the whole exchange: the wake
+        // that reacted to each report listed it, and it left the manifest
+        // only after the final report was handled without a resume.
+        let calls = root_provider.captured_calls();
+        assert_eq!(calls.len(), 5);
+        // The child may already be running again (resumed by its queued
+        // parent message) or still stopped when the wake snapshots.
+        assert!(
+            calls[2]
+                .system
+                .contains(&manifest_line("child-mr", "coder", "running", "task done"))
+                || calls[2].system.contains(&manifest_line(
+                    "child-mr",
+                    "coder",
+                    "stopped",
+                    "task done"
+                )),
+            "the report after the message still lists the child: {}",
+            calls[2].system
+        );
+        assert!(
+            calls[3].system.contains(&manifest_line(
+                "child-mr",
+                "coder",
+                "stopped",
+                "here is the detail"
+            )) || calls[3].system.contains(&manifest_line(
+                "child-mr",
+                "coder",
+                "running",
+                "here is the detail"
+            )),
+            "the answer's wake still lists the child: {}",
+            calls[3].system
+        );
+        assert!(
+            !calls[4].system.contains("child-mr"),
+            "the child leaves the manifest once its answer was handled: {}",
+            calls[4].system
+        );
+
+        let parent_messages = store.messages("root-mr", false).await.unwrap();
+        assert!(
+            parent_messages.iter().any(|(_, message)| {
+                matches!(
+                    &message.block,
+                    Block::ToolResult { name, is_error, content, .. }
+                        if name == "message_child"
+                            && !is_error
+                            && content == &json!({ "ok": true })
+                )
+            }),
+            "messaging a running child succeeds"
+        );
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn message_child_is_advertised_only_to_roots_with_a_mailbox_attached() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t6")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-t6", "root-t6"))
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+
+        for (id, name) in [
+            ("root-t6", "root with mailbox"),
+            ("root-t6", "root without mailbox"),
+            ("child-t6", "child with mailbox"),
+        ] {
+            let provider = Arc::new(ScriptedProvider::new(vec![vec![
+                StreamEvent::TextDelta("hi".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ]]));
+            let deps = if name.contains("without mailbox") {
+                test_deps(
+                    &store,
+                    provider.clone(),
+                    Arc::new(MockTools::new(default_outcome())),
+                    Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                )
+            } else {
+                test_deps_with_mailbox(
+                    &store,
+                    provider.clone(),
+                    Arc::new(MockTools::new(default_outcome())),
+                    Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                    mailbox.clone(),
+                )
+            };
+            let handle = spawn_loop(id.to_string(), Arc::new(deps));
+            handle.send(LoopEvent::Wake);
+
+            wait_for(&format!("the {name} turn to run"), {
+                let provider = provider.clone();
+                move || {
+                    let provider = provider.clone();
+                    async move { provider.captured_calls().len() == 1 }
+                }
+            })
+            .await;
+
+            let calls = provider.captured_calls();
+            let names: Vec<&str> = calls[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(
+                names.contains(&"message_child"),
+                name == "root with mailbox",
+                "message_child is advertised to the {name} only: {names:?}"
+            );
+            handle.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn message_child_refuses_when_gated_or_aimed_at_a_non_child() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-t7")).await.unwrap();
+        store
+            .create_session(&child_session_of("my-child", "root-t7"))
+            .await
+            .unwrap();
+        store
+            .create_session(&session("other-parent"))
+            .await
+            .unwrap();
+        store
+            .create_session(&child_session_of("other-child", "other-parent"))
+            .await
+            .unwrap();
+
+        // A root with a mailbox attached: messaging another parent's child or
+        // an unknown id is refused; messaging its own child lands the message
+        // in the child's thread and succeeds even with no child loop running.
+        let mailbox = Arc::new(TestMailbox::new());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"other-child","text":"hi"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"ghost","text":"hi"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-3".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"my-child","text":"please expand"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps_with_mailbox(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mailbox.clone(),
+        ));
+        let handle = spawn_loop("root-t7".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root's turns to finish", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-t7").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let results = store.tool_calls("root-t7").await.unwrap();
+        let error_of = |id: &str| {
+            results
+                .iter()
+                .find(|call| call.call_id == id)
+                .and_then(|call| call.result.as_ref())
+                .and_then(|result| result["error"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            error_of("call-1").as_deref(),
+            Some("session other-child is not a child of this session")
+        );
+        assert_eq!(
+            error_of("call-2").as_deref(),
+            Some("no child session ghost")
+        );
+        assert_eq!(
+            error_of("call-3").as_deref(),
+            None,
+            "own-child call succeeds"
+        );
+        let other_messages = store.messages("other-child", false).await.unwrap();
+        assert!(
+            other_messages.is_empty(),
+            "a refused message never reaches the foreign child's thread"
+        );
+        let my_messages = store.messages("my-child", false).await.unwrap();
+        assert!(
+            my_messages.iter().any(|(_, message)| {
+                message.role == Role::User
+                    && matches!(&message.block, Block::Text { text } if text == "please expand")
+            }),
+            "a successful message_child lands in its child's thread"
+        );
+        handle.stop();
+
+        // A child session calling message_child is refused before anything is
+        // delivered: child sessions cannot message their own children until a
+        // later sprint.
+        store
+            .create_session(&child_session_of("child-t7", "root-t7"))
+            .await
+            .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-9".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"my-child","text":"hi"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-t7".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child's turn to wrap up", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-t7").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+
+        let messages = store.messages("child-t7", false).await.unwrap();
+        assert!(
+            messages.iter().any(|(_, message)| message.role == Role::User
+                && matches!(
+                    &message.block,
+                    Block::ToolResult { id, name, is_error, content } if id == "call-9"
+                        && name == "message_child"
+                        && *is_error
+                        && content
+                            == &json!({ "error": "message_child is only available to root sessions" })
+                )),
+            "a child's message_child call records a refusal"
         );
 
         handle.stop();

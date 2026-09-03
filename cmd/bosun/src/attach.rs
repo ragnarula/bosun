@@ -13,6 +13,7 @@ use bosun_agent::sse::SseError;
 use bosun_agent::sse::SseEvent;
 use bosun_agent::sse::sse_stream;
 use bosun_common::session::Block;
+use bosun_common::session::ChildEventKind;
 use bosun_common::session::Event;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
@@ -74,7 +75,7 @@ pub enum LineKind {
     ToolResult,
     Ask,
     Summary,
-    ChildReport,
+    ChildEvent,
     ModelCall,
     Status,
 }
@@ -159,6 +160,15 @@ impl ClientState {
     }
 }
 
+/// A child event's kind as a transcript verb.
+fn child_event_verb(kind: ChildEventKind) -> &'static str {
+    match kind {
+        ChildEventKind::Report => "reported",
+        ChildEventKind::Ask => "asked",
+        ChildEventKind::Failure => "failed",
+    }
+}
+
 /// Maps a durable event to the transcript lines it contributes.
 fn event_lines(event: &Event) -> Vec<Line> {
     match event {
@@ -198,9 +208,13 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     kind: LineKind::Summary,
                     text: text.clone(),
                 }],
-                Block::ChildReport { child_id, text } => vec![Line {
-                    kind: LineKind::ChildReport,
-                    text: format!("child {child_id} reported: {text}"),
+                Block::ChildEvent {
+                    child_id,
+                    kind,
+                    text,
+                } => vec![Line {
+                    kind: LineKind::ChildEvent,
+                    text: format!("child {child_id} {}: {text}", child_event_verb(*kind)),
                 }],
             }
         }
@@ -379,7 +393,7 @@ fn prefix_for(line: &Line) -> &'static str {
         LineKind::ToolResult => "  ← ",
         LineKind::Ask => "  ? ",
         LineKind::Summary => "  ⤷ ",
-        LineKind::ChildReport => "  ⤷ ",
+        LineKind::ChildEvent => "  ⤷ ",
         LineKind::ModelCall => "  ",
         LineKind::Status => "── ",
     }
@@ -393,7 +407,7 @@ fn kind_color(kind: LineKind) -> Color {
         LineKind::ToolCall => Color::Magenta,
         LineKind::ToolResult => Color::Blue,
         LineKind::Ask => Color::Yellow,
-        LineKind::Summary | LineKind::ChildReport | LineKind::ModelCall => Color::DarkGray,
+        LineKind::Summary | LineKind::ChildEvent | LineKind::ModelCall => Color::DarkGray,
         LineKind::Status => Color::Cyan,
     }
 }
@@ -1133,6 +1147,7 @@ fn redraw(
 
 #[cfg(test)]
 mod tests {
+    use bosun_common::session::ChildEventKind;
     use bosun_common::session::Message;
     use bosun_common::session::SessionState;
     use serde_json::json;
@@ -1462,8 +1477,9 @@ mod tests {
         let child_report = Event::Message {
             message: Message {
                 role: Role::Assistant,
-                block: Block::ChildReport {
+                block: Block::ChildEvent {
                     child_id: "explorer-1".into(),
+                    kind: ChildEventKind::Report,
                     text: "found it".into(),
                 },
             },
@@ -1471,7 +1487,7 @@ mod tests {
         assert_eq!(
             event_lines(&child_report),
             vec![Line {
-                kind: LineKind::ChildReport,
+                kind: LineKind::ChildEvent,
                 text: "child explorer-1 reported: found it".into(),
             }]
         );

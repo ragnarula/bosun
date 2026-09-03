@@ -1,4 +1,5 @@
 use bosun_common::session::Block;
+use bosun_common::session::ChildEventKind;
 use bosun_common::session::Message;
 use bosun_common::session::Role;
 use bosun_common::tool::ToolSpec;
@@ -78,8 +79,15 @@ fn anthropic_message(message: &Message) -> Value {
             json!({ "type": "text", "text": format!("[question to user] {ask}") })
         }
         (_, Block::Summary { text }) => json!({ "type": "text", "text": text }),
-        (_, Block::ChildReport { child_id, text }) => {
-            json!({ "type": "text", "text": report_text(child_id, text) })
+        (
+            _,
+            Block::ChildEvent {
+                child_id,
+                kind,
+                text,
+            },
+        ) => {
+            json!({ "type": "text", "text": authored_event_text(child_id, *kind, text) })
         }
         (Role::User, Block::ToolCall { name, .. }) => {
             json!({ "type": "text", "text": format!("[tool call {name}]") })
@@ -125,8 +133,15 @@ fn openai_message(message: &Message) -> Value {
         (_, Block::Summary { text }) => {
             json!({ "role": message.role.as_str(), "content": text })
         }
-        (_, Block::ChildReport { child_id, text }) => {
-            json!({ "role": message.role.as_str(), "content": report_text(child_id, text) })
+        (
+            _,
+            Block::ChildEvent {
+                child_id,
+                kind,
+                text,
+            },
+        ) => {
+            json!({ "role": message.role.as_str(), "content": authored_event_text(child_id, *kind, text) })
         }
         (Role::User, Block::ToolCall { name, .. }) => {
             json!({ "role": "user", "content": format!("[tool call {name}]") })
@@ -161,13 +176,14 @@ fn tool_result_text(is_error: bool, content: &Value) -> String {
     }
 }
 
-/// A child's completion report as provider text: attributed to the child so
-/// the parent does not read the words as its own.
-fn report_text(child_id: &str, text: &str) -> String {
+/// A child's authored event as provider text: attributed to the child by
+/// session id and kind so the parent does not read the words as its own.
+fn authored_event_text(child_id: &str, kind: ChildEventKind, text: &str) -> String {
+    let attribution = format!("[{} from child {child_id}]", kind.as_str());
     if text.is_empty() {
-        format!("[report from child {child_id}]")
+        attribution
     } else {
-        format!("[report from child {child_id}]\n{text}")
+        format!("{attribution}\n{text}")
     }
 }
 
@@ -228,9 +244,10 @@ mod tests {
                 },
             },
             Message {
-                role: Role::Assistant,
-                block: Block::ChildReport {
+                role: Role::User,
+                block: Block::ChildEvent {
                     child_id: "child-1".into(),
+                    kind: ChildEventKind::Report,
                     text: "sub done".into(),
                 },
             },
@@ -344,7 +361,7 @@ mod tests {
             },
             { "role": "user", "content": "[question to user] continue?" },
             { "role": "assistant", "content": "did things" },
-            { "role": "assistant", "content": "[report from child child-1]\nsub done" },
+            { "role": "user", "content": "[report from child child-1]\nsub done" },
             { "role": "user", "content": "[tool call git]" },
             { "role": "tool", "tool_call_id": "call-5", "content": "{\"ok\":true}" },
         ]);
@@ -383,5 +400,46 @@ mod tests {
             },
         ]);
         assert_eq!(openai_tools(&sample_tools()), expected);
+    }
+
+    #[test]
+    fn authored_events_render_their_kind_and_attribution() {
+        let message = |kind: ChildEventKind, text: &str| Message {
+            role: Role::User,
+            block: Block::ChildEvent {
+                child_id: "child-1".into(),
+                kind,
+                text: text.into(),
+            },
+        };
+
+        let anthropic = |message: &Message| anthropic_messages("", std::slice::from_ref(message));
+        assert_eq!(
+            anthropic(&message(ChildEventKind::Report, "done")),
+            json!({ "system": "", "messages": [
+                { "type": "text", "text": "[report from child child-1]\ndone" }
+            ] })
+        );
+        assert_eq!(
+            anthropic(&message(ChildEventKind::Ask, "may I push?")),
+            json!({ "system": "", "messages": [
+                { "type": "text", "text": "[ask from child child-1]\nmay I push?" }
+            ] })
+        );
+        assert_eq!(
+            anthropic(&message(ChildEventKind::Failure, "")),
+            json!({ "system": "", "messages": [
+                { "type": "text", "text": "[failure from child child-1]" }
+            ] })
+        );
+
+        let openai = |message: &Message| openai_messages("", std::slice::from_ref(message));
+        assert_eq!(
+            openai(&message(ChildEventKind::Report, "done")),
+            json!([{ "role": "system", "content": "" }, {
+                "role": "user",
+                "content": "[report from child child-1]\ndone"
+            }])
+        );
     }
 }

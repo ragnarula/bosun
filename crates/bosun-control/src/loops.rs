@@ -12,6 +12,7 @@ use bosun_agent::agent_loop::DeltaSink;
 use bosun_agent::agent_loop::LoopDeps;
 use bosun_agent::agent_loop::LoopEvent;
 use bosun_agent::agent_loop::LoopHandle;
+use bosun_agent::agent_loop::LoopMailbox;
 use bosun_agent::agent_loop::spawn_loop;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
@@ -89,9 +90,11 @@ impl AgentRegistry {
     }
 
     /// Starts one loop task for the session and publishes a live-delta
-    /// channel for it. Replacing an existing loop drops the old handle.
+    /// channel for it. Replacing an existing loop drops the old handle. The
+    /// loop receives this registry as its mailbox, so a child session can
+    /// wake its parent and a parent can wake a child it messages.
     pub fn start(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         store: Store,
         provider: Arc<dyn Provider>,
@@ -118,6 +121,7 @@ impl AgentRegistry {
             price_input_per_mtok,
             price_output_per_mtok,
             spawner: self.spawner.read().unwrap().clone(),
+            mailbox: Some(self.clone()),
         };
         let handle = spawn_loop(session_id.to_string(), Arc::new(deps));
         self.loops
@@ -156,6 +160,14 @@ impl AgentRegistry {
             handle.stop();
         }
         self.live.write().unwrap().remove(session_id);
+    }
+}
+
+impl LoopMailbox for AgentRegistry {
+    fn send(&self, session_id: &str, event: LoopEvent) {
+        if let Some(handle) = self.loops.read().unwrap().get(session_id) {
+            handle.send(event);
+        }
     }
 }
 
@@ -249,12 +261,12 @@ mod tests {
             .await
             .unwrap();
 
-        let registry = AgentRegistry::new(
+        let registry = Arc::new(AgentRegistry::new(
             None,
             HashMap::new(),
             HashMap::new(),
             HashMap::from([("mock-model".to_string(), (3.0, 15.0))]),
-        );
+        ));
         registry.start(
             "s1",
             store.clone(),
@@ -321,7 +333,12 @@ mod tests {
             .await
             .unwrap();
 
-        let registry = AgentRegistry::new(None, HashMap::new(), HashMap::new(), HashMap::new());
+        let registry = Arc::new(AgentRegistry::new(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
         registry.start(
             "s1",
             store.clone(),

@@ -274,6 +274,29 @@ impl Store {
         .await
     }
 
+    /// The sessions `parent_id` spawned, ordered by id. The loop reads this
+    /// per wake to build the parent's manifest of live children.
+    pub async fn child_sessions(&self, parent_id: &str) -> Result<Vec<Session>, StoreError> {
+        let parent_id = parent_id.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                     FROM sessions WHERE parent_id = ?1 ORDER BY id",
+                )
+                .context("failed to prepare child session query")?;
+            let mut rows = stmt
+                .query([parent_id])
+                .context("failed to query child sessions")?;
+            let mut sessions = Vec::new();
+            while let Some(row) = rows.next().context("failed to read session row")? {
+                sessions.push(session_from_row(row)?);
+            }
+            Ok(sessions)
+        })
+        .await
+    }
+
     /// Updates the session state and emits the matching `Event::State` in one
     /// transaction, so the SSE stream and the sessions table never diverge.
     /// Callers must not append the event separately.

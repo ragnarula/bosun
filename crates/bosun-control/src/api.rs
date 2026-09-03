@@ -2413,8 +2413,10 @@ mod tests {
     async fn spawn_creates_a_child_session_that_runs_concurrently_and_reports() {
         // The root's model answers with a spawn call and then an
         // acknowledgement; the child's model (a separate persona and provider)
-        // answers with the review text. Two scripted servers keep the two
-        // loops' scripts apart, so the interleaving stays deterministic.
+        // answers with the review text. The child's completion wakes the root
+        // once more, so a third root script reacts to the authored report.
+        // Two scripted servers keep the two loops' scripts apart, so the
+        // interleaving stays deterministic.
         let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
             Arc::new(Mutex::new(VecDeque::from(vec![
                 vec![spawn_call_fragment(
@@ -2422,6 +2424,7 @@ mod tests {
                     r#"{"persona":"reviewer","instructions":"review the change"}"#,
                 )],
                 vec![text_chunk("acknowledged")],
+                vec![text_chunk("thanks for the review")],
             ])));
         let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
             vec![vec![text_chunk("the change looks good")]],
@@ -2670,7 +2673,7 @@ mod tests {
                 let messages = store.messages(&root_id, false).await.unwrap();
                 messages.iter().any(|(_, message)| matches!(
                     &message.block,
-                    Block::ChildReport { child_id: id, text } if id == &child_id && text == "the change looks good"
+                    Block::ChildEvent { child_id: id, text, .. } if id == &child_id && text == "the change looks good"
                 ))
             }
         })
@@ -2679,7 +2682,7 @@ mod tests {
         let reports: Vec<&str> = root_messages
             .iter()
             .filter_map(|(_, message)| match &message.block {
-                Block::ChildReport { child_id: id, .. } if id == &child_id => Some(id.as_str()),
+                Block::ChildEvent { child_id: id, .. } if id == &child_id => Some(id.as_str()),
                 _ => None,
             })
             .collect();

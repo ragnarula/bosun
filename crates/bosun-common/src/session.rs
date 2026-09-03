@@ -120,13 +120,44 @@ pub enum Block {
     Summary {
         text: String,
     },
-    /// One authored completion report a child session wrote into its
-    /// parent's thread: the child's final text, attributed by session id.
-    /// The child's own transcript stays on the child session.
-    ChildReport {
+    /// One authored event a child session wrote into its parent's thread: a
+    /// completion report, a question, or a failure notice, attributed by
+    /// session id. The child's own transcript stays on the child session.
+    ChildEvent {
         child_id: String,
+        /// Report, ask, or failure. The outer enum already uses `kind` as its
+        /// serde tag, so this field is renamed on the wire.
+        #[serde(rename = "event_kind")]
+        kind: ChildEventKind,
         text: String,
     },
+}
+
+/// What a child session authored to its parent. S5 delivers reports; the
+/// ask and failure paths arrive with ask gating (S6) and crash reporting
+/// (S8), and the event channel carries all three from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildEventKind {
+    /// The child ended its turn without an ask: its final words, reporting
+    /// what it did.
+    Report,
+    /// The child asked its parent a question.
+    Ask,
+    /// The child's turn failed; the parent decides what to do with it.
+    Failure,
+}
+
+impl ChildEventKind {
+    /// The kind's wire-format name, which reads as the verb in transcript
+    /// renderings.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChildEventKind::Report => "report",
+            ChildEventKind::Ask => "ask",
+            ChildEventKind::Failure => "failure",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,13 +295,35 @@ mod tests {
             Block::Summary {
                 text: "summarized".into(),
             },
-            Block::ChildReport {
+            Block::ChildEvent {
                 child_id: "child-1".into(),
+                kind: ChildEventKind::Report,
                 text: "finished the change".into(),
             },
         ] {
             assert_round_trips(&block);
         }
+    }
+
+    #[test]
+    fn child_event_kind_round_trips_and_parses_snake_case() {
+        for kind in [
+            ChildEventKind::Report,
+            ChildEventKind::Ask,
+            ChildEventKind::Failure,
+        ] {
+            assert_round_trips(&kind);
+        }
+        let report: ChildEventKind = serde_json::from_str("\"report\"").unwrap();
+        let ask: ChildEventKind = serde_json::from_str("\"ask\"").unwrap();
+        let failure: ChildEventKind = serde_json::from_str("\"failure\"").unwrap();
+        assert_eq!(report, ChildEventKind::Report);
+        assert_eq!(ask, ChildEventKind::Ask);
+        assert_eq!(failure, ChildEventKind::Failure);
+        assert_eq!(
+            serde_json::to_string(&ChildEventKind::Ask).unwrap(),
+            "\"ask\""
+        );
     }
 
     #[test]
@@ -302,13 +355,15 @@ mod tests {
         assert_eq!(json["kind"], "ask");
         assert_eq!(json["answer"], serde_json::Value::Null);
 
-        let json = serde_json::to_value(Block::ChildReport {
+        let json = serde_json::to_value(Block::ChildEvent {
             child_id: "child-1".into(),
+            kind: ChildEventKind::Report,
             text: "done".into(),
         })
         .unwrap();
-        assert_eq!(json["kind"], "child_report");
+        assert_eq!(json["kind"], "child_event");
         assert_eq!(json["child_id"], "child-1");
+        assert_eq!(json["event_kind"], "report");
         assert_eq!(json["text"], "done");
     }
 

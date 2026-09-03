@@ -819,10 +819,10 @@ function renderMessage(message) {
     case 'summary':
       appendLine('summary', '[summary] ' + block.text);
       break;
-    case 'child_report':
+    case 'child_event':
       appendLine(
         'child-report',
-        '[child ' + block.child_id + ' reported] ' + block.text
+        '[child ' + block.child_id + ' ' + (block.event_kind || 'report') + '] ' + block.text
       );
       break;
     default:
