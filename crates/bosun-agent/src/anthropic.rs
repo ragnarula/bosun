@@ -33,7 +33,7 @@ impl Anthropic {
     }
 
     fn request_body(&self, call: &ProviderCall<'_>) -> Value {
-        let mut body = anthropic_messages(call.system, &call.messages);
+        let mut body = anthropic_messages(call.system, &call.messages, call.ask_recipient);
         body["model"] = json!(call.model);
         body["max_tokens"] = json!(call.max_tokens);
         body["stream"] = json!(true);

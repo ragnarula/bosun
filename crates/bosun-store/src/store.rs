@@ -58,6 +58,32 @@ pub struct ToolCall {
     pub is_error: bool,
 }
 
+/// A root session's pending bound ask: the child whose surfaced question is
+/// awaiting the user's answer. `ask_message_id` is the id of the surfaced
+/// Ask block in the root's own thread, so the answer can be recorded on it.
+/// The row outlives compaction, which archives the Ask block without deleting
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAsk {
+    pub session_id: String,
+    pub child_id: String,
+    pub question: String,
+    pub ask_message_id: i64,
+}
+
+/// What routing a user's answer to a pending bound ask did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteAnswer {
+    /// No binding was pending; the answer was not routed to a child.
+    NoBinding,
+    /// The answer was appended to the bound child's thread; the caller must
+    /// wake that child's loop.
+    Routed { child_id: String },
+    /// The binding's child session is gone; the binding was cleared and the
+    /// answer was not routed.
+    ChildGone { child_id: String },
+}
+
 /// The sessions table is the source of truth for sessions; the node registry
 /// keeps only liveness. rusqlite's Connection is not Sync, so one connection
 /// is shared behind a std Mutex and serialized through it.
@@ -100,6 +126,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   result TEXT,
   is_error INTEGER NOT NULL DEFAULT 0,
   UNIQUE(session_id, call_id)
+);
+CREATE TABLE IF NOT EXISTS pending_asks (
+  session_id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  question TEXT NOT NULL,
+  ask_message_id INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS model_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -436,17 +468,7 @@ impl Store {
         self.with_session(session_id, move |conn, session_id| {
             let message = Message { role, block };
             let tx = transaction(conn)?;
-            tx.execute(
-                "INSERT INTO messages (session_id, role, block) VALUES (?1, ?2, ?3)",
-                params![
-                    session_id,
-                    serde_json::to_string(&message.role)?,
-                    serde_json::to_string(&message.block)?,
-                ],
-            )
-            .context("failed to insert message")?;
-            let message_id = tx.last_insert_rowid();
-            append_event(&tx, session_id, "message", &Event::Message { message })?;
+            let message_id = insert_message(&tx, session_id, &message)?;
             tx.commit().context("failed to commit message")?;
             Ok(message_id)
         })
@@ -706,6 +728,143 @@ impl Store {
         .await
     }
 
+    /// The session's most recent message, when it has one. The loop reads
+    /// this to validate that a child a root wants to bind actually has its
+    /// own unanswered question at the end of its thread.
+    pub async fn last_message(&self, session_id: &str) -> Result<Option<Message>, StoreError> {
+        self.with_session(session_id, move |conn, session_id| {
+            let row = conn.query_row(
+                "SELECT role, block FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            );
+            match row {
+                Ok((role, block)) => Ok(Some(Message {
+                    role: serde_json::from_str(&role).context("failed to parse role")?,
+                    block: serde_json::from_str(&block).context("failed to parse block")?,
+                })),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await
+    }
+
+    /// The session's pending bound ask: the child whose surfaced question is
+    /// awaiting the user's answer, when one is.
+    pub async fn get_pending_ask(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PendingAsk>, StoreError> {
+        self.with_session(session_id, move |conn, session_id| {
+            read_pending_ask(conn, session_id)
+        })
+        .await
+    }
+
+    /// Records that the root surfaced `question` from `child_id` as an Ask
+    /// block in its own thread at `ask_message_id`. There is one pending ask
+    /// per root, so recording again replaces the earlier one.
+    pub async fn set_pending_ask(
+        &self,
+        session_id: &str,
+        child_id: &str,
+        question: &str,
+        ask_message_id: i64,
+    ) -> Result<(), StoreError> {
+        let child_id = child_id.to_string();
+        let question = question.to_string();
+        self.with_session(session_id, move |conn, session_id| {
+            conn.execute(
+                "INSERT INTO pending_asks (session_id, child_id, question, ask_message_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   child_id = excluded.child_id,
+                   question = excluded.question,
+                   ask_message_id = excluded.ask_message_id",
+                params![session_id, child_id, question, ask_message_id],
+            )
+            .context("failed to store the pending ask")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Drops the session's pending bound ask, when one is. Called when the
+    /// ask is answered or when the root model takes the pending ask over by
+    /// messaging its child.
+    pub async fn clear_pending_ask(&self, session_id: &str) -> Result<(), StoreError> {
+        self.with_session(session_id, move |conn, session_id| {
+            conn.execute(
+                "DELETE FROM pending_asks WHERE session_id = ?1",
+                [session_id],
+            )
+            .context("failed to clear the pending ask")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Routes a user's answer to the child whose surfaced ask is pending for
+    /// this session, in one transaction: the text is appended verbatim to the
+    /// child's thread, the answer is recorded on the surfaced Ask block, and
+    /// the binding is cleared. Routing and clearing in one transaction means
+    /// a crash cannot route the answer twice. Waking the child's loop is the
+    /// caller's to do after a [`RouteAnswer::Routed`].
+    pub async fn route_answer(
+        &self,
+        session_id: &str,
+        answer: &str,
+    ) -> Result<RouteAnswer, StoreError> {
+        let answer = answer.to_string();
+        self.with_session(session_id, move |conn, session_id| {
+            let tx = transaction(conn)?;
+            let Some(binding) = read_pending_ask(&tx, session_id)? else {
+                return Ok(RouteAnswer::NoBinding);
+            };
+            let child_exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    [&binding.child_id],
+                    |row| row.get(0),
+                )
+                .context("failed to check the bound child session")?;
+            if !child_exists {
+                tx.execute(
+                    "DELETE FROM pending_asks WHERE session_id = ?1",
+                    [session_id],
+                )
+                .context("failed to clear a stale pending ask")?;
+                tx.commit()
+                    .context("failed to commit the stale-ask clear")?;
+                return Ok(RouteAnswer::ChildGone {
+                    child_id: binding.child_id,
+                });
+            }
+            insert_message(
+                &tx,
+                &binding.child_id,
+                &Message {
+                    role: Role::User,
+                    block: Block::Text {
+                        text: answer.clone(),
+                    },
+                },
+            )?;
+            record_ask_answer(&tx, session_id, binding.ask_message_id, &answer)?;
+            tx.execute(
+                "DELETE FROM pending_asks WHERE session_id = ?1",
+                [session_id],
+            )
+            .context("failed to clear the pending ask")?;
+            tx.commit().context("failed to commit the routed answer")?;
+            Ok(RouteAnswer::Routed {
+                child_id: binding.child_id,
+            })
+        })
+        .await
+    }
+
     /// Deletes the session and its messages, events, tool calls and model
     /// calls in one transaction.
     pub async fn remove_session(&self, id: &str) -> Result<(), StoreError> {
@@ -720,6 +879,11 @@ impl Store {
                 .context("failed to delete session tool calls")?;
             tx.execute("DELETE FROM model_calls WHERE session_id = ?1", [&id])
                 .context("failed to delete session model calls")?;
+            tx.execute(
+                "DELETE FROM pending_asks WHERE session_id = ?1 OR child_id = ?1",
+                [&id],
+            )
+            .context("failed to delete the session's pending asks")?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", [&id])
                 .context("failed to delete session")?;
             tx.commit().context("failed to commit session removal")?;
@@ -747,6 +911,110 @@ fn append_event(
     )
     .with_context(|| format!("failed to append {label} event"))?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Inserts a message row and its matching `Event::Message` inside the
+/// caller's transaction, so a write that spans sessions stays atomic.
+fn insert_message(
+    tx: &rusqlite::Transaction,
+    session_id: &str,
+    message: &Message,
+) -> Result<i64, anyhow::Error> {
+    tx.execute(
+        "INSERT INTO messages (session_id, role, block) VALUES (?1, ?2, ?3)",
+        params![
+            session_id,
+            serde_json::to_string(&message.role)?,
+            serde_json::to_string(&message.block)?,
+        ],
+    )
+    .context("failed to insert message")?;
+    let message_id = tx.last_insert_rowid();
+    append_event(
+        tx,
+        session_id,
+        "message",
+        &Event::Message {
+            message: message.clone(),
+        },
+    )?;
+    Ok(message_id)
+}
+
+/// The session's pending bound ask row, when it has one.
+fn read_pending_ask(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<PendingAsk>, anyhow::Error> {
+    let row = conn.query_row(
+        "SELECT session_id, child_id, question, ask_message_id
+         FROM pending_asks WHERE session_id = ?1",
+        [session_id],
+        |row| {
+            Ok(PendingAsk {
+                session_id: row.get(0)?,
+                child_id: row.get(1)?,
+                question: row.get(2)?,
+                ask_message_id: row.get(3)?,
+            })
+        },
+    );
+    match row {
+        Ok(pending) => Ok(Some(pending)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Records the user's answer on the surfaced Ask block the binding names.
+/// Compaction archives the block's row but never deletes it, so the update
+/// always finds it; a block that is no longer an ask, or one that already
+/// carries an answer, is left alone.
+fn record_ask_answer(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    message_id: i64,
+    answer: &str,
+) -> Result<(), anyhow::Error> {
+    let row = conn.query_row(
+        "SELECT block FROM messages WHERE id = ?1 AND session_id = ?2",
+        params![message_id, session_id],
+        |row| row.get::<_, String>(0),
+    );
+    let raw = match row {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let block: Block = serde_json::from_str(&raw).context("failed to parse message block")?;
+    let Block::Ask {
+        message,
+        options,
+        child_id,
+        answer: recorded,
+    } = block
+    else {
+        return Ok(());
+    };
+    if recorded.is_some() {
+        return Ok(());
+    }
+    let answered = Block::Ask {
+        message,
+        options,
+        child_id,
+        answer: Some(answer.to_string()),
+    };
+    conn.execute(
+        "UPDATE messages SET block = ?1 WHERE id = ?2 AND session_id = ?3",
+        params![
+            serde_json::to_string(&answered).context("failed to serialize the answered ask")?,
+            message_id,
+            session_id,
+        ],
+    )
+    .context("failed to record the ask answer")?;
+    Ok(())
 }
 
 /// Runs `f` against the shared connection on a blocking thread, converting the
@@ -934,6 +1202,7 @@ mod tests {
                 "events",
                 "messages",
                 "model_calls",
+                "pending_asks",
                 "sessions",
                 "tool_calls"
             ]
@@ -1686,5 +1955,276 @@ mod tests {
         // A session's cursor never sees another session's events, even at the
         // boundary between them.
         assert!(store.events_after("a", 3).await.unwrap().is_empty());
+    }
+
+    /// The surfaced Ask block a root records when it passes a child's
+    /// question to the user.
+    fn surfaced_ask(child_id: &str, question: &str) -> Block {
+        Block::Ask {
+            message: question.into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: Some(child_id.into()),
+            answer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_ask_round_trips_and_setting_replaces() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+        let first = store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &surfaced_ask("child-1", "may I push?"),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &surfaced_ask("child-1", "may I merge?"),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.get_pending_ask("root-1").await.unwrap().is_none());
+
+        store
+            .set_pending_ask("root-1", "child-1", "may I push?", first)
+            .await
+            .unwrap();
+        let pending = store.get_pending_ask("root-1").await.unwrap().unwrap();
+        assert_eq!(pending.session_id, "root-1");
+        assert_eq!(pending.child_id, "child-1");
+        assert_eq!(pending.question, "may I push?");
+        assert_eq!(pending.ask_message_id, first);
+
+        // A root surfaces one question at a time: a second surface replaces
+        // the first binding.
+        store
+            .set_pending_ask("root-1", "child-1", "may I merge?", second)
+            .await
+            .unwrap();
+        let pending = store.get_pending_ask("root-1").await.unwrap().unwrap();
+        assert_eq!(pending.question, "may I merge?");
+        assert_eq!(pending.ask_message_id, second);
+
+        store.clear_pending_ask("root-1").await.unwrap();
+        assert!(store.get_pending_ask("root-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn route_answer_appends_the_answer_to_the_child_records_it_on_the_ask_and_clears_the_binding()
+     {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-1",
+                Role::User,
+                &Block::Text {
+                    text: "implement the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let ask_id = store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &surfaced_ask("child-1", "may I push?"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_pending_ask("root-1", "child-1", "may I push?", ask_id)
+            .await
+            .unwrap();
+
+        let routed = store
+            .route_answer("root-1", "yes, push to main")
+            .await
+            .unwrap();
+        assert_eq!(
+            routed,
+            RouteAnswer::Routed {
+                child_id: "child-1".into()
+            }
+        );
+
+        // The answer lands verbatim in the child's thread as its next user
+        // message, exactly as a `message_child` message would.
+        let child_messages = store.messages("child-1", false).await.unwrap();
+        let (_, last) = child_messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(
+            matches!(&last.block, Block::Text { text } if text == "yes, push to main"),
+            "the answer is the child's next message: {child_messages:?}"
+        );
+
+        // The answer is recorded on the surfaced Ask block and the binding is
+        // gone, so a retry cannot route the answer twice.
+        let root_messages = store.messages("root-1", false).await.unwrap();
+        let ask = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    child_id: Some(child_id),
+                    answer,
+                    ..
+                } if child_id == "child-1" => Some(answer),
+                _ => None,
+            })
+            .expect("the surfaced ask block exists");
+        assert_eq!(ask.as_deref(), Some("yes, push to main"));
+        assert!(store.get_pending_ask("root-1").await.unwrap().is_none());
+        assert_eq!(
+            store.route_answer("root-1", "again").await.unwrap(),
+            RouteAnswer::NoBinding,
+            "a second answer routes nowhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_answer_without_a_binding_appends_nothing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+
+        assert_eq!(
+            store.route_answer("root-1", "hello").await.unwrap(),
+            RouteAnswer::NoBinding
+        );
+        assert!(store.messages("root-1", false).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_answer_to_a_gone_child_clears_the_stale_binding() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        let ask_id = store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &surfaced_ask("gone-child", "may I push?"),
+            )
+            .await
+            .unwrap();
+        // The bound child was stopped between the surface and the answer, so
+        // its binding names a session that no longer exists.
+        store
+            .set_pending_ask("root-1", "gone-child", "may I push?", ask_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.route_answer("root-1", "yes").await.unwrap(),
+            RouteAnswer::ChildGone {
+                child_id: "gone-child".into()
+            }
+        );
+        assert!(
+            store.get_pending_ask("root-1").await.unwrap().is_none(),
+            "a stale binding is cleared"
+        );
+        let root_messages = store.messages("root-1", false).await.unwrap();
+        assert_eq!(
+            root_messages.len(),
+            1,
+            "the answer is not appended to the root: {root_messages:?}"
+        );
+        assert!(
+            matches!(&root_messages[0].1.block, Block::Ask { answer: None, .. }),
+            "the surfaced ask of a gone child keeps no answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_message_returns_the_newest_message_or_none() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        assert!(store.last_message("a").await.unwrap().is_none());
+        store
+            .append_message("a", Role::User, &Block::Text { text: "one".into() })
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "a",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "may I push?".into(),
+                    options: vec![],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+        let last = store.last_message("a").await.unwrap().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(
+            matches!(&last.block, Block::Ask { message, .. } if message == "may I push?"),
+            "the child's pending ask is its last message"
+        );
+
+        let error = store.last_message("ghost").await.unwrap_err();
+        assert!(matches!(error, StoreError::SessionNotFound { id } if id == "ghost"));
+    }
+
+    #[tokio::test]
+    async fn remove_session_clears_pending_asks_bound_to_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let store = Store::open(&path).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("child-1", "root-1"))
+            .await
+            .unwrap();
+        let ask_id = store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &surfaced_ask("child-1", "may I push?"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_pending_ask("root-1", "child-1", "may I push?", ask_id)
+            .await
+            .unwrap();
+
+        // Stopping the bound child clears the root's binding: an answer to a
+        // stopped child must not route into the void.
+        store.remove_session("child-1").await.unwrap();
+        assert!(store.get_pending_ask("root-1").await.unwrap().is_none());
+
+        // Stopping the root clears its own binding too.
+        store
+            .set_pending_ask("root-1", "child-1", "may I push?", ask_id)
+            .await
+            .unwrap();
+        store.remove_session("root-1").await.unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_asks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 }

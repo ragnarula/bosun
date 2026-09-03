@@ -37,6 +37,7 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::provider::AskRecipient;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
 use crate::provider::StreamEvent;
@@ -347,7 +348,12 @@ enum TurnOutcome {
         text: String,
     },
     ToolCalls,
-    AskedUser,
+    /// The turn ended in an `ask`. `question` is the ask's message: a child
+    /// ends its wake by authoring it as an Ask event to its parent, a root by
+    /// waiting for the user's answer.
+    AskedUser {
+        question: String,
+    },
     Interrupted,
     Failed,
 }
@@ -473,7 +479,18 @@ async fn handle_wake(
                     .await?;
                 return Ok(());
             }
-            TurnOutcome::Finished { .. } | TurnOutcome::AskedUser => {
+            // A child that asked ends its wake by authoring the Ask event to
+            // its parent and waiting for the parent's answer, denial, or
+            // redirection. The question stays in its own thread so the parent's
+            // later message resumes it with the question in context.
+            TurnOutcome::AskedUser { question } if is_child && !interrupted => {
+                author_child_event(deps, session_id, ChildEventKind::Ask, question).await?;
+                deps.store
+                    .set_state(session_id, SessionState::WaitingForInput)
+                    .await?;
+                return Ok(());
+            }
+            TurnOutcome::Finished { .. } | TurnOutcome::AskedUser { .. } => {
                 deps.store
                     .set_state(session_id, SessionState::WaitingForInput)
                     .await?;
@@ -499,10 +516,10 @@ async fn handle_wake(
     }
 }
 
-/// Authors a child's event into its parent's thread — a completion report
-/// today; asks and failure notices arrive in later sprints through the same
-/// channel — and wakes the parent's loop. The append can fail when the parent
-/// is gone; the child's own state is the caller's to set.
+/// Authors a child's event into its parent's thread — a completion report or
+/// a question to the parent; failure notices arrive in a later sprint through
+/// the same channel — and wakes the parent's loop. The append can fail when
+/// the parent is gone; the child's own state is the caller's to set.
 async fn author_child_event(
     deps: &Arc<LoopDeps>,
     child_id: &str,
@@ -620,14 +637,15 @@ async fn run_turn(
 
 /// Appends a message to the store and to the wake's working window, so the
 /// wake's later turns read it: the window mirrors the store's active thread
-/// minus the messages other writers appended mid-wake.
+/// minus the messages other writers appended mid-wake. Returns the appended
+/// message's row id.
 async fn record_in_wake(
     deps: &LoopDeps,
     session_id: &str,
     window: &mut Vec<(i64, Message)>,
     role: Role,
     block: &Block,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     let id = deps.store.append_message(session_id, role, block).await?;
     window.push((
         id,
@@ -636,7 +654,7 @@ async fn record_in_wake(
             block: block.clone(),
         },
     ));
-    Ok(())
+    Ok(id)
 }
 
 async fn run_turn_inner(
@@ -662,6 +680,14 @@ async fn run_turn_inner(
     // at the start of every turn, so a persona switch applies to the next
     // model call without restarting the loop.
     let turn = deps.turn_model(&session.model);
+    // A session's own asks go to the user at the root of the tree and to its
+    // parent anywhere below; the recipient never changes mid-session, and
+    // ask blocks in the serialized thread render it.
+    let ask_recipient = if session.parent_id.is_some() {
+        AskRecipient::Parent
+    } else {
+        AskRecipient::User
+    };
     // The wake's own appends since its snapshot are in `window`, so a turn
     // sees the previous turns' tool traffic but nothing that landed mid-wake
     // from another writer. `surfaced_through` is the snapshot boundary: it
@@ -674,16 +700,29 @@ async fn run_turn_inner(
         signal,
         window,
         state.surfaced_through,
+        ask_recipient,
     )
-    .await?
-    .into_iter()
-    .filter(|message| {
-        // An ask tool call has no matching tool result in the transcript:
-        // the Ask block replaces it, so the provider would reject the
-        // dangling tool_use on the next turn.
-        !matches!(&message.block, Block::ToolCall { name, .. } if name == "ask")
-    })
-    .collect();
+    .await?;
+    // A successful ask's tool call has no tool result in the transcript — its
+    // Ask block replaced the result — so it is dropped from the window or the
+    // provider would reject the dangling tool_use on the next turn. A refused
+    // ask records an error tool result and its turn continues, so its tool
+    // call stays: the result needs its matching use or the provider rejects
+    // the dangling tool_result instead.
+    let ask_result_ids: Vec<String> = messages
+        .iter()
+        .filter_map(|message| match &message.block {
+            Block::ToolResult { id, name, .. } if name == "ask" => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let messages: Vec<Message> = messages
+        .into_iter()
+        .filter(|message| {
+            !matches!(&message.block, Block::ToolCall { id, name, .. }
+                if name == "ask" && !ask_result_ids.contains(id))
+        })
+        .collect();
 
     // The working-copy skill list is fetched once per session and cached, so
     // a turn does not round-trip to the node for it. The on-demand `skill`
@@ -743,6 +782,7 @@ async fn run_turn_inner(
         system: &system,
         messages,
         tools,
+        ask_recipient,
     })?;
 
     let (text, tool_calls, stopped) =
@@ -876,22 +916,107 @@ async fn run_turn_inner(
                             .collect()
                     })
                     .unwrap_or_default();
+                let child_id = args["child_id"].as_str().map(String::from);
+                // A child_id binds the ask to the child whose question is
+                // being surfaced to the user: the binding is recorded
+                // durably, and the user's answer routes to that child without
+                // another root turn. The binding names a child of this
+                // session that is actually waiting on a question of its own;
+                // children have no user of their own to surface to, so a
+                // child session cannot bind one.
+                let outcome = async {
+                    if let Some(child_id) = &child_id {
+                        if session.parent_id.is_some() {
+                            anyhow::bail!("ask with child_id is only available to root sessions");
+                        }
+                        let Some(child) = deps.store.get_session(child_id).await? else {
+                            anyhow::bail!("no child session {child_id}");
+                        };
+                        if child.parent_id.as_deref() != Some(session.id.as_str()) {
+                            anyhow::bail!("session {child_id} is not a child of this session");
+                        }
+                        // The child's own thread ends in its Ask block while it
+                        // waits for the parent's answer, so a running or
+                        // stopped child that never asked cannot be bound.
+                        let waiting_on_question = matches!(
+                            deps.store.last_message(child_id).await?,
+                            Some(Message {
+                                role: Role::Assistant,
+                                block: Block::Ask { .. },
+                            })
+                        );
+                        if !waiting_on_question {
+                            anyhow::bail!(
+                                "child session {child_id} has no pending question to surface"
+                            );
+                        }
+                    }
+                    // A root surfaces one question at a time: while a surfaced
+                    // ask awaits the user's answer, another ask would split the
+                    // user's next message between two questions, so the root
+                    // must resolve the pending one first (message its child to
+                    // cancel it, or wait for the answer).
+                    if session.parent_id.is_none()
+                        && let Some(pending) = deps.store.get_pending_ask(&session.id).await?
+                    {
+                        if child_id.as_deref() == Some(pending.child_id.as_str()) {
+                            anyhow::bail!(
+                                "child {}'s question is already pending with the user",
+                                pending.child_id
+                            );
+                        }
+                        anyhow::bail!(
+                            "another question is pending with the user; send child {} a message to cancel it before asking again",
+                            pending.child_id
+                        );
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                let (content, is_error) = match outcome {
+                    Ok(()) => (json!({ "asked": true }), false),
+                    Err(error) => (json!({ "error": error.to_string() }), true),
+                };
                 deps.store
-                    .complete_tool_call(session_id, &id, &json!({ "asked": true }), false)
+                    .complete_tool_call(session_id, &id, &content, is_error)
                     .await?;
-                record_in_wake(
+                if is_error {
+                    record_in_wake(
+                        deps,
+                        session_id,
+                        window,
+                        Role::User,
+                        &Block::ToolResult {
+                            id,
+                            name,
+                            is_error: true,
+                            content,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                let ask_id = record_in_wake(
                     deps,
                     session_id,
                     window,
                     Role::Assistant,
                     &Block::Ask {
-                        message,
+                        message: message.clone(),
                         options,
+                        child_id: child_id.clone(),
                         answer: None,
                     },
                 )
                 .await?;
-                return Ok(TurnOutcome::AskedUser);
+                if let Some(child_id) = &child_id {
+                    // The surfaced Ask block can be compacted away, so the
+                    // binding is a store record, not a transcript scan.
+                    deps.store
+                        .set_pending_ask(&session.id, child_id, &message, ask_id)
+                        .await?;
+                }
+                return Ok(TurnOutcome::AskedUser { question: message });
             }
             "todowrite" => {
                 match args["items"].as_array() {
@@ -1047,6 +1172,18 @@ async fn run_turn_inner(
                     };
                     if child.parent_id.as_deref() != Some(session.id.as_str()) {
                         anyhow::bail!("session {child_id} is not a child of this session");
+                    }
+                    // A message to the bound child resolves the surfaced ask
+                    // the model has taken over (a redirect wake's cancel or
+                    // denial): drop the binding first, so the user's next
+                    // message is not routed to a child the model already
+                    // answered.
+                    let pending = deps.store.get_pending_ask(&session.id).await?;
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.child_id == child_id)
+                    {
+                        deps.store.clear_pending_ask(&session.id).await?;
                     }
                     deps.store
                         .append_message(&child_id, Role::User, &Block::Text { text })
@@ -1321,6 +1458,7 @@ async fn maybe_compact(
     signal: &Arc<InterruptSignal>,
     window: &mut Vec<(i64, Message)>,
     wake_boundary: i64,
+    ask_recipient: AskRecipient,
 ) -> anyhow::Result<Vec<Message>> {
     if window.len() > deps.max_window_messages {
         let keep = deps.max_window_messages / 2;
@@ -1333,7 +1471,7 @@ async fn maybe_compact(
             let tail: Vec<(i64, Message)> = window.drain(..retire).collect();
             let tail_last_id = tail.last().expect("retire is at least one").0;
             if let Some((text, input_tokens, output_tokens)) =
-                summarize_tail(turn, session_id, &tail, signal).await
+                summarize_tail(turn, session_id, ask_recipient, &tail, signal).await
             {
                 let summary = Message {
                     role: Role::Assistant,
@@ -1383,6 +1521,7 @@ async fn maybe_compact(
 async fn summarize_tail(
     turn: &TurnModel,
     session_id: &str,
+    ask_recipient: AskRecipient,
     tail: &[(i64, Message)],
     signal: &Arc<InterruptSignal>,
 ) -> Option<(String, Option<u64>, Option<u64>)> {
@@ -1391,7 +1530,7 @@ async fn summarize_tail(
         prompt.push_str(&format!(
             "\n\n{}: {}",
             message.role.as_str(),
-            render_block(&message.block)
+            render_block(&message.block, ask_recipient)
         ));
     }
     let messages = vec![Message {
@@ -1404,6 +1543,7 @@ async fn summarize_tail(
         system: "",
         messages,
         tools: vec![],
+        ask_recipient,
     }) {
         Ok(stream) => stream,
         Err(error) => {
@@ -1474,8 +1614,10 @@ async fn summarize_tail(
     Some((text, input_tokens, output_tokens))
 }
 
-/// One message as plain text for the summarizer.
-fn render_block(block: &Block) -> String {
+/// One message as plain text for the summarizer. `ask_recipient` is whose
+/// answer the session's own asks wait on, so the rendered question does not
+/// misattribute a child's ask to the user.
+fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
     match block {
         Block::Text { text } => text.clone(),
         Block::ToolCall { id, name, args } => format!("tool call {name} (id {id}): {args}"),
@@ -1486,11 +1628,25 @@ fn render_block(block: &Block) -> String {
             content,
         } => format!("tool result {name} (id {id}, is_error {is_error}): {content}"),
         Block::Ask {
-            message, options, ..
-        } => format!(
-            "question to user: {message} (options: {})",
-            options.join(", ")
-        ),
+            message,
+            options,
+            child_id,
+            answer,
+        } => {
+            let origin = child_id
+                .as_deref()
+                .map(|child_id| format!(", from child {child_id}"))
+                .unwrap_or_default();
+            let answered = answer
+                .as_deref()
+                .map(|answer| format!(" (user answered: {answer})"))
+                .unwrap_or_default();
+            format!(
+                "question to {}{origin}: {message}{answered} (options: {})",
+                ask_recipient.as_str(),
+                options.join(", ")
+            )
+        }
         Block::Summary { text } => format!("summary: {text}"),
         Block::ChildEvent {
             child_id,
@@ -1653,6 +1809,7 @@ mod tests {
         system: String,
         messages: Vec<Message>,
         tools: Vec<ToolSpec>,
+        ask_recipient: AskRecipient,
     }
 
     /// One scripted `chat_stream` answer, item by item.
@@ -1724,6 +1881,7 @@ mod tests {
                 system: call.system.to_string(),
                 messages: call.messages.clone(),
                 tools: call.tools.clone(),
+                ask_recipient: call.ask_recipient,
             });
             let delay = self.delay;
             let stream = stream::iter(script).then(move |item| {
@@ -1736,6 +1894,26 @@ mod tests {
                 }
             });
             Ok(stream.boxed())
+        }
+    }
+
+    /// Asserts one provider request's tool traffic is a shape a real provider
+    /// accepts: every tool result names a tool use that precedes it in the
+    /// same request. The scripted provider never validates requests, so a
+    /// dangling tool result — one whose tool use the loop dropped — surfaces
+    /// only as a real provider's 400.
+    fn assert_tool_results_have_matching_tool_uses(call: &CapturedCall) {
+        for (index, message) in call.messages.iter().enumerate() {
+            let Block::ToolResult { id, name, .. } = &message.block else {
+                continue;
+            };
+            assert!(
+                call.messages[..index]
+                    .iter()
+                    .any(|earlier| matches!(&earlier.block, Block::ToolCall { id: use_id, .. } if use_id == id)),
+                "provider request has a tool result for {name} ({id}) with no preceding tool use: {:#?}",
+                call.messages
+            );
         }
     }
 
@@ -2058,16 +2236,22 @@ mod tests {
     }
 
     /// Appends a child's authored event to the parent's thread the way a
-    /// finishing child would, without running a child loop: the event-injection
+    /// child's loop would, without running a child loop: the event-injection
     /// seam loop tests use to deliver child events in a scripted order.
-    async fn deliver_child_event(store: &Store, parent_id: &str, child_id: &str, text: &str) {
+    async fn deliver_child_event(
+        store: &Store,
+        parent_id: &str,
+        child_id: &str,
+        kind: ChildEventKind,
+        text: &str,
+    ) {
         store
             .append_message(
                 parent_id,
                 Role::User,
                 &Block::ChildEvent {
                     child_id: child_id.to_string(),
-                    kind: ChildEventKind::Report,
+                    kind,
                     text: text.to_string(),
                 },
             )
@@ -2309,20 +2493,21 @@ mod tests {
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("s-ask")).await.unwrap();
 
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("ask".into()),
+                args_delta: r#"{"message":"continue?","options":["yes","no"]}"#.into(),
+            },
+            StreamEvent::Stop {
+                input_tokens: 3,
+                output_tokens: 2,
+            },
+        ]]));
         let deps = Arc::new(test_deps(
             &store,
-            Arc::new(ScriptedProvider::new(vec![vec![
-                StreamEvent::ToolCallDelta {
-                    index: 0,
-                    id: Some("call-1".into()),
-                    name: Some("ask".into()),
-                    args_delta: r#"{"message":"continue?","options":["yes","no"]}"#.into(),
-                },
-                StreamEvent::Stop {
-                    input_tokens: 3,
-                    output_tokens: 2,
-                },
-            ]])),
+            provider.clone(),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
         ));
@@ -2347,19 +2532,24 @@ mod tests {
             )),
             "the ask tool call is recorded"
         );
-        let (message, options, answer) = messages
+        let (message, options, child_id, answer) = messages
             .iter()
             .find_map(|(_, message)| match &message.block {
                 Block::Ask {
                     message,
                     options,
+                    child_id,
                     answer,
-                } => Some((message, options, answer)),
+                } => Some((message, options, child_id, answer)),
                 _ => None,
             })
             .expect("an ask block is recorded");
         assert_eq!(message.as_str(), "continue?");
         assert_eq!(options.as_slice(), ["yes", "no"]);
+        assert!(
+            child_id.is_none(),
+            "a root's own ask is not bound to a child"
+        );
         assert!(answer.is_none());
 
         let calls = store.model_calls("s-ask").await.unwrap();
@@ -2374,7 +2564,43 @@ mod tests {
         assert_eq!(tool_calls[0].result, Some(json!({ "asked": true })));
         assert!(!tool_calls[0].is_error);
 
+        let requests = provider.captured_calls();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].ask_recipient,
+            AskRecipient::User,
+            "a root's own ask is rendered as a question to the user"
+        );
+
         handle.stop();
+    }
+
+    #[test]
+    fn render_block_renders_a_childs_own_ask_to_its_parent() {
+        let ask = Block::Ask {
+            message: "may I push?".into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: None,
+            answer: None,
+        };
+        assert_eq!(
+            render_block(&ask, AskRecipient::Parent),
+            "question to parent: may I push? (options: yes, no)"
+        );
+    }
+
+    #[test]
+    fn render_block_attributes_a_surfaced_ask_to_its_child_with_the_serializers_comma() {
+        let ask = Block::Ask {
+            message: "may I push?".into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: Some("child-1".into()),
+            answer: None,
+        };
+        assert_eq!(
+            render_block(&ask, AskRecipient::User),
+            "question to user, from child child-1: may I push? (options: yes, no)"
+        );
     }
 
     #[tokio::test]
@@ -5708,7 +5934,14 @@ mod tests {
             )
             .await
             .unwrap();
-        deliver_child_event(&store, "root-t2", "child-t2", "the work is done").await;
+        deliver_child_event(
+            &store,
+            "root-t2",
+            "child-t2",
+            ChildEventKind::Report,
+            "the work is done",
+        )
+        .await;
 
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
@@ -5873,7 +6106,14 @@ mod tests {
 
         // The child completes mid-turn: the event is appended to the parent's
         // thread and the wake is queued, so the in-flight stream is untouched.
-        deliver_child_event(&store, "root-t3", "child-t3", "child done").await;
+        deliver_child_event(
+            &store,
+            "root-t3",
+            "child-t3",
+            ChildEventKind::Report,
+            "child done",
+        )
+        .await;
         store
             .set_state("child-t3", SessionState::Stopped)
             .await
@@ -6014,12 +6254,26 @@ mod tests {
 
         // Both children complete mid-turn: two events and two wakes queue
         // behind the in-flight turn.
-        deliver_child_event(&store, "root-t4", "child-t4a", "a done").await;
+        deliver_child_event(
+            &store,
+            "root-t4",
+            "child-t4a",
+            ChildEventKind::Report,
+            "a done",
+        )
+        .await;
         store
             .set_state("child-t4a", SessionState::Stopped)
             .await
             .unwrap();
-        deliver_child_event(&store, "root-t4", "child-t4b", "b done").await;
+        deliver_child_event(
+            &store,
+            "root-t4",
+            "child-t4b",
+            ChildEventKind::Report,
+            "b done",
+        )
+        .await;
         store
             .set_state("child-t4b", SessionState::Stopped)
             .await
@@ -6412,7 +6666,14 @@ mod tests {
 
         // The child event lands mid-wake, while the first turn is in flight;
         // the event's wake is queued behind the running wake.
-        deliver_child_event(&store, "root-cp", "child-cp", "done mid-wake").await;
+        deliver_child_event(
+            &store,
+            "root-cp",
+            "child-cp",
+            ChildEventKind::Report,
+            "done mid-wake",
+        )
+        .await;
         handle.send(LoopEvent::Wake);
 
         // The running wake then continues: its second turn exceeds the
@@ -7204,6 +7465,1665 @@ mod tests {
                 )),
             "a child's message_child call records a refusal"
         );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_ask_authors_an_ask_event_to_its_parent_and_the_child_waits() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6ask")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-s6ask", "root-s6ask"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-s6ask",
+                Role::User,
+                &Block::Text {
+                    text: "implement the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The child's turn calls ask: instead of hanging, its wake must end
+        // with an authored Ask event in the parent's thread and the child
+        // waiting for the parent's answer.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("ask".into()),
+                args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
+            },
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-s6ask".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to wait for the parent's answer", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-s6ask").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let stored = store.get_session("child-s6ask").await.unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::WaitingForInput,
+            "a child that asks waits for its parent instead of stopping"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "the ask ended the child's wake"
+        );
+        let calls = provider.captured_calls();
+        let child_tools: Vec<&str> = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            child_tools.contains(&"ask"),
+            "ask is advertised to a child so it can raise a question to its parent: {child_tools:?}"
+        );
+
+        let parent_messages = store.messages("root-s6ask", false).await.unwrap();
+        let events: Vec<(&str, &str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind,
+                    text,
+                } => Some((child_id.as_str(), kind.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [("child-s6ask", "ask", "may I push?")],
+            "the child's ask reaches the parent as one Ask event, not a report"
+        );
+
+        // The child's own thread keeps the question, so the parent's answer
+        // resumes it with its question in context.
+        let child_messages = store.messages("child-s6ask", false).await.unwrap();
+        assert!(
+            child_messages
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::Ask { message, .. } if message == "may I push?")),
+            "the child's own thread records the question it asked"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_root_answers_a_child_ask_and_the_child_resumes_and_finishes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6ans")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-s6ans", "root-s6ans"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-s6ans",
+                Role::User,
+                &Block::Text {
+                    text: "implement the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        // The root answers on the user's behalf: its wake for the child's Ask
+        // event calls message_child with the answer, and its later wake
+        // handles the child's completion report.
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("message_child".into()),
+                    args_delta: r#"{"id":"child-s6ans","text":"yes, push to main"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("answered the child".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("noted the report".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        // The child asks its first turn, then resumes from its own thread
+        // when the parent's answer arrives and finishes with a report.
+        let child_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("pushed to main".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let root_handle = spawn_loop(
+            "root-s6ans".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-s6ans".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-s6ans", root_handle.sender.clone());
+        mailbox.register("child-s6ans", child_handle.sender.clone());
+
+        child_handle.send(LoopEvent::Wake);
+
+        wait_for("the child to finish after the parent's answer", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-s6ans").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+                    && store.messages("child-s6ans", false).await.unwrap().len() == 5
+            }
+        })
+        .await;
+        wait_for("the root's turns to finish", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+        wait_for("the root to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-s6ans").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        // The parent's thread holds the child's Ask event and, after the
+        // answer, its completion report — and no surfaced ask block.
+        let parent_messages = store.messages("root-s6ans", false).await.unwrap();
+        let events: Vec<(&str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind,
+                    text,
+                } if child_id == "child-s6ans" => Some((kind.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [("ask", "may I push?"), ("report", "pushed to main")],
+            "the answer resumes the child, whose completion reports back"
+        );
+        assert!(
+            !parent_messages
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::Ask { .. })),
+            "answering on the user's behalf never surfaces the question"
+        );
+
+        // The child resumed from its own thread: its second turn reads its
+        // question and the parent's answer, and the answer landed verbatim in
+        // its archived thread.
+        let child_calls = child_provider.captured_calls();
+        assert_eq!(child_calls.len(), 2);
+        assert!(
+            child_calls
+                .iter()
+                .all(|call| call.ask_recipient == AskRecipient::Parent),
+            "a child session's asks are rendered as questions to its parent, not the user"
+        );
+        assert!(
+            child_calls[1].messages.iter().any(|message| {
+                matches!(&message.block, Block::Ask { message, .. } if message == "may I push?")
+            }),
+            "the resumed child still reads the question it asked: {:#?}",
+            child_calls[1].messages
+        );
+        assert!(
+            child_calls[1].messages.iter().any(|message| {
+                message.role == Role::User
+                    && matches!(&message.block, Block::Text { text } if text == "yes, push to main")
+            }),
+            "the parent's answer is the child's next user message: {:#?}",
+            child_calls[1].messages
+        );
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_root_denies_a_child_ask_and_the_child_resumes_and_re_asks() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6den")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-s6den", "root-s6den"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-s6den",
+                Role::User,
+                &Block::Text {
+                    text: "push the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        let denial = "denied: never push to main directly; use a branch";
+        // The root denies with a reason; the child resumes from its thread,
+        // reads the denial, and asks a fresh question instead.
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("message_child".into()),
+                    args_delta: format!(r#"{{"id":"child-s6den","text":"{denial}"}}"#),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("denied the child".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("the re-ask stays pending".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push to main?","options":["yes","no"]}"#
+                        .into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push to a branch instead?"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let root_handle = spawn_loop(
+            "root-s6den".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-s6den".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-s6den", root_handle.sender.clone());
+        mailbox.register("child-s6den", child_handle.sender.clone());
+
+        child_handle.send(LoopEvent::Wake);
+
+        wait_for("the child to ask again after the denial", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-s6den").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+                    && store
+                        .messages("root-s6den", false)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, message)| {
+                            matches!(
+                                &message.block,
+                                Block::ChildEvent {
+                                    kind: ChildEventKind::Ask,
+                                    ..
+                                }
+                            )
+                        })
+                        .count()
+                        == 2
+            }
+        })
+        .await;
+        wait_for("the root's turns to finish", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+
+        // Each question the child asks authors exactly one Ask event.
+        let parent_messages = store.messages("root-s6den", false).await.unwrap();
+        let asks: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Ask,
+                    text,
+                } if child_id == "child-s6den" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            ["may I push to main?", "may I push to a branch instead?"],
+            "a re-ask is a new Ask event, not a replay of the old one"
+        );
+
+        // The denial reached the child: its second turn reads its original
+        // question and the parent's denial, then chose to re-ask.
+        let child_calls = child_provider.captured_calls();
+        assert_eq!(child_calls.len(), 2);
+        assert!(
+            child_calls[1].messages.iter().any(|message| {
+                message.role == Role::User
+                    && matches!(&message.block, Block::Text { text } if text == denial)
+            }),
+            "the denial is the message that resumed the child: {:#?}",
+            child_calls[1].messages
+        );
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_root_surfacing_a_child_ask_binds_the_leaf_durably_and_waits_for_the_answer() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6sur")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-s6sur", "root-s6sur"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-s6sur",
+                Role::User,
+                &Block::Text {
+                    text: "implement the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        // The root surfaces the child's question to the user with the child's
+        // id bound; the user's answer is routed by the control plane, not by
+        // another root turn, so the root's wake ends here.
+        let root_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("ask".into()),
+                args_delta:
+                    r#"{"message":"may I push?","options":["yes","no"],"child_id":"child-s6sur"}"#
+                        .into(),
+            },
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("ask".into()),
+                args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
+            },
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let root_handle = spawn_loop(
+            "root-s6sur".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-s6sur".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-s6sur", root_handle.sender.clone());
+        mailbox.register("child-s6sur", child_handle.sender.clone());
+
+        child_handle.send(LoopEvent::Wake);
+
+        wait_for("the root to surface the ask and record the binding", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("root-s6sur").await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask("root-s6sur").await.unwrap().is_some()
+                }
+            }
+        })
+        .await;
+        let root_calls = root_provider.captured_calls();
+        assert_eq!(root_calls.len(), 1, "the surface is the root's only turn");
+
+        // The surfaced ask is bound to the child: one bound Ask block, one
+        // ask tool call naming the child, and a durable binding record that
+        // names the surfaced Ask block's row, so a later compaction cannot
+        // lose the binding.
+        let parent_messages = store.messages("root-s6sur", false).await.unwrap();
+        let bound_asks: Vec<(&str, &str, i64)> = parent_messages
+            .iter()
+            .filter_map(|(id, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: Some(child_id),
+                    ..
+                } => Some((child_id.as_str(), message.as_str(), *id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bound_asks,
+            [(
+                "child-s6sur",
+                "may I push?",
+                parent_messages.last().unwrap().0
+            )],
+            "the surfaced ask is bound to the child that asked"
+        );
+        let pending = store.get_pending_ask("root-s6sur").await.unwrap().unwrap();
+        assert_eq!(pending.session_id, "root-s6sur");
+        assert_eq!(pending.child_id, "child-s6sur");
+        assert_eq!(pending.question, "may I push?");
+        assert_eq!(
+            pending.ask_message_id, bound_asks[0].2,
+            "the binding names the surfaced Ask block's row"
+        );
+        let root_asks: Vec<_> = store
+            .tool_calls("root-s6sur")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|call| call.name == "ask")
+            .collect();
+        assert_eq!(root_asks.len(), 1, "one question is surfaced exactly once");
+        assert_eq!(
+            root_asks[0].args["child_id"], "child-s6sur",
+            "the ask tool call carries the bound child"
+        );
+
+        // The child waits on the answer with its own question still at the
+        // end of its thread; nothing has resumed it yet.
+        let stored = store.get_session("child-s6sur").await.unwrap().unwrap();
+        assert_eq!(stored.state, SessionState::WaitingForInput);
+        let child_calls = child_provider.captured_calls();
+        assert_eq!(child_calls.len(), 1, "the child asked once and waits");
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn when_the_user_redirects_the_root_cancels_the_pending_ask_and_notifies_the_child() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6red")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-s6red", "root-s6red"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-s6red",
+                Role::User,
+                &Block::Text {
+                    text: "push the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        let cancel_notice = "the user redirected instead of answering; your question is cancelled. Re-ask, adapt, or stop.";
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push to main?","options":["yes","no"],"child_id":"child-s6red"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("message_child".into()),
+                    args_delta: format!(r#"{{"id":"child-s6red","text":"{cancel_notice}"}}"#),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("cancelled the ask".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("noted the report".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push to main?","options":["yes","no"]}"#
+                        .into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("understood — stopping the push".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let root_handle = spawn_loop(
+            "root-s6red".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-s6red".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-s6red", root_handle.sender.clone());
+        mailbox.register("child-s6red", child_handle.sender.clone());
+
+        child_handle.send(LoopEvent::Wake);
+
+        wait_for("the root to surface the ask and record the binding", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("root-s6red").await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask("root-s6red").await.unwrap().is_some()
+                }
+            }
+        })
+        .await;
+        let pending = store.get_pending_ask("root-s6red").await.unwrap().unwrap();
+        assert_eq!(pending.child_id, "child-s6red");
+
+        // The user redirects instead of answering: the root's next turn
+        // decides the pending ask's fate and cancels it. The binding stays
+        // pending until the root takes the ask over, so the root wakes with
+        // the surfaced ask still bound.
+        store
+            .append_message(
+                "root-s6red",
+                Role::User,
+                &Block::Text {
+                    text: "stop the push attempt and review the README instead".into(),
+                },
+            )
+            .await
+            .unwrap();
+        root_handle.send(LoopEvent::Wake);
+
+        wait_for("the child to be notified and stop", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-s6red").await.unwrap().unwrap();
+                stored.state == SessionState::Stopped
+            }
+        })
+        .await;
+        wait_for("the root's turns to finish", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 4 }
+            }
+        })
+        .await;
+        wait_for("the pending binding to be cleared by the cancel", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move { store.get_pending_ask("root-s6red").await.unwrap().is_none() }
+            }
+        })
+        .await;
+
+        // The original question was surfaced exactly once; the redirect never
+        // surfaced it again.
+        let parent_messages = store.messages("root-s6red", false).await.unwrap();
+        let bound_asks: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: Some(child_id),
+                    ..
+                } if child_id == "child-s6red" => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bound_asks,
+            ["may I push to main?"],
+            "a cancelled ask is never surfaced a second time"
+        );
+        let root_asks: Vec<_> = store
+            .tool_calls("root-s6red")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|call| call.name == "ask")
+            .collect();
+        assert_eq!(root_asks.len(), 1, "one ask tool call for one question");
+
+        // The cancellation notice reached the waiting child, which resumed
+        // from its own thread and chose to stop.
+        let child_calls = child_provider.captured_calls();
+        assert_eq!(child_calls.len(), 2);
+        assert!(
+            child_calls[1].messages.iter().any(|message| {
+                message.role == Role::User
+                    && matches!(&message.block, Block::Text { text } if text == cancel_notice)
+            }),
+            "the cancelled child reads the notice in its own thread: {:#?}",
+            child_calls[1].messages
+        );
+        let child_messages = store.messages("child-s6red", false).await.unwrap();
+        let child_texts: Vec<&str> = child_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            child_texts.contains(&"understood — stopping the push"),
+            "the notified child reports its decision: {child_texts:?}"
+        );
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn binding_to_a_child_without_a_pending_question_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6np")).await.unwrap();
+        // A running child, a stopped child that finished, and a child waiting
+        // on nothing: none of them has an unanswered question of its own at
+        // the end of its thread, so none may be bound.
+        for (id, state) in [
+            ("runner-s6np", SessionState::Running),
+            ("done-s6np", SessionState::Stopped),
+            ("waiter-s6np", SessionState::WaitingForInput),
+        ] {
+            store
+                .create_session(&child_session_of(id, "root-s6np"))
+                .await
+                .unwrap();
+            store
+                .append_message(
+                    id,
+                    Role::User,
+                    &Block::Text {
+                        text: "do the work".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            store.set_state(id, state).await.unwrap();
+        }
+        store
+            .append_message(
+                "done-s6np",
+                Role::Assistant,
+                &Block::Text {
+                    text: "all done".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The root tries to surface a question for each child in turn; every
+        // binding is refused and the wake continues, so the model can recover.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"runner-s6np"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"done-s6np"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-3".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"waiter-s6np"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("noted".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-s6np".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the refused bindings' wake to end", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-s6np").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let results = store.tool_calls("root-s6np").await.unwrap();
+        let error_of = |id: &str| {
+            results
+                .iter()
+                .find(|call| call.call_id == id)
+                .and_then(|call| call.result.as_ref())
+                .and_then(|result| result["error"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            error_of("call-1").as_deref(),
+            Some("child session runner-s6np has no pending question to surface")
+        );
+        assert_eq!(
+            error_of("call-2").as_deref(),
+            Some("child session done-s6np has no pending question to surface")
+        );
+        assert_eq!(
+            error_of("call-3").as_deref(),
+            Some("child session waiter-s6np has no pending question to surface")
+        );
+        let messages = store.messages("root-s6np", false).await.unwrap();
+        assert!(
+            !messages
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::Ask { .. })),
+            "a refused binding records no surfaced ask"
+        );
+        assert!(
+            store.get_pending_ask("root-s6np").await.unwrap().is_none(),
+            "a refused binding records no pending ask"
+        );
+        // A refused ask continues the turn, so its error result must keep its
+        // tool use in the next request: the scripted provider never checks,
+        // but a real one rejects a dangling tool result with a 400.
+        let calls = provider.captured_calls();
+        assert_eq!(
+            calls.len(),
+            4,
+            "three refused bindings, then the recovery turn"
+        );
+        for call in &calls {
+            assert_tool_results_have_matching_tool_uses(call);
+        }
+        for id in ["call-1", "call-2", "call-3"] {
+            assert!(
+                calls[3].messages.iter().any(|message| matches!(
+                    &message.block,
+                    Block::ToolCall { id: use_id, name, .. } if use_id == id && name == "ask"
+                )),
+                "the refused ask {id} keeps its tool use in the recovery turn's window"
+            );
+        }
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn surfacing_a_second_question_while_one_is_pending_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6two")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-a-s6two", "root-s6two"))
+            .await
+            .unwrap();
+        // Child B asked too, but its event is injected: only child A's
+        // question is surfaced, and the root must resolve it before another
+        // question can reach the user.
+        store
+            .create_session(&child_session_of("child-b-s6two", "root-s6two"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-b-s6two",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "may I refactor?".into(),
+                    options: vec![],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_state("child-b-s6two", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+
+        let mailbox = Arc::new(TestMailbox::new());
+        // The root surfaces child A's question, then — woken by child B's ask
+        // event — tries to surface B's too. One question reaches the user at a
+        // time, so the second surface is refused with the pending one named.
+        let root_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"child-a-s6two"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I refactor?","child_id":"child-b-s6two"}"#
+                        .into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("waiting on the user".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("ask".into()),
+                args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
+            },
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let root_handle = spawn_loop(
+            "root-s6two".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                root_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        let child_handle = spawn_loop(
+            "child-a-s6two".into(),
+            Arc::new(test_deps_with_mailbox(
+                &store,
+                child_provider.clone(),
+                instant_tools(),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+                mailbox.clone(),
+            )),
+        );
+        mailbox.register("root-s6two", root_handle.sender.clone());
+        mailbox.register("child-a-s6two", child_handle.sender.clone());
+
+        child_handle.send(LoopEvent::Wake);
+        wait_for("child A to ask and the root to surface it", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("root-s6two").await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask("root-s6two").await.unwrap().is_some()
+                }
+            }
+        })
+        .await;
+
+        deliver_child_event(
+            &store,
+            "root-s6two",
+            "child-b-s6two",
+            ChildEventKind::Ask,
+            "may I refactor?",
+        )
+        .await;
+        root_handle.send(LoopEvent::Wake);
+
+        wait_for("the refused second surface's wake to end", {
+            let root_provider = root_provider.clone();
+            move || {
+                let root_provider = root_provider.clone();
+                async move { root_provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+
+        let results = store.tool_calls("root-s6two").await.unwrap();
+        let second = results
+            .iter()
+            .find(|call| call.call_id == "call-2")
+            .and_then(|call| call.result.as_ref())
+            .and_then(|result| result["error"].as_str())
+            .map(str::to_string);
+        assert_eq!(
+            second.as_deref(),
+            Some(
+                "another question is pending with the user; send child child-a-s6two a message to cancel it before asking again"
+            )
+        );
+        let pending = store.get_pending_ask("root-s6two").await.unwrap().unwrap();
+        assert_eq!(
+            pending.child_id, "child-a-s6two",
+            "the first surface stays bound"
+        );
+        let bound_asks: Vec<String> = store
+            .messages("root-s6two", false)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: Some(child_id),
+                    ..
+                } if child_id == "child-a-s6two" => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bound_asks,
+            vec!["may I push?".to_string()],
+            "only child A's question reaches the user"
+        );
+
+        // The refused second surface continues the root's wake, so its error
+        // result must keep its tool use in the follow-up request.
+        for call in &root_provider.captured_calls() {
+            assert_tool_results_have_matching_tool_uses(call);
+        }
+
+        root_handle.stop();
+        child_handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_root_ask_to_the_user_is_answered_like_before() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6reg")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"continue?","options":["yes","no"]}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("continuing".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-s6reg".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to wait for the answer", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-s6reg").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("root-s6reg", false).await.unwrap();
+        let asks: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: None,
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            ["continue?"],
+            "a root's own question stays unbound and reaches the user"
+        );
+
+        // The user's answer starts the root's next turn exactly as before.
+        store
+            .append_message(
+                "root-s6reg",
+                Role::User,
+                &Block::Text { text: "yes".into() },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the answer's turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+        let calls = provider.captured_calls();
+        assert!(
+            calls[1].messages.iter().any(|message| {
+                message.role == Role::User
+                    && matches!(&message.block, Block::Text { text } if text == "yes")
+            }),
+            "the root's next turn reads the user's answer: {:#?}",
+            calls[1].messages
+        );
+        wait_for("the root to wait for input again", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-s6reg").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_ask_delivered_mid_turn_is_surfaced_once_in_its_own_wake() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6mid")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-s6mid", "root-s6mid"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-s6mid",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // The child's own thread ends in its pending ask, the way a child
+        // loop that asked leaves it; the injected event below delivers that
+        // ask to the root without running a child loop.
+        store
+            .append_message(
+                "child-s6mid",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "may I push?".into(),
+                    options: vec!["yes".into(), "no".into()],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_state("child-s6mid", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+
+        // The delay keeps the first turn in flight while the child's Ask
+        // event lands behind it; the queued wake then surfaces the event
+        // exactly once and the root's reaction ends in the ask.
+        let provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::TextDelta("overseeing".into()),
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+                vec![
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some("call-1".into()),
+                        name: Some("ask".into()),
+                        args_delta: r#"{"message":"may I push?","child_id":"child-s6mid"}"#.into(),
+                    },
+                    StreamEvent::Stop {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                ],
+            ],
+            Duration::from_millis(200),
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-s6mid".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn to start", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        deliver_child_event(
+            &store,
+            "root-s6mid",
+            "child-s6mid",
+            ChildEventKind::Ask,
+            "may I push?",
+        )
+        .await;
+        handle.send(LoopEvent::Wake);
+
+        // The session reaches WaitingForInput at the end of both the
+        // in-flight wake and the queued wake, so the state alone cannot tell
+        // the two apart. The durable pending ask is written only when the
+        // queued wake's ask tool has run, which is when the provider has seen
+        // both calls and the surfaced ask sits in the thread.
+        wait_for("the queued wake to surface the ask durably", || {
+            let store = store.clone();
+            async move { store.get_pending_ask("root-s6mid").await.unwrap().is_some() }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 2, "the running wake and the event's wake");
+        assert!(
+            !calls[0]
+                .messages
+                .iter()
+                .any(|message| { matches!(&message.block, Block::ChildEvent { .. }) }),
+            "the in-flight turn's window predates the mid-turn ask"
+        );
+        assert!(
+            calls[1].messages.iter().any(|message| {
+                matches!(&message.block, Block::ChildEvent { child_id, kind, text }
+                    if child_id == "child-s6mid"
+                        && *kind == ChildEventKind::Ask
+                        && text == "may I push?")
+            }),
+            "the queued wake surfaces the child's ask event once: {:#?}",
+            calls[1].messages
+        );
+
+        // The reaction surfaced exactly one bound ask, and the event was not
+        // delivered to any other turn.
+        let parent_messages = store.messages("root-s6mid", false).await.unwrap();
+        let asks: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: Some(child_id),
+                    ..
+                } if child_id == "child-s6mid" => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            ["may I push?"],
+            "the child's ask is surfaced exactly once"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn ask_with_a_child_binding_to_a_foreign_or_unknown_child_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-s6ref")).await.unwrap();
+        store.create_session(&session("other-s6ref")).await.unwrap();
+        store
+            .create_session(&child_session_of("foreign-child", "other-s6ref"))
+            .await
+            .unwrap();
+
+        // A root may only surface a question bound to one of its own
+        // children: a foreign child and an unknown id are refused and the
+        // wake continues, so the model can recover.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"foreign-child"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"ghost"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-3".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"proceed?"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-s6ref".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("root-s6ref").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let results = store.tool_calls("root-s6ref").await.unwrap();
+        let error_of = |id: &str| {
+            results
+                .iter()
+                .find(|call| call.call_id == id)
+                .and_then(|call| call.result.as_ref())
+                .and_then(|result| result["error"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            error_of("call-1").as_deref(),
+            Some("session foreign-child is not a child of this session")
+        );
+        assert_eq!(
+            error_of("call-2").as_deref(),
+            Some("no child session ghost")
+        );
+        assert_eq!(
+            error_of("call-3").as_deref(),
+            None,
+            "the unbound ask succeeds"
+        );
+        let messages = store.messages("root-s6ref", false).await.unwrap();
+        let bound: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: Some(_),
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bound.is_empty(),
+            "a refused binding records no surfaced ask"
+        );
+        let reached_user: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    message,
+                    child_id: None,
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reached_user, ["proceed?"]);
+        // The refused bindings continued the wake, so each error result kept
+        // its tool use in the follow-up requests.
+        for call in &provider.captured_calls() {
+            assert_tool_results_have_matching_tool_uses(call);
+        }
+        handle.stop();
+
+        // A child session calling ask with a binding is refused too: children
+        // have no user of their own to surface to. The child's own plain ask
+        // still reaches its parent.
+        store
+            .create_session(&child_session_of("child-s6ref", "root-s6ref"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-s6ref",
+                Role::User,
+                &Block::Text {
+                    text: "do the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-4".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?","child_id":"foreign-child"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-5".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"may I push?"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-s6ref".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to wait after its plain ask", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("child-s6ref").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let results = store.tool_calls("child-s6ref").await.unwrap();
+        let refused = results
+            .iter()
+            .find(|call| call.call_id == "call-4")
+            .and_then(|call| call.result.as_ref())
+            .and_then(|result| result["error"].as_str())
+            .map(str::to_string);
+        assert_eq!(
+            refused.as_deref(),
+            Some("ask with child_id is only available to root sessions")
+        );
+        let parent_messages = store.messages("root-s6ref", false).await.unwrap();
+        let events: Vec<&str> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind: ChildEventKind::Ask,
+                    text,
+                } if child_id == "child-s6ref" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["may I push?"],
+            "only the child's plain ask reaches its parent"
+        );
+
+        // The refused child ask continued the wake into the plain ask, so its
+        // error result kept its tool use in the plain ask's request.
+        for call in &provider.captured_calls() {
+            assert_tool_results_have_matching_tool_uses(call);
+        }
 
         handle.stop();
     }

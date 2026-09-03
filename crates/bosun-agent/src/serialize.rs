@@ -6,9 +6,18 @@ use bosun_common::tool::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::provider::AskRecipient;
+
 /// Anthropic keeps the system prompt out of the message list.
-pub fn anthropic_messages(system: &str, messages: &[Message]) -> Value {
-    let messages: Vec<Value> = messages.iter().map(anthropic_message).collect();
+pub fn anthropic_messages(
+    system: &str,
+    messages: &[Message],
+    ask_recipient: AskRecipient,
+) -> Value {
+    let messages: Vec<Value> = messages
+        .iter()
+        .map(|message| anthropic_message(message, ask_recipient))
+        .collect();
     json!({ "system": system, "messages": messages })
 }
 
@@ -28,9 +37,13 @@ pub fn anthropic_tools(tools: &[ToolSpec]) -> Value {
 }
 
 /// OpenAI puts the system prompt in the first message.
-pub fn openai_messages(system: &str, messages: &[Message]) -> Value {
+pub fn openai_messages(system: &str, messages: &[Message], ask_recipient: AskRecipient) -> Value {
     let mut out = vec![json!({ "role": "system", "content": system })];
-    out.extend(messages.iter().map(openai_message));
+    out.extend(
+        messages
+            .iter()
+            .map(|message| openai_message(message, ask_recipient)),
+    );
     Value::Array(out)
 }
 
@@ -52,7 +65,7 @@ pub fn openai_tools(tools: &[ToolSpec]) -> Value {
     Value::Array(tools)
 }
 
-fn anthropic_message(message: &Message) -> Value {
+fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
     match (&message.role, &message.block) {
         (Role::User, Block::Text { text }) => json!({ "type": "text", "text": text }),
         (
@@ -75,9 +88,18 @@ fn anthropic_message(message: &Message) -> Value {
             "name": name,
             "input": args,
         }),
-        (_, Block::Ask { message: ask, .. }) => {
-            json!({ "type": "text", "text": format!("[question to user] {ask}") })
-        }
+        (
+            _,
+            Block::Ask {
+                message: ask,
+                child_id,
+                answer,
+                ..
+            },
+        ) => json!({
+            "type": "text",
+            "text": ask_text(ask_recipient, child_id.as_deref(), ask, answer.as_deref())
+        }),
         (_, Block::Summary { text }) => json!({ "type": "text", "text": text }),
         (
             _,
@@ -101,7 +123,7 @@ fn anthropic_message(message: &Message) -> Value {
     }
 }
 
-fn openai_message(message: &Message) -> Value {
+fn openai_message(message: &Message, ask_recipient: AskRecipient) -> Value {
     match (&message.role, &message.block) {
         (Role::User, Block::Text { text }) => json!({ "role": "user", "content": text }),
         (
@@ -127,9 +149,18 @@ fn openai_message(message: &Message) -> Value {
                 "function": { "name": name, "arguments": args.to_string() },
             }],
         }),
-        (_, Block::Ask { message: ask, .. }) => {
-            json!({ "role": message.role.as_str(), "content": format!("[question to user] {ask}") })
-        }
+        (
+            _,
+            Block::Ask {
+                message: ask,
+                child_id,
+                answer,
+                ..
+            },
+        ) => json!({
+            "role": message.role.as_str(),
+            "content": ask_text(ask_recipient, child_id.as_deref(), ask, answer.as_deref())
+        }),
         (_, Block::Summary { text }) => {
             json!({ "role": message.role.as_str(), "content": text })
         }
@@ -187,6 +218,31 @@ fn authored_event_text(child_id: &str, kind: ChildEventKind, text: &str) -> Stri
     }
 }
 
+/// An ask as provider text. The recipient is who the question is for: the
+/// user when the thread belongs to a root session, the session's parent when
+/// it belongs to a child session. A bound ask names the child whose question
+/// it carries, so the session reading it knows whose question awaits an
+/// answer; a recorded answer is included, so a later wake sees the question
+/// was resolved.
+fn ask_text(
+    recipient: AskRecipient,
+    child_id: Option<&str>,
+    ask: &str,
+    answer: Option<&str>,
+) -> String {
+    let mut text = match child_id {
+        Some(child_id) => format!(
+            "[question to {}, from child {child_id}] {ask}",
+            recipient.as_str()
+        ),
+        None => format!("[question to {}] {ask}", recipient.as_str()),
+    };
+    if let Some(answer) = answer {
+        text.push_str(&format!("\n[user answered: {answer}]"));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +290,7 @@ mod tests {
                 block: Block::Ask {
                     message: "continue?".into(),
                     options: vec!["yes".into()],
+                    child_id: None,
                     answer: None,
                 },
             },
@@ -312,7 +369,7 @@ mod tests {
             ],
         });
         assert_eq!(
-            anthropic_messages("You are Bosun.", &sample_messages()),
+            anthropic_messages("You are Bosun.", &sample_messages(), AskRecipient::User),
             expected
         );
     }
@@ -366,7 +423,7 @@ mod tests {
             { "role": "tool", "tool_call_id": "call-5", "content": "{\"ok\":true}" },
         ]);
         assert_eq!(
-            openai_messages("You are Bosun.", &sample_messages()),
+            openai_messages("You are Bosun.", &sample_messages(), AskRecipient::User),
             expected
         );
     }
@@ -413,7 +470,9 @@ mod tests {
             },
         };
 
-        let anthropic = |message: &Message| anthropic_messages("", std::slice::from_ref(message));
+        let anthropic = |message: &Message| {
+            anthropic_messages("", std::slice::from_ref(message), AskRecipient::User)
+        };
         assert_eq!(
             anthropic(&message(ChildEventKind::Report, "done")),
             json!({ "system": "", "messages": [
@@ -433,12 +492,118 @@ mod tests {
             ] })
         );
 
-        let openai = |message: &Message| openai_messages("", std::slice::from_ref(message));
+        let openai = |message: &Message| {
+            openai_messages("", std::slice::from_ref(message), AskRecipient::User)
+        };
         assert_eq!(
             openai(&message(ChildEventKind::Report, "done")),
             json!([{ "role": "system", "content": "" }, {
                 "role": "user",
                 "content": "[report from child child-1]\ndone"
+            }])
+        );
+    }
+
+    #[test]
+    fn a_bound_ask_names_its_child_and_a_plain_ask_does_not() {
+        let ask = |child_id: Option<&str>| Message {
+            role: Role::Assistant,
+            block: Block::Ask {
+                message: "may I push?".into(),
+                options: vec!["yes".into(), "no".into()],
+                child_id: child_id.map(String::from),
+                answer: None,
+            },
+        };
+
+        let anthropic = |message: &Message| {
+            anthropic_messages("", std::slice::from_ref(message), AskRecipient::User)
+        };
+        assert_eq!(
+            anthropic(&ask(Some("child-1"))),
+            json!({ "system": "", "messages": [
+                { "type": "text", "text": "[question to user, from child child-1] may I push?" }
+            ] })
+        );
+        assert_eq!(
+            anthropic(&ask(None)),
+            json!({ "system": "", "messages": [
+                { "type": "text", "text": "[question to user] may I push?" }
+            ] })
+        );
+
+        let openai = |message: &Message| {
+            openai_messages("", std::slice::from_ref(message), AskRecipient::User)
+        };
+        assert_eq!(
+            openai(&ask(Some("child-1"))),
+            json!([{ "role": "system", "content": "" }, {
+                "role": "assistant",
+                "content": "[question to user, from child child-1] may I push?"
+            }])
+        );
+    }
+
+    #[test]
+    fn a_recorded_answer_is_visible_in_later_serialized_asks() {
+        // The mechanical answer route records the user's words on the
+        // surfaced Ask block, so a later wake reads the question as resolved
+        // instead of dangling.
+        let message = Message {
+            role: Role::Assistant,
+            block: Block::Ask {
+                message: "may I push?".into(),
+                options: vec!["yes".into()],
+                child_id: Some("child-1".into()),
+                answer: Some("yes, push to main".into()),
+            },
+        };
+
+        let anthropic = anthropic_messages("", std::slice::from_ref(&message), AskRecipient::User);
+        assert_eq!(
+            anthropic,
+            json!({ "system": "", "messages": [{
+                "type": "text",
+                "text": "[question to user, from child child-1] may I push?\n[user answered: yes, push to main]"
+            }] })
+        );
+        let openai = openai_messages("", std::slice::from_ref(&message), AskRecipient::User);
+        assert_eq!(
+            openai,
+            json!([{ "role": "system", "content": "" }, {
+                "role": "assistant",
+                "content": "[question to user, from child child-1] may I push?\n[user answered: yes, push to main]"
+            }])
+        );
+    }
+
+    #[test]
+    fn a_childs_own_ask_is_rendered_as_a_question_to_its_parent() {
+        // A child session's ask goes to its parent, never to the user, so the
+        // resumed child reads its own question as addressed to the parent.
+        let ask = Message {
+            role: Role::Assistant,
+            block: Block::Ask {
+                message: "may I push?".into(),
+                options: vec!["yes".into(), "no".into()],
+                child_id: None,
+                answer: None,
+            },
+        };
+
+        let anthropic = anthropic_messages("", std::slice::from_ref(&ask), AskRecipient::Parent);
+        assert_eq!(
+            anthropic,
+            json!({ "system": "", "messages": [
+                { "type": "text", "text": "[question to parent] may I push?" }
+            ] })
+        );
+        let openai = openai_messages("", std::slice::from_ref(&ask), AskRecipient::Parent);
+        assert_eq!(
+            openai,
+            json!([{ "role": "system", "content": "" }, {
+                "role": "assistant",
+                "content": "[question to parent] may I push?"
             }])
         );
     }

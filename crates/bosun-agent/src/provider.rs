@@ -19,6 +19,28 @@ pub struct ProviderCall<'a> {
     pub system: &'a str,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// Who the session whose thread is serialized asks: the user for a root
+    /// session, its parent for a child session. Ask blocks render this.
+    pub ask_recipient: AskRecipient,
+}
+
+/// Who answers a session's own asks: the user, when the session is a tree
+/// root, or the session's parent, when the session is a child. `ask` is
+/// contextual, so the recipient is fixed by where the session sits in the
+/// tree, not by the ask itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskRecipient {
+    User,
+    Parent,
+}
+
+impl AskRecipient {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskRecipient::User => "user",
+            AskRecipient::Parent => "parent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

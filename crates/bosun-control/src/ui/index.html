@@ -274,8 +274,9 @@
   </header>
   <div id="transcript"></div>
   <div class="input-row">
-    <textarea id="input" rows="3" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+    <textarea id="input" rows="3" placeholder="Message (Enter to send, Shift+Enter for a new line; while a question is on screen, sending answers it)"></textarea>
     <button id="btn-send" type="button">Send</button>
+    <button id="btn-redirect" type="button" title="Send as a new instruction instead of answering the question on screen">Redirect</button>
   </div>
 </div>
 
@@ -318,6 +319,7 @@ const btnClose = $('btn-close');
 const transcript = $('transcript');
 const input = $('input');
 const btnSend = $('btn-send');
+const btnRedirect = $('btn-redirect');
 
 let nodes = [];
 let sessions = [];
@@ -697,13 +699,15 @@ btnStop.addEventListener('click', async () => {
 
 btnClose.addEventListener('click', closeSession);
 
-async function send() {
+async function send(redirect) {
   if (sending || !input.value.trim()) return;
   sending = true;
   btnSend.disabled = true;
+  btnRedirect.disabled = true;
   try {
     await post('/sessions/' + encodeURIComponent(current) + '/messages', {
       content: input.value,
+      redirect: !!redirect,
     });
     input.value = '';
   } catch (error) {
@@ -711,15 +715,17 @@ async function send() {
   } finally {
     sending = false;
     btnSend.disabled = false;
+    btnRedirect.disabled = false;
     input.focus();
   }
 }
 
-btnSend.addEventListener('click', send);
+btnSend.addEventListener('click', () => send(false));
+btnRedirect.addEventListener('click', () => send(true));
 input.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    send();
+    send(false);
   }
 });
 
@@ -796,7 +802,9 @@ function renderMessage(message) {
       const box = document.createElement('div');
       box.className = 'ask';
       const question = document.createElement('div');
-      question.textContent = block.message;
+      question.textContent = block.child_id
+        ? 'child ' + block.child_id + ' asks: ' + block.message
+        : block.message;
       box.appendChild(question);
       const options = document.createElement('ul');
       options.className = 'options';

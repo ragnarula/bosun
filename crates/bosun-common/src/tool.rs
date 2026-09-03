@@ -68,8 +68,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ask".into(),
-            description: "Ask the user a question with optional choices. Ends the turn; the session waits for an answer.".into(),
-            schema: json!({"type":"object","properties":{"message":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["message"]}),
+            description: "Ask a question with optional choices that ends the turn and waits for an answer. At the root the question reaches the user. In a child session it reaches your parent instead: the parent answers, denies with a reason, or passes the question up, and you wait for the parent's message. To pass a child session's question up to the user, call ask with the child's id from your manifest as child_id and the question as message; the user's answer is routed back to that child automatically. While a surfaced question awaits the user's answer you may ask nothing else: message that child to cancel its pending question first.".into(),
+            schema: json!({"type":"object","properties":{"message":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"child_id":{"type":"string"}},"required":["message"]}),
         },
         ToolSpec {
             name: "todowrite".into(),
@@ -98,7 +98,7 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "message_child".into(),
-            description: "Send a message to one of your child sessions, named in your live-children manifest, to ask for detail or redirect it. The child resumes from its own thread and reports again.".into(),
+            description: "Send a message to one of your child sessions, named in your live-children manifest. A child waiting for input has asked you a question: answer it or deny it with a reason here, and the child resumes from its own thread. If you surfaced a child's question to the user and the user redirects instead of answering, message the bound child to cancel its pending question. You can also use it to ask a working child for detail or to redirect it.".into(),
             schema: json!({"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}),
         },
     ];
@@ -225,6 +225,18 @@ mod tests {
             .find(|tool| tool.name == "message_child")
             .unwrap();
         assert_eq!(message_child.schema["required"], json!(["id", "text"]));
+    }
+
+    #[test]
+    fn ask_schema_requires_message_and_makes_child_id_optional() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let ask = tools.iter().find(|tool| tool.name == "ask").unwrap();
+        assert_eq!(ask.schema["required"], json!(["message"]));
+        assert_eq!(
+            ask.schema["properties"]["child_id"],
+            json!({"type": "string"})
+        );
+        assert!(ask.description.contains("child_id"));
     }
 
     #[test]

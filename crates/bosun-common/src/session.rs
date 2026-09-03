@@ -115,6 +115,14 @@ pub enum Block {
     Ask {
         message: String,
         options: Vec<String>,
+        /// The child whose question this ask carries: when a root surfaces a
+        /// child's question instead of answering it, the ask binds to that
+        /// child so the user's answer is attributed to it and routes back to
+        /// it. None for a question the session asks on its own behalf. Skipped
+        /// when None, so an unbound ask serializes byte-identically to the
+        /// pre-binding transcript format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_id: Option<String>,
         answer: Option<String>,
     },
     Summary {
@@ -133,9 +141,10 @@ pub enum Block {
     },
 }
 
-/// What a child session authored to its parent. S5 delivers reports; the
-/// ask and failure paths arrive with ask gating (S6) and crash reporting
-/// (S8), and the event channel carries all three from the start.
+/// What a child session authored to its parent: a completion report, a
+/// question the parent answers, denies, or passes up (ask gating, S6), or a
+/// failure notice (crash reporting, S8). The event channel carries all three
+/// from the start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildEventKind {
@@ -290,6 +299,7 @@ mod tests {
             Block::Ask {
                 message: "continue?".into(),
                 options: vec!["yes".into(), "no".into()],
+                child_id: None,
                 answer: None,
             },
             Block::Summary {
@@ -331,9 +341,54 @@ mod tests {
         let block = Block::Ask {
             message: "continue?".into(),
             options: vec!["yes".into()],
+            child_id: Some("child-1".into()),
             answer: Some("yes".into()),
         };
         assert_round_trips(&block);
+    }
+
+    #[test]
+    fn an_ask_without_a_child_id_field_parses_as_unbound() {
+        // Asks written before the binding existed carry no child_id; they
+        // parse as an unbound question, so stored transcripts stay readable.
+        let ask: Block = serde_json::from_str(
+            r#"{"kind":"ask","message":"continue?","options":[],"answer":null}"#,
+        )
+        .unwrap();
+        let Block::Ask { child_id, .. } = &ask else {
+            panic!("expected an ask block");
+        };
+        assert!(child_id.is_none());
+    }
+
+    #[test]
+    fn an_unbound_ask_serializes_without_a_child_id_field() {
+        // Asks written before the binding existed carry no child_id; an
+        // unbound ask must serialize byte-identically, so a transcript the
+        // current build writes stays indistinguishable from a pre-binding one.
+        let json = serde_json::to_value(Block::Ask {
+            message: "continue?".into(),
+            options: vec![],
+            child_id: None,
+            answer: None,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "ask");
+        assert_eq!(json["answer"], serde_json::Value::Null);
+        assert!(
+            json.get("child_id").is_none(),
+            "an unbound ask carries no child_id field: {json}"
+        );
+
+        let json = serde_json::to_value(Block::Ask {
+            message: "may I push?".into(),
+            options: vec![],
+            child_id: Some("child-1".into()),
+            answer: None,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "ask");
+        assert_eq!(json["child_id"], "child-1");
     }
 
     #[test]
@@ -349,11 +404,12 @@ mod tests {
         let json = serde_json::to_value(Block::Ask {
             message: "continue?".into(),
             options: vec![],
+            child_id: Some("child-1".into()),
             answer: None,
         })
         .unwrap();
         assert_eq!(json["kind"], "ask");
-        assert_eq!(json["answer"], serde_json::Value::Null);
+        assert_eq!(json["child_id"], "child-1");
 
         let json = serde_json::to_value(Block::ChildEvent {
             child_id: "child-1".into(),

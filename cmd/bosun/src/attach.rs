@@ -199,11 +199,20 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     }]
                 }
                 Block::Ask {
-                    message, options, ..
-                } => vec![Line {
-                    kind: LineKind::Ask,
-                    text: format!("{message} [{}]", options.join(", ")),
-                }],
+                    message,
+                    options,
+                    child_id,
+                    ..
+                } => {
+                    let origin = child_id
+                        .as_deref()
+                        .map(|child_id| format!("child {child_id}: "))
+                        .unwrap_or_default();
+                    vec![Line {
+                        kind: LineKind::Ask,
+                        text: format!("{origin}{message} [{}]", options.join(", ")),
+                    }]
+                }
                 Block::Summary { text } => vec![Line {
                     kind: LineKind::Summary,
                     text: text.clone(),
@@ -558,7 +567,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    "message  ·  esc/^C interrupt  ·  ^P permission  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll",
+                    "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll",
                     Style::default().fg(Color::DarkGray),
                 )),
         )
@@ -910,12 +919,17 @@ async fn handle_key(
             Ok(Action::Continue)
         }
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Ok(Action::Exit),
+        // Ctrl-R sends the input as a redirect: "new instruction, not an
+        // answer", for when a child's surfaced question is on screen.
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            submit_input(app, client, cp_url, session_id, true).await
+        }
         // Esc interrupts like Ctrl-C; Ctrl-Q and /exit quit.
         KeyCode::Esc => {
             interrupt(app, client, cp_url, session_id).await;
             Ok(Action::Continue)
         }
-        KeyCode::Enter => submit_input(app, client, cp_url, session_id).await,
+        KeyCode::Enter => submit_input(app, client, cp_url, session_id, false).await,
         KeyCode::Backspace | KeyCode::Delete => {
             app.state.input.pop();
             Ok(Action::Continue)
@@ -959,6 +973,7 @@ async fn submit_input(
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
+    as_redirect: bool,
 ) -> anyhow::Result<Action> {
     // Sending a message is the user saying "look at what comes next", so the
     // transcript returns to the newest rows even after a manual scroll-up.
@@ -986,7 +1001,7 @@ async fn submit_input(
             _ => {
                 if !content.is_empty() {
                     app.history_submit(&content);
-                    send_message(app, client, cp_url, session_id, &content).await;
+                    send_message(app, client, cp_url, session_id, &content, as_redirect).await;
                 }
                 Ok(Action::Continue)
             }
@@ -1005,18 +1020,23 @@ fn persona_switch_target(content: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Sends the input as a session message. `redirect` marks it as a new
+/// instruction rather than an answer, which matters while a surfaced child
+/// ask is pending: an answer routes mechanically to the child that asked, and
+/// a redirect wakes the root model instead.
 async fn send_message(
     app: &mut App,
     client: &reqwest::Client,
     cp_url: &str,
     session_id: &str,
     content: &str,
+    redirect: bool,
 ) {
     let send = tokio::time::timeout(
         REQUEST_TIMEOUT,
         client
             .post(format!("{cp_url}/sessions/{session_id}/messages"))
-            .json(&serde_json::json!({ "content": content }))
+            .json(&serde_json::json!({ "content": content, "redirect": redirect }))
             .send(),
     )
     .await;
@@ -1446,6 +1466,7 @@ mod tests {
                 block: Block::Ask {
                     message: "pick".into(),
                     options: vec!["a".into(), "b".into()],
+                    child_id: None,
                     answer: None,
                 },
             },
@@ -1455,6 +1476,25 @@ mod tests {
             vec![Line {
                 kind: LineKind::Ask,
                 text: "pick [a, b]".into(),
+            }]
+        );
+
+        let bound_ask = Event::Message {
+            message: Message {
+                role: Role::Assistant,
+                block: Block::Ask {
+                    message: "may I push?".into(),
+                    options: vec!["yes".into(), "no".into()],
+                    child_id: Some("explorer-1".into()),
+                    answer: None,
+                },
+            },
+        };
+        assert_eq!(
+            event_lines(&bound_ask),
+            vec![Line {
+                kind: LineKind::Ask,
+                text: "child explorer-1: may I push? [yes, no]".into(),
             }]
         );
 
@@ -1767,7 +1807,7 @@ mod tests {
         let mut app = App::new(test_session());
         app.follow = false;
 
-        let action = submit_input(&mut app, &client, "http://x", "s1")
+        let action = submit_input(&mut app, &client, "http://x", "s1", false)
             .await
             .unwrap();
         assert_eq!(action, Action::Continue);

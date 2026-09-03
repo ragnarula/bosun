@@ -25,6 +25,8 @@ use axum::response::sse::KeepAlive;
 use axum::response::sse::Sse;
 use axum::routing::get;
 use axum::routing::post;
+use bosun_agent::agent_loop::LoopEvent;
+use bosun_agent::agent_loop::LoopMailbox;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
@@ -46,6 +48,7 @@ use bosun_common::types::PollRequest;
 use bosun_common::types::PollResponse;
 use bosun_common::types::StopRequest;
 use bosun_store::store::ModelCall;
+use bosun_store::store::RouteAnswer;
 use bosun_store::store::Store;
 use bosun_store::store::StoreError;
 use futures_util::Stream;
@@ -707,6 +710,12 @@ async fn stop(
 #[derive(Debug, Deserialize)]
 struct AddMessageRequest {
     content: String,
+    /// A new instruction rather than an answer: while a surfaced child ask
+    /// is pending, an answer routes mechanically to the bound child, and a
+    /// redirect wakes the root model to decide the pending ask's fate. With
+    /// no pending ask the flag changes nothing.
+    #[serde(default)]
+    redirect: bool,
 }
 
 /// Accepts a user message for a session. Only the owner of a tree accepts
@@ -722,6 +731,32 @@ async fn add_message(
         return Err(ApiError::SessionNotFound { id });
     };
     ensure_root(&session)?;
+    // An answer to a surfaced child ask is routed by the control plane, not
+    // by the root model: the text goes verbatim to the bound child and that
+    // child's loop is woken, exactly like a `message_child` message, while
+    // the root is left out of the turn entirely.
+    if !req.redirect {
+        match state.store.route_answer(&id, &req.content).await? {
+            RouteAnswer::Routed { child_id } => {
+                state.loops.send(&child_id, LoopEvent::ParentMessage);
+                info!(
+                    session_id = %id,
+                    child_id = %child_id,
+                    "routed the user's answer to the bound child"
+                );
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            RouteAnswer::ChildGone { child_id } => {
+                warn!(
+                    session_id = %id,
+                    child_id = %child_id,
+                    "the pending ask's child is gone; treating the answer as a root message"
+                );
+            }
+            // A message with no pending ask is an ordinary root message.
+            RouteAnswer::NoBinding => {}
+        }
+    }
     state
         .store
         .append_message(&id, Role::User, &Block::Text { text: req.content })
@@ -2086,6 +2121,17 @@ mod tests {
         json!({ "choices": [{ "index": 0, "delta": { "content": text } }] })
     }
 
+    /// One fragment of a tool call's arguments. The first fragment of a call
+    /// carries its id and name, like a real provider stream.
+    fn tool_call_fragment(id: &str, name: &str, args_fragment: &str) -> Value {
+        json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+            "index": 0,
+            "id": id,
+            "type": "function",
+            "function": { "name": name, "arguments": args_fragment },
+        }] } }] })
+    }
+
     /// One fragment of the `spawn` tool call's arguments. The first fragment
     /// of a call carries its id and name, like a real provider stream.
     fn spawn_call_fragment(with_id_name: bool, args_fragment: &str) -> Value {
@@ -2702,6 +2748,347 @@ mod tests {
             }
         })
         .await;
+    }
+
+    /// Builds a control-plane state whose root and its one child each run a
+    /// loop against their own scripted provider: two sessions, two models,
+    /// two fake providers, like the spawn test's wiring. The child's thread
+    /// starts with an assignment, so waking the child makes it ask. Returns
+    /// the state, the store, and the root and child ids.
+    async fn state_with_child_tree(
+        dir: &tempfile::TempDir,
+        root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+    ) -> (Arc<AppState>, Store, String, String) {
+        let root_addr = scripted_provider(root_scripts).await;
+        let child_addr = scripted_provider(child_scripts).await;
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut root = session("root-s6");
+        root.model = "root-model".into();
+        root.persona = None;
+        let mut child = child_session("child-s6", "root-s6");
+        child.model = "child-model".into();
+        child.persona = None;
+        store.create_session(&root).await.unwrap();
+        store.create_session(&child).await.unwrap();
+        store
+            .append_message(
+                &child.id,
+                Role::User,
+                &Block::Text {
+                    text: "implement the change".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let providers = HashMap::from([
+            (
+                "root-model".to_string(),
+                openai_provider_with_model(root_addr, "root-model"),
+            ),
+            (
+                "child-model".to_string(),
+                openai_provider_with_model(child_addr, "child-model"),
+            ),
+        ]);
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let loops = Arc::new(AgentRegistry::new(
+            None,
+            providers.clone(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        loops.start(
+            "root-s6",
+            store.clone(),
+            providers["root-model"].clone(),
+            tunnels.clone(),
+            "root-model",
+        );
+        loops.start(
+            "child-s6",
+            store.clone(),
+            providers["child-model"].clone(),
+            tunnels.clone(),
+            "child-model",
+        );
+        let state = Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels,
+            store: store.clone(),
+            loops,
+            providers,
+            personas: HashMap::new(),
+            default_persona: None,
+            skills_dir: None,
+        });
+        (state, store, root.id, child.id)
+    }
+
+    #[tokio::test]
+    async fn a_user_answer_to_a_surfaced_child_ask_routes_to_the_child_without_a_root_model_call() {
+        let answer = "yes, push to main";
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                // The root surfaces the child's question, bound to the child.
+                vec![tool_call_fragment(
+                    "call-1",
+                    "ask",
+                    r#"{"message":"may I push?","options":["yes","no"],"child_id":"child-s6"}"#,
+                )],
+                // The root's only later turn reacts to the child's completion
+                // report: the answer itself is routed by the control plane, so
+                // no root turn relays it.
+                vec![text_chunk("noted the report")],
+            ])));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![tool_call_fragment(
+                    "call-1",
+                    "ask",
+                    r#"{"message":"may I push?","options":["yes","no"]}"#,
+                )],
+                vec![text_chunk("pushed to main")],
+            ])));
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, child_id) =
+            state_with_child_tree(&dir, root_scripts, child_scripts).await;
+        // The child's assignment is in its thread; waking it makes it ask.
+        state.loops.wake(&child_id);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        wait_for("the child to ask and the root to surface the bound ask", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask(&root_id).await.unwrap().is_some()
+                        && store.model_calls(&root_id).await.unwrap().len() == 1
+                }
+            }
+        })
+        .await;
+
+        // The user answers. The answer routes verbatim to the child and no
+        // root model call is spent on it.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/messages"))
+            .json(&json!({ "content": answer }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the child to resume on the answer and finish", {
+            let store = store.clone();
+            let child_id = child_id.clone();
+            move || {
+                let store = store.clone();
+                let child_id = child_id.clone();
+                async move {
+                    let stored = store.get_session(&child_id).await.unwrap().unwrap();
+                    stored.state == SessionState::Stopped
+                        && store.model_calls(&child_id).await.unwrap().len() == 2
+                }
+            }
+        })
+        .await;
+        wait_for("the root to react to the child report and wait", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.model_calls(&root_id).await.unwrap().len() == 2
+                }
+            }
+        })
+        .await;
+
+        // The root ran exactly the surface turn and the report-reaction turn:
+        // no turn forwarded the answer, and no message_child tool call exists.
+        let root_calls = store.model_calls(&root_id).await.unwrap();
+        assert_eq!(
+            root_calls.len(),
+            2,
+            "the answer routing spent no root model turn"
+        );
+        let root_tool_calls = store.tool_calls(&root_id).await.unwrap();
+        assert!(
+            !root_tool_calls
+                .iter()
+                .any(|call| call.name == "message_child"),
+            "the root never relayed the answer: {root_tool_calls:?}"
+        );
+
+        // The answer landed verbatim in the child's thread and the child
+        // finished its work.
+        let child_messages = store.messages(&child_id, false).await.unwrap();
+        let child_texts: Vec<&str> = child_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_texts,
+            ["implement the change", answer, "pushed to main"],
+            "the answer is the child's next message, verbatim"
+        );
+
+        // The surfaced ask records the answer on the root's thread, and the
+        // binding is cleared.
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        let asked = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    child_id: Some(child_id),
+                    answer,
+                    ..
+                } if child_id == "child-s6" => Some(answer),
+                _ => None,
+            })
+            .expect("the surfaced ask block exists");
+        assert_eq!(
+            asked.as_deref(),
+            Some(answer),
+            "the answer is recorded on the surfaced ask"
+        );
+        assert!(
+            !root_messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::Text { text } if text == answer
+            )),
+            "the answer is not addressed to the root's thread"
+        );
+        assert!(
+            store.get_pending_ask(&root_id).await.unwrap().is_none(),
+            "the binding is cleared once the ask is answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_while_a_surfaced_ask_is_pending_wakes_the_root_and_keeps_the_binding() {
+        let redirect = "stop the push attempt and review the README instead";
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![tool_call_fragment(
+                    "call-1",
+                    "ask",
+                    r#"{"message":"may I push?","options":["yes","no"],"child_id":"child-s6"}"#,
+                )],
+                // The redirect wakes the root, which decides to hold the
+                // pending ask: it answers with text and does not message the
+                // child, so the binding stays for a later answer.
+                vec![text_chunk("understood — the question still stands")],
+            ])));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![vec![tool_call_fragment(
+                "call-1",
+                "ask",
+                r#"{"message":"may I push?","options":["yes","no"]}"#,
+            )]])));
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, child_id) =
+            state_with_child_tree(&dir, root_scripts, child_scripts).await;
+        // The child's assignment is in its thread; waking it makes it ask.
+        state.loops.wake(&child_id);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        wait_for("the child to ask and the root to surface the bound ask", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask(&root_id).await.unwrap().is_some()
+                        && store.model_calls(&root_id).await.unwrap().len() == 1
+                }
+            }
+        })
+        .await;
+        let child_messages_before = store.messages(&child_id, false).await.unwrap().len();
+
+        // The user redirects instead of answering: the message is an ordinary
+        // root message, so the root wakes to decide the pending ask's fate.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/messages"))
+            .json(&json!({ "content": redirect, "redirect": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the root's redirect turn to run and end", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.model_calls(&root_id).await.unwrap().len() == 2
+                }
+            }
+        })
+        .await;
+
+        // The redirect reached the root as a normal message...
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        assert!(
+            root_messages.iter().any(
+                |(_, message)| matches!(&message.block, Block::Text { text } if text == redirect)
+            ),
+            "the redirect text is in the root's thread"
+        );
+        // ...was never routed to the child...
+        let child_messages = store.messages(&child_id, false).await.unwrap();
+        assert_eq!(
+            child_messages.len(),
+            child_messages_before,
+            "a redirect is not routed to the child"
+        );
+        assert!(!child_messages.iter().any(
+            |(_, message)| matches!(&message.block, Block::Text { text } if text == redirect)
+        ));
+        let child = store.get_session(&child_id).await.unwrap().unwrap();
+        assert_eq!(
+            child.state,
+            SessionState::WaitingForInput,
+            "the child still waits on its question"
+        );
+        // ...and the binding stayed pending: the root chose to hold, so the
+        // user can still answer the surfaced question.
+        let pending = store.get_pending_ask(&root_id).await.unwrap().unwrap();
+        assert_eq!(pending.child_id, child_id);
+        let surfaced = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::Ask {
+                    child_id: Some(child_id),
+                    answer,
+                    ..
+                } if child_id == "child-s6" => Some(answer),
+                _ => None,
+            })
+            .expect("the surfaced ask block exists");
+        assert_eq!(surfaced, &None, "a held ask is not answered");
     }
 
     #[tokio::test]

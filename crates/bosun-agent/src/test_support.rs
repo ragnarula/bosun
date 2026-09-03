@@ -21,6 +21,7 @@ use serde_json::Value;
 use serde_json::json;
 use tokio::net::TcpListener;
 
+use crate::provider::AskRecipient;
 use crate::provider::Provider;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
@@ -128,6 +129,7 @@ pub fn provider_call(model: &'static str) -> ProviderCall<'static> {
             description: "Run a command.".into(),
             schema: json!({"type": "object"}),
         }],
+        ask_recipient: AskRecipient::User,
     }
 }
 

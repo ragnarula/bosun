@@ -35,7 +35,7 @@ impl OpenAi {
             "model": call.model,
             "max_tokens": call.max_tokens,
             "stream": true,
-            "messages": openai_messages(call.system, &call.messages),
+            "messages": openai_messages(call.system, &call.messages, call.ask_recipient),
             "tools": openai_tools(&call.tools),
             "stream_options": { "include_usage": true },
         })

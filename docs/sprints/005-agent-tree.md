@@ -90,6 +90,8 @@ As a user, I want only questions worth asking to reach me, answered or denied by
 - A surfaced ask binds to the originating leaf; the user's answer routes verbatim down the tree to that leaf and resumes it.
 - When the user redirects instead of answering, the root model decides the pending ask's fate; a cancelled ask is notified to the leaf.
 
+Routing is mechanical in the control plane, not model-mediated. Surfacing a bound ask records a durable `pending_asks` store row (root session, bound child, the surfaced question, and the surfaced Ask block's message id — the block itself may be compacted away); the answer path never wakes the root model. A root has one pending ask at a time, and a bound child must itself be waiting on an unanswered question (`ask` with a `child_id` is refused otherwise, and a second surface while one is pending is refused). `POST /sessions/{id}/messages` distinguishes an answer (default) from a redirect (`redirect: true`). An answer with no pending binding, or with the binding's child gone, is an ordinary root message. A redirect never clears the binding: the root model wakes with the surfaced ask still in its thread and decides — messaging the bound child via `message_child` cancels the pending ask and clears the binding, ending the turn without messaging it holds, so a later answer still routes. The terminal client sends redirects with Ctrl-R, the web pane with a Redirect button.
+
 - [ ] **S7 — Recursive tree and watch-only clients**
 
 As a user, I want any agent to be able to delegate and for the tree to be visible and inspectable, so deep work composes and I always know what is running.
