@@ -1,5 +1,6 @@
-//! Tool calls over the session tunnel. Each call opens a fresh logical
-//! connection on the session's tunnel and speaks HTTP/1.1 to the node's
+//! Tool calls over the node tunnel. Each call resolves the session's node
+//! from the store, opens a fresh logical connection on that node's tunnel
+//! addressed with the session id, and speaks HTTP/1.1 to the session's
 //! executor, which the node relay dials on loopback.
 
 use std::future::Future;
@@ -13,6 +14,7 @@ use bosun_agent::agent_loop::ToolOutcome;
 use bosun_agent::sse::sse_stream;
 use bosun_common::session::Permission;
 use bosun_common::tool::ToolDelta;
+use bosun_store::store::Store;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
@@ -39,9 +41,12 @@ const ERROR_BODY_LIMIT: usize = 64 * 1024;
 /// Cap on a JSON tool result body.
 const JSON_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-/// Dispatches tool calls to the node's executor over the session tunnel.
+/// Dispatches tool calls to the executor on the session's node. The session
+/// row names its node; a logical connection opened on that node's tunnel
+/// carries the session id, so the node relay dials the session's executor.
 pub struct TunnelToolExecutor {
     pub tunnels: Arc<TunnelRegistry>,
+    pub store: Store,
 }
 
 impl ToolExecutor for TunnelToolExecutor {
@@ -54,8 +59,10 @@ impl ToolExecutor for TunnelToolExecutor {
         delta: mpsc::UnboundedSender<ToolDelta>,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutcome, ToolError>> + Send>> {
         let tunnels = self.tunnels.clone();
+        let store = self.store.clone();
         Box::pin(async move {
-            let outcome = call_tool(&tunnels, &session_id, &run_id, &name, &args, &delta).await?;
+            let outcome =
+                call_tool(&tunnels, &store, &session_id, &run_id, &name, &args, &delta).await?;
             Ok(outcome)
         })
     }
@@ -66,8 +73,9 @@ impl ToolExecutor for TunnelToolExecutor {
         run_id: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), ToolError>> + Send>> {
         let tunnels = self.tunnels.clone();
+        let store = self.store.clone();
         Box::pin(async move {
-            if let Err(error) = cancel_tool(&tunnels, &session_id, &run_id).await {
+            if let Err(error) = cancel_tool(&tunnels, &store, &session_id, &run_id).await {
                 debug!(
                     msg = "tool cancel failed; the tool dies with the tunnel",
                     session_id = %session_id,
@@ -82,6 +90,7 @@ impl ToolExecutor for TunnelToolExecutor {
 
 async fn call_tool(
     tunnels: &TunnelRegistry,
+    store: &Store,
     session_id: &str,
     run_id: &str,
     name: &str,
@@ -94,7 +103,8 @@ async fn call_tool(
         tool = %name,
         run_id = %run_id
     );
-    let mut sender = open_connection(tunnels, session_id).await?;
+    let node = resolve_session_node(store, session_id).await?;
+    let mut sender = open_connection(tunnels, &node, session_id).await?;
     let body = serde_json::to_vec(&json!({ "run_id": run_id, "args": args }))
         .context("failed to serialize the tool request")?;
     let response = post_json(&mut sender, &format!("/tool/{name}"), body.into(), "tool").await?;
@@ -131,10 +141,12 @@ async fn call_tool(
 
 async fn cancel_tool(
     tunnels: &TunnelRegistry,
+    store: &Store,
     session_id: &str,
     run_id: &str,
 ) -> anyhow::Result<()> {
-    let mut sender = open_connection(tunnels, session_id).await?;
+    let node = resolve_session_node(store, session_id).await?;
+    let mut sender = open_connection(tunnels, &node, session_id).await?;
     let _ = post_json(
         &mut sender,
         &format!("/tool/{run_id}/cancel"),
@@ -145,15 +157,16 @@ async fn cancel_tool(
     Ok(())
 }
 
-/// Forwards a permission change to the node's executor. The caller treats
+/// Forwards a permission change to the session's executor. The caller treats
 /// transport errors as best-effort: the loop's tool schema gates the
 /// permission too.
 pub async fn set_executor_permission(
     tunnels: &TunnelRegistry,
+    node: &str,
     session_id: &str,
     permission: Permission,
 ) -> anyhow::Result<()> {
-    let mut sender = open_connection(tunnels, session_id).await?;
+    let mut sender = open_connection(tunnels, node, session_id).await?;
     let body = serde_json::to_vec(&json!({ "permission": permission }))
         .context("failed to serialize the permission request")?;
     let response = post_json(&mut sender, "/permission", body.into(), "permission").await?;
@@ -167,7 +180,7 @@ pub async fn set_executor_permission(
     Ok(())
 }
 
-/// Sends a JSON POST to the executor over the session tunnel.
+/// Sends a JSON POST to the executor over the session's node tunnel.
 async fn post_json(
     sender: &mut http1::SendRequest<Full<Bytes>>,
     path: &str,
@@ -189,21 +202,39 @@ async fn post_json(
         .with_context(|| format!("failed to send the {what} request"))
 }
 
-/// Opens a logical connection on the session's tunnel and handshakes HTTP/1.1
-/// over it, so the node relay can forward the request to the executor.
+/// Resolves the node a session runs on from the store. The session row is the
+/// control plane's record of where the session's executor lives.
+async fn resolve_session_node(store: &Store, session_id: &str) -> anyhow::Result<String> {
+    let session = store
+        .get_session(session_id)
+        .await
+        .with_context(|| format!("failed to look up session {session_id}"))?
+        .with_context(|| format!("session {session_id} was not found"))?;
+    Ok(session.node)
+}
+
+/// Opens a logical connection on the session's node tunnel and handshakes
+/// HTTP/1.1 over it, so the node relay can forward the request to the
+/// session's executor.
 async fn open_connection(
     tunnels: &TunnelRegistry,
+    node: &str,
     session_id: &str,
 ) -> anyhow::Result<http1::SendRequest<Full<Bytes>>> {
-    let stream = match tunnels.open(session_id).await {
+    let stream = match tunnels.open(node, session_id).await {
         Ok(stream) => stream,
         Err(TunnelError::NoTunnel { .. }) | Err(TunnelError::TunnelClosed { .. }) => {
+            debug!(
+                msg = "the session's node has no live tunnel",
+                session_id = %session_id,
+                node = %node
+            );
             anyhow::bail!("session {session_id} has no live tunnel");
         }
     };
     let (sender, conn) = http1::handshake(TokioIo::new(stream))
         .await
-        .context("failed to handshake with the session tunnel")?;
+        .context("failed to handshake with the node tunnel")?;
     tokio::spawn(async move {
         if let Err(error) = conn.with_upgrades().await {
             debug!(error = %error, "tool tunnel connection ended with an error");
@@ -296,8 +327,12 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::response::Response;
     use axum::routing::post;
+    use bosun_common::session::Session;
+    use bosun_common::session::SessionState;
     use bosun_common::tunnel::Tunnel;
+    use bosun_store::store::Store;
     use futures_util::stream;
+    use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -305,7 +340,7 @@ mod tests {
     use super::*;
 
     /// A stub executor implementing the tool protocol over plain TCP, with the
-    /// session tunnel relayed to it like a node would.
+    /// node tunnel relayed to it like a node would.
     async fn stub_executor() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         let cancels: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
@@ -373,16 +408,46 @@ mod tests {
         Json(json!({}))
     }
 
-    /// Registers a real `TunnelRegistry` for a fresh session whose node side
-    /// relays every opened logical connection to the stub executor.
-    async fn test_executor(backend: SocketAddr) -> (TunnelToolExecutor, String) {
+    /// A session row for `session_id` on `node`, as a clone or dev request
+    /// would create it.
+    async fn create_session_row(store: &Store, session_id: &str, node: &str) {
+        store
+            .create_session(&Session {
+                id: session_id.to_string(),
+                node: node.to_string(),
+                repo_url: None,
+                git_ref: None,
+                dir: "/work".into(),
+                model: "mock".into(),
+                persona: None,
+                parent_id: None,
+                owner_id: session_id.to_string(),
+                permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
+                state: SessionState::WaitingForInput,
+                interrupt_cause: None,
+                created_at_secs: 1_700_000_000,
+                prompt: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Registers a real `TunnelRegistry` for a node whose tunnel relays every
+    /// opened logical connection to the stub executor, like a node's relay
+    /// does for one of its sessions.
+    async fn test_executor(backend: SocketAddr) -> (TunnelToolExecutor, String, String) {
         let (cp_side, node_side) = tokio::io::duplex(1 << 20);
         let (cp_tunnel, _) = Tunnel::new(cp_side);
         let (node_tunnel, mut opens) = Tunnel::new(node_side);
 
         let session_id = uuid::Uuid::new_v4().to_string();
+        let node = "node-1".to_string();
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        create_session_row(&store, &session_id, &node).await;
         let tunnels = TunnelRegistry::new();
-        tunnels.register(&session_id, cp_tunnel);
+        tunnels.register(&node, cp_tunnel);
 
         tokio::spawn(async move {
             while let Some(event) = opens.recv().await {
@@ -398,15 +463,17 @@ mod tests {
         (
             TunnelToolExecutor {
                 tunnels: Arc::new(tunnels),
+                store,
             },
             session_id,
+            node,
         )
     }
 
     #[tokio::test]
     async fn call_dispatches_json_tools() {
         let (backend, _) = stub_executor().await;
-        let (executor, session_id) = test_executor(backend).await;
+        let (executor, session_id, _node) = test_executor(backend).await;
         let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
 
         let outcome = executor
@@ -427,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn call_streams_shell_output() {
         let (backend, _) = stub_executor().await;
-        let (executor, session_id) = test_executor(backend).await;
+        let (executor, session_id, _node) = test_executor(backend).await;
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
         let outcome = executor
@@ -456,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn call_reports_non_2xx_as_tool_error_outcome() {
         let (backend, _) = stub_executor().await;
-        let (executor, session_id) = test_executor(backend).await;
+        let (executor, session_id, _node) = test_executor(backend).await;
         let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
 
         let outcome = executor
@@ -480,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn a_nonzero_exit_code_marks_the_outcome_as_error() {
         let (backend, _) = stub_executor().await;
-        let (executor, session_id) = test_executor(backend).await;
+        let (executor, session_id, _node) = test_executor(backend).await;
         let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
 
         let outcome = executor
@@ -504,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_posts_to_the_run_id_route() {
         let (backend, cancels) = stub_executor().await;
-        let (executor, session_id) = test_executor(backend).await;
+        let (executor, session_id, _node) = test_executor(backend).await;
 
         executor.cancel(session_id, "run-9".into()).await.unwrap();
 
@@ -521,9 +588,9 @@ mod tests {
     #[tokio::test]
     async fn set_executor_permission_posts_the_snake_case_permission() {
         let (backend, seen) = stub_executor().await;
-        let (executor, session_id) = test_executor(backend).await;
+        let (executor, session_id, node) = test_executor(backend).await;
 
-        set_executor_permission(&executor.tunnels, &session_id, Permission::ReadOnly)
+        set_executor_permission(&executor.tunnels, &node, &session_id, Permission::ReadOnly)
             .await
             .unwrap();
 
@@ -533,6 +600,40 @@ mod tests {
                 .iter()
                 .any(|body| body == r#"{"permission":"read_only"}"#),
             "the executor never received the permission body: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_reports_a_missing_node_tunnel_as_no_live_tunnel() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        create_session_row(&store, &session_id, "node-down").await;
+        let executor = TunnelToolExecutor {
+            tunnels: Arc::new(TunnelRegistry::new()),
+            store,
+        };
+        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+
+        let error = match executor
+            .call(
+                session_id.clone(),
+                "run-5".into(),
+                "echo".into(),
+                json!({}),
+                delta_tx,
+            )
+            .await
+        {
+            Err(bosun_agent::agent_loop::ToolError::Internal(error)) => error,
+            Ok(_) => panic!("no tunnel means the call fails"),
+        };
+
+        let chain = format!("{error:?}");
+        // No error variant distinguishes no-live-tunnel, so the message text is the only handle.
+        assert!(
+            chain.contains(&format!("session {session_id} has no live tunnel")),
+            "the error chain must name the session like a node that is down: {chain}"
         );
     }
 }

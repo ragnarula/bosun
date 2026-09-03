@@ -70,7 +70,7 @@ the next turn; the session's event stream records it.
 With no message, a new session idles at `waiting_for_input`; with
 `--message <prompt>` the first turn starts immediately. The control plane runs
 one agent loop per session; tool calls travel to the node's executor over the
-session tunnel.
+node tunnel.
 
 ## Dev session in an existing directory
 

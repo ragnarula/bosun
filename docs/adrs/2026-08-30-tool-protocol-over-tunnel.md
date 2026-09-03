@@ -3,6 +3,8 @@
 **Date:** 2026-08-30
 **Author:** Raghav
 
+> Superseded in part by `2026-09-03-one-tunnel-per-node.md`: the tool protocol above survives unchanged; a logical connection is now opened on the node's tunnel, addressed by session id, instead of on the session's tunnel.
+
 ## Context
 
 Nodes dial the control plane only (see `2026-08-21-nodes-dial-out-only.md`), so the control plane cannot reach the executor directly. The MVP's byte-level proxy spoke the opencode wire protocol through the tunnel. Sprint 002 replaces opencode with the executor, so the tunnel's payload protocol is now ours to choose.

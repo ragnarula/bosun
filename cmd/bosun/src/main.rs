@@ -483,6 +483,9 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         config.cp_url.clone(),
         tls_config.clone(),
     ));
+    // The one outbound tunnel starts at boot and reconnects on its own, so it
+    // is already up (or coming up) when the first session's executor starts.
+    manager.start_node_tunnel(&config.node_name);
     manager.restore().await;
 
     tokio::select! {

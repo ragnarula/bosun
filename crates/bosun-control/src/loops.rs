@@ -108,10 +108,14 @@ impl AgentRegistry {
             .insert(session_id.to_string(), sender.clone());
         let (price_input_per_mtok, price_output_per_mtok) =
             self.prices.get(model_name).copied().unwrap_or((0.0, 0.0));
+        let tool_store = store.clone();
         let deps = LoopDeps {
             store,
             provider,
-            tools: Arc::new(TunnelToolExecutor { tunnels }),
+            tools: Arc::new(TunnelToolExecutor {
+                tunnels,
+                store: tool_store,
+            }),
             delta_sink: Arc::new(LiveSink { tx: sender }),
             max_window_messages: MAX_WINDOW_MESSAGES,
             injected_skills_dir: self.skills_dir.clone(),

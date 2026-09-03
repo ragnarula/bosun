@@ -3,6 +3,8 @@
 **Date:** 2026-08-21
 **Author:** Raghav
 
+> Superseded in part by `2026-09-03-one-tunnel-per-node.md`: the tunnel is now one per node, opened at boot with `GET /tunnel/node/<name>`, instead of one per session opened at `GET /tunnel/session/<id>`. The polling and command delivery sections survive unchanged.
+
 ## Context
 
 Nodes today run an HTTP control listener and a per-session TCP forwarder on their advertised address. The control plane reaches both by dialing the node: it posts clone, dev, dirs, and stop to the control listener, and it connects a socket to each session's forwarder to route opencode client traffic. Every node therefore accepts inbound connections, and when the advertised address is not loopback, those connections are reachable from the network.

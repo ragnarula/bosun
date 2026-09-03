@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -81,7 +82,6 @@ pub struct NodeManager {
     tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     processes: RwLock<HashMap<String, Child>>,
-    tunnels: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl NodeManager {
@@ -112,7 +112,6 @@ impl NodeManager {
             tls_config,
             sessions: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
-            tunnels: RwLock::new(HashMap::new()),
         }
     }
 
@@ -187,8 +186,6 @@ impl NodeManager {
                 return Err(e);
             }
         };
-
-        self.open_tunnel(session_id, port);
 
         let record = SessionRecord {
             id: session_id.to_string(),
@@ -324,11 +321,6 @@ impl NodeManager {
                 .with_context(|| format!("failed to kill executor for session {session_id}"))?;
         }
 
-        let tunnel = self.tunnels.write().unwrap().remove(session_id);
-        if let Some(handle) = tunnel {
-            handle.abort();
-        }
-
         self.sessions.write().unwrap().remove(session_id);
         if record.reapable {
             cleanup(&record.dir).await;
@@ -396,20 +388,47 @@ impl NodeManager {
         Ok(child)
     }
 
-    /// Opens the session's outbound tunnel to the control plane. The tunnel
-    /// reconnects on its own until the session stops, so a refused connection
-    /// does not fail the session.
-    fn open_tunnel(&self, session_id: &str, executor_port: u16) {
+    /// Starts the node's one outbound tunnel to the control plane. The task
+    /// reconnects on its own until the node exits, so sessions never nudge
+    /// it, and a control-plane restart needs no per-session nudge either.
+    pub fn start_node_tunnel(self: &Arc<Self>, node_name: &str) {
         let cp_url = self.cp_url.clone();
-        let session_id = session_id.to_string();
+        let node_name = node_name.to_string();
         let tls_config = self.tls_config.clone();
-        let handle = tokio::spawn(crate::tunnel::run_session_tunnel(
-            cp_url,
-            session_id.clone(),
-            executor_port,
-            tls_config,
+        let manager = self.clone();
+        tokio::spawn(crate::tunnel::run_node_tunnel(
+            cp_url, node_name, manager, tls_config,
         ));
-        let _ = self.tunnels.write().unwrap().insert(session_id, handle);
+    }
+
+    /// The executor port of one running session. The node's tunnel relay
+    /// dials it when a logical connection addressed to the session arrives.
+    pub fn executor_port(&self, session_id: &str) -> Option<u16> {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(session_id)
+            .and_then(|record| record.executor_port)
+    }
+
+    /// Registers a running session without spawning an executor, so tunnel
+    /// tests can relay to stub executors on real ports.
+    #[cfg(test)]
+    pub(crate) fn add_session_for_test(&self, id: &str, executor_port: u16) {
+        let record = SessionRecord {
+            id: id.to_string(),
+            repo_url: None,
+            git_ref: None,
+            dir: PathBuf::from("/work"),
+            reapable: false,
+            status: "running".into(),
+            executor_port: Some(executor_port),
+            permission: Permission::ReadWrite,
+        };
+        self.sessions
+            .write()
+            .unwrap()
+            .insert(id.to_string(), record);
     }
 
     fn persisted_sessions(&self) -> Vec<PersistedSession> {
@@ -515,8 +534,6 @@ impl NodeManager {
                     continue;
                 }
             };
-
-            self.open_tunnel(&session.id, session.executor_port);
 
             let record = SessionRecord {
                 id: session.id.clone(),

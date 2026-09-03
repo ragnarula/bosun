@@ -299,7 +299,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/nodes/{name}/dirs", get(dirs))
         .route("/nodes/{name}/update", post(node_update))
         .route("/stop", post(stop))
-        .route("/tunnel/session/{id}", get(tunnel))
+        .route("/tunnel/node/{node}", get(tunnel))
         .fallback(not_found)
         .layer(from_fn(add_version_header))
         .with_state(state)
@@ -711,10 +711,12 @@ async fn subtree_sessions(state: &AppState, top: &str) -> Result<Vec<Session>, A
 
 /// Stops a session and every session below it in its tree. `bosun stop` on
 /// the owner cascades to the whole tree; on a child it cascades that child's
-/// subtree. Each stopped session's executor is torn down on its node, its
-/// loop task and tunnel are dropped, and its rows are removed, so a stopped
-/// subtree is gone — completed children keep no executor behind (S4's note).
-/// Teardown runs leaves-first so the topmost row disappears last.
+/// subtree. Each stopped session's executor is torn down on its node and its
+/// loop task is dropped, and its rows are removed, so a stopped subtree is
+/// gone — completed children keep no executor behind (S4's note). The node's
+/// tunnel stays: it carries the node's other sessions, and only the node
+/// tears it down. Teardown runs leaves-first so the topmost row disappears
+/// last.
 #[instrument(skip(state))]
 async fn stop(
     State(state): State<Arc<AppState>>,
@@ -751,8 +753,8 @@ async fn stop(
         } else {
             // The node is down: still enqueue the stop so it runs on the
             // node's next poll. Without it a restarted node would keep this
-            // session's executor and tunnel alive while the control plane
-            // forgets the session, and nothing would ever stop them.
+            // session's executor alive while the control plane forgets the
+            // session, and nothing would ever stop it.
             let (reply, _reply_rx) = oneshot::channel();
             state.commands.enqueue(
                 &session.node,
@@ -767,7 +769,6 @@ async fn stop(
 
     for session in subtree.iter().rev() {
         state.loops.stop(&session.id);
-        state.tunnels.unregister(&session.id);
         state.store.remove_session(&session.id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -930,7 +931,9 @@ async fn set_permission(
     // The forward is best-effort: the store is authoritative and the loop
     // gates the tool schema per turn, so a node restart reverting the
     // executor to its persisted permission is not a safety hole.
-    if let Err(error) = set_executor_permission(&state.tunnels, &id, req.permission).await {
+    if let Err(error) =
+        set_executor_permission(&state.tunnels, &session.node, &id, req.permission).await
+    {
         warn!(
             msg = "failed to forward the permission change to the executor",
             session_id = %id,
@@ -977,7 +980,8 @@ async fn switch_persona(
     // The toggle is best-effort like `set_permission`: the store is
     // authoritative and the loop gates the tool schema per turn.
     if permission_changed
-        && let Err(error) = set_executor_permission(&state.tunnels, &id, config.permission).await
+        && let Err(error) =
+            set_executor_permission(&state.tunnels, &session.node, &id, config.permission).await
     {
         warn!(
             msg = "failed to forward the permission change to the executor",
@@ -1102,17 +1106,18 @@ async fn enqueue_and_await(
     }
 }
 
-/// Accepts a node's outbound tunnel for a session. The node keeps the
-/// connection; tool calls open logical connections on it per request.
+/// Accepts a node's outbound tunnel. The node keeps the connection; tool
+/// calls addressed to its sessions open logical connections on it per
+/// request.
 async fn tunnel(
     State(state): State<Arc<AppState>>,
-    AxumPath(session_id): AxumPath<String>,
+    AxumPath(node): AxumPath<String>,
     mut req: Request<Body>,
 ) -> Response {
-    // The store cannot gate this route: the node opens the tunnel right after
-    // spawning the executor, which races the control plane creating the store
-    // session for a clone. A tunnel for a session the store does not know is
-    // inert — no loop dispatches tools on it — so it is harmless.
+    // The store cannot gate this route: the node opens its tunnel at boot,
+    // before any clone or dev session exists. A tunnel for a node the store
+    // has no sessions on is inert — no loop dispatches tools on it — so it is
+    // harmless.
     if !wants_tunnel_upgrade(&req) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -1125,14 +1130,14 @@ async fn tunnel(
         let stream = match upgrade.await {
             Ok(stream) => stream,
             Err(error) => {
-                warn!(session_id = %session_id, error = %error, "session tunnel upgrade failed");
+                warn!(node = %node, error = %error, "node tunnel upgrade failed");
                 return;
             }
         };
         let (tunnel, _opens) = Tunnel::new(TokioIo::new(stream));
-        tunnels.register(&session_id, tunnel.clone());
+        tunnels.register(&node, tunnel.clone());
         tunnel.closed().await;
-        tunnels.unregister(&session_id);
+        tunnels.unregister_if_current(&node, &tunnel);
     });
 
     Response::builder()
@@ -1935,7 +1940,7 @@ mod tests {
         });
         let request = HttpRequest::builder()
             .method("GET")
-            .uri(format!("/tunnel/session/{session_id}"))
+            .uri("/tunnel/node/n1")
             .header(header::HOST, addr.to_string())
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, "bosun-tunnel")
@@ -1959,12 +1964,13 @@ mod tests {
             }
         });
 
-        // The control plane registers the tunnel after the 101; a request
-        // opened on it then reaches the relayed backend.
+        // The control plane registers the node's tunnel after the 101; a
+        // request opened on it for the session then reaches the relayed
+        // backend.
         let tunnels = state.tunnels.clone();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let stream = match tunnels.open(&session_id).await {
+            let stream = match tunnels.open("n1", &session_id).await {
                 Ok(stream) => stream,
                 Err(TunnelError::NoTunnel { .. }) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4068,7 +4074,9 @@ mod tests {
         let (cp_tunnel, _) = Tunnel::new(cp_side);
         let (node_tunnel, mut opens) = Tunnel::new(node_side);
         let tunnels = Arc::new(TunnelRegistry::new());
-        tunnels.register("s1", cp_tunnel);
+        // The session helper puts s1 on node n1, and the registry is keyed by
+        // node, so n1's tunnel is what the permission toggle opens on.
+        tunnels.register("n1", cp_tunnel);
         tokio::spawn(async move {
             while let Some(event) = opens.recv().await {
                 let tunnel = node_tunnel.clone();
@@ -4479,7 +4487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnel_accepts_a_session_the_store_does_not_know() {
+    async fn tunnel_accepts_a_node_the_store_does_not_know() {
         let dir = tempdir().unwrap();
         let addr = serve(test_state(&dir)).await;
 
@@ -4493,7 +4501,7 @@ mod tests {
         });
         let request = HttpRequest::builder()
             .method("GET")
-            .uri("/tunnel/session/ghost")
+            .uri("/tunnel/node/ghost")
             .header(header::HOST, addr.to_string())
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, "bosun-tunnel")
@@ -4503,7 +4511,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::SWITCHING_PROTOCOLS,
-            "the tunnel must not depend on the store: a node's tunnel can arrive before the control plane records the clone"
+            "the tunnel must not depend on the store: a node's tunnel can arrive before its first poll or session"
         );
     }
 

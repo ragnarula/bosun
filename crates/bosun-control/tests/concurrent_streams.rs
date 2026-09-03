@@ -1,7 +1,11 @@
-//! Reproduction for: concurrent streams over one session tunnel stall after
-//! roughly 800 KiB of a large response. Mirrors the reported deployment: a
-//! control plane, a node that dials out over one tunnel, and two requests
-//! over logical connections on the same tunnel at the same time.
+//! One node tunnel carries tool calls for every session on the node. Two
+//! sessions sharing a node reach their own executors concurrently over the
+//! tunnel, and large responses over one logical connection do not stall the
+//! other (the original flow-control regression: concurrent streams over one
+//! tunnel stalled after roughly 800 KiB of a large response). Mirrors the
+//! reported deployment: a control plane, a node that dials out over one
+//! tunnel, and requests over logical connections on the same tunnel at the
+//! same time.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -10,6 +14,9 @@ use std::time::Duration;
 
 use axum::http::Request as HttpRequest;
 use axum::http::StatusCode;
+use bosun_common::session::Permission;
+use bosun_common::session::Session;
+use bosun_common::session::SessionState;
 use bosun_common::tunnel::Tunnel;
 use bosun_control::api::AppState;
 use bosun_control::api::router;
@@ -26,11 +33,13 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 const ASSET_BODY_LEN: usize = 2_738_956;
-const ROOT_BODY: &[u8] = b"root page";
+const ROOT_BODY_A: &[u8] = b"root page from executor A";
+const ROOT_BODY_B: &[u8] = b"root page from executor B";
 
 /// Serves a request head based on the path: `/assets/index.js` returns a body
-/// the size of a large web asset bundle, everything else a tiny body.
-async fn backend() -> SocketAddr {
+/// the size of a large web asset bundle, everything else a tiny body that
+/// identifies the backend.
+async fn backend(root_body: &'static [u8]) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -62,10 +71,10 @@ async fn backend() -> SocketAddr {
                 } else {
                     let header = format!(
                         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
-                        ROOT_BODY.len()
+                        root_body.len()
                     );
                     let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(ROOT_BODY).await;
+                    let _ = stream.write_all(root_body).await;
                 }
             });
         }
@@ -73,8 +82,8 @@ async fn backend() -> SocketAddr {
     addr
 }
 
-/// A control plane with a session tunnel registry. Returns the store too, so
-/// a test can register the tunnel's session up front.
+/// A control plane with a node tunnel registry. Returns the store too, so
+/// a test can register the tunnel's sessions up front.
 async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>) {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -104,13 +113,9 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>) {
     (addr, store, tunnels)
 }
 
-/// Registers the session in the store, as a clone/dev request would, so the
-/// tunnel endpoint accepts its tunnel.
+/// Registers a session on `node-1` in the store, as a clone/dev request
+/// would.
 async fn register_session(store: &Store, session_id: &str) {
-    use bosun_common::session::Permission;
-    use bosun_common::session::Session;
-    use bosun_common::session::SessionState;
-
     store
         .create_session(&Session {
             id: session_id.to_string(),
@@ -133,9 +138,11 @@ async fn register_session(store: &Store, session_id: &str) {
         .unwrap();
 }
 
-/// The node side: opens the outbound tunnel and relays every logical
-/// connection to `backend`, the way `bosun-node/src/tunnel.rs` does.
-async fn node_tunnel(cp_addr: SocketAddr, session_id: &str, backend: SocketAddr) {
+/// The node side: opens the outbound node tunnel and relays every logical
+/// connection to the backend its session names, the way
+/// `bosun-node/src/tunnel.rs` dials the executor of the session a connection
+/// is addressed to.
+async fn node_tunnel(cp_addr: SocketAddr, backends: HashMap<String, SocketAddr>) {
     let stream = TcpStream::connect(cp_addr).await.unwrap();
     let (mut sender, conn) =
         http1::handshake::<_, http_body_util::Empty<bytes::Bytes>>(TokioIo::new(stream))
@@ -146,7 +153,7 @@ async fn node_tunnel(cp_addr: SocketAddr, session_id: &str, backend: SocketAddr)
     });
     let request = HttpRequest::builder()
         .method("GET")
-        .uri(format!("/tunnel/session/{session_id}"))
+        .uri("/tunnel/node/node-1")
         .header("host", cp_addr.to_string())
         .header("connection", "upgrade")
         .header("upgrade", "bosun-tunnel")
@@ -159,6 +166,9 @@ async fn node_tunnel(cp_addr: SocketAddr, session_id: &str, backend: SocketAddr)
     let (tunnel, mut opens) = Tunnel::new(TokioIo::new(upgraded));
     tokio::spawn(async move {
         while let Some(event) = opens.recv().await {
+            let Some(backend) = backends.get(&event.session_id).copied() else {
+                continue;
+            };
             let tunnel = tunnel.clone();
             tokio::spawn(async move {
                 let Ok(mut backend) = TcpStream::connect(backend).await else {
@@ -173,15 +183,15 @@ async fn node_tunnel(cp_addr: SocketAddr, session_id: &str, backend: SocketAddr)
     });
 }
 
-/// Opens a logical connection on the session's tunnel and sends one GET over
-/// HTTP/1.1, the way the control plane's tool transport does. Returns `None`
-/// while the tunnel is not yet registered.
+/// Opens a logical connection on the node's tunnel for one session and sends
+/// one GET over HTTP/1.1, the way the control plane's tool transport does.
+/// Returns `None` while the tunnel is not yet registered.
 async fn tunnel_get(
     tunnels: &TunnelRegistry,
     session_id: &str,
     path: &str,
 ) -> Option<hyper::Response<hyper::body::Incoming>> {
-    let stream = tunnels.open(session_id).await.ok()?;
+    let stream = tunnels.open("node-1", session_id).await.ok()?;
     let (mut sender, conn) =
         http1::handshake::<_, http_body_util::Empty<bytes::Bytes>>(TokioIo::new(stream))
             .await
@@ -201,18 +211,14 @@ async fn tunnel_get(
 /// Waits until the tunnel is live, then fetches the root and the asset
 /// concurrently over two logical connections on one tunnel.
 #[tokio::test]
-async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
-    let backend_addr = backend().await;
+async fn concurrent_streams_over_one_node_tunnel_deliver_both_bodies() {
+    let backend_a = backend(ROOT_BODY_A).await;
     let (cp_addr, store, tunnels) = control_plane().await;
     let session_id = uuid::Uuid::new_v4().to_string();
     register_session(&store, &session_id).await;
-    node_tunnel(cp_addr, &session_id, backend_addr).await;
+    let mut backends = HashMap::new();
+    backends.insert(session_id.clone(), backend_a);
+    node_tunnel(cp_addr, backends).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -221,7 +227,7 @@ async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
             _ => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "session route never became live"
+                    "node route never became live"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -240,12 +246,62 @@ async fn concurrent_streams_over_one_tunnel_deliver_both_bodies() {
     let root_len = tokio::time::timeout(Duration::from_secs(10), body_bytes(root))
         .await
         .expect("root body stalled");
-    assert_eq!(root_len, ROOT_BODY, "root body mismatch");
+    assert_eq!(root_len, ROOT_BODY_A, "root body mismatch");
 
     let asset_len = tokio::time::timeout(Duration::from_secs(10), body_bytes(asset))
         .await
         .expect("asset download stalled");
     assert_eq!(asset_len.len(), ASSET_BODY_LEN, "asset body truncated");
+}
+
+/// Two sessions share the node's one tunnel: each session's call reaches its
+/// own executor, concurrently.
+#[tokio::test]
+async fn two_sessions_on_one_node_reach_their_own_executors_concurrently() {
+    let backend_a = backend(ROOT_BODY_A).await;
+    let backend_b = backend(ROOT_BODY_B).await;
+    let (cp_addr, store, tunnels) = control_plane().await;
+    let session_a = uuid::Uuid::new_v4().to_string();
+    let session_b = uuid::Uuid::new_v4().to_string();
+    register_session(&store, &session_a).await;
+    register_session(&store, &session_b).await;
+    let mut backends = HashMap::new();
+    backends.insert(session_a.clone(), backend_a);
+    backends.insert(session_b.clone(), backend_b);
+    node_tunnel(cp_addr, backends).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tunnel_get(&tunnels, &session_a, "/index.html").await {
+            Some(response) if response.status().is_success() => break,
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "node route never became live"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    let from_a = tunnel_get(&tunnels, &session_a, "/index.html");
+    let from_b = tunnel_get(&tunnels, &session_b, "/index.html");
+
+    let (from_a, from_b) = tokio::join!(from_a, from_b);
+    let from_a = from_a.expect("session A's request failed");
+    let from_b = from_b.expect("session B's request failed");
+    assert_eq!(from_a.status(), StatusCode::OK);
+    assert_eq!(from_b.status(), StatusCode::OK);
+
+    let body_a = tokio::time::timeout(Duration::from_secs(10), body_bytes(from_a))
+        .await
+        .expect("session A's body stalled");
+    assert_eq!(body_a, ROOT_BODY_A, "session A reached the wrong executor");
+
+    let body_b = tokio::time::timeout(Duration::from_secs(10), body_bytes(from_b))
+        .await
+        .expect("session B's body stalled");
+    assert_eq!(body_b, ROOT_BODY_B, "session B reached the wrong executor");
 }
 
 async fn body_bytes(response: hyper::Response<hyper::body::Incoming>) -> Vec<u8> {

@@ -49,14 +49,14 @@ enum FrameType {
 }
 
 enum Frame {
-    Open { conn_id: u64 },
+    Open { conn_id: u64, session_id: String },
     Data { conn_id: u64, bytes: Vec<u8> },
     Close { conn_id: u64 },
     WindowUpdate { conn_id: u64, bytes: u32 },
 }
 
 enum TunnelWrite {
-    Open { conn_id: u64 },
+    Open { conn_id: u64, session_id: String },
     Data { conn_id: u64, bytes: Vec<u8> },
     Close { conn_id: u64 },
     WindowUpdate { conn_id: u64, bytes: u32 },
@@ -69,9 +69,12 @@ pub enum Incoming {
 }
 
 /// A logical connection the peer opened. Carried out of the reader task so the
-/// node side can relay it.
+/// node side can relay it; `session_id` names the session the connection
+/// belongs to, so a node hosting many sessions can dial that session's
+/// executor.
 pub struct OpenEvent {
     pub conn_id: u64,
+    pub session_id: String,
     pub rx: mpsc::Receiver<Incoming>,
 }
 
@@ -107,6 +110,9 @@ struct TunnelInner {
 /// the other side receives them as [`OpenEvent`]s and relays each with
 /// [`Tunnel::attach`]. Logical connections are independent full-duplex
 /// streams; closing one does not affect the others.
+///
+/// Each opened connection names the session it serves, so one tunnel can
+/// carry tool calls for every session on a node.
 ///
 /// Each logical connection is flow-controlled in both directions. A sender
 /// may put at most [`INITIAL_WINDOW`] bytes in flight before the receiver
@@ -148,9 +154,10 @@ impl Tunnel {
         (Tunnel { inner }, open_rx)
     }
 
-    /// Allocates a connection id, tells the peer to open a connection, and
-    /// returns the local end of it. Returns `None` when the tunnel is dead.
-    pub async fn open(&self) -> Option<LogicalStream> {
+    /// Allocates a connection id, tells the peer to open a connection for the
+    /// session, and returns the local end of it. Returns `None` when the
+    /// tunnel is dead.
+    pub async fn open(&self, session_id: &str) -> Option<LogicalStream> {
         if self.inner.dead.load(Ordering::SeqCst) {
             return None;
         }
@@ -165,7 +172,10 @@ impl Tunnel {
         if self
             .inner
             .writer
-            .send(TunnelWrite::Open { conn_id })
+            .send(TunnelWrite::Open {
+                conn_id,
+                session_id: session_id.to_string(),
+            })
             .await
             .is_err()
         {
@@ -193,6 +203,13 @@ impl Tunnel {
     /// connections. Idempotent: every caller is released at once.
     pub async fn closed(&self) {
         self.inner.death.notified().await;
+    }
+
+    /// Whether both handles refer to the same underlying connection. A
+    /// registry uses this to tell a stale handle of a replaced connection
+    /// apart from the connection that replaced it.
+    pub fn same_as(&self, other: &Tunnel) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     fn stream_for(&self, conn_id: u64, rx: mpsc::Receiver<Incoming>) -> LogicalStream {
@@ -417,7 +434,13 @@ where
 {
     while let Some(item) = rx.recv().await {
         let frame = match item {
-            TunnelWrite::Open { conn_id } => Frame::Open { conn_id },
+            TunnelWrite::Open {
+                conn_id,
+                session_id,
+            } => Frame::Open {
+                conn_id,
+                session_id,
+            },
             TunnelWrite::Data { conn_id, bytes } => Frame::Data { conn_id, bytes },
             TunnelWrite::Close { conn_id } => Frame::Close { conn_id },
             TunnelWrite::WindowUpdate { conn_id, bytes } => Frame::WindowUpdate { conn_id, bytes },
@@ -458,10 +481,17 @@ async fn reader_loop<R>(
             }
         };
         match frame {
-            Frame::Open { conn_id } => {
+            Frame::Open {
+                conn_id,
+                session_id,
+            } => {
                 let (tx, rx) = mpsc::channel(RECEIVE_CAPACITY);
                 inner.conns.write().unwrap().insert(conn_id, tx);
-                let _ = open_tx.send(OpenEvent { conn_id, rx });
+                let _ = open_tx.send(OpenEvent {
+                    conn_id,
+                    session_id,
+                    rx,
+                });
             }
             Frame::Data { conn_id, bytes } => {
                 let conns = inner.conns.read().unwrap();
@@ -540,11 +570,23 @@ where
             write.write_all(&header).await?;
             write.write_all(&bytes.to_le_bytes()).await
         }
-        Frame::Open { conn_id } => {
+        Frame::Open {
+            conn_id,
+            session_id,
+        } => {
+            let len = session_id.len();
+            if len as u32 > MAX_FRAME_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session id exceeds the maximum frame size",
+                ));
+            }
             let mut header = [0u8; HEADER_LEN];
             header[0] = FrameType::Open as u8;
             header[1..9].copy_from_slice(&conn_id.to_le_bytes());
-            write.write_all(&header).await
+            header[9..HEADER_LEN].copy_from_slice(&(len as u32).to_le_bytes());
+            write.write_all(&header).await?;
+            write.write_all(session_id.as_bytes()).await
         }
         Frame::Data { conn_id, bytes } => {
             let mut header = [0u8; HEADER_LEN];
@@ -608,7 +650,24 @@ where
     let mut payload = vec![0u8; len as usize];
     read.read_exact(&mut payload).await?;
     let frame = match frame_type {
-        _ if frame_type == FrameType::Open as u8 => Frame::Open { conn_id },
+        _ if frame_type == FrameType::Open as u8 => {
+            let session_id = String::from_utf8(payload).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "open frame carries a non-UTF-8 session id",
+                )
+            })?;
+            if session_id.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "open frame carries an empty session id",
+                ));
+            }
+            Frame::Open {
+                conn_id,
+                session_id,
+            }
+        }
         _ if frame_type == FrameType::Data as u8 => Frame::Data {
             conn_id,
             bytes: payload,
@@ -648,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn streams_bytes_both_ways() {
         let (cp, node, mut opens) = pair();
-        let mut client = cp.open().await.expect("open");
+        let mut client = cp.open("s1").await.expect("open");
         let mut server = attach(opens.recv().await.expect("open event"), &node).await;
 
         client.write_all(b"hello").await.unwrap();
@@ -663,10 +722,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_open_carries_the_session_id_to_the_peer() {
+        let (cp, _node, mut opens) = pair();
+        let _client = cp.open("session-42").await.expect("open");
+        let event = opens.recv().await.expect("open event");
+        assert_eq!(event.session_id, "session-42");
+
+        // A second session's connection names its own session on the same
+        // tunnel.
+        let _other = cp.open("session-7").await.expect("open");
+        let event = opens.recv().await.expect("open event");
+        assert_eq!(event.session_id, "session-7");
+    }
+
+    #[tokio::test]
     async fn concurrent_connections_are_isolated() {
         let (cp, node, mut opens) = pair();
-        let mut first = cp.open().await.expect("open");
-        let mut second = cp.open().await.expect("open");
+        let mut first = cp.open("s1").await.expect("open");
+        let mut second = cp.open("s2").await.expect("open");
 
         let first_event = opens.recv().await.expect("first open event");
         let second_event = opens.recv().await.expect("second open event");
@@ -687,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_client_end_closes_the_server_end() {
         let (cp, node, mut opens) = pair();
-        let client = cp.open().await.expect("open");
+        let client = cp.open("s1").await.expect("open");
         let mut server = attach(opens.recv().await.expect("open event"), &node).await;
 
         drop(client);
@@ -700,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn data_published_after_attach_is_delivered() {
         let (cp, node, mut opens) = pair();
-        let mut client = cp.open().await.expect("open");
+        let mut client = cp.open("s1").await.expect("open");
         let event = opens.recv().await.expect("open event");
 
         client.write_all(b"early").await.unwrap();
@@ -719,10 +792,77 @@ mod tests {
 
         // The reader observes EOF and marks the tunnel dead.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while cp.open().await.is_some() && tokio::time::Instant::now() < deadline {
+        while cp.open("s1").await.is_some() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(cp.open().await.is_none());
+        assert!(cp.open("s1").await.is_none());
+    }
+
+    /// A malformed frame is a protocol violation: the whole tunnel dies
+    /// rather than one stream failing silently.
+    #[tokio::test]
+    async fn an_unknown_frame_type_tears_the_tunnel_down() {
+        let (a, b) = duplex(4096);
+        let (tunnel, _opens) = Tunnel::new(a);
+        let mut raw = b;
+
+        // A header with an unknown type byte: 0x7f, conn id 0, length 0.
+        let header = [0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        raw.write_all(&header).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.closed())
+            .await
+            .expect("the tunnel must close after a malformed frame");
+        assert!(tunnel.open("s1").await.is_none());
+    }
+
+    /// An Open frame without a session id cannot be relayed to any executor,
+    /// so it is a protocol violation like any other malformed frame.
+    #[tokio::test]
+    async fn an_open_without_a_session_id_tears_the_tunnel_down() {
+        let (a, b) = duplex(4096);
+        let (tunnel, mut opens) = Tunnel::new(a);
+        let mut raw = b;
+
+        // Open frame with an empty payload: type 0x01, conn id 1, length 0.
+        let mut header = [0u8; 13];
+        header[0] = FrameType::Open as u8;
+        header[1..9].copy_from_slice(&1u64.to_le_bytes());
+        raw.write_all(&header).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.closed())
+            .await
+            .expect("the tunnel must close after an open frame without a session id");
+        assert!(
+            opens.try_recv().is_err(),
+            "no open event may surface for a session id-less open"
+        );
+    }
+
+    /// A session id that is not UTF-8 cannot name any executor either, so it
+    /// is a protocol violation like any other malformed frame.
+    #[tokio::test]
+    async fn an_open_with_a_non_utf8_session_id_tears_the_tunnel_down() {
+        let (a, b) = duplex(4096);
+        let (tunnel, mut opens) = Tunnel::new(a);
+        let mut raw = b;
+
+        // Open frame with a non-UTF-8 payload: type 0x01, conn id 1,
+        // length 2, then 0xff 0xfe.
+        let mut header = [0u8; 13];
+        header[0] = FrameType::Open as u8;
+        header[1..9].copy_from_slice(&1u64.to_le_bytes());
+        header[9..13].copy_from_slice(&2u32.to_le_bytes());
+        raw.write_all(&header).await.unwrap();
+        raw.write_all(&[0xff, 0xfe]).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.closed())
+            .await
+            .expect("the tunnel must close after an open frame with a non-UTF-8 session id");
+        assert!(
+            opens.try_recv().is_err(),
+            "no open event may surface for a non-UTF-8 session id"
+        );
     }
 
     /// A producer that outruns its consumer must pause, never lose data, and
@@ -733,7 +873,7 @@ mod tests {
         let (a, b) = duplex(64 * 1024);
         let (cp, _opens) = Tunnel::new(a);
         let (node, mut opens) = Tunnel::new(b);
-        let mut client = cp.open().await.expect("open");
+        let mut client = cp.open("s1").await.expect("open");
         let event = opens.recv().await.expect("open event");
         let mut server = node.attach(event.conn_id, event.rx).expect("attach");
 
