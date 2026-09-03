@@ -233,10 +233,6 @@
   #transcript hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
   #transcript .md-li { margin: 2px 0; }
   #transcript .md-marker { color: var(--muted); }
-  #transcript .j-key { color: var(--accent); }
-  #transcript .j-str { color: var(--user); }
-  #transcript .j-num { color: var(--ok); }
-  #transcript .j-lit { color: var(--muted); }
   .input-row {
     display: flex;
     gap: 10px;
@@ -834,13 +830,16 @@ function appendLine(kind, text) {
 
 const INLINE_TOOL_LIMIT = 240;
 
-// Tool traffic shows as a one-line summary and expands to the raw payload on
-// request, so assistant text is not buried under long tool output. A `json`
-// payload expands as pretty-printed, colour-coded structure.
-function appendToolLine(kind, prefix, payload, suffix, json) {
-  const flat = payload.replace(/\s+/g, ' ').trim();
-  const clipped = clipAt(flat, INLINE_TOOL_LIMIT);
-  if (clipped === null) {
+// Tool traffic shows as a one-line summary and expands to the full payload on
+// request, so assistant text is not buried under long tool output. A `preview`
+// limits the summary to the useful text (stdout, content, error); the rest of
+// the payload appears only when the line is expanded.
+function appendToolLine(kind, prefix, payload, suffix, preview) {
+  const shown = preview === undefined || preview === null ? payload : preview;
+  const flatShown = shown.replace(/\s+/g, ' ').trim();
+  const clippedShown = clipAt(flatShown, INLINE_TOOL_LIMIT);
+  const hasMore = payload !== shown || clippedShown !== null;
+  if (!hasMore) {
     appendLine(kind, prefix + payload + suffix);
     return;
   }
@@ -849,7 +848,8 @@ function appendToolLine(kind, prefix, payload, suffix, json) {
   const summary = document.createElement('span');
   const full = document.createElement('span');
   full.hidden = true;
-  summary.textContent = prefix + clipped + '…' + suffix;
+  summary.textContent =
+    prefix + (clippedShown === null ? flatShown : clippedShown + '…') + suffix;
   const fold = document.createElement('button');
   fold.type = 'button';
   fold.className = 'fold';
@@ -866,14 +866,8 @@ function appendToolLine(kind, prefix, payload, suffix, json) {
       return;
     }
     if (!revealed) {
+      full.textContent = prefix + payload + suffix;
       revealed = true;
-      if (json) {
-        full.appendChild(document.createTextNode(prefix));
-        renderJson(full, payload);
-        full.appendChild(document.createTextNode(suffix));
-      } else {
-        full.textContent = prefix + payload + suffix;
-      }
     }
     full.hidden = false;
     summary.hidden = true;
@@ -888,91 +882,33 @@ function appendToolLine(kind, prefix, payload, suffix, json) {
   scrollToBottom();
 }
 
-// Pretty-prints a JSON-looking string, or null when it is not JSON.
-function prettyJson(text) {
-  const trimmed = text.trim();
-  if (trimmed[0] !== '{' && trimmed[0] !== '[') return null;
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2);
-  } catch (error) {
-    return null;
+// A tool result for a human reader: strings read raw and structure flattens
+// to `key: value` and `- item` lines instead of JSON.
+function readableValue(value) {
+  if (typeof value === 'string') return value;
+  if (value === null) return 'null';
+  if (Array.isArray(value)) {
+    return value.map((item) => '- ' + readableValue(item)).join('\n');
   }
+  if (typeof value === 'object') {
+    return Object.keys(value)
+      .map((key) => key + ': ' + readableValue(value[key]))
+      .join('\n');
+  }
+  return String(value);
 }
 
-// Splits a JSON string into coloured tokens. Valid JSON only needs four kinds
-// of highlight: property names, string values, numbers, and true/false/null.
-function jsonTokens(text) {
-  const tokens = [];
-  let plain = '';
-  const numberChar = /[0-9.eE+\-]/;
-  const letter = /[A-Za-z]/;
-  const flush = () => {
-    if (plain !== '') {
-      tokens.push({ text: plain, cls: '' });
-      plain = '';
-    }
-  };
-  const push = (text, cls) => {
-    flush();
-    tokens.push({ text, cls });
-  };
-  let i = 0;
-  while (i < text.length) {
-    const char = text[i];
-    if (char === '"') {
-      let end = i + 1;
-      while (end < text.length) {
-        if (text[end] === '\\') {
-          end += 2;
-          continue;
-        }
-        if (text[end] === '"') break;
-        end += 1;
-      }
-      let next = end + 1;
-      while (next < text.length && (text[next] === ' ' || text[next] === '\t')) next += 1;
-      const isKey = text[next] === ':';
-      push(text.slice(i, end + 1), isKey ? 'j-key' : 'j-str');
-      i = end + 1;
-      continue;
-    }
-    if (char === '-' || (char >= '0' && char <= '9')) {
-      let end = i + 1;
-      while (end < text.length && numberChar.test(text[end])) end += 1;
-      push(text.slice(i, end), 'j-num');
-      i = end;
-      continue;
-    }
-    if (letter.test(char)) {
-      let matched = false;
-      for (const literal of ['true', 'false', 'null']) {
-        if (text.startsWith(literal, i)) {
-          push(literal, 'j-lit');
-          i += literal.length;
-          matched = true;
-          break;
-        }
-      }
-      if (matched) continue;
-    }
-    plain += char;
-    i += 1;
+// The text a collapsed tool result should show: the stdout/content of the
+// tool, not the envelope fields around it. A single-field payload is already
+// all content, so it previews itself.
+function resultPreview(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.keys(value).length === 1) return null;
+  for (const key of ['stdout', 'stderr', 'content', 'output', 'error']) {
+    const field = value[key];
+    if (typeof field === 'string' && field.trim() !== '') return field;
   }
-  flush();
-  return tokens;
-}
-
-function renderJson(parent, text) {
-  for (const token of jsonTokens(text)) {
-    if (token.cls === '') {
-      parent.appendChild(document.createTextNode(token.text));
-      continue;
-    }
-    const span = document.createElement('span');
-    span.className = token.cls;
-    span.textContent = token.text;
-    parent.appendChild(span);
-  }
+  return null;
 }
 
 // The first `max` code points of `text`, or null when none are cut.
@@ -1251,34 +1187,22 @@ function renderMessage(message) {
       appendToolLine(
         'mono',
         '→ ' + block.name + '(',
-        JSON.stringify(block.args == null ? {} : block.args, null, 2),
-        ')',
-        true
+        JSON.stringify(block.args == null ? {} : block.args),
+        ')'
       );
       break;
     case 'tool_result': {
       const content = block.content;
-      let payload;
-      let json = false;
-      if (typeof content === 'string') {
-        payload = content;
-        const pretty = prettyJson(payload);
-        if (pretty !== null) {
-          payload = pretty;
-          json = true;
-        }
-      } else if (content !== null) {
-        payload = JSON.stringify(content, null, 2);
-        json = true;
-      } else {
-        payload = 'null';
-      }
+      const payload =
+        typeof content === 'string' || content === null
+          ? String(content)
+          : readableValue(content);
       appendToolLine(
         block.is_error ? 'mono error' : 'mono',
         '← ' + block.name + ': ',
         payload,
         '',
-        json
+        typeof content === 'object' && content !== null ? resultPreview(content) : null
       );
       break;
     }
