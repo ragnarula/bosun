@@ -1184,7 +1184,18 @@ function renderMessage(message) {
     appendAssistant(block.text);
     return;
   }
-  closeLive();
+  // Tool-streamed output streams into a live assistant paragraph while the
+  // executor runs; it is tool output, not assistant prose, so the moment a
+  // durable tool frame lands the live paragraph is dropped rather than left
+  // in the transcript. The full output still lives inside the collapsed strip.
+  if (block.kind === 'tool_call' || block.kind === 'tool_result') {
+    if (liveEl) {
+      liveEl.remove();
+      liveEl = null;
+    }
+  } else {
+    closeLive();
+  }
   switch (block.kind) {
     case 'text':
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
