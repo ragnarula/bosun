@@ -406,7 +406,7 @@ async fn run_turn_inner(
     let system = system_prompt(todos, skills);
     let mut stream = deps.provider.chat_stream(ProviderCall {
         model: deps.provider.model(),
-        max_tokens: 4096,
+        max_tokens: deps.provider.max_output_tokens(),
         system: &system,
         messages,
         tools,
@@ -1030,7 +1030,7 @@ async fn run_subagent(
     for _ in 0..MAX_SUBAGENT_TURNS {
         let mut stream = provider.chat_stream(ProviderCall {
             model: &config.model,
-            max_tokens: MAX_TOKENS,
+            max_tokens: provider.max_output_tokens(),
             system: "",
             messages: window.clone(),
             tools: tools.clone(),

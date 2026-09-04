@@ -11,6 +11,18 @@ listen_addr = "127.0.0.1:8090"
 # api_key = "env:ANTHROPIC_API_KEY"
 # price_input_per_mtok = 3
 # price_output_per_mtok = 15
+# max_output_tokens = 32768  # output budget per completion, counting reasoning
+#                            # (default 32768; lower it to bound a model's spend)
+# thinking_budget_tokens = 16000  # Anthropic thinking budget, clamped below the
+#                                 # output budget so a reply always has room
+
+# A reasoning model behind an OpenAI-compatible gateway, with room to think.
+# [models.code]
+# provider = "openai"
+# name = "code"
+# base_url = "http://switchyard:4000/v1"
+# api_key = "unused"
+# max_output_tokens = 32768
 
 # [models.small]
 # provider = "openai"

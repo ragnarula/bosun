@@ -21,12 +21,14 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// `/v1/chat/completions`.
 pub struct OpenAi {
     inner: ProviderAdapter,
+    max_output_tokens: u32,
 }
 
 impl OpenAi {
-    pub fn new(model: &str, api_key: &str, base_url: Option<&str>) -> Self {
+    pub fn new(model: &str, api_key: &str, base_url: Option<&str>, max_output_tokens: u32) -> Self {
         Self {
             inner: ProviderAdapter::new(model, api_key, base_url, DEFAULT_BASE_URL),
+            max_output_tokens,
         }
     }
 
@@ -49,6 +51,10 @@ impl Provider for OpenAi {
 
     fn model(&self) -> &str {
         &self.inner.model
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
     }
 
     fn chat_stream<'a>(
@@ -168,7 +174,12 @@ mod tests {
     #[tokio::test]
     async fn request_headers_and_body_match_the_provider_shape() {
         let server = FakeProvider::start(|_| sse_response(&[])).await;
-        let provider = OpenAi::new("gpt-test", "sk-test", Some(&server.url()));
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
 
         let events = collect_stream(&provider, provider_call("gpt-test")).await;
         assert!(events.is_empty());
@@ -246,7 +257,12 @@ mod tests {
             sse(json!("[DONE]")),
         ];
         let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
-        let provider = OpenAi::new("gpt-test", "sk-test", Some(&server.url()));
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
 
         let events = collect_stream(&provider, provider_call("gpt-test")).await;
         assert_eq!(
@@ -286,7 +302,12 @@ mod tests {
             (axum::http::StatusCode::BAD_REQUEST, "bad request").into_response()
         })
         .await;
-        let provider = OpenAi::new("gpt-test", "sk-test", Some(&server.url()));
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
 
         assert_non_200_is_an_error_item(&provider, provider_call("gpt-test")).await;
     }
@@ -344,7 +365,12 @@ mod tests {
             sse(json!("[DONE]")),
         ];
         let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
-        let provider = OpenAi::new("gpt-test", "sk-test", Some(&server.url()));
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
 
         let events = collect_stream(&provider, provider_call("gpt-test")).await;
         let deltas: Vec<StreamEvent> = events

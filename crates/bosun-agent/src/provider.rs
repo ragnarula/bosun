@@ -11,6 +11,11 @@ use crate::sse::SseError;
 use crate::sse::SseEvent;
 use crate::sse::sse_stream;
 
+/// The output-token budget a completion gets unless the model config raises
+/// it. Reasoning models consume this budget on thinking, so the default is
+/// generous enough that thinking and the reply both fit.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32768;
+
 /// One canonical provider request. The provider adapter serializes it and
 /// parses the streamed response back into [`StreamEvent`].
 pub struct ProviderCall<'a> {
@@ -55,6 +60,14 @@ pub enum ProviderError {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     fn model(&self) -> &str;
+    /// The output-token budget this model's completions may consume.
+    fn max_output_tokens(&self) -> u32 {
+        DEFAULT_MAX_OUTPUT_TOKENS
+    }
+    /// The thinking budget a reasoning model may spend, when it exposes one.
+    fn thinking_budget(&self) -> Option<u32> {
+        None
+    }
     fn chat_stream<'a>(
         &'a self,
         call: ProviderCall<'a>,

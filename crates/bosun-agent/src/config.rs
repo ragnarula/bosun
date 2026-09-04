@@ -65,6 +65,8 @@ mod tests {
             api_key: api_key.into(),
             price_input_per_mtok: 0.0,
             price_output_per_mtok: 0.0,
+            max_output_tokens: None,
+            thinking_budget_tokens: None,
         }
     }
 
