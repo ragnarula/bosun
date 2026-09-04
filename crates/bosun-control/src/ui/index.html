@@ -183,6 +183,62 @@
   }
   #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
   #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
+  #transcript .fold {
+    margin-left: 6px;
+    padding: 0 2px;
+    min-height: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  #transcript .fold:hover { text-decoration: underline; }
+  #transcript h1, #transcript h2, #transcript h3, #transcript h4, #transcript h5, #transcript h6 {
+    margin: 12px 0 4px;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  #transcript h1 { font-size: 18px; }
+  #transcript h2 { font-size: 16px; }
+  #transcript h3 { font-size: 15px; }
+  #transcript h4 { font-size: 14px; }
+  #transcript h5, #transcript h6 { font-size: 13px; color: var(--muted); }
+  #transcript .msg p { margin: 0 0 6px; }
+  #transcript .md-bold { font-weight: 700; }
+  #transcript .md-italic { font-style: italic; }
+  #transcript .md-code {
+    padding: 0 4px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+  }
+  #transcript .md-link { color: var(--accent); text-decoration: underline; }
+  #transcript pre.md-pre {
+    margin: 6px 0;
+    padding: 10px 12px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--mono);
+    white-space: pre;
+  }
+  #transcript blockquote {
+    margin: 4px 0 8px;
+    padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border);
+    color: var(--muted);
+  }
+  #transcript blockquote p { margin: 0; }
+  #transcript hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  #transcript .md-li { margin: 2px 0; }
+  #transcript .md-marker { color: var(--muted); }
   .input-row {
     display: flex;
     gap: 10px;
@@ -200,6 +256,31 @@
     border-radius: 8px;
     padding: 9px 11px;
     font: inherit;
+  }
+  @media (max-width: 640px) {
+    header.top { flex-wrap: wrap; padding: 10px 12px; }
+    main { padding: 0 12px 16px; }
+    #status { padding: 3px 12px 7px; }
+    button { min-height: 40px; padding: 8px 14px; }
+    #new-session-form input, #new-session-form select, #new-session-form textarea,
+    .input-row textarea { font-size: 16px; }
+    tbody tr.clickable { -webkit-tap-highlight-color: transparent; }
+    tbody tr.clickable:active { background: var(--panel-2); }
+    tbody tr.clickable td { padding-top: 12px; padding-bottom: 12px; }
+    #dir-entries .dir-entry {
+      min-height: 44px;
+      padding: 5px 8px;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #dir-entries .dir-entry:active { background: var(--border); }
+    .view-header { flex-wrap: wrap; padding: 10px 12px; }
+    .view-actions { flex-wrap: wrap; }
+    .dir-browser-head { flex-wrap: wrap; }
+    #transcript { padding: 12px 14px; }
+    .input-row { padding: 12px 14px; }
+  }
+  @media (max-width: 560px) {
+    .col-model, .col-permission { display: none; }
   }
 </style>
 </head>
@@ -253,7 +334,7 @@
     </form>
     <table>
       <thead>
-        <tr><th>Id</th><th>Node</th><th>Model</th><th>State</th><th>Permission</th></tr>
+        <tr><th>Id</th><th>Node</th><th class="col-model">Model</th><th>State</th><th class="col-permission">Permission</th></tr>
       </thead>
       <tbody id="sessions-body"></tbody>
     </table>
@@ -332,6 +413,7 @@ const btnSend = $('btn-send');
 const btnRedirect = $('btn-redirect');
 
 let nodes = [];
+let nodeOptionsSignature = null;
 let sessions = [];
 let current = null;   // the open session id
 let es = null;        // the open EventSource
@@ -393,6 +475,10 @@ function renderNodes() {
 }
 
 function renderNodeOptions() {
+  const signature = nodes.map((node) => node.name + (node.up ? 'up' : 'down')).join(',');
+  if (signature === nodeOptionsSignature) return;
+  nodeOptionsSignature = signature;
+  const selected = formNode.value;
   formNode.textContent = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
@@ -404,6 +490,13 @@ function renderNodeOptions() {
     option.textContent = node.name + (node.up ? '' : ' (down)');
     formNode.appendChild(option);
   }
+  if (!selected) return;
+  if (nodes.some((node) => node.name === selected)) {
+    formNode.value = selected;
+    return;
+  }
+  // The picked node vanished: reuse the change listener to drop the stale dir pick.
+  formNode.dispatchEvent(new Event('change'));
 }
 
 function shortId(id) {
@@ -434,9 +527,13 @@ function renderSessions() {
       row.title = session.id;
       row.appendChild(cell('  '.repeat(depth) + shortId(session.id)));
       row.appendChild(cell(session.node));
-      row.appendChild(cell(session.model));
+      const model = cell(session.model);
+      model.className = 'col-model';
+      row.appendChild(model);
       row.appendChild(cell(session.state));
-      row.appendChild(cell(session.permission));
+      const permission = cell(session.permission);
+      permission.className = 'col-permission';
+      row.appendChild(permission);
       row.addEventListener('click', () => openSession(session.id));
       sessionsBody.appendChild(row);
       renderLevel(session.id, depth + 1);
@@ -496,7 +593,13 @@ async function refreshSessions() {
 
 newSessionBtn.addEventListener('click', () => {
   newSessionForm.hidden = !newSessionForm.hidden;
-  if (!newSessionForm.hidden) formNode.focus();
+  if (!newSessionForm.hidden) {
+    if (window.matchMedia('(max-width: 640px)').matches) {
+      newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      formNode.focus();
+    }
+  }
 });
 
 // A picked directory belongs to one node; switch nodes, drop the pick.
@@ -780,12 +883,323 @@ function appendLine(kind, text) {
   scrollToBottom();
 }
 
+const INLINE_TOOL_LIMIT = 240;
+
+// Tool traffic shows as a one-line summary and expands to the full payload on
+// request, so assistant text is not buried under long tool output. A `preview`
+// limits the summary to the useful text (stdout, content, error); the rest of
+// the payload appears only when the line is expanded.
+function appendToolLine(kind, prefix, payload, suffix, preview) {
+  const shown = preview === undefined || preview === null ? payload : preview;
+  const flatShown = shown.replace(/\s+/g, ' ').trim();
+  const clippedShown = clipAt(flatShown, INLINE_TOOL_LIMIT);
+  const hasMore = payload !== shown || clippedShown !== null;
+  if (!hasMore) {
+    appendLine(kind, prefix + payload + suffix);
+    return;
+  }
+  const line = document.createElement('div');
+  line.className = 'line ' + kind;
+  const summary = document.createElement('span');
+  const full = document.createElement('span');
+  full.hidden = true;
+  summary.textContent =
+    prefix + (clippedShown === null ? flatShown : clippedShown + '…') + suffix;
+  const fold = document.createElement('button');
+  fold.type = 'button';
+  fold.className = 'fold';
+  fold.setAttribute('aria-expanded', 'false');
+  fold.textContent = 'show all';
+  let revealed = false;
+  fold.addEventListener('click', () => {
+    const wasOpen = !full.hidden;
+    if (wasOpen) {
+      full.hidden = true;
+      summary.hidden = false;
+      fold.setAttribute('aria-expanded', 'false');
+      fold.textContent = 'show all';
+      return;
+    }
+    if (!revealed) {
+      full.textContent = prefix + payload + suffix;
+      revealed = true;
+    }
+    full.hidden = false;
+    summary.hidden = true;
+    fold.setAttribute('aria-expanded', 'true');
+    fold.textContent = 'show less';
+    scrollToBottom();
+  });
+  line.appendChild(summary);
+  line.appendChild(full);
+  line.appendChild(fold);
+  transcript.appendChild(line);
+  scrollToBottom();
+}
+
+// A tool result for a human reader: strings read raw and structure flattens
+// to `key: value` and `- item` lines instead of JSON.
+function readableValue(value) {
+  if (typeof value === 'string') return value;
+  if (value === null) return 'null';
+  if (Array.isArray(value)) {
+    return value.map((item) => '- ' + readableValue(item)).join('\n');
+  }
+  if (typeof value === 'object') {
+    return Object.keys(value)
+      .map((key) => key + ': ' + readableValue(value[key]))
+      .join('\n');
+  }
+  return String(value);
+}
+
+// The text a collapsed tool result should show: the stdout/content of the
+// tool, not the envelope fields around it. A single-field payload is already
+// all content, so it previews itself.
+function resultPreview(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.keys(value).length === 1) return null;
+  for (const key of ['stdout', 'stderr', 'content', 'output', 'error']) {
+    const field = value[key];
+    if (typeof field === 'string' && field.trim() !== '') return field;
+  }
+  return null;
+}
+
+// The first `max` code points of `text`, or null when none are cut.
+function clipAt(text, max) {
+  let end = 0;
+  let count = 0;
+  for (const char of text) {
+    if (count === max) return text.slice(0, end);
+    count += 1;
+    end += char.length;
+  }
+  return null;
+}
+
 function appendMsg(role, text) {
   const paragraph = document.createElement('p');
   paragraph.className = 'msg ' + role;
   paragraph.textContent = text;
   transcript.appendChild(paragraph);
   scrollToBottom();
+}
+
+// Assistant turns render markdown like the terminal client; user text stays
+// plain. Renders the same subset the TUI parses: headings, emphasis, inline
+// code, code fences, links, lists, blockquotes, and rules.
+function appendAssistant(text) {
+  const container = document.createElement('div');
+  container.className = 'msg assistant';
+  renderMarkdown(container, text);
+  transcript.appendChild(container);
+  scrollToBottom();
+}
+
+function renderMarkdown(container, text) {
+  const lines = text.split('\n');
+  let inCode = false;
+  let code = [];
+  let para = [];
+  const paraOut = () => {
+    if (para.length === 0) return;
+    const paragraph = document.createElement('p');
+    appendInline(paragraph, para.join('\n'));
+    container.appendChild(paragraph);
+    para = [];
+  };
+  const codeOut = () => {
+    if (code.length === 0) return;
+    const pre = document.createElement('pre');
+    pre.className = 'md-pre';
+    pre.textContent = code.join('\n');
+    container.appendChild(pre);
+    code = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const raw = lines[i];
+    if (inCode) {
+      if (raw.trimStart().startsWith('```')) {
+        inCode = false;
+        codeOut();
+      } else {
+        code.push(raw);
+      }
+      i += 1;
+      continue;
+    }
+    const line = raw.trim();
+    if (line.startsWith('```')) {
+      paraOut();
+      inCode = true;
+      i += 1;
+      continue;
+    }
+    if (line === '') {
+      paraOut();
+      i += 1;
+      continue;
+    }
+    const heading = headingLevel(line);
+    if (heading > 0) {
+      paraOut();
+      const el = document.createElement('h' + heading);
+      appendInline(el, line.slice(heading).trim());
+      container.appendChild(el);
+      i += 1;
+      continue;
+    }
+    if (isRule(line)) {
+      paraOut();
+      container.appendChild(document.createElement('hr'));
+      i += 1;
+      continue;
+    }
+    if (line.startsWith('>')) {
+      paraOut();
+      const quote = document.createElement('blockquote');
+      while (i < lines.length && lines[i].trimStart().startsWith('>')) {
+        const paragraph = document.createElement('p');
+        appendInline(paragraph, lines[i].trimStart().slice(1).trim());
+        quote.appendChild(paragraph);
+        i += 1;
+      }
+      container.appendChild(quote);
+      continue;
+    }
+    const marker = listMarker(line);
+    if (marker !== null) {
+      paraOut();
+      const item = document.createElement('div');
+      item.className = 'md-li';
+      const bullet = document.createElement('span');
+      bullet.className = 'md-marker';
+      bullet.textContent = marker;
+      item.appendChild(bullet);
+      appendInline(item, line.slice(marker.length));
+      container.appendChild(item);
+      i += 1;
+      continue;
+    }
+    para.push(line);
+    i += 1;
+  }
+  paraOut();
+  if (inCode && code.length > 0) codeOut();
+}
+
+function headingLevel(line) {
+  let hashes = 0;
+  while (hashes < line.length && line[hashes] === '#') hashes += 1;
+  if (hashes < 1 || hashes > 6) return 0;
+  const rest = line[hashes];
+  return rest === ' ' || rest === '\t' ? hashes : 0;
+}
+
+function isRule(line) {
+  if (line.length < 3) return false;
+  for (const char of line) {
+    if (char !== '-' && char !== '*' && char !== '_') return false;
+  }
+  return true;
+}
+
+function listMarker(line) {
+  if (/^[-*+]\s/.test(line)) return '• ';
+  const numbered = line.match(/^\d+([.)])\s/);
+  return numbered ? numbered[0].slice(0, -1) + ' ' : null;
+}
+
+// Splits inline text into styled tokens. Underscores stay literal so names
+// like `file_name` are not split into italics.
+function parseInline(text) {
+  const chars = Array.from(text);
+  const tokens = [];
+  let run = '';
+  let bold = false;
+  let italic = false;
+  let code = false;
+  const flush = () => {
+    if (run === '') return;
+    tokens.push({ text: run, bold, italic, code });
+    run = '';
+  };
+  let i = 0;
+  while (i < chars.length) {
+    const char = chars[i];
+    if (char === '`') {
+      flush();
+      code = !code;
+      i += 1;
+      continue;
+    }
+    if (char === '*') {
+      let count = 0;
+      while (chars[i + count] === '*') count += 1;
+      flush();
+      if (count === 3) {
+        bold = !bold;
+        italic = !italic;
+      } else if (count === 2) {
+        bold = !bold;
+      } else {
+        italic = !italic;
+      }
+      i += count;
+      continue;
+    }
+    if (char === '[') {
+      const close = chars.indexOf(']', i + 1);
+      if (close !== -1 && chars[close + 1] === '(') {
+        const paren = chars.indexOf(')', close + 2);
+        if (paren !== -1) {
+          flush();
+          tokens.push({
+            text: chars.slice(i + 1, close).join(''),
+            url: chars.slice(close + 2, paren).join(''),
+          });
+          i = paren + 1;
+          continue;
+        }
+      }
+      run += '[';
+      i += 1;
+      continue;
+    }
+    run += char;
+    i += 1;
+  }
+  flush();
+  return tokens;
+}
+
+function appendInline(parent, text) {
+  for (const token of parseInline(text)) {
+    if (token.url) {
+      const link = document.createElement('a');
+      link.className = 'md-link';
+      link.href = token.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = token.text;
+      parent.appendChild(link);
+      continue;
+    }
+    const classes = [];
+    if (token.bold) classes.push('md-bold');
+    if (token.italic) classes.push('md-italic');
+    if (token.code) classes.push('md-code');
+    if (classes.length === 0) {
+      parent.appendChild(document.createTextNode(token.text));
+      continue;
+    }
+    const span = document.createElement('span');
+    span.className = classes.join(' ');
+    span.textContent = token.text;
+    parent.appendChild(span);
+  }
 }
 
 // Live deltas stream into one assistant paragraph until the turn's durable
@@ -808,12 +1222,15 @@ function renderMessage(message) {
   const block = message.block;
   if (message.role === 'assistant' && block.kind === 'text') {
     if (liveEl) {
-      liveEl.textContent = block.text;
+      const container = document.createElement('div');
+      container.className = 'msg assistant';
+      renderMarkdown(container, block.text);
+      liveEl.replaceWith(container);
       liveEl = null;
       scrollToBottom();
       return;
     }
-    appendMsg('assistant', block.text);
+    appendAssistant(block.text);
     return;
   }
   closeLive();
@@ -822,14 +1239,25 @@ function renderMessage(message) {
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
       break;
     case 'tool_call':
-      appendLine('mono', '→ ' + block.name + '(' + JSON.stringify(block.args) + ')');
+      appendToolLine(
+        'mono',
+        '→ ' + block.name + '(',
+        JSON.stringify(block.args == null ? {} : block.args),
+        ')'
+      );
       break;
     case 'tool_result': {
-      const content =
-        typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-      appendLine(
+      const content = block.content;
+      const payload =
+        typeof content === 'string' || content === null
+          ? String(content)
+          : readableValue(content);
+      appendToolLine(
         block.is_error ? 'mono error' : 'mono',
-        '← ' + block.name + ': ' + content
+        '← ' + block.name + ': ',
+        payload,
+        '',
+        typeof content === 'object' && content !== null ? resultPreview(content) : null
       );
       break;
     }

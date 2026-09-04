@@ -26,7 +26,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Where release archives are downloaded from when the environment does not
 /// name a mirror: GitHub Releases for this repository, in cargo-dist's layout.
-pub const DEFAULT_UPDATE_BASE_URL: &str = "https://github.com/ragnarula/ade/releases/download";
+pub const DEFAULT_UPDATE_BASE_URL: &str = "https://github.com/ragnarula/bosun/releases/download";
 
 /// The environment variable naming an update mirror: a base URL served in the
 /// same layout as GitHub Releases, for clients that cannot reach GitHub.
@@ -804,11 +804,11 @@ mod release_tests {
     fn release_archive_url_points_at_the_cargo_dist_asset() {
         assert_eq!(
             release_archive_url(
-                "https://github.com/ragnarula/ade/releases/download",
+                "https://github.com/ragnarula/bosun/releases/download",
                 "0.6.0",
                 "aarch64-apple-darwin"
             ),
-            "https://github.com/ragnarula/ade/releases/download/v0.6.0/bosun-aarch64-apple-darwin.tar.xz"
+            "https://github.com/ragnarula/bosun/releases/download/v0.6.0/bosun-aarch64-apple-darwin.tar.xz"
         );
     }
 
@@ -832,7 +832,7 @@ mod release_tests {
         );
         assert_eq!(
             release_archive_url(DEFAULT_UPDATE_BASE_URL, "0.6.0", "x86_64-pc-windows-msvc"),
-            "https://github.com/ragnarula/ade/releases/download/v0.6.0/bosun-x86_64-pc-windows-msvc.zip"
+            "https://github.com/ragnarula/bosun/releases/download/v0.6.0/bosun-x86_64-pc-windows-msvc.zip"
         );
     }
 

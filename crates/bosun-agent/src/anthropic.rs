@@ -23,12 +23,22 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// `/v1/messages`.
 pub struct Anthropic {
     inner: ProviderAdapter,
+    max_output_tokens: u32,
+    thinking_budget_tokens: Option<u32>,
 }
 
 impl Anthropic {
-    pub fn new(model: &str, api_key: &str, base_url: Option<&str>) -> Self {
+    pub fn new(
+        model: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+        max_output_tokens: u32,
+        thinking_budget_tokens: Option<u32>,
+    ) -> Self {
         Self {
             inner: ProviderAdapter::new(model, api_key, base_url, DEFAULT_BASE_URL),
+            max_output_tokens,
+            thinking_budget_tokens,
         }
     }
 
@@ -38,6 +48,15 @@ impl Anthropic {
         body["max_tokens"] = json!(call.max_tokens);
         body["stream"] = json!(true);
         body["tools"] = anthropic_tools(&call.tools);
+        if let Some(budget) = self.thinking_budget_tokens {
+            // Anthropic requires max_tokens to exceed the thinking budget, so
+            // clamp the budget to leave at least one token for the reply.
+            let max = call.max_tokens.saturating_sub(1);
+            let budget = budget.min(max) as u64;
+            if budget > 0 {
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            }
+        }
         body
     }
 }
@@ -49,6 +68,14 @@ impl Provider for Anthropic {
 
     fn model(&self) -> &str {
         &self.inner.model
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
+
+    fn thinking_budget(&self) -> Option<u32> {
+        self.thinking_budget_tokens
     }
 
     fn chat_stream<'a>(
@@ -178,7 +205,13 @@ mod tests {
     #[tokio::test]
     async fn request_headers_and_body_match_the_provider_shape() {
         let server = FakeProvider::start(|_| sse_response(&[])).await;
-        let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
         let events = collect_stream(&provider, provider_call("claude-test")).await;
         assert!(events.is_empty());
 
@@ -197,6 +230,26 @@ mod tests {
         );
         assert_eq!(body["tools"][0]["name"], "shell");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn thinking_budget_is_sent_and_clamped_below_max_tokens() {
+        let fitted = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            None,
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            Some(50),
+        );
+        let body = fitted.request_body(&provider_call("claude-test"));
+        assert_eq!(body["thinking"]["type"].as_str(), Some("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(50));
+
+        // The call's max_tokens is 100, so a larger budget leaves room for a
+        // reply by being clamped below it, as Anthropic requires.
+        let capped = Anthropic::new("claude-test", "sk-test", None, 100, Some(10_000));
+        let body = capped.request_body(&provider_call("claude-test"));
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(99));
     }
 
     #[tokio::test]
@@ -278,7 +331,13 @@ mod tests {
             sse("message_stop", json!({ "type": "message_stop" })),
         ];
         let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
-        let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
 
         let events = collect_stream(&provider, provider_call("claude-test")).await;
         assert_eq!(
@@ -312,7 +371,13 @@ mod tests {
             (axum::http::StatusCode::BAD_REQUEST, "bad request").into_response()
         })
         .await;
-        let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
 
         assert_non_200_is_an_error_item(&provider, provider_call("claude-test")).await;
     }
@@ -336,7 +401,13 @@ mod tests {
             ),
         ];
         let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
-        let provider = Anthropic::new("claude-test", "sk-test", Some(&server.url()));
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
 
         let mut stream = provider.chat_stream(provider_call("claude-test")).unwrap();
         let item = stream.next().await.unwrap();

@@ -911,7 +911,7 @@ async fn run_turn_inner(
     );
     let mut stream = turn.provider.chat_stream(ProviderCall {
         model: turn.provider.model(),
-        max_tokens: 4096,
+        max_tokens: turn.provider.max_output_tokens(),
         system: &system,
         messages,
         tools,

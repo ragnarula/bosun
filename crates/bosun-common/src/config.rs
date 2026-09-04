@@ -129,6 +129,16 @@ pub struct ModelConfig {
     pub price_input_per_mtok: f64,
     #[serde(default)]
     pub price_output_per_mtok: f64,
+    /// Maximum output tokens per completion, counting reasoning tokens where
+    /// the provider reports them. Defaults to 32768 so reasoning models keep
+    /// room to think and still reply; lower it to bound a model's spend.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Thinking budget for reasoning models that expose one. Sent to Anthropic
+    /// as `thinking.budget_tokens`; clamped below the output budget so a
+    /// reply always has room. Other providers ignore it.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
