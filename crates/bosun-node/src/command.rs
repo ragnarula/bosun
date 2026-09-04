@@ -7,6 +7,7 @@ use bosun_common::types::CommandResult;
 use bosun_common::types::NodeCloneRequest;
 use bosun_common::types::NodeCommand;
 use bosun_common::types::NodeDevRequest;
+use bosun_common::types::NodeStartRequest;
 use bosun_common::types::UpdateStatus;
 use bosun_common::version::VERSION;
 use bosun_common::version::compare;
@@ -161,6 +162,28 @@ pub async fn execute(manager: &Arc<NodeManager>, command: NodeCommand) -> Comman
                 permission,
             };
             match manager.dev(&request).await {
+                Ok(record) => CommandResult::Session {
+                    id,
+                    session: record.to_info(),
+                },
+                Err(error) => CommandResult::Error {
+                    id,
+                    message: error.to_string(),
+                },
+            }
+        }
+        NodeCommand::Start {
+            id,
+            session_id,
+            dir,
+            permission,
+        } => {
+            let request = NodeStartRequest {
+                session_id,
+                dir,
+                permission,
+            };
+            match manager.start(&request).await {
                 Ok(record) => CommandResult::Session {
                     id,
                     session: record.to_info(),
@@ -406,5 +429,177 @@ mod tests {
         };
         assert_eq!(id, 7);
         assert!(!message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_command_without_browse_roots_refuses_an_existing_dir() {
+        // The roots gate applies to the child-session spawner's start command
+        // exactly as it does to `dev`: with no browse roots the node refuses
+        // the executor before the directory is even looked at.
+        let work = tempfile::tempdir().unwrap();
+        let session_dir = work.path().join("repo");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let manager = Arc::new(NodeManager::new(
+            work.path().to_path_buf(),
+            vec![],
+            "http://cp:8090".into(),
+            None,
+        ));
+
+        let result = execute(
+            &manager,
+            NodeCommand::Start {
+                id: 7,
+                session_id: "child-1".into(),
+                dir: session_dir,
+                permission: bosun_common::session::Permission::ReadOnly,
+            },
+        )
+        .await;
+
+        let CommandResult::Error { id, message } = result else {
+            panic!("a start without browse roots must report an error, not a session");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(message, "no browse roots configured on this node");
+    }
+
+    #[tokio::test]
+    async fn dev_command_on_a_node_without_roots_is_refused_by_the_browse_root_gate() {
+        // The dev command keeps its browse-root gate at the handler: with no
+        // browse roots the gate refuses before the directory is even looked
+        // at, so the two commands stay distinct end to end.
+        let work = tempfile::tempdir().unwrap();
+        let manager = Arc::new(NodeManager::new(
+            work.path().to_path_buf(),
+            vec![],
+            "http://cp:8090".into(),
+            None,
+        ));
+
+        let result = execute(
+            &manager,
+            NodeCommand::Dev {
+                id: 7,
+                session_id: "s1".into(),
+                dir: work.path().join("missing"),
+                permission: bosun_common::session::Permission::ReadOnly,
+            },
+        )
+        .await;
+
+        let CommandResult::Error { id, message } = result else {
+            panic!("dev must report an error on a node without browse roots");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(message, "no browse roots configured on this node");
+    }
+
+    #[tokio::test]
+    async fn start_command_refuses_an_existing_dir_outside_browse_roots() {
+        // The escape browse roots close: the control plane asked the node to
+        // run a child executor in a directory that exists but sits outside
+        // every configured root, and the node refuses it.
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let manager = Arc::new(NodeManager::new(
+            work.path().to_path_buf(),
+            vec![work.path().to_path_buf()],
+            "http://cp:8090".into(),
+            None,
+        ));
+
+        let result = execute(
+            &manager,
+            NodeCommand::Start {
+                id: 7,
+                session_id: "child-1".into(),
+                dir: outside.path().to_path_buf(),
+                permission: bosun_common::session::Permission::ReadOnly,
+            },
+        )
+        .await;
+
+        let CommandResult::Error { id, message } = result else {
+            panic!("a start outside the browse roots must report an error, not a session");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(
+            message,
+            format!(
+                "directory {} is outside the configured browse roots",
+                outside.path().display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn start_command_refuses_a_missing_dir_as_a_dir_error() {
+        // The absent-directory refusal still applies after the roots check:
+        // with browse roots configured, a start at a directory that does not
+        // exist is refused before any executor starts.
+        let work = tempfile::tempdir().unwrap();
+        let manager = Arc::new(NodeManager::new(
+            work.path().to_path_buf(),
+            vec![work.path().to_path_buf()],
+            "http://cp:8090".into(),
+            None,
+        ));
+
+        let result = execute(
+            &manager,
+            NodeCommand::Start {
+                id: 7,
+                session_id: "child-1".into(),
+                dir: work.path().join("missing"),
+                permission: bosun_common::session::Permission::ReadOnly,
+            },
+        )
+        .await;
+
+        let CommandResult::Error { id, message } = result else {
+            panic!("an absent dir must report an error, not a session");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(
+            message,
+            format!(
+                "directory {} does not exist",
+                work.path().join("missing").display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn start_command_refuses_a_file_path_as_a_dir_error() {
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let manager = Arc::new(NodeManager::new(
+            work.path().to_path_buf(),
+            vec![work.path().to_path_buf()],
+            "http://cp:8090".into(),
+            None,
+        ));
+
+        let result = execute(
+            &manager,
+            NodeCommand::Start {
+                id: 7,
+                session_id: "child-1".into(),
+                dir: file.clone(),
+                permission: bosun_common::session::Permission::ReadOnly,
+            },
+        )
+        .await;
+
+        let CommandResult::Error { id, message } = result else {
+            panic!("a file path must report an error, not a session");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(
+            message,
+            format!("path {} is not a directory", file.display())
+        );
     }
 }

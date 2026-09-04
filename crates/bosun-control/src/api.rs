@@ -2731,7 +2731,7 @@ mod tests {
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
-        // A node that answers `Dev` commands like a real node: it starts an
+        // A node that answers `Start` commands like a real node: it starts an
         // executor on the requested dir and reports the session. The commands
         // it received are captured, so the test can see the child's executor
         // was requested on the parent's working copy.
@@ -2765,7 +2765,7 @@ mod tests {
                 let command: NodeCommand = serde_json::from_value(Value::Object(command)).unwrap();
                 seen_for_node.lock().unwrap().push(command.clone());
                 match command {
-                    NodeCommand::Dev {
+                    NodeCommand::Start {
                         ref dir,
                         ref session_id,
                         ..
@@ -2840,8 +2840,9 @@ mod tests {
             .expect("the spawn result names the child");
 
         // The child is a full session on the parent's node and working copy,
-        // under its own persona, and its executor was requested through a Dev
-        // command for its own session id.
+        // under its own persona, and its executor was requested through a
+        // Start command (the internal executor-in-existing-dir command) for
+        // its own session id.
         wait_for("the child to run its assignment and stop", || {
             let store = store.clone();
             let child_id = child_id.clone();
@@ -2872,12 +2873,12 @@ mod tests {
             "the assignment is stored as the child's prompt"
         );
 
-        let dev = seen
+        let start = seen
             .lock()
             .unwrap()
             .iter()
             .find_map(|command| match command {
-                NodeCommand::Dev {
+                NodeCommand::Start {
                     session_id,
                     dir,
                     permission,
@@ -2885,10 +2886,10 @@ mod tests {
                 } if session_id == &child_id => Some((dir.clone(), *permission)),
                 _ => None,
             });
-        let (dev_dir, dev_permission) =
-            dev.expect("a Dev command for the child's executor was queued");
-        assert_eq!(dev_dir, std::path::PathBuf::from("/work/repo"));
-        assert_eq!(dev_permission, Permission::ReadWrite);
+        let (start_dir, start_permission) =
+            start.expect("a Start command for the child's executor was queued");
+        assert_eq!(start_dir, std::path::PathBuf::from("/work/repo"));
+        assert_eq!(start_permission, Permission::ReadWrite);
 
         // The child stored its own transcript and model call; the parent's
         // thread shows exactly one authored report, not the child's raw work.
@@ -2944,6 +2945,226 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_node_that_refuses_a_start_command_fails_the_spawn_cleanly() {
+        // A real node refuses a child executor whose directory sits outside
+        // its browse roots, even when the control plane requested it. The
+        // refusal must surface to the spawning parent as a spawn tool error,
+        // and no child session row may be left behind.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![spawn_call_fragment(
+                    true,
+                    r#"{"persona":"reviewer","instructions":"review the change"}"#,
+                )],
+                vec![text_chunk("I will do it myself")],
+            ])));
+        let root_addr = scripted_provider(root_scripts).await;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let node_timeout = Duration::from_secs(4);
+        let nodes = Arc::new(NodeRegistry::new(node_timeout));
+        let commands = Arc::new(CommandQueue::new(node_timeout));
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let providers = HashMap::from([
+            (
+                "main-model".to_string(),
+                openai_provider_with_model(root_addr, "main-model"),
+            ),
+            (
+                "reviewer-model".to_string(),
+                openai_provider_with_model(root_addr, "reviewer-model"),
+            ),
+        ]);
+        let personas = HashMap::from([
+            (
+                "coder".to_string(),
+                PersonaConfig {
+                    model: "main-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Makes changes".into(),
+                    system_prompt: None,
+                },
+            ),
+            (
+                "reviewer".to_string(),
+                PersonaConfig {
+                    model: "reviewer-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Reviews changes".into(),
+                    system_prompt: None,
+                },
+            ),
+        ]);
+        let loops = Arc::new(AgentRegistry::new(
+            None,
+            providers.clone(),
+            personas.clone(),
+            HashMap::new(),
+        ));
+        let state = Arc::new(AppState {
+            registry: nodes.clone(),
+            commands: commands.clone(),
+            tunnels: tunnels.clone(),
+            store: store.clone(),
+            loops,
+            providers,
+            personas,
+            default_persona: Some("coder".into()),
+            skills_dir: None,
+        });
+        state.loops.attach_child_spawner(nodes, commands, tunnels);
+
+        // A node whose browse roots do not cover the parent's working copy:
+        // it refuses the child's start with the real node's outside-roots
+        // error. The commands it received are captured, so the test can see
+        // the refused start named the parent's directory.
+        let seen: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let seen_for_node = seen.clone();
+        let addr_for_node = addr;
+        tokio::spawn(async move {
+            let mut result: Option<CommandResult> = None;
+            loop {
+                let poll = json!({
+                    "node_name": "n1",
+                    "status": "up",
+                    "version": bosun_common::version::VERSION,
+                    "result": result,
+                });
+                let response: Value = match client
+                    .post(format!("http://{addr_for_node}/poll"))
+                    .json(&poll)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.json().await.unwrap(),
+                    Err(_) => break,
+                };
+                let Some(command) = response["command"].clone().as_object().cloned() else {
+                    result = None;
+                    continue;
+                };
+                let command: NodeCommand = serde_json::from_value(Value::Object(command)).unwrap();
+                seen_for_node.lock().unwrap().push(command.clone());
+                match command {
+                    NodeCommand::Start { .. } => {
+                        result = Some(CommandResult::Error {
+                            id: command.id(),
+                            message: "directory /work/repo is outside the configured browse roots"
+                                .to_string(),
+                        });
+                    }
+                    NodeCommand::Stop { .. } => {
+                        result = Some(CommandResult::Stop { id: command.id() });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Register the node before the root session exists: the spawn tool
+        // call refuses a node that is not up.
+        let state_for_ready = state.clone();
+        wait_for("the fake node to register", move || {
+            let state = state_for_ready.clone();
+            async move { state.registry.node("n1", SystemTime::now()).is_some() }
+        })
+        .await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/work/repo",
+                "persona": "coder",
+                "prompt": "review the change for me"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let root: Value = response.json().await.unwrap();
+        let root_id = root["id"].as_str().unwrap().to_string();
+
+        wait_for("the refused spawn to reach the parent as a tool error", || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move {
+                let messages = store.messages(&root_id, false).await.unwrap();
+                messages.iter().any(|(_, message)| {
+                    matches!(&message.block, Block::ToolResult { name, is_error, .. } if name == "spawn" && *is_error)
+                })
+            }
+        })
+        .await;
+        wait_for("the root to recover and wait for input", || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move {
+                let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        let error_text: String = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ToolResult { name, content, .. } if name == "spawn" => {
+                    content["error"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .expect("the spawn tool result carries the refusal");
+        assert!(
+            error_text.contains("outside the configured browse roots"),
+            "the refusal must name the browse-root escape: {error_text}"
+        );
+
+        let sessions: Value = client
+            .get(format!("http://{addr}/sessions"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions.as_array().unwrap().len(),
+            1,
+            "a refused start must leave no child session row behind"
+        );
+
+        let start = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|command| match command {
+                NodeCommand::Start {
+                    session_id,
+                    dir,
+                    permission,
+                    ..
+                } => Some((session_id.clone(), dir.clone(), *permission)),
+                _ => None,
+            });
+        let (child_id, start_dir, start_permission) =
+            start.expect("a Start command for the child's executor was queued");
+        assert_eq!(start_dir, std::path::PathBuf::from("/work/repo"));
+        assert_eq!(start_permission, Permission::ReadWrite);
+        assert!(
+            store.get_session(&child_id).await.unwrap().is_none(),
+            "the refused child must never reach the store"
+        );
     }
 
     /// Builds a control-plane state whose root and its one child each run a

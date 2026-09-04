@@ -96,6 +96,17 @@ pub enum NodeCommand {
         dir: PathBuf,
         permission: Permission,
     },
+    /// Start a session executor in a directory that already exists on the
+    /// node. Only the control plane's child-session spawner sends this: the
+    /// directory is the parent session's working copy. The node confines the
+    /// directory to its browse roots exactly like `Dev`, because a spawned
+    /// child's executor holds the same shell and file access as any session's.
+    Start {
+        id: u64,
+        session_id: String,
+        dir: PathBuf,
+        permission: Permission,
+    },
     Dirs {
         id: u64,
         path: Option<PathBuf>,
@@ -120,6 +131,7 @@ impl NodeCommand {
         match self {
             NodeCommand::Clone { id, .. }
             | NodeCommand::Dev { id, .. }
+            | NodeCommand::Start { id, .. }
             | NodeCommand::Dirs { id, .. }
             | NodeCommand::Stop { id, .. }
             | NodeCommand::Update { id, .. } => *id,
@@ -212,6 +224,13 @@ pub struct DevRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeDevRequest {
+    pub session_id: String,
+    pub dir: PathBuf,
+    pub permission: Permission,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeStartRequest {
     pub session_id: String,
     pub dir: PathBuf,
     pub permission: Permission,
@@ -427,6 +446,35 @@ mod tests {
             panic!("expected the update command");
         };
         assert!(!force);
+    }
+
+    #[test]
+    fn start_command_round_trips_kind_dir_and_permission() {
+        let command = NodeCommand::Start {
+            id: 9,
+            session_id: "child-1".into(),
+            dir: "/work/repo".into(),
+            permission: Permission::ReadOnly,
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["kind"], "start");
+        assert_eq!(json["session_id"], "child-1");
+        assert_eq!(json["dir"], "/work/repo");
+        assert_eq!(json["permission"], "read_only");
+        let decoded: NodeCommand = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.id(), 9);
+        let NodeCommand::Start {
+            session_id,
+            dir,
+            permission,
+            ..
+        } = decoded
+        else {
+            panic!("the command must stay a start");
+        };
+        assert_eq!(session_id, "child-1");
+        assert_eq!(dir, PathBuf::from("/work/repo"));
+        assert_eq!(permission, Permission::ReadOnly);
     }
 
     #[test]

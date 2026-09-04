@@ -61,9 +61,11 @@ impl ChildSpawner for ChildSessionSpawner {
     }
 }
 
-/// Starts the child's executor on the node through a `Dev` command, creates
-/// the child's session row, starts its loop, hands it the assignment as its
-/// first user message, and returns the child's id.
+/// Starts the child's executor on the node through a `Start` command (the
+/// internal command for running an executor in a directory that already
+/// exists on the node), creates the child's session row, starts its loop,
+/// hands it the assignment as its first user message, and returns the child's
+/// id.
 async fn spawn_child(
     registry: &Weak<AgentRegistry>,
     nodes: &NodeRegistry,
@@ -91,7 +93,12 @@ async fn spawn_child(
     }
 
     let child_id = uuid::Uuid::new_v4().to_string();
-    let command = NodeCommand::Dev {
+    // The child runs in the parent's working copy, a directory this node
+    // already created. The start command is the internal executor-in-
+    // existing-dir command; the node confines the directory to its browse
+    // roots exactly like dev, so a clone-session parent needs a root that
+    // covers the node's work_dir.
+    let command = NodeCommand::Start {
         id: commands.next_id(),
         session_id: child_id.clone(),
         dir: PathBuf::from(&parent.dir),
@@ -181,7 +188,7 @@ async fn enqueue_and_await(
             "node {node} rejected the request: {message}"
         ))),
         _ => Err(SpawnError::Failed(format!(
-            "node {node} answered dev with a non-session result"
+            "node {node} answered start with a non-session result"
         ))),
     }
 }

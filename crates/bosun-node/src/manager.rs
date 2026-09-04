@@ -13,6 +13,7 @@ use bosun_common::types::DirEntry;
 use bosun_common::types::DirListing;
 use bosun_common::types::NodeCloneRequest;
 use bosun_common::types::NodeDevRequest;
+use bosun_common::types::NodeStartRequest;
 use bosun_common::types::SessionInfo;
 use thiserror::Error;
 use tokio::process::Child;
@@ -80,6 +81,9 @@ pub struct NodeManager {
     cp_url: String,
     browse_roots: Vec<PathBuf>,
     tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+    /// How long an executor start waits to become healthy before the start
+    /// fails. Tests shorten it; the node always uses `HEALTH_TIMEOUT`.
+    health_timeout: Duration,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     processes: RwLock<HashMap<String, Child>>,
 }
@@ -110,6 +114,7 @@ impl NodeManager {
             cp_url,
             browse_roots,
             tls_config,
+            health_timeout: HEALTH_TIMEOUT,
             sessions: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
         }
@@ -163,6 +168,23 @@ impl NodeManager {
             .start_in_dir(&req.session_id, &dir, false, None, None, req.permission)
             .await?;
         info!(session_id = %req.session_id, dir = %record.dir.display(), "dev session started");
+        Ok(record)
+    }
+
+    /// Starts a session executor in a directory that already exists on the
+    /// node. Only the control plane's child-session spawner calls this: the
+    /// directory is the parent session's working copy. A spawned child's
+    /// executor holds the same shell and file access as any session's, so the
+    /// directory is confined to the configured browse roots exactly like a
+    /// `dev` session's directory; clone-session parents live under
+    /// `work_dir/<session_id>`, so a root must cover the node's `work_dir`
+    /// for their children to start.
+    pub async fn start(&self, req: &NodeStartRequest) -> Result<SessionRecord, NodeError> {
+        let dir = self.resolve_within_roots(&req.dir)?;
+        let record = self
+            .start_in_dir(&req.session_id, &dir, false, None, None, req.permission)
+            .await?;
+        info!(session_id = %req.session_id, dir = %record.dir.display(), "session started in existing dir");
         Ok(record)
     }
 
@@ -384,7 +406,7 @@ impl NodeManager {
             .with_context(|| format!("failed to start executor for session {id}"))?;
 
         let client = reqwest::Client::new();
-        wait_for_health(&client, port, HEALTH_TIMEOUT).await?;
+        wait_for_health(&client, port, self.health_timeout).await?;
         Ok(child)
     }
 
@@ -1036,5 +1058,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, NodeError::NoBrowseRoots));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_missing_out_of_root_and_file_paths() {
+        let work = tempdir().unwrap();
+        let manager = manager(&work);
+
+        let missing = manager
+            .start(&NodeStartRequest {
+                session_id: "s1".into(),
+                dir: work.path().join("missing"),
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, NodeError::DirNotFound { .. }));
+
+        // The escape browse roots close: the directory exists, but it sits
+        // outside every root, so the start is refused.
+        let outside = tempdir().unwrap();
+        let err = manager
+            .start(&NodeStartRequest {
+                session_id: "s2".into(),
+                dir: outside.path().to_path_buf(),
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::OutsideRoot { .. }));
+
+        let file = work.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let err = manager
+            .start(&NodeStartRequest {
+                session_id: "s3".into(),
+                dir: file,
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::NotADirectory { .. }));
+    }
+
+    #[tokio::test]
+    async fn start_without_browse_roots_refuses_an_existing_dir() {
+        // A spawned child's executor has full shell and file access, so a node
+        // without browse roots refuses to run one anywhere: the roots gate
+        // applies to `start` exactly as it does to `dev`.
+        let work = tempdir().unwrap();
+        let session_dir = work.path().join("repo");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let manager = NodeManager::new(
+            work.path().to_path_buf(),
+            Vec::new(),
+            "http://127.0.0.1:8090".into(),
+            None,
+        );
+
+        let err = manager
+            .start(&NodeStartRequest {
+                session_id: "s1".into(),
+                dir: session_dir,
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::NoBrowseRoots));
+    }
+
+    #[tokio::test]
+    async fn start_within_browse_roots_reaches_executor_startup() {
+        // Browse roots cover the directory, so the gate lets the start through
+        // to executor startup. The node re-execs its own binary as a `bosun
+        // executor`, and the unit-test binary is not bosun, so the spawned
+        // executor can never become healthy; the health timeout is the proof
+        // the start passed the roots gate and ran the executor.
+        let work = tempdir().unwrap();
+        let session_dir = work.path().join("repo");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut manager = NodeManager::new(
+            work.path().to_path_buf(),
+            vec![work.path().to_path_buf()],
+            "http://127.0.0.1:8090".into(),
+            None,
+        );
+        manager.health_timeout = Duration::from_millis(700);
+
+        let err = manager
+            .start(&NodeStartRequest {
+                session_id: "s1".into(),
+                dir: session_dir,
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::HealthTimeout { .. }));
     }
 }
