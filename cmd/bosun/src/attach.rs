@@ -45,6 +45,9 @@ use ratatui::text::Line as TuiLine;
 use ratatui::text::Span;
 use ratatui::widgets::Block as TuiBlock;
 use ratatui::widgets::Borders;
+use ratatui::widgets::Clear;
+use ratatui::widgets::List;
+use ratatui::widgets::ListState;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use serde::Deserialize;
@@ -53,6 +56,7 @@ use tokio::sync::mpsc;
 
 use crate::markdown::markdown_rows;
 use crate::state_name;
+use bosun_control::api::PersonaSummary;
 
 /// How long to wait before reconnecting after the event stream ends.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -481,6 +485,15 @@ pub struct App {
     /// A child session is watch-only: its transcript and state render live,
     /// but nothing this client sends reaches it, so no input is offered.
     watch_only: bool,
+    /// The persona catalog for the persona picker, fetched at attach.
+    personas: Vec<PersonaSummary>,
+    /// Why the persona list is missing, rendered when the picker is asked
+    /// for, so an empty list is never mistaken for an empty catalog.
+    persona_error: Option<String>,
+    /// The persona picker is open and renders over the transcript.
+    pick_persona: bool,
+    /// The highlighted option in the open picker.
+    pick_index: usize,
 }
 
 impl App {
@@ -500,6 +513,10 @@ impl App {
             history_pos: 0,
             draft: String::new(),
             watch_only,
+            personas: Vec::new(),
+            persona_error: None,
+            pick_persona: false,
+            pick_index: 0,
         }
     }
 
@@ -601,7 +618,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll",
+                    "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll",
                     Style::default().fg(Color::DarkGray),
                 )),
         )
@@ -625,6 +642,73 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if interactive {
         let (_, tail_len) = input_row(&app.state.input, inner_width);
         frame.set_cursor_position((input.x + 1 + 2 + tail_len as u16, input.y + 1));
+    }
+    if app.pick_persona {
+        render_persona_picker(frame, output, app);
+    }
+}
+
+/// The persona picker: a bordered list of the configured personas rendered
+/// over the transcript. The highlighted row, or the current session's persona
+/// when nothing is highlighted, is switched on Enter; Esc closes without a
+/// change.
+fn render_persona_picker(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let height = app.personas.len() as u16 + 2;
+    let width = area.width.clamp(20, 60);
+    let popup = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height: height.min(area.height),
+    };
+    let list = if app.personas.is_empty() {
+        List::new(vec![TuiLine::from(Span::styled(
+            app.persona_error
+                .as_deref()
+                .unwrap_or("no personas configured"),
+            Style::default().fg(Color::DarkGray),
+        ))])
+    } else {
+        let items: Vec<TuiLine> = app
+            .personas
+            .iter()
+            .map(|persona| {
+                let mut line = TuiLine::from(Span::raw(persona.name.clone()));
+                if persona.default {
+                    line.spans.push(Span::styled(
+                        " (default)",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                if !persona.description.is_empty() {
+                    line.spans
+                        .push(Span::raw(format!(" — {}", clip(&persona.description, 40))));
+                }
+                line
+            })
+            .collect();
+        List::new(items)
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+            .highlight_symbol("› ")
+    };
+    if app.personas.is_empty() {
+        frame.render_widget(
+            list.block(TuiBlock::default().borders(Borders::ALL).title("personas")),
+            popup,
+        );
+    } else {
+        let mut state = ListState::default();
+        state.select(Some(app.pick_index.min(app.personas.len() - 1)));
+        frame.render_stateful_widget(
+            list.block(
+                TuiBlock::default()
+                    .borders(Borders::ALL)
+                    .title("switch persona (↑/↓ pick, enter switch, esc close)"),
+            ),
+            popup,
+            &mut state,
+        );
     }
 }
 
@@ -720,7 +804,7 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
     spawn_signal_waiter(stop_tx);
 
     let mut app = App::new(session);
-
+    fetch_personas(&client, cp_url, &mut app).await;
     let result = run_attach(
         &mut terminal,
         &client,
@@ -992,9 +1076,47 @@ async fn handle_key(
             _ => Ok(Action::Continue),
         };
     }
+    if app.pick_persona {
+        // The picker owns the keys while it is open: arrows move the
+        // highlight, Enter switches the persona, Esc closes it.
+        return match key.code {
+            KeyCode::Esc => {
+                app.pick_persona = false;
+                Ok(Action::Continue)
+            }
+            KeyCode::Up => {
+                if !app.personas.is_empty() {
+                    app.pick_index = app.pick_index.saturating_sub(1);
+                }
+                Ok(Action::Continue)
+            }
+            KeyCode::Down => {
+                if !app.personas.is_empty() {
+                    app.pick_index = (app.pick_index + 1).min(app.personas.len() - 1);
+                }
+                Ok(Action::Continue)
+            }
+            KeyCode::Enter => {
+                let persona = app
+                    .personas
+                    .get(app.pick_index.min(app.personas.len().saturating_sub(1)))
+                    .cloned();
+                app.pick_persona = false;
+                if let Some(persona) = persona {
+                    switch_persona(app, client, cp_url, session_id, &persona.name).await;
+                }
+                Ok(Action::Continue)
+            }
+            _ => Ok(Action::Continue),
+        };
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             interrupt(app, client, cp_url, session_id).await;
+            Ok(Action::Continue)
+        }
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            open_persona_picker(app);
             Ok(Action::Continue)
         }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1075,10 +1197,7 @@ async fn submit_input(
                 Ok(Action::Continue)
             }
             "/persona" => {
-                app.state.push_line(Line {
-                    kind: LineKind::Status,
-                    text: "usage: /persona <name>".into(),
-                });
+                open_persona_picker(app);
                 Ok(Action::Continue)
             }
             _ => {
@@ -1101,6 +1220,17 @@ fn persona_switch_target(content: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Opens the persona picker over the transcript, highlighting the session's
+/// current persona when it is in the catalog.
+fn open_persona_picker(app: &mut App) {
+    app.pick_persona = true;
+    app.pick_index = app
+        .personas
+        .iter()
+        .position(|persona| app.session.persona.as_deref() == Some(persona.name.as_str()))
+        .unwrap_or(0);
 }
 
 /// Sends the input as a session message. `redirect` marks it as a new
@@ -1234,6 +1364,30 @@ async fn switch_persona(
             kind: LineKind::Status,
             text: format!("persona switch failed: {error}"),
         });
+    }
+}
+
+/// Fetches the configured personas for the picker. A miss keeps the picker
+/// out of the way and explains itself when invoked.
+async fn fetch_personas(client: &reqwest::Client, cp_url: &str, app: &mut App) {
+    let send = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        client.get(format!("{cp_url}/personas")).send(),
+    )
+    .await;
+    let result = match send {
+        Ok(result) => result.and_then(reqwest::Response::error_for_status),
+        Err(_) => {
+            app.persona_error = Some("request timed out".into());
+            return;
+        }
+    };
+    match result {
+        Ok(response) => match response.json::<Vec<PersonaSummary>>().await {
+            Ok(personas) => app.personas = personas,
+            Err(error) => app.persona_error = Some(format!("failed to parse personas: {error}")),
+        },
+        Err(error) => app.persona_error = Some(format!("failed to fetch personas: {error}")),
     }
 }
 
@@ -1754,6 +1908,163 @@ mod tests {
             persona_switch_target("switch to reviewer"),
             None,
             "plain text is not the command"
+        );
+    }
+
+    fn summary(name: &str, description: &str, default: bool) -> PersonaSummary {
+        PersonaSummary {
+            name: name.into(),
+            description: description.into(),
+            default,
+        }
+    }
+
+    #[test]
+    fn open_persona_picker_highlights_the_sessions_persona() {
+        let mut app = App::new(test_session());
+        app.personas = vec![
+            summary("coder", "", false),
+            summary("reviewer", "", true),
+            summary("architect", "", false),
+        ];
+        app.session.persona = Some("reviewer".into());
+
+        open_persona_picker(&mut app);
+
+        assert!(app.pick_persona, "the picker opens");
+        assert_eq!(app.pick_index, 1, "the session's persona is highlighted");
+    }
+
+    #[test]
+    fn open_persona_picker_falls_back_to_the_first_entry() {
+        let mut app = App::new(test_session());
+        app.personas = vec![summary("coder", "", true)];
+        app.session.persona = Some("ghost".into());
+
+        open_persona_picker(&mut app);
+
+        assert!(app.pick_persona);
+        assert_eq!(app.pick_index, 0, "a stranger persona starts at the top");
+    }
+
+    #[tokio::test]
+    async fn persona_picker_switches_on_enter_and_closes_on_escape() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        app.personas = vec![summary("coder", "", true), summary("reviewer", "", false)];
+        app.pick_persona = true;
+        app.pick_index = 1;
+
+        // Enter switches to the highlighted persona. The local test server
+        // errors, so the line records the failure; the picker still closes.
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(
+            !app.pick_persona,
+            "Enter closes the picker and issues the switch"
+        );
+
+        // Esc closes the picker without a switch.
+        app.pick_persona = true;
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(!app.pick_persona, "Esc closes the picker");
+    }
+
+    #[tokio::test]
+    async fn persona_picker_arrows_move_the_highlight_within_bounds() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        app.personas = vec![summary("coder", "", true), summary("reviewer", "", false)];
+        app.pick_persona = true;
+        app.pick_index = 0;
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, &client, "http://x", "s1", down)
+            .await
+            .unwrap();
+        assert_eq!(app.pick_index, 1);
+        handle_key(&mut app, &client, "http://x", "s1", down)
+            .await
+            .unwrap();
+        assert_eq!(app.pick_index, 1, "Down stops at the last entry");
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key(&mut app, &client, "http://x", "s1", up)
+            .await
+            .unwrap();
+        assert_eq!(app.pick_index, 0);
+        handle_key(&mut app, &client, "http://x", "s1", up)
+            .await
+            .unwrap();
+        assert_eq!(app.pick_index, 0, "Up stops at the first entry");
+        assert!(app.pick_persona, "arrows keep the picker open");
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_opens_the_persona_picker() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(app.pick_persona, "^O opens the persona picker");
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_and_bare_persona_do_not_reach_the_session() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(app.state.lines.is_empty(), "no request leaves the client");
+
+        // A bare /persona submit opens the picker instead of sending text.
+        let mut app = App::new(test_session());
+        app.state.input = "/persona".into();
+        let action = submit_input(&mut app, &client, "http://x", "s1", false)
+            .await
+            .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(app.pick_persona, "a bare /persona opens the picker");
+        assert!(
+            app.state.lines.is_empty(),
+            "a bare /persona sends nothing to the session"
+        );
+        assert!(
+            persona_switch_target("/persona").is_none(),
+            "the bare form still names nothing"
         );
     }
 

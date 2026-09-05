@@ -151,6 +151,14 @@
   }
   .badge.state { color: var(--accent); border-color: var(--accent); }
   .view-actions { display: flex; gap: 8px; }
+  .view-actions select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font: inherit;
+  }
   #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
   #transcript .msg { margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
   #transcript .msg.user { color: var(--user); }
@@ -321,7 +329,9 @@
         <div id="dir-entries"></div>
       </div>
       <label>Persona
-        <input id="form-persona" type="text" placeholder="default persona">
+        <select id="form-persona">
+          <option value="">default persona</option>
+        </select>
       </label>
       <label>Prompt
         <textarea id="form-prompt" rows="3" placeholder="optional first instruction"></textarea>
@@ -354,7 +364,9 @@
     <div class="view-actions">
       <button id="btn-interrupt" type="button">Interrupt</button>
       <button id="btn-permission" type="button">Switch to read-only</button>
-      <input id="persona-name" type="text" placeholder="persona name" size="14">
+      <select id="persona-name">
+        <option value="">switch persona…</option>
+      </select>
       <button id="btn-persona" type="button">Switch persona</button>
       <button id="btn-stop" type="button">Stop</button>
       <button id="btn-close" type="button">Close</button>
@@ -413,6 +425,7 @@ const btnRedirect = $('btn-redirect');
 
 let nodes = [];
 let nodeOptionsSignature = null;
+let personas = [];
 let sessions = [];
 let current = null;   // the open session id
 let es = null;        // the open EventSource
@@ -496,6 +509,50 @@ function renderNodeOptions() {
   }
   // The picked node vanished: reuse the change listener to drop the stale dir pick.
   formNode.dispatchEvent(new Event('change'));
+}
+
+function renderPersonaOptions() {
+  formPersona.textContent = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'default persona';
+  formPersona.appendChild(placeholder);
+  for (const persona of personas) {
+    const option = document.createElement('option');
+    option.value = persona.name;
+    option.textContent = persona.name + (persona.default ? ' (default)' : '');
+    formPersona.appendChild(option);
+  }
+
+  const selected = personaName.value;
+  personaName.textContent = '';
+  const switchPlaceholder = document.createElement('option');
+  switchPlaceholder.value = '';
+  switchPlaceholder.textContent = 'switch persona…';
+  personaName.appendChild(switchPlaceholder);
+  for (const persona of personas) {
+    const option = document.createElement('option');
+    option.value = persona.name;
+    option.textContent = persona.name;
+    personaName.appendChild(option);
+  }
+  if (selected) personaName.value = selected;
+}
+
+let personasFetching = false;
+async function refreshPersonas() {
+  if (personasFetching) return;
+  personasFetching = true;
+  try {
+    const response = await fetch('/personas');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    personas = await response.json();
+    renderPersonaOptions();
+  } catch (error) {
+    showStatus('personas: ' + error.message);
+  } finally {
+    personasFetching = false;
+  }
 }
 
 function shortId(id) {
@@ -770,6 +827,13 @@ function updateHeader(session) {
   viewPersona.textContent = session.persona || '';
   updatePermissionBadge(session.permission);
   viewState.textContent = session.state;
+  // The switch dropdown preselects the session's current persona, so the
+  // "switch persona" action reads as a dropdown rather than a blank field.
+  if (session.persona && personas.some((persona) => persona.name === session.persona)) {
+    personaName.value = session.persona;
+  } else {
+    personaName.value = '';
+  }
   // A child session is watch-only: its transcript and state render live, but
   // the pane offers no input path and no user actions toward it.
   const watchOnly = !!session.parent_id;
@@ -808,9 +872,9 @@ btnPermission.addEventListener('click', async () => {
 });
 
 btnPersona.addEventListener('click', async () => {
-  const name = personaName.value.trim();
+  const name = personaName.value;
   if (!name) {
-    showStatus('persona: type a persona name first');
+    showStatus('persona: pick a persona first');
     return;
   }
   try {
@@ -1310,8 +1374,10 @@ function handleFrame(frame) {
 
 refreshNodes();
 refreshSessions();
+refreshPersonas();
 setInterval(refreshNodes, 5000);
 setInterval(refreshSessions, 3000);
+setInterval(refreshPersonas, 30000);
 </script>
 </body>
 </html>
