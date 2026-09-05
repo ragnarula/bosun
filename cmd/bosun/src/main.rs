@@ -466,6 +466,9 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     // every session's tool calls reach the control plane as soon as it is up.
     manager.start_node_tunnel(&config.node_name);
     manager.restore().await;
+    // Sessions are restored and the tunnel is up, so the node is as ready
+    // as it gets. Under Type=notify the unit is not started until this.
+    bosun_node::notify::ready();
 
     tokio::select! {
         _ = bosun_node::poll::run_poll_loop(
