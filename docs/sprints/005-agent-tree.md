@@ -4,6 +4,8 @@ Sessions become a tree of agents. A persona — a model plus a system prompt, pe
 
 Status: **complete**. All ten stories are implemented and tested.
 
+> The executor-transport parts of this sprint — one executor process per session, each on its own port and executor-port dial in the relay — are superseded by sprint 006: executors run in the node process and tool calls are typed frames. See `006-in-process-executors.md` and its ADR `../adrs/2026-09-05-in-process-executors.md`. The session-tree, persona, ask-gating, and transport decisions above otherwise stand.
+
 ## Confirmed decisions
 
 - A **persona** is `{ name, description, model, system_prompt, permission, allowed_tools }`, configured once on the control plane: a TOML registry in `serve.toml` plus one prompt file per persona under `<data dir>/personas/<name>.md`. `bosun clone` and `bosun dev` take `--persona` instead of `--model`; a `default_persona` config field names what sessions use when none is given. Personas resolve live by name; a missing persona fails the session and reports to its parent.
