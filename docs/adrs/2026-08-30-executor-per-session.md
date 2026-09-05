@@ -3,6 +3,8 @@
 **Date:** 2026-08-30
 **Author:** Raghav
 
+> Superseded by `2026-09-05-in-process-executors.md`: each session's executor is now in-process state on the node, not a `bosun executor` process. No port, pid, or health poll exists.
+
 ## Context
 
 The MVP started `opencode serve` on each node session to run the agent. Sprint 002 removes opencode; the node must instead host the process that executes tools against the session's working copy. That process must be owned and recycled by the node exactly as `opencode serve` was: spawned on clone, restored on boot, killed on stop.

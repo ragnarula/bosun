@@ -984,7 +984,8 @@ struct SwitchPersonaRequest {
 /// re-resolves the session's model at every turn, so the switch applies to
 /// the next model call; a turn in flight is not aborted. When the persona's
 /// permission differs from the stored one, the executor's permission is
-/// toggled best-effort through `/permission` exactly like `set_permission`.
+/// toggled best-effort with a typed permission operation, exactly like
+/// `set_permission`.
 #[instrument(skip(state))]
 async fn switch_persona(
     State(state): State<Arc<AppState>>,
@@ -1258,6 +1259,10 @@ mod tests {
     use bosun_agent::provider::ProviderError;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
+    use bosun_common::tool::ToolMsg;
+    use bosun_common::tool::ToolOp;
+    use bosun_common::tool::read_tool_frame;
+    use bosun_common::tool::write_tool_frame;
     use bosun_common::types::SessionInfo;
     use bosun_common::types::UpdateStatus;
     use bosun_test_support::stub_backend;
@@ -4355,31 +4360,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_persona_switch_toggles_the_executor_permission_only_when_it_differs() {
-        // A stub executor whose /permission handler records every body it
+        // A stub node whose relay records every permission operation it
         // receives, reached through a registered tunnel like a node's.
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let app = {
-            use axum::extract::State as AxumState;
-            use axum::routing::post as axum_post;
-
-            async fn handle_permission(
-                AxumState(seen): AxumState<Arc<Mutex<Vec<String>>>>,
-                body: axum::body::Bytes,
-            ) -> Json<serde_json::Value> {
-                seen.lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&body).into_owned());
-                Json(json!({}))
-            }
-            axum::Router::new()
-                .route("/permission", axum_post(handle_permission))
-                .with_state(seen.clone())
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let seen: Arc<Mutex<Vec<Permission>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_node = seen.clone();
 
         let (cp_side, node_side) = tokio::io::duplex(1 << 20);
         let (cp_tunnel, _) = Tunnel::new(cp_side);
@@ -4391,10 +4375,18 @@ mod tests {
         tokio::spawn(async move {
             while let Some(event) = opens.recv().await {
                 let tunnel = node_tunnel.clone();
+                let seen = seen_for_node.clone();
                 tokio::spawn(async move {
-                    let mut backend = TcpStream::connect(backend).await.unwrap();
-                    let mut logical = tunnel.attach(event.conn_id, event.rx).unwrap();
-                    let _ = tokio::io::copy_bidirectional(&mut backend, &mut logical).await;
+                    let Some(mut logical) = tunnel.attach(event.conn_id, event.rx) else {
+                        return;
+                    };
+                    let Ok(Some(ToolOp::SetPermission { permission })) =
+                        read_tool_frame::<_, ToolOp>(&mut logical).await
+                    else {
+                        return;
+                    };
+                    seen.lock().unwrap().push(permission);
+                    let _ = write_tool_frame(&mut logical, &ToolMsg::Ack).await;
                 });
             }
         });
@@ -4447,7 +4439,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(
             *seen.lock().unwrap(),
-            [r#"{"permission":"read_only"}"#],
+            [Permission::ReadOnly],
             "the executor receives the new read-only permission"
         );
 
@@ -4470,14 +4462,8 @@ mod tests {
             Some("architect")
         );
         {
-            let bodies = seen.lock().unwrap();
-            assert_eq!(
-                *bodies,
-                [
-                    r#"{"permission":"read_only"}"#,
-                    r#"{"permission":"read_write"}"#
-                ]
-            );
+            let permissions = seen.lock().unwrap();
+            assert_eq!(*permissions, [Permission::ReadOnly, Permission::ReadWrite]);
         }
 
         // architect (read_write) -> coder (read_write): the permission does

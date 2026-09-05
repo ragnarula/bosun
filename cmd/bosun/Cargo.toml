@@ -15,7 +15,6 @@ axum.workspace = true
 bosun-agent.workspace = true
 bosun-common.workspace = true
 bosun-control.workspace = true
-bosun-executor.workspace = true
 bosun-node.workspace = true
 bosun-store.workspace = true
 clap.workspace = true

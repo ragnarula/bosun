@@ -3,6 +3,8 @@
 **Date:** 2026-09-03
 **Author:** Raghav
 
+> Superseded in part by `2026-09-05-in-process-executors.md`: the relay no longer dials a session's executor port on loopback. Executors run in the node process, and the relay dispatches each logical connection's typed tool call to the session's in-process executor. The tunnel transport, registry, session-addressed Opens, and flow control survive unchanged.
+
 ## Context
 
 A node hosts a tree of sessions, and every session runs its own executor on the node. Until now each session kept its own outbound tunnel to the control plane, opened when its executor started and torn down when the session stopped. A session tree therefore multiplies connections: a root with several live children holds several tunnels from one node. Session teardown and node restarts manage a tunnel per session, and a control-plane restart that drops the registry is repaired only by whatever sessions still have tunnel tasks running.

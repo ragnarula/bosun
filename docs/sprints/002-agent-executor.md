@@ -5,6 +5,8 @@ Bosun runs its own agent sessions. The agent loop lives on the control plane, to
 Status: **complete**. All eleven stories are implemented and tested.
 
 > The subagent model recorded here — subagent types `{ name, model, permission }` and the `spawn_subagent` tool in S8 — is superseded by sprint 005: personas and real child sessions replace it. See `005-agent-tree.md` and its ADR `../adrs/2026-09-03-agent-tree.md`.
+>
+> The executor arrangement recorded here — one `bosun executor` process per session and HTTP/1.1 tool calls over a logical stream — is superseded by sprint 006: executors run in the node process and tool calls are typed frames. See `006-in-process-executors.md` and its ADR `../adrs/2026-09-05-in-process-executors.md`.
 
 ## Confirmed decisions
 

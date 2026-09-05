@@ -3,6 +3,8 @@
 **Date:** 2026-08-30
 **Author:** Raghav
 
+> Superseded by `2026-09-05-in-process-executors.md`: tool calls ride the tunnel as typed frames, not HTTP/1.1 over a loopback-dialed executor port. The relay and the executor no longer exist as described here.
+>
 > Superseded in part by `2026-09-03-one-tunnel-per-node.md`: the tool protocol above survives unchanged; a logical connection is now opened on the node's tunnel, addressed by session id, instead of on the session's tunnel.
 
 ## Context

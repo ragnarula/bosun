@@ -22,7 +22,6 @@ use bosun_common::config::load_config;
 use bosun_common::config::save_cli_config;
 #[cfg(windows)]
 use bosun_common::error::ErrorExt;
-use bosun_common::session::Permission;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
 use bosun_common::telemetry::setup_logging;
@@ -41,7 +40,6 @@ use bosun_control::loops::AgentRegistry;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::tunnel::TunnelRegistry;
-use bosun_executor::tools;
 use bosun_node::manager::NodeManager;
 use bosun_store::store::Store;
 use clap::Args;
@@ -89,8 +87,6 @@ enum Command {
     /// from nodes. The self-update fetches its binary from the release feed:
     /// BOSUN_UPDATE_BASE_URL when set, else GitHub Releases.
     Update(UpdateArgs),
-    /// Run an executor server for one session.
-    Executor(ExecutorArgs),
 }
 
 #[derive(Args)]
@@ -222,22 +218,6 @@ struct UpdateArgs {
     cp_url: Option<String>,
 }
 
-#[derive(Args)]
-struct ExecutorArgs {
-    /// Directory the session works in.
-    #[arg(long)]
-    session_dir: PathBuf,
-    /// Port the executor listens on.
-    #[arg(long)]
-    port: u16,
-    /// Tool permission: read_only or read_write.
-    #[arg(long, default_value = "read_write")]
-    permission: String,
-    /// Override the log filter. Defaults to RUST_LOG, then info.
-    #[arg(long)]
-    log_filter: Option<String>,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
@@ -263,7 +243,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Config(args) => run_config(args),
         Command::Stop(args) => run_stop(args).await,
         Command::Update(args) => run_update_cmd(args).await,
-        Command::Executor(args) => run_executor(args).await,
     }
 }
 
@@ -483,8 +462,8 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         config.cp_url.clone(),
         tls_config.clone(),
     ));
-    // The one outbound tunnel starts at boot and reconnects on its own, so it
-    // is already up (or coming up) when the first session's executor starts.
+    // The one outbound tunnel starts at boot and reconnects on its own, so
+    // every session's tool calls reach the control plane as soon as it is up.
     manager.start_node_tunnel(&config.node_name);
     manager.restore().await;
 
@@ -1024,19 +1003,6 @@ fn update_notice_line(headers: &HeaderMap) -> Option<String> {
         .then(|| format!("bosun {cp_version} available, run \"bosun update\""))
 }
 
-fn parse_permission(value: &str) -> anyhow::Result<Permission> {
-    tools::permission_from_str(value).ok_or_else(|| {
-        anyhow::anyhow!("invalid permission: {value}; expected read-only or read-write")
-    })
-}
-
-async fn run_executor(args: ExecutorArgs) -> anyhow::Result<()> {
-    let permission = parse_permission(&args.permission)?;
-    setup_logging(args.log_filter.as_deref())?;
-    bosun_executor::server::serve(args.session_dir, args.port, permission).await?;
-    Ok(())
-}
-
 fn format_ago(now: SystemTime, unix_secs: u64) -> String {
     let now_secs = bosun_common::time::unix_secs(now) as u64;
     let diff = now_secs.saturating_sub(unix_secs);
@@ -1053,6 +1019,7 @@ fn format_ago(now: SystemTime, unix_secs: u64) -> String {
 mod tests {
     use std::time::UNIX_EPOCH;
 
+    use bosun_common::session::Permission;
     use bosun_common::types::UpdateStatus;
 
     use super::*;
@@ -1397,22 +1364,6 @@ mod tests {
         };
         assert!(!args.rollback);
         assert_eq!(args.config.as_deref(), Some(Path::new("x.toml")));
-    }
-
-    #[test]
-    fn parse_permission_accepts_dashes_and_underscores() {
-        assert_eq!(parse_permission("read-only").unwrap(), Permission::ReadOnly);
-        assert_eq!(parse_permission("read_only").unwrap(), Permission::ReadOnly);
-        assert_eq!(
-            parse_permission("read-write").unwrap(),
-            Permission::ReadWrite
-        );
-        assert_eq!(
-            parse_permission("read_write").unwrap(),
-            Permission::ReadWrite
-        );
-        assert!(parse_permission("admin").is_err());
-        assert!(parse_permission("").is_err());
     }
 
     #[test]

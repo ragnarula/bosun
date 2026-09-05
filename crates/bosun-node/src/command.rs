@@ -194,7 +194,7 @@ pub async fn execute(manager: &Arc<NodeManager>, command: NodeCommand) -> Comman
                 },
             }
         }
-        NodeCommand::Dirs { id, path } => match manager.list_dir(path.as_deref()) {
+        NodeCommand::Dirs { id, path } => match manager.list_dir(path.as_deref()).await {
             Ok(listing) => CommandResult::Dirs { id, listing },
             Err(error) => CommandResult::Error {
                 id,
