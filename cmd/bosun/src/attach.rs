@@ -2,6 +2,7 @@
 //! over SSE in a two-pane TUI (scrollable output, pinned input box) and sends
 //! the user's input back over the session API.
 
+use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -61,6 +62,9 @@ use bosun_control::api::PersonaSummary;
 /// How long to wait before reconnecting after the event stream ends.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// How long a tool call's inline args or result may render before it is cut.
+/// The TUI row is final — there is no click to expand — so the cap is generous.
+/// The web pane clips its result preview at `TOOL_RESULT_PREVIEW` (400) instead,
+/// because the full text is one click away there.
 const MAX_INLINE_CHARS: usize = 1000;
 /// Transcript rows kept in memory; the oldest rows scroll away.
 const MAX_LINES: usize = 5000;
@@ -325,6 +329,9 @@ fn clip(text: &str, max: usize) -> String {
     clipped
 }
 
+// Mirrors the web pane's `clip` in `crates/bosun-control/src/ui/index.html`;
+// keep the two in step.
+
 /// Word-wraps text to `width` columns, splitting on newlines first. A word
 /// longer than the width is hard-wrapped at character width.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -424,18 +431,49 @@ fn row_color(kind: LineKind, text: &str) -> Color {
 }
 
 /// The per-kind prefix that aligns the transcript: messages start at the
-/// margin, tool activity and meta rows are indented, state rows are separated.
-fn prefix_for(line: &Line) -> &'static str {
+/// margin, tool activity and meta rows are indented, section rows are
+/// separated. Tool calls carry the tool's own glyph; the result nests under
+/// it, so a call and its outcome read as one unit like opencode's inline tool
+/// rows. Summary and Status both use the divider so a compaction reads as a
+/// section boundary rather than a message.
+fn prefix_for(line: &Line) -> Cow<'static, str> {
     match line.kind {
-        LineKind::User => "you: ",
-        LineKind::Assistant => "",
-        LineKind::ToolCall => "  → ",
-        LineKind::ToolResult => "  ← ",
-        LineKind::Ask => "  ? ",
-        LineKind::Summary => "  ⤷ ",
-        LineKind::ChildEvent => "  ⤷ ",
-        LineKind::ModelCall => "  ",
-        LineKind::Status => "── ",
+        LineKind::User => Cow::Borrowed("you: "),
+        LineKind::Assistant => Cow::Borrowed(""),
+        LineKind::ToolCall => Cow::Owned(format!("  {} ", tool_glyph(&line.text))),
+        LineKind::ToolResult => Cow::Borrowed("    ↳ "),
+        LineKind::Ask => Cow::Borrowed("  ? "),
+        LineKind::Summary => Cow::Borrowed("── "),
+        LineKind::ChildEvent => Cow::Borrowed("  ⤷ "),
+        LineKind::ModelCall => Cow::Borrowed("  ◆ "),
+        LineKind::Status => Cow::Borrowed("── "),
+    }
+}
+
+/// The single-glyph marker that identifies the tool kind in the gutter, so a
+/// reader sees what ran before reading its name and args. Unknown tools fall
+/// back to a generic gear.
+///
+/// Mirrors the web pane's `toolGlyph` in `crates/bosun-control/src/ui/index.html`;
+/// keep both in step with the canonical tool list in `bosun_common::tool::canonical_tools`.
+/// Every glyph measures one column in `unicode-width` (which ratatui uses to
+/// lay out rows), because the gutter prefix width is counted in chars; a glyph
+/// that rendered two columns would misalign wrapped rows.
+fn tool_glyph(text: &str) -> &'static str {
+    match text.split_whitespace().next().unwrap_or_default() {
+        "shell" => "$",
+        "file/read" => "→",
+        "file/write" | "edit" => "✎",
+        "grep" => "⌕",
+        "glob" => "✱",
+        "ask" => "?",
+        "todowrite" => "✓",
+        "git" => "⎇",
+        "webfetch" => "↗",
+        "skill" => "⚒",
+        "spawn" => "⊕",
+        "message_child" => "⇄",
+        _ => "⚙",
     }
 }
 
@@ -1476,7 +1514,7 @@ mod tests {
             row_texts(&rows),
             vec![
                 "you: hello",
-                "  → shell {\"cmd\":\"ls\"}",
+                "  $ shell {\"cmd\":\"ls\"}",
                 "── state: waiting_for_input",
                 "streaming"
             ]

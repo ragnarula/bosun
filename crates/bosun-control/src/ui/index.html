@@ -160,25 +160,59 @@
     font: inherit;
   }
   #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
-  #transcript .msg { margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
-  #transcript .msg.user { color: var(--user); }
-  #transcript .msg.assistant { color: var(--text); }
+  #transcript .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* User and assistant messages carry a left accent gutter like opencode's
+     message boxes: the user's is tinted with the user color, the assistant's
+     with the plain panel border. */
+  #transcript .msg.user {
+    border-left: 3px solid var(--user);
+    padding: 2px 0 2px 12px;
+    color: var(--user);
+  }
+  #transcript .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
   #transcript .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* Tool traffic: one inline row per call, glyph + name + args, with the
+     payload collapsed until clicked. The result nests under its call as a
+     bordered block, so a call and its outcome read as one unit. */
   #transcript .tool {
     background: var(--panel-2);
     border-radius: 6px;
     padding: 2px 8px;
     display: block;
     cursor: pointer;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
   }
   #transcript .tool:hover { background: var(--border); }
-  #transcript .tool.error { color: var(--error); }
+  #transcript .tool .glyph { color: var(--muted); margin-right: 6px; }
   #transcript .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
   #transcript .tool.open .toggle { color: var(--accent); }
+  #transcript .tool-result {
+    margin: 0 0 6px 20px;
+    border-left: 2px solid var(--border);
+    padding: 2px 0 2px 10px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  #transcript .tool-result.clipped { cursor: pointer; color: var(--muted); }
+  #transcript .tool-result.clipped:hover { color: var(--text); }
+  /* An error result stays red even when clipped; the muted affordance must
+     not hide that the tool failed. */
+  #transcript .tool-result.error { color: var(--error); }
+  #transcript .tool-result.error.clipped:hover { color: var(--error); }
+  #transcript .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
   #transcript .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
   #transcript .error { color: var(--error); }
   #transcript .state { color: var(--muted); font-size: 12px; }
-  #transcript .summary { color: var(--muted); font-style: italic; }
+  #transcript .summary {
+    color: var(--muted);
+    font-style: italic;
+    text-align: center;
+    font-size: 12px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+    margin-top: 10px;
+  }
   #transcript .child-report { color: var(--muted); padding-left: 18px; }
   #transcript .child-link {
     color: var(--accent);
@@ -197,11 +231,13 @@
     margin: 6px 0;
     padding: 10px 14px;
     border: 1px solid var(--accent);
+    border-left: 4px solid var(--accent);
     border-radius: 8px;
     background: rgba(91, 140, 255, 0.08);
   }
   #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
   #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
+  #transcript .ask .ask-to { color: var(--muted); font-size: 12px; }
   #transcript h1, #transcript h2, #transcript h3, #transcript h4, #transcript h5, #transcript h6 {
     margin: 12px 0 4px;
     font-weight: 700;
@@ -947,17 +983,105 @@ function appendLine(kind, text) {
 }
 
 // Tool traffic renders as one subtle strip so assistant text is not buried
-// under long tool output. The strip is quiet by default; the payload stays
-// hidden until the strip is clicked.
-function appendToolLine(kind, payload) {
+// under long tool output. The strip shows a per-tool glyph, the tool name,
+// and the args; the payload stays hidden until the strip is clicked.
+function toolGlyph(name) {
+  // Mirrors the TUI's `tool_glyph` in `cmd/bosun/src/attach.rs`; keep both in
+  // step with the canonical tool list in `crates/bosun-common/src/tool.rs`.
+  const glyphs = {
+    shell: '$',
+    'file/read': '→',
+    'file/write': '✎',
+    edit: '✎',
+    grep: '⌕',
+    glob: '✱',
+    ask: '?',
+    todowrite: '✓',
+    git: '⎇',
+    webfetch: '↗',
+    skill: '⚒',
+    spawn: '⊕',
+    message_child: '⇄',
+  };
+  // A hasOwnProperty guard keeps a tool literally named `constructor` or
+  // `toString` from printing Object.prototype's function source.
+  return Object.prototype.hasOwnProperty.call(glyphs, name) ? glyphs[name] : '⚙';
+}
+
+// The compact one-line label for a tool call, opencode-style: the tool name
+// plus the arguments that say what it acted on, never the raw JSON. Falls
+// back to the first string argument for unknown tools. Whitespace is
+// collapsed so a multi-line command or heredoc stays one row; the full args
+// live in the hidden body.
+function toolSummary(name, args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return name;
+  const s = (value) =>
+    typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+  const first = Object.values(args).find((value) => typeof value === 'string') || '';
+  switch (name) {
+    case 'shell': {
+      const command = s(args.command);
+      return command ? name + ' ' + clip(command, TOOL_SUMMARY_LIMIT) : name;
+    }
+    case 'file/read':
+    case 'file/write':
+    case 'edit':
+      return name + (s(args.path) ? ' ' + clip(s(args.path), TOOL_SUMMARY_LIMIT) : '');
+    case 'grep':
+      return name + (s(args.pattern) ? ' "' + clip(s(args.pattern), TOOL_SUMMARY_LIMIT) + '"' : '');
+    case 'glob':
+      return name + (s(args.pattern) ? ' "' + clip(s(args.pattern), TOOL_SUMMARY_LIMIT) + '"' : '');
+    case 'ask':
+      return name + (s(args.message) ? ' "' + clip(s(args.message), TOOL_SUMMARY_LIMIT) + '"' : '');
+    case 'todowrite':
+      return args.items && args.items.length ? name + ' (' + args.items.length + ')' : name;
+    case 'git':
+      return Array.isArray(args.args) && args.args.length
+        ? 'git ' + clip(args.args.join(' '), TOOL_SUMMARY_LIMIT)
+        : 'git';
+    case 'webfetch':
+      return name + (s(args.url) ? ' ' + clip(s(args.url), TOOL_SUMMARY_LIMIT) : '');
+    case 'skill':
+      return name + (s(args.name) ? ' "' + clip(s(args.name), TOOL_SUMMARY_LIMIT) + '"' : '');
+    case 'spawn':
+      return name + (s(args.persona) ? ' ' + clip(s(args.persona), TOOL_SUMMARY_LIMIT) : '');
+    case 'message_child':
+      return name + (s(args.id) ? ' ' + clip(s(args.id), TOOL_SUMMARY_LIMIT) : '');
+    default:
+      return first ? name + ' ' + clip(s(first), TOOL_SUMMARY_LIMIT) : name;
+  }
+}
+
+function clip(text, max) {
+  const chars = Array.from(text);
+  return chars.length > max ? chars.slice(0, max).join('') + '…' : text;
+}
+
+// Mirrors the TUI's `clip` in `cmd/bosun/src/attach.rs`; keep the two in step.
+
+// The one-line label for a shell command or path is clipped so a very long
+// command does not wrap the tool strip into many lines.
+const TOOL_SUMMARY_LIMIT = 120;
+
+// One-line tool strip: the glyph, the tool name, and a compact label of what
+// it acted on. The full args stay hidden until the line is clicked.
+function appendToolStrip(name, args) {
   const line = document.createElement('div');
-  line.className = 'line ' + kind;
+  line.className = 'line tool';
+  const glyph = document.createElement('span');
+  glyph.className = 'glyph';
+  glyph.textContent = toolGlyph(name);
   const toggle = document.createElement('span');
   toggle.className = 'toggle';
   toggle.textContent = '▸';
+  const summary = document.createElement('span');
+  summary.textContent = toolSummary(name, args);
   const body = document.createElement('span');
   body.hidden = true;
+  body.textContent = readableValue(args);
   line.appendChild(toggle);
+  line.appendChild(glyph);
+  line.appendChild(summary);
   line.appendChild(body);
   line.addEventListener('click', () => {
     const wasOpen = !body.hidden;
@@ -967,12 +1091,56 @@ function appendToolLine(kind, payload) {
       toggle.textContent = '▸';
       return;
     }
-    body.textContent = payload;
     body.hidden = false;
     line.classList.add('open');
     toggle.textContent = '▾';
     scrollToBottom();
   });
+  transcript.appendChild(line);
+  scrollToBottom();
+}
+
+// A tool result nests under its call as a bordered block, so the call and
+// its outcome read as one unit. Long output is clipped with a click to
+// expand; error results render red with the tool name kept. An empty result
+// (a write that returned `{}`) adds nothing beyond the call's strip.
+// The preview is shorter than the TUI's `MAX_INLINE_CHARS` (1000) because
+// the full text is one click away here, where the TUI row is final.
+const TOOL_RESULT_PREVIEW = 400;
+
+function appendToolResult(name, payload, error) {
+  const text = payload == null ? '' : String(payload);
+  if (!error && text === '') return;
+  const line = document.createElement('div');
+  line.className = 'tool-result' + (error ? ' error' : '');
+  if (error) {
+    const label = document.createElement('span');
+    label.className = 'error-label';
+    label.textContent = name + ' failed';
+    line.appendChild(label);
+  }
+  const preview = clip(text, TOOL_RESULT_PREVIEW);
+  const body = document.createElement('span');
+  body.textContent = preview;
+  line.appendChild(body);
+  if (preview !== text) {
+    line.classList.add('clipped');
+    line.title = 'click to expand';
+    line.addEventListener('click', () => {
+      if (line.classList.contains('expanded')) {
+        body.textContent = preview;
+        line.classList.remove('expanded');
+        line.classList.add('clipped');
+        line.title = 'click to expand';
+      } else {
+        body.textContent = text;
+        line.classList.add('expanded');
+        line.classList.remove('clipped');
+        line.title = 'click to collapse';
+      }
+      scrollToBottom();
+    });
+  }
   transcript.appendChild(line);
   scrollToBottom();
 }
@@ -1266,26 +1434,29 @@ function renderMessage(message) {
       break;
     case 'tool_call': {
       const args = block.args == null ? {} : block.args;
-      appendToolLine('tool', readableValue(args));
+      appendToolStrip(block.name, args);
       break;
     }
     case 'tool_result': {
       const content = block.content;
-      appendToolLine(
-        block.is_error ? 'tool error' : 'tool',
+      const payload =
         typeof content === 'string' || content === null
           ? String(content)
-          : readableValue(content)
-      );
+          : readableValue(content);
+      appendToolResult(block.name, payload, block.is_error);
       break;
     }
     case 'ask': {
       const box = document.createElement('div');
       box.className = 'ask';
       const question = document.createElement('div');
-      question.textContent = block.child_id
-        ? 'child ' + block.child_id + ' asks: ' + block.message
-        : block.message;
+      if (block.child_id) {
+        const to = document.createElement('span');
+        to.className = 'ask-to';
+        to.textContent = 'child ' + block.child_id + ' asks: ';
+        question.appendChild(to);
+      }
+      question.appendChild(document.createTextNode(block.message));
       box.appendChild(question);
       const options = document.createElement('ul');
       options.className = 'options';
@@ -1306,7 +1477,7 @@ function renderMessage(message) {
       break;
     }
     case 'summary':
-      appendLine('summary', '[summary] ' + block.text);
+      appendLine('summary', block.text);
       break;
     case 'child_event': {
       // Child activity renders as one line whose child id expands into that
@@ -1340,7 +1511,7 @@ function renderModelCall(event) {
   if (event.input_tokens != null) detail.push('in=' + event.input_tokens);
   if (event.output_tokens != null) detail.push('out=' + event.output_tokens);
   const suffix = detail.length > 0 ? ' ' + detail.join(' ') : '';
-  appendLine('model-call', '[model ' + event.model + suffix + ']');
+  appendLine('model-call', '— ' + event.model + suffix + ' —');
 }
 
 function handleEvent(event) {
