@@ -351,19 +351,22 @@ impl Drop for ShellGuard {
 /// child is still alive, so the group it names cannot have been reused. On
 /// Unix the shell runs in its own session (setsid), so the group is confined
 /// to the shell and its children; on Windows taskkill with /T covers the
-/// tree. Pids at or below 1 are refused: `kill -KILL -1` would reach every
-/// process the user can signal and `-0` would reach the caller's own group.
+/// tree. Pids at or below 1 are refused: `killpg(-1)` would reach every
+/// process the caller can signal and `killpg(-0)` would reach the caller's
+/// own group.
 async fn kill_group(pgid: u32) {
     if pgid <= 1 {
         return;
     }
     #[cfg(unix)]
     {
-        let _ = tokio::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pgid}")])
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        // A direct killpg is used rather than the `kill` command: some
+        // systems' /usr/bin/kill parses the negative-group form as a signal
+        // number, so `kill -KILL -<pgid>` can signal the wrong group (or
+        // none) while reporting success.
+        unsafe {
+            libc::killpg(pgid as i32, libc::SIGKILL);
+        }
     }
     #[cfg(windows)]
     {
