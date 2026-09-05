@@ -286,6 +286,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(crate::ui::pane))
         .route("/poll", post(poll))
         .route("/nodes", get(nodes))
+        .route("/personas", get(personas))
         .route("/sessions", get(sessions).post(create_session))
         .route("/sessions/{id}", get(session_detail))
         .route("/sessions/{id}/messages", post(add_message))
@@ -346,6 +347,35 @@ async fn poll(
 #[instrument(skip(state))]
 async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
     Json(state.registry.list(SystemTime::now()))
+}
+
+/// One configured persona as the clients need it: the name for the dropdown
+/// value, the description to show beside it, and whether it is the default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSummary {
+    pub name: String,
+    pub description: String,
+    pub default: bool,
+}
+
+/// The configured personas for the persona dropdowns: the terminal attach
+/// and the web pane both render one option per persona, with the default
+/// persona marked.
+#[instrument(skip(state))]
+async fn personas(State(state): State<Arc<AppState>>) -> Json<Vec<PersonaSummary>> {
+    let default = state.default_persona.as_deref();
+    let mut names: Vec<&String> = state.personas.keys().collect();
+    names.sort();
+    Json(
+        names
+            .into_iter()
+            .map(|name| PersonaSummary {
+                name: name.clone(),
+                description: state.personas[name].description.clone(),
+                default: Some(name.as_str()) == default,
+            })
+            .collect(),
+    )
 }
 
 #[instrument(skip(state))]
@@ -2035,6 +2065,64 @@ mod tests {
             let body = response.text().await.unwrap();
             assert!(body.contains("Bosun"), "{path} contains the pane title");
         }
+    }
+
+    #[tokio::test]
+    async fn the_personas_endpoint_lists_the_catalog_with_the_default_marked() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(
+            &dir,
+            &["alpha"],
+            &[("coder", "alpha"), ("reviewer", "alpha")],
+            Some("coder"),
+        );
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        let personas: Value = client
+            .get(format!("http://{addr}/personas"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let personas = personas.as_array().unwrap();
+        let names: Vec<&str> = personas
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["coder", "reviewer"], "personas come in name order");
+        let coder = personas
+            .iter()
+            .find(|p| p["name"] == "coder")
+            .expect("the coder persona is listed");
+        assert_eq!(coder["default"], true, "the default persona is marked");
+        let reviewer = personas
+            .iter()
+            .find(|p| p["name"] == "reviewer")
+            .expect("the reviewer persona is listed");
+        assert_eq!(reviewer["default"], false);
+    }
+
+    #[tokio::test]
+    async fn the_personas_endpoint_is_empty_without_a_catalog() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("http://{addr}/personas"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let personas: Value = response.json().await.unwrap();
+        assert_eq!(
+            personas.as_array().unwrap().len(),
+            0,
+            "an empty catalog lists no personas"
+        );
     }
 
     #[tokio::test]

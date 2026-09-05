@@ -151,11 +151,30 @@
   }
   .badge.state { color: var(--accent); border-color: var(--accent); }
   .view-actions { display: flex; gap: 8px; }
+  .view-actions select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font: inherit;
+  }
   #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
   #transcript .msg { margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
   #transcript .msg.user { color: var(--user); }
   #transcript .msg.assistant { color: var(--text); }
   #transcript .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #transcript .tool {
+    background: var(--panel-2);
+    border-radius: 6px;
+    padding: 2px 8px;
+    display: block;
+    cursor: pointer;
+  }
+  #transcript .tool:hover { background: var(--border); }
+  #transcript .tool.error { color: var(--error); }
+  #transcript .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
+  #transcript .tool.open .toggle { color: var(--accent); }
   #transcript .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
   #transcript .error { color: var(--error); }
   #transcript .state { color: var(--muted); font-size: 12px; }
@@ -183,18 +202,6 @@
   }
   #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
   #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
-  #transcript .fold {
-    margin-left: 6px;
-    padding: 0 2px;
-    min-height: 0;
-    border: none;
-    background: none;
-    color: var(--accent);
-    font-family: inherit;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  #transcript .fold:hover { text-decoration: underline; }
   #transcript h1, #transcript h2, #transcript h3, #transcript h4, #transcript h5, #transcript h6 {
     margin: 12px 0 4px;
     font-weight: 700;
@@ -322,7 +329,9 @@
         <div id="dir-entries"></div>
       </div>
       <label>Persona
-        <input id="form-persona" type="text" placeholder="default persona">
+        <select id="form-persona">
+          <option value="">default persona</option>
+        </select>
       </label>
       <label>Prompt
         <textarea id="form-prompt" rows="3" placeholder="optional first instruction"></textarea>
@@ -355,7 +364,9 @@
     <div class="view-actions">
       <button id="btn-interrupt" type="button">Interrupt</button>
       <button id="btn-permission" type="button">Switch to read-only</button>
-      <input id="persona-name" type="text" placeholder="persona name" size="14">
+      <select id="persona-name">
+        <option value="">switch persona…</option>
+      </select>
       <button id="btn-persona" type="button">Switch persona</button>
       <button id="btn-stop" type="button">Stop</button>
       <button id="btn-close" type="button">Close</button>
@@ -363,7 +374,7 @@
   </header>
   <div id="transcript"></div>
   <div class="input-row" id="input-row">
-    <textarea id="input" rows="3" placeholder="Message (Enter to send, Shift+Enter for a new line; while a question is on screen, sending answers it)"></textarea>
+    <textarea id="input" rows="3" placeholder="Message (Ctrl+Enter to send, Enter for a new line; while a question is on screen, sending answers it)"></textarea>
     <button id="btn-send" type="button">Send</button>
     <button id="btn-redirect" type="button" title="Send as a new instruction instead of answering the question on screen">Redirect</button>
   </div>
@@ -414,6 +425,7 @@ const btnRedirect = $('btn-redirect');
 
 let nodes = [];
 let nodeOptionsSignature = null;
+let personas = [];
 let sessions = [];
 let current = null;   // the open session id
 let es = null;        // the open EventSource
@@ -497,6 +509,50 @@ function renderNodeOptions() {
   }
   // The picked node vanished: reuse the change listener to drop the stale dir pick.
   formNode.dispatchEvent(new Event('change'));
+}
+
+function renderPersonaOptions() {
+  formPersona.textContent = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'default persona';
+  formPersona.appendChild(placeholder);
+  for (const persona of personas) {
+    const option = document.createElement('option');
+    option.value = persona.name;
+    option.textContent = persona.name + (persona.default ? ' (default)' : '');
+    formPersona.appendChild(option);
+  }
+
+  const selected = personaName.value;
+  personaName.textContent = '';
+  const switchPlaceholder = document.createElement('option');
+  switchPlaceholder.value = '';
+  switchPlaceholder.textContent = 'switch persona…';
+  personaName.appendChild(switchPlaceholder);
+  for (const persona of personas) {
+    const option = document.createElement('option');
+    option.value = persona.name;
+    option.textContent = persona.name;
+    personaName.appendChild(option);
+  }
+  if (selected) personaName.value = selected;
+}
+
+let personasFetching = false;
+async function refreshPersonas() {
+  if (personasFetching) return;
+  personasFetching = true;
+  try {
+    const response = await fetch('/personas');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    personas = await response.json();
+    renderPersonaOptions();
+  } catch (error) {
+    showStatus('personas: ' + error.message);
+  } finally {
+    personasFetching = false;
+  }
 }
 
 function shortId(id) {
@@ -771,6 +827,13 @@ function updateHeader(session) {
   viewPersona.textContent = session.persona || '';
   updatePermissionBadge(session.permission);
   viewState.textContent = session.state;
+  // The switch dropdown preselects the session's current persona, so the
+  // "switch persona" action reads as a dropdown rather than a blank field.
+  if (session.persona && personas.some((persona) => persona.name === session.persona)) {
+    personaName.value = session.persona;
+  } else {
+    personaName.value = '';
+  }
   // A child session is watch-only: its transcript and state render live, but
   // the pane offers no input path and no user actions toward it.
   const watchOnly = !!session.parent_id;
@@ -809,9 +872,9 @@ btnPermission.addEventListener('click', async () => {
 });
 
 btnPersona.addEventListener('click', async () => {
-  const name = personaName.value.trim();
+  const name = personaName.value;
   if (!name) {
-    showStatus('persona: type a persona name first');
+    showStatus('persona: pick a persona first');
     return;
   }
   try {
@@ -861,7 +924,7 @@ async function send(redirect) {
 btnSend.addEventListener('click', () => send(false));
 btnRedirect.addEventListener('click', () => send(true));
 input.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && !event.shiftKey) {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
     send(false);
   }
@@ -883,56 +946,33 @@ function appendLine(kind, text) {
   scrollToBottom();
 }
 
-const INLINE_TOOL_LIMIT = 240;
-
-// Tool traffic shows as a one-line summary and expands to the full payload on
-// request, so assistant text is not buried under long tool output. A `preview`
-// limits the summary to the useful text (stdout, content, error); the rest of
-// the payload appears only when the line is expanded.
-function appendToolLine(kind, prefix, payload, suffix, preview) {
-  const shown = preview === undefined || preview === null ? payload : preview;
-  const flatShown = shown.replace(/\s+/g, ' ').trim();
-  const clippedShown = clipAt(flatShown, INLINE_TOOL_LIMIT);
-  const hasMore = payload !== shown || clippedShown !== null;
-  if (!hasMore) {
-    appendLine(kind, prefix + payload + suffix);
-    return;
-  }
+// Tool traffic renders as one subtle strip so assistant text is not buried
+// under long tool output. The strip is quiet by default; the payload stays
+// hidden until the strip is clicked.
+function appendToolLine(kind, payload) {
   const line = document.createElement('div');
   line.className = 'line ' + kind;
-  const summary = document.createElement('span');
-  const full = document.createElement('span');
-  full.hidden = true;
-  summary.textContent =
-    prefix + (clippedShown === null ? flatShown : clippedShown + '…') + suffix;
-  const fold = document.createElement('button');
-  fold.type = 'button';
-  fold.className = 'fold';
-  fold.setAttribute('aria-expanded', 'false');
-  fold.textContent = 'show all';
-  let revealed = false;
-  fold.addEventListener('click', () => {
-    const wasOpen = !full.hidden;
+  const toggle = document.createElement('span');
+  toggle.className = 'toggle';
+  toggle.textContent = '▸';
+  const body = document.createElement('span');
+  body.hidden = true;
+  line.appendChild(toggle);
+  line.appendChild(body);
+  line.addEventListener('click', () => {
+    const wasOpen = !body.hidden;
     if (wasOpen) {
-      full.hidden = true;
-      summary.hidden = false;
-      fold.setAttribute('aria-expanded', 'false');
-      fold.textContent = 'show all';
+      body.hidden = true;
+      line.classList.remove('open');
+      toggle.textContent = '▸';
       return;
     }
-    if (!revealed) {
-      full.textContent = prefix + payload + suffix;
-      revealed = true;
-    }
-    full.hidden = false;
-    summary.hidden = true;
-    fold.setAttribute('aria-expanded', 'true');
-    fold.textContent = 'show less';
+    body.textContent = payload;
+    body.hidden = false;
+    line.classList.add('open');
+    toggle.textContent = '▾';
     scrollToBottom();
   });
-  line.appendChild(summary);
-  line.appendChild(full);
-  line.appendChild(fold);
   transcript.appendChild(line);
   scrollToBottom();
 }
@@ -951,31 +991,6 @@ function readableValue(value) {
       .join('\n');
   }
   return String(value);
-}
-
-// The text a collapsed tool result should show: the stdout/content of the
-// tool, not the envelope fields around it. A single-field payload is already
-// all content, so it previews itself.
-function resultPreview(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
-  if (Object.keys(value).length === 1) return null;
-  for (const key of ['stdout', 'stderr', 'content', 'output', 'error']) {
-    const field = value[key];
-    if (typeof field === 'string' && field.trim() !== '') return field;
-  }
-  return null;
-}
-
-// The first `max` code points of `text`, or null when none are cut.
-function clipAt(text, max) {
-  let end = 0;
-  let count = 0;
-  for (const char of text) {
-    if (count === max) return text.slice(0, end);
-    count += 1;
-    end += char.length;
-  }
-  return null;
 }
 
 function appendMsg(role, text) {
@@ -1233,31 +1248,34 @@ function renderMessage(message) {
     appendAssistant(block.text);
     return;
   }
-  closeLive();
+  // Tool-streamed output streams into a live assistant paragraph while the
+  // executor runs; it is tool output, not assistant prose, so the moment a
+  // durable tool frame lands the live paragraph is dropped rather than left
+  // in the transcript. The full output still lives inside the collapsed strip.
+  if (block.kind === 'tool_call' || block.kind === 'tool_result') {
+    if (liveEl) {
+      liveEl.remove();
+      liveEl = null;
+    }
+  } else {
+    closeLive();
+  }
   switch (block.kind) {
     case 'text':
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
       break;
-    case 'tool_call':
-      appendToolLine(
-        'mono',
-        '→ ' + block.name + '(',
-        JSON.stringify(block.args == null ? {} : block.args),
-        ')'
-      );
+    case 'tool_call': {
+      const args = block.args == null ? {} : block.args;
+      appendToolLine('tool', readableValue(args));
       break;
+    }
     case 'tool_result': {
       const content = block.content;
-      const payload =
+      appendToolLine(
+        block.is_error ? 'tool error' : 'tool',
         typeof content === 'string' || content === null
           ? String(content)
-          : readableValue(content);
-      appendToolLine(
-        block.is_error ? 'mono error' : 'mono',
-        '← ' + block.name + ': ',
-        payload,
-        '',
-        typeof content === 'object' && content !== null ? resultPreview(content) : null
+          : readableValue(content)
       );
       break;
     }
@@ -1356,8 +1374,10 @@ function handleFrame(frame) {
 
 refreshNodes();
 refreshSessions();
+refreshPersonas();
 setInterval(refreshNodes, 5000);
 setInterval(refreshSessions, 3000);
+setInterval(refreshPersonas, 30000);
 </script>
 </body>
 </html>
