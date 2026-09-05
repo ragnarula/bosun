@@ -27,7 +27,7 @@ use crate::update::update_status;
 /// The control plane holds a poll for `node_timeout_secs / 2`. The client
 /// timeout must exceed the longest possible hold, so it is fixed well above
 /// the default hold.
-const POLL_TIMEOUT: Duration = Duration::from_secs(600);
+pub const POLL_TIMEOUT: Duration = Duration::from_secs(600);
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// A failed update attempt suppresses the next one for this long, so a bad
 /// release cannot turn the poll loop into a retry storm.
@@ -61,8 +61,13 @@ pub async fn run_poll_loop(
     // The status a request carries describes the control plane's last answer;
     // the first poll of a fresh loop has none yet.
     let mut last_cp_version = String::new();
+    // The watchdog, when the unit asks for one, is fed from this: it
+    // reports the loop turning, not merely the process existing.
+    let progress = Arc::new(crate::notify::Progress::new());
+    crate::notify::spawn_watchdog(progress.clone());
 
     loop {
+        progress.mark();
         let result = pending.take();
         let update_in_flight = update_task.as_ref().is_some_and(|task| !task.is_finished());
         let outcome = last_outcome.lock().unwrap().clone();

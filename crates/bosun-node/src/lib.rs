@@ -1,5 +1,6 @@
 pub mod command;
 pub mod manager;
+pub mod notify;
 pub mod poll;
 pub mod state;
 #[cfg(test)]
