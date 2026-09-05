@@ -188,7 +188,6 @@ dependencies = [
  "bosun-agent",
  "bosun-common",
  "bosun-control",
- "bosun-executor",
  "bosun-node",
  "bosun-store",
  "clap",
@@ -266,6 +265,7 @@ dependencies = [
  "axum",
  "bosun-agent",
  "bosun-common",
+ "bosun-node",
  "bosun-store",
  "bosun-test-support",
  "bytes",
@@ -289,13 +289,10 @@ name = "bosun-executor"
 version = "0.8.0"
 dependencies = [
  "anyhow",
- "axum",
  "bosun-common",
  "bosun-test-support",
- "bytes",
  "futures-util",
  "glob",
- "http-body-util",
  "libc",
  "regex",
  "reqwest",
@@ -304,7 +301,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -314,6 +310,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bosun-common",
+ "bosun-executor",
  "bosun-test-support",
  "bytes",
  "futures-util",

@@ -1,7 +1,12 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 
 use crate::session::Permission;
 
@@ -17,12 +22,124 @@ pub struct ToolSpec {
     pub schema: Value,
 }
 
-/// Uniform envelope the control plane sends the executor for every tool call.
-/// `run_id` lets a later POST /tool/{run_id}/cancel target the running tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRequest {
-    pub run_id: String,
-    pub args: Value,
+/// One typed operation the control plane sends to a session's executor on a
+/// fresh logical connection. The node relay reads exactly one operation as the
+/// first message of the connection, dispatches it to the session's in-process
+/// `ExecutorState`, and writes the response frames on the same connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ToolOp {
+    /// Runs one tool: a JSON tool answers with one `Result`, the `shell` tool
+    /// streams `Event` frames and ends with `Done`.
+    Call {
+        run_id: String,
+        tool: String,
+        args: Value,
+    },
+    /// Kills the running `shell` named by `run_id`. Always answered with
+    /// `Ack`, even for an unknown run id.
+    Cancel { run_id: String },
+    /// Replaces the session's executor permission. Answered with `Ack` once
+    /// applied.
+    SetPermission { permission: Permission },
+}
+
+/// One typed response frame the node relay writes back to the control plane on
+/// the connection an operation arrived on. `Ack`, `Error`, and `Result` are
+/// terminal; `Event` and `Done` belong to one `shell` run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "msg", rename_all = "snake_case")]
+pub enum ToolMsg {
+    /// A `Cancel` or `SetPermission` operation was applied.
+    Ack,
+    /// A call was refused or failed; carries the message the executor's tool
+    /// error describes.
+    Error { message: String },
+    /// A non-streaming tool's JSON result.
+    Result { content: Value },
+    /// One chunk of a running shell's streamed output.
+    Event { text: String },
+    /// A shell run ended; carries its exit code.
+    Done { exit_code: i32 },
+}
+
+/// Largest serialized tool frame, in bytes. Both ends enforce it: the writer
+/// refuses a payload over the cap instead of emitting a frame the peer will
+/// reject, and the reader rejects a length header over it, so neither side can
+/// be driven into an unbounded allocation. File reads cap at 1 MiB and grep
+/// caps at 500 matches, so every legitimate response stays well under this.
+pub const MAX_TOOL_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Serialized payload is written in chunks of this size. A logical tunnel
+/// connection rejects any single write above its frame limit, so one frame is
+/// never handed over in a single oversized write.
+const TOOL_FRAME_WRITE_CHUNK: usize = 32 * 1024;
+
+/// Serializes `message` and writes it as one length-prefixed JSON frame: a
+/// little-endian `u32` payload length followed by the payload.
+pub async fn write_tool_frame<W>(write: &mut W, message: &impl Serialize) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_vec(message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if payload.len() > MAX_TOOL_FRAME_BYTES as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "tool frame of {} bytes exceeds the {MAX_TOOL_FRAME_BYTES} byte limit",
+                payload.len()
+            ),
+        ));
+    }
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame is too large"))?;
+    write.write_all(&len.to_le_bytes()).await?;
+    for chunk in payload.chunks(TOOL_FRAME_WRITE_CHUNK) {
+        write.write_all(chunk).await?;
+    }
+    Ok(())
+}
+
+/// Reads one length-prefixed JSON frame. Returns `Ok(None)` when the peer
+/// closed the connection at a frame boundary, and an error on a truncated or
+/// oversized frame or invalid JSON.
+pub async fn read_tool_frame<R, M>(read: &mut R) -> std::io::Result<Option<M>>
+where
+    R: AsyncRead + Unpin,
+    M: DeserializeOwned,
+{
+    let mut len_bytes = [0u8; 4];
+    let mut read_count = 0;
+    while read_count < len_bytes.len() {
+        match read.read(&mut len_bytes[read_count..]).await {
+            Ok(0) => break,
+            Ok(n) => read_count += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if read_count == 0 {
+        return Ok(None);
+    }
+    if read_count < len_bytes.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated tool frame length",
+        ));
+    }
+    let len = u32::from_le_bytes(len_bytes);
+    if len > MAX_TOOL_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("tool frame of {len} bytes exceeds the {MAX_TOOL_FRAME_BYTES} byte limit"),
+        ));
+    }
+    let mut payload = vec![0u8; len as usize];
+    read.read_exact(&mut payload).await?;
+    let message = serde_json::from_slice(&payload)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(Some(message))
 }
 
 /// Live streaming delta from a running tool (shell output).
@@ -283,5 +400,156 @@ mod tests {
         let spec: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         let parsed = parse_allowed_tools(&spec.join(" ")).unwrap();
         assert_eq!(parsed.unwrap().len(), tools.len());
+    }
+
+    #[test]
+    fn tool_ops_and_msgs_round_trip_snake_case() {
+        for op in [
+            ToolOp::Call {
+                run_id: "run-1".into(),
+                tool: "file/read".into(),
+                args: json!({ "path": "a.txt" }),
+            },
+            ToolOp::Cancel {
+                run_id: "run-2".into(),
+            },
+            ToolOp::SetPermission {
+                permission: Permission::ReadOnly,
+            },
+        ] {
+            let json = serde_json::to_value(&op).unwrap();
+            let decoded: ToolOp = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(decoded, op);
+        }
+
+        let json = serde_json::to_value(ToolOp::Call {
+            run_id: "run-1".into(),
+            tool: "shell".into(),
+            args: json!({}),
+        })
+        .unwrap();
+        assert_eq!(json["op"], "call");
+
+        let json = serde_json::to_value(ToolOp::SetPermission {
+            permission: Permission::ReadOnly,
+        })
+        .unwrap();
+        assert_eq!(json["op"], "set_permission");
+        assert_eq!(json["permission"], "read_only");
+
+        for msg in [
+            ToolMsg::Ack,
+            ToolMsg::Error {
+                message: "boom".into(),
+            },
+            ToolMsg::Result { content: json!({}) },
+            ToolMsg::Event { text: "hi".into() },
+            ToolMsg::Done { exit_code: 3 },
+        ] {
+            let json = serde_json::to_value(&msg).unwrap();
+            let decoded: ToolMsg = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(decoded, msg);
+        }
+
+        let json = serde_json::to_value(ToolMsg::Done { exit_code: 3 }).unwrap();
+        assert_eq!(json["msg"], "done");
+    }
+
+    #[tokio::test]
+    async fn tool_frames_round_trip_over_a_stream() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::io::duplex;
+
+        let (mut client, mut node) = duplex(64 * 1024);
+        let messages = vec![
+            ToolMsg::Event {
+                text: "building...".into(),
+            },
+            ToolMsg::Done { exit_code: 0 },
+        ];
+        for message in &messages {
+            write_tool_frame(&mut client, message).await.unwrap();
+        }
+        client.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        while let Some(message) = read_tool_frame::<_, ToolMsg>(&mut node).await.unwrap() {
+            received.push(message);
+        }
+        assert_eq!(received, messages);
+    }
+
+    #[tokio::test]
+    async fn read_tool_frame_reports_eof_and_truncation() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::io::duplex;
+
+        let (client, mut node) = duplex(1024);
+        drop(client);
+        assert!(
+            read_tool_frame::<_, ToolMsg>(&mut node)
+                .await
+                .unwrap()
+                .is_none(),
+            "a clean close at a frame boundary reads as no frame"
+        );
+
+        let (mut client, mut node) = duplex(1024);
+        client.write_all(&[0x10, 0x00]).await.unwrap();
+        drop(client);
+        let error = read_tool_frame::<_, ToolMsg>(&mut node)
+            .await
+            .expect_err("a truncated length must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn read_tool_frame_rejects_oversized_lengths() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::io::duplex;
+
+        let (mut client, mut node) = duplex(1024);
+        let huge = (MAX_TOOL_FRAME_BYTES + 1).to_le_bytes();
+        client.write_all(&huge).await.unwrap();
+        let error = read_tool_frame::<_, ToolMsg>(&mut node)
+            .await
+            .expect_err("an oversized length must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn write_tool_frame_rejects_an_oversized_payload() {
+        use tokio::io::duplex;
+
+        let (mut client, _node) = duplex(1024);
+        let oversized = "x".repeat(MAX_TOOL_FRAME_BYTES as usize + 1);
+        let error = write_tool_frame(&mut client, &ToolMsg::Event { text: oversized })
+            .await
+            .expect_err("a payload over the cap must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_large_frame_writes_and_reads_across_chunks() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::io::duplex;
+
+        let (mut client, mut node) = duplex(1024 * 1024);
+        let content = "x".repeat(300 * 1024);
+        write_tool_frame(
+            &mut client,
+            &ToolMsg::Result {
+                content: json!({ "content": content }),
+            },
+        )
+        .await
+        .unwrap();
+        client.shutdown().await.unwrap();
+
+        let message: ToolMsg = read_tool_frame(&mut node).await.unwrap().expect("a frame");
+        let ToolMsg::Result { content } = message else {
+            panic!("expected a result frame");
+        };
+        assert_eq!(content["content"].as_str().unwrap().len(), 300 * 1024);
     }
 }

@@ -3,9 +3,21 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bosun_common::error::ErrorExt;
+use bosun_common::tool::ToolMsg;
+use bosun_common::tool::ToolOp;
+use bosun_common::tool::read_tool_frame;
+use bosun_common::tool::write_tool_frame;
+use bosun_common::tunnel::LogicalStream;
 use bosun_common::tunnel::OpenEvent;
 use bosun_common::tunnel::Tunnel;
+use bosun_executor::CallOutcome;
+use bosun_executor::ExecutorError;
+use bosun_executor::ExecutorState;
+use bosun_executor::ShellEvent;
+use bosun_executor::ShellStream;
+use bosun_executor::run_call;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use http_body_util::Empty;
 use hyper::client::conn::http1;
 use hyper::header;
@@ -15,11 +27,12 @@ use hyper::upgrade::Upgraded;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
-use tokio::io::copy_bidirectional;
-use tokio::net::TcpStream;
+use serde_json::Value;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tower_service::Service as _;
 use tracing::debug;
+use tracing::error;
 use tracing::warn;
 
 use crate::manager::NodeManager;
@@ -28,9 +41,9 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 /// Keeps the node's one outbound tunnel to the control plane open. On any
 /// failure the connection is re-established after a short delay; the node's
-/// executors keep running, so a reconnect restores every session's tool
-/// calls at once. Runs until the node exits, independent of how many sessions
-/// the node hosts.
+/// sessions keep their executors, so a reconnect restores every session's
+/// tool calls at once. Runs until the node exits, independent of how many
+/// sessions the node hosts.
 pub async fn run_node_tunnel(
     cp_url: String,
     node_name: String,
@@ -57,7 +70,7 @@ pub async fn run_node_tunnel(
 
 /// Relays every logical connection the control plane opens on the node's
 /// tunnel until the tunnel dies. Each opened connection names a session, so
-/// the relay dials that session's executor port.
+/// the relay dispatches it to that session's in-process executor.
 async fn relay_tunnel(
     tunnel: Tunnel,
     mut opens: mpsc::UnboundedReceiver<OpenEvent>,
@@ -80,7 +93,7 @@ async fn relay_tunnel(
 /// Attaching and dropping the logical stream sends a close frame, so a tool
 /// call aimed at a session this node does not run fails instead of hanging.
 async fn relay_connection(event: OpenEvent, manager: Arc<NodeManager>, tunnel: Tunnel) {
-    let Some(executor_port) = manager.executor_port(&event.session_id) else {
+    let Some(state) = manager.executor(&event.session_id) else {
         debug!(
             conn_id = event.conn_id,
             session_id = %event.session_id,
@@ -89,24 +102,148 @@ async fn relay_connection(event: OpenEvent, manager: Arc<NodeManager>, tunnel: T
         let _ = tunnel.attach(event.conn_id, event.rx);
         return;
     };
-    let mut local = match TcpStream::connect(("127.0.0.1", executor_port)).await {
-        Ok(stream) => stream,
+    let Some(mut logical) = tunnel.attach(event.conn_id, event.rx) else {
+        return;
+    };
+    let op = match read_tool_frame::<_, ToolOp>(&mut logical).await {
+        Ok(Some(op)) => op,
+        Ok(None) => {
+            debug!(
+                conn_id = event.conn_id,
+                session_id = %event.session_id,
+                "the control plane closed the connection without an operation"
+            );
+            return;
+        }
         Err(error) => {
             debug!(
                 conn_id = event.conn_id,
                 session_id = %event.session_id,
                 error = %error,
-                "failed to dial the session's executor; closing the connection"
+                "failed to read the operation frame; closing the connection"
             );
-            let _ = tunnel.attach(event.conn_id, event.rx);
             return;
         }
     };
-    let Some(mut logical) = tunnel.attach(event.conn_id, event.rx) else {
-        return;
-    };
-    if let Err(error) = copy_bidirectional(&mut local, &mut logical).await {
-        debug!(conn_id = event.conn_id, error = %error, "tunnel relay closed with an error");
+    match op {
+        ToolOp::Cancel { run_id } => {
+            state.cancel(&run_id).await;
+            if let Err(error) = write_tool_frame(&mut logical, &ToolMsg::Ack).await {
+                debug!(
+                    conn_id = event.conn_id,
+                    session_id = %event.session_id,
+                    run_id = %run_id,
+                    error = %error,
+                    "failed to write the cancel ack; closing the connection"
+                );
+            }
+        }
+        ToolOp::SetPermission { permission } => {
+            state.set_permission(permission).await;
+            if let Err(error) = write_tool_frame(&mut logical, &ToolMsg::Ack).await {
+                debug!(
+                    conn_id = event.conn_id,
+                    session_id = %event.session_id,
+                    error = %error,
+                    "failed to write the permission ack; closing the connection"
+                );
+            }
+        }
+        ToolOp::Call { run_id, tool, args } => {
+            relay_call(logical, &state, &run_id, &tool, &args).await;
+        }
+    }
+}
+
+/// Dispatches one tool call and writes its response frames back over the
+/// connection.
+async fn relay_call(
+    logical: LogicalStream,
+    state: &Arc<ExecutorState>,
+    run_id: &str,
+    tool: &str,
+    args: &Value,
+) {
+    let outcome = run_call(state, run_id, tool, args).await;
+    let mut logical = logical;
+    match outcome {
+        Ok(CallOutcome::Result { content }) => {
+            if let Err(error) = write_tool_frame(&mut logical, &ToolMsg::Result { content }).await {
+                debug!(
+                    run_id = %run_id,
+                    tool = %tool,
+                    error = %error,
+                    "failed to write the result frame; closing the connection"
+                );
+            }
+        }
+        Ok(CallOutcome::Shell(stream)) => {
+            relay_shell_stream(logical, stream).await;
+        }
+        Err(error) => {
+            match &error {
+                ExecutorError::Tool(bosun_executor::tools::ToolError::Internal(internal)) => {
+                    error!(
+                        error = %internal.display_chain(),
+                        tool = %tool,
+                        run_id = %run_id,
+                        "tool call failed with an internal error"
+                    );
+                }
+                _ => warn!(error = %error, tool = %tool, run_id = %run_id, "tool call failed"),
+            }
+            if let Err(write_error) = write_tool_frame(
+                &mut logical,
+                &ToolMsg::Error {
+                    message: error.to_string(),
+                },
+            )
+            .await
+            {
+                debug!(
+                    run_id = %run_id,
+                    tool = %tool,
+                    error = %write_error,
+                    "failed to write the error frame; closing the connection"
+                );
+            }
+        }
+    }
+}
+
+/// Forwards a shell run's streamed events as frames until it ends with a done
+/// code. While streaming, the control plane's end of the connection is
+/// watched: when it closes, the stream is dropped, whose guard kills the
+/// shell's process group and deregisters the run.
+async fn relay_shell_stream(logical: LogicalStream, mut stream: ShellStream) {
+    let (mut reader, mut writer) = tokio::io::split(logical);
+    let mut buf = [0u8; 1024];
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                let Some(event) = event else { break };
+                let (frame, terminal) = match event {
+                    ShellEvent::Out(text) => (ToolMsg::Event { text }, false),
+                    ShellEvent::Done(exit_code) => (ToolMsg::Done { exit_code }, true),
+                };
+                if write_tool_frame(&mut writer, &frame).await.is_err() {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+            }
+            read = reader.read(&mut buf) => {
+                match read {
+                    // EOF means the control plane dropped its end.
+                    Ok(0) => break,
+                    // Unexpected bytes are discarded; the operation protocol
+                    // is one request per connection, so nothing else arrives.
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
     }
 }
 
@@ -174,7 +311,7 @@ async fn connect_tunnel(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -183,13 +320,23 @@ mod tests {
 
     use axum::Router;
     use axum::body::Body;
-    use axum::extract::Path;
+    use axum::extract::Path as AxumPath;
     use axum::extract::State;
     use axum::http::Request;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::response::Response;
     use axum::routing::get;
+    use bosun_common::session::Permission;
+    use bosun_common::tool::ToolMsg;
+    use bosun_common::tool::ToolOp;
+    use bosun_common::tool::read_tool_frame;
+    use bosun_common::tool::write_tool_frame;
+    use bosun_common::tunnel::LogicalStream;
+    use bosun_common::tunnel::Tunnel;
+    use bosun_common::types::NodeStartRequest;
+    use serde_json::Value;
+    use serde_json::json;
     use tempfile::tempdir;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
@@ -197,50 +344,36 @@ mod tests {
 
     use super::*;
 
-    /// A manager holding the given sessions with no real executors, so the
-    /// relay dials the stub executors the tests bind instead.
-    fn manager_with(sessions: &[(&str, u16)]) -> Arc<NodeManager> {
-        let work = tempdir().unwrap();
+    /// A manager running one in-process session per id, each with its own
+    /// directory under `root`.
+    async fn manager_with(root: &Path, sessions: &[&str]) -> Arc<NodeManager> {
         let manager = Arc::new(NodeManager::new(
-            work.path().to_path_buf(),
-            vec![],
+            root.to_path_buf(),
+            vec![root.to_path_buf()],
             "http://127.0.0.1:1".into(),
             None,
         ));
-        for (id, port) in sessions {
-            manager.add_session_for_test(id, *port);
+        for session_id in sessions {
+            let dir = root.join(session_id);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            manager
+                .start(&NodeStartRequest {
+                    session_id: (*session_id).into(),
+                    dir,
+                    permission: Permission::ReadWrite,
+                })
+                .await
+                .expect("the session should start");
         }
         manager
     }
 
-    /// A stub executor: answers every connection with `marker`, which names
-    /// it, and records everything the connection sends. Returns its address
-    /// and the recorded payloads.
-    async fn stub_executor(marker: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let received_for_task = received.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let received = received_for_task.clone();
-                tokio::spawn(async move {
-                    let (mut read, mut write) = stream.into_split();
-                    let _ = write.write_all(marker).await;
-                    let mut buf = vec![0u8; 1024];
-                    loop {
-                        match read.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => received.lock().unwrap().push(buf[..n].to_vec()),
-                        }
-                    }
-                });
-            }
-        });
-        (addr, received)
+    /// A duplex pair of tunnels with the node side's opens exposed.
+    fn tunnel_pair() -> (Tunnel, Tunnel, mpsc::UnboundedReceiver<OpenEvent>) {
+        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
+        let (cp_tunnel, _cp_opens) = Tunnel::new(cp_side);
+        let (node_tunnel, opens) = Tunnel::new(node_side);
+        (cp_tunnel, node_tunnel, opens)
     }
 
     async fn wait_until<F>(what: &str, mut condition: F)
@@ -260,54 +393,123 @@ mod tests {
         }
     }
 
+    /// Sends one Call operation over a fresh connection and returns the
+    /// terminal frame the node answers with.
+    async fn typed_call(
+        tunnel: &Tunnel,
+        session_id: &str,
+        run_id: &str,
+        tool: &str,
+        args: Value,
+    ) -> ToolMsg {
+        let mut conn = tunnel
+            .open(session_id)
+            .await
+            .expect("the node tunnel is up");
+        write_tool_frame(
+            &mut conn,
+            &ToolOp::Call {
+                run_id: run_id.into(),
+                tool: tool.into(),
+                args,
+            },
+        )
+        .await
+        .unwrap();
+        read_reply(&mut conn).await
+    }
+
+    /// Reads frames until a terminal one arrives.
+    async fn read_reply(conn: &mut LogicalStream) -> ToolMsg {
+        loop {
+            let message =
+                tokio::time::timeout(Duration::from_secs(10), read_tool_frame::<_, ToolMsg>(conn))
+                    .await
+                    .expect("the node never answered")
+                    .expect("read failed")
+                    .expect("the node closed the connection without a reply");
+            match &message {
+                ToolMsg::Ack
+                | ToolMsg::Error { .. }
+                | ToolMsg::Result { .. }
+                | ToolMsg::Done { .. } => {
+                    return message;
+                }
+                ToolMsg::Event { .. } => {}
+            }
+        }
+    }
+
     /// The one node tunnel carries logical connections addressed to different
-    /// sessions, and the relay dials each session's own executor, so two
-    /// sessions' tool calls run concurrently over the same tunnel.
+    /// sessions, and the relay dispatches each to that session's own
+    /// executor, so two sessions' tool calls run concurrently over the same
+    /// tunnel.
     #[tokio::test]
-    async fn one_node_tunnel_relays_each_session_to_its_own_executor() {
-        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
-        let (cp_tunnel, _cp_opens) = Tunnel::new(cp_side);
-        let (node_tunnel, opens) = Tunnel::new(node_side);
-        let (srv1_addr, srv1_seen) = stub_executor(b"SRV1").await;
-        let (srv2_addr, srv2_seen) = stub_executor(b"SRV2").await;
-        let manager = manager_with(&[("s1", srv1_addr.port()), ("s2", srv2_addr.port())]);
+    async fn one_node_tunnel_dispatches_each_session_to_its_own_executor() {
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1", "s2"]).await;
+        tokio::fs::write(root.path().join("s1/marker.txt"), "SRV1")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("s2/marker.txt"), "SRV2")
+            .await
+            .unwrap();
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
         let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
 
-        let mut conn1 = cp_tunnel.open("s1").await.expect("open for s1");
-        let mut conn2 = cp_tunnel.open("s2").await.expect("open for s2");
-
         // Each connection reached its own session's executor.
-        let mut marker = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(5), conn1.read_exact(&mut marker))
-            .await
-            .expect("s1's executor never answered")
-            .expect("s1's read failed");
-        assert_eq!(&marker, b"SRV1");
-        let mut marker = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(5), conn2.read_exact(&mut marker))
-            .await
-            .expect("s2's executor never answered")
-            .expect("s2's read failed");
-        assert_eq!(&marker, b"SRV2");
+        let from_s1 = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-1",
+            "file/read",
+            json!({ "path": "marker.txt" }),
+        )
+        .await;
+        let ToolMsg::Result { content } = from_s1 else {
+            panic!("s1's call must return a result: {from_s1:?}");
+        };
+        assert_eq!(content["content"], "SRV1");
 
-        // The session-to-executor direction flows too.
-        conn1.write_all(b"ping-1").await.unwrap();
-        conn2.write_all(b"ping-2").await.unwrap();
-        wait_until("s1's executor to receive s1's payload", || {
-            srv1_seen.lock().unwrap().iter().any(|b| b == b"ping-1")
-        })
+        let from_s2 = typed_call(
+            &cp_tunnel,
+            "s2",
+            "run-2",
+            "file/read",
+            json!({ "path": "marker.txt" }),
+        )
         .await;
-        wait_until("s2's executor to receive s2's payload", || {
-            srv2_seen.lock().unwrap().iter().any(|b| b == b"ping-2")
-        })
+        let ToolMsg::Result { content } = from_s2 else {
+            panic!("s2's call must return a result: {from_s2:?}");
+        };
+        assert_eq!(content["content"], "SRV2");
+
+        // The session-to-executor direction flows too, and a write to one
+        // session's working copy never reaches the other session's.
+        let wrote = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-3",
+            "file/write",
+            json!({ "path": "mine.txt", "content": "one" }),
+        )
         .await;
+        assert!(matches!(wrote, ToolMsg::Result { .. }));
+        let read_back = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-4",
+            "file/read",
+            json!({ "path": "mine.txt" }),
+        )
+        .await;
+        let ToolMsg::Result { content } = read_back else {
+            panic!("s1's read must return a result");
+        };
+        assert_eq!(content["content"], "one");
         assert!(
-            !srv1_seen.lock().unwrap().iter().any(|b| b == b"ping-2"),
-            "s1's executor must not receive s2's connection"
-        );
-        assert!(
-            !srv2_seen.lock().unwrap().iter().any(|b| b == b"ping-1"),
-            "s2's executor must not receive s1's connection"
+            !root.path().join("s2/mine.txt").exists(),
+            "s2's working copy must not see s1's write"
         );
 
         relay.abort();
@@ -318,11 +520,9 @@ mod tests {
     /// stalling.
     #[tokio::test]
     async fn an_open_for_an_unknown_session_is_closed() {
-        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
-        let (cp_tunnel, _cp_opens) = Tunnel::new(cp_side);
-        let (node_tunnel, opens) = Tunnel::new(node_side);
-        let (srv1_addr, _) = stub_executor(b"SRV1").await;
-        let manager = manager_with(&[("s1", srv1_addr.port())]);
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
         let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
 
         let mut conn = cp_tunnel
@@ -339,30 +539,234 @@ mod tests {
         relay.abort();
     }
 
-    /// A session whose executor port has no listener refuses the dial, and
-    /// the relay closes the connection instead of hanging, so the tool call
-    /// fails rather than stalling.
+    /// A refused tool call comes back as an error frame on the same
+    /// connection.
     #[tokio::test]
-    async fn an_open_for_a_session_with_no_executor_listener_is_closed() {
-        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
-        let (cp_tunnel, _cp_opens) = Tunnel::new(cp_side);
-        let (node_tunnel, opens) = Tunnel::new(node_side);
-
-        // Reserve a port, then release it so nothing answers a dial to it.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let manager = manager_with(&[("s1", dead_port)]);
+    async fn a_failed_tool_call_answers_with_an_error_frame() {
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
         let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
 
-        let mut conn = cp_tunnel.open("s1").await.expect("the node tunnel is up");
-        let mut buf = [0u8; 4];
-        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+        let reply = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-1",
+            "file/read",
+            json!({ "path": "absent.txt" }),
+        )
+        .await;
+        let ToolMsg::Error { message } = reply else {
+            panic!("a missing file must answer with an error frame: {reply:?}");
+        };
+        assert!(message.contains("absent.txt"), "the error names the file");
+
+        relay.abort();
+    }
+
+    /// A shell call streams event frames over the relay and ends with a done
+    /// frame carrying the exit code.
+    #[tokio::test]
+    async fn a_shell_call_streams_events_and_ends_with_done() {
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
+        let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
+
+        let mut conn = cp_tunnel.open("s1").await.expect("open for s1");
+        write_tool_frame(
+            &mut conn,
+            &ToolOp::Call {
+                run_id: "run-1".into(),
+                tool: "shell".into(),
+                args: json!({ "command": "echo hello" }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut exit_code = None;
+        while exit_code.is_none() {
+            let message = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_tool_frame::<_, ToolMsg>(&mut conn),
+            )
             .await
-            .expect("the dial-refused connection hung")
-            .expect("read failed");
-        assert_eq!(n, 0, "the peer closes the connection");
+            .expect("the shell stream hung")
+            .expect("read failed")
+            .expect("the connection closed before the done frame");
+            match message {
+                ToolMsg::Event { text } => events.push(text),
+                ToolMsg::Done { exit_code: code } => exit_code = Some(code),
+                other => panic!("unexpected frame in a shell stream: {other:?}"),
+            }
+        }
+        assert_eq!(exit_code, Some(0));
+        assert!(
+            events.iter().any(|text| text.contains("hello")),
+            "the streamed output must carry the shell's output: {events:?}"
+        );
+
+        relay.abort();
+    }
+
+    /// Dropping the control plane's end of a streaming shell connection kills
+    /// the shell's process group and empties the running map, exactly like an
+    /// aborted client under the old HTTP transport.
+    #[tokio::test]
+    async fn dropping_the_connection_kills_the_shell() {
+        #[cfg(unix)]
+        {
+            let root = tempdir().unwrap();
+            let manager = manager_with(root.path(), &["s1"]).await;
+            let executor = manager.executor("s1").expect("the session's executor");
+            let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
+            let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
+
+            let mut conn = cp_tunnel.open("s1").await.expect("open for s1");
+            let pid = {
+                write_tool_frame(
+                    &mut conn,
+                    &ToolOp::Call {
+                        run_id: "run-1".into(),
+                        tool: "shell".into(),
+                        args: json!({ "command": "sleep 64" }),
+                    },
+                )
+                .await
+                .unwrap();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    // The run is registered before the shell is up, with pid 0;
+                    // wait for the owner task to publish the real pid.
+                    let pid = executor
+                        .running
+                        .read()
+                        .await
+                        .get("run-1")
+                        .map(|shell| shell.pid)
+                        .unwrap_or(0);
+                    if pid > 0 {
+                        break pid;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("the shell never published its pid");
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+
+            // Dropping the connection closes it; the relay's stream guard
+            // must kill the shell and empty the running map.
+            drop(conn);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let empty = executor.running.read().await.is_empty();
+                let alive = std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false);
+                if empty && !alive {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("the shell survived the dropped connection");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            relay.abort();
+        }
+    }
+
+    /// A cancel operation on its own connection kills the streaming shell
+    /// named by the run id.
+    #[tokio::test]
+    async fn a_cancel_operation_kills_the_streaming_shell() {
+        #[cfg(unix)]
+        {
+            let root = tempdir().unwrap();
+            let manager = manager_with(root.path(), &["s1"]).await;
+            let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
+            let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
+
+            let mut stream_conn = cp_tunnel.open("s1").await.expect("open for s1");
+            write_tool_frame(
+                &mut stream_conn,
+                &ToolOp::Call {
+                    run_id: "run-cancel".into(),
+                    tool: "shell".into(),
+                    args: json!({ "command": "sleep 65" }),
+                },
+            )
+            .await
+            .unwrap();
+
+            let mut cancel_conn = cp_tunnel.open("s1").await.expect("open for s1");
+            write_tool_frame(
+                &mut cancel_conn,
+                &ToolOp::Cancel {
+                    run_id: "run-cancel".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let ack = read_reply(&mut cancel_conn).await;
+            assert!(
+                matches!(ack, ToolMsg::Ack),
+                "cancel answers with ack: {ack:?}"
+            );
+
+            // The streaming connection ends with a killed-run done code.
+            let done = read_reply(&mut stream_conn).await;
+            assert!(matches!(done, ToolMsg::Done { exit_code: -1 }));
+
+            relay.abort();
+        }
+    }
+
+    /// A read-only permission update reaches the session's executor and gates
+    /// the next dispatches.
+    #[tokio::test]
+    async fn a_set_permission_operation_gates_the_session() {
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
+        let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
+
+        let mut conn = cp_tunnel.open("s1").await.expect("open for s1");
+        write_tool_frame(
+            &mut conn,
+            &ToolOp::SetPermission {
+                permission: Permission::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+        let ack = read_reply(&mut conn).await;
+        assert!(
+            matches!(ack, ToolMsg::Ack),
+            "set_permission answers with ack: {ack:?}"
+        );
+
+        let reply = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-2",
+            "shell",
+            json!({ "command": "echo hi" }),
+        )
+        .await;
+        let ToolMsg::Error { message } = reply else {
+            panic!("read-only must refuse shell through the relay: {reply:?}");
+        };
+        assert!(
+            message.contains("read-write"),
+            "the refusal names the permission"
+        );
 
         relay.abort();
     }
@@ -387,10 +791,10 @@ mod tests {
     /// A control plane that upgrades one tunnel per node connection, kills
     /// the first one, and keeps the newest surviving one for the test to open
     /// logical connections on.
-    async fn fake_control_plane(first: FirstTunnelAction) -> (FakeCpState, SocketAddr) {
+    async fn fake_control_plane(first: FirstTunnelAction) -> (FakeCpState, std::net::SocketAddr) {
         async fn serve_tunnel(
             State(state): State<FakeCpState>,
-            Path(_node): Path<String>,
+            AxumPath(_node): AxumPath<String>,
             mut req: Request<Body>,
         ) -> Response {
             if !wants_tunnel_upgrade(&req) {
@@ -466,13 +870,16 @@ mod tests {
             && upgrade.eq_ignore_ascii_case("bosun-tunnel")
     }
 
-    /// A dropped tunnel does not touch the executors: the node reconnects
-    /// its one tunnel and the sessions' tool calls reach their executors
-    /// again over it.
+    /// A dropped tunnel does not touch the sessions' executors: the node
+    /// reconnects its one tunnel and tool calls reach the sessions again over
+    /// it.
     #[tokio::test]
     async fn a_dropped_tunnel_reconnects_and_restores_the_node_sessions() {
-        let (srv1_addr, _seen) = stub_executor(b"SRV1").await;
-        let manager = manager_with(&[("s1", srv1_addr.port())]);
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        tokio::fs::write(root.path().join("s1/marker.txt"), "SRV1")
+            .await
+            .unwrap();
         let (state, addr) = fake_control_plane(FirstTunnelAction::Drop).await;
         let base = format!("http://127.0.0.1:{}", addr.port());
         let task = tokio::spawn(run_node_tunnel(base, "node-1".into(), manager, None));
@@ -488,16 +895,18 @@ mod tests {
             .clone()
             .expect("the reconnected tunnel");
 
-        let mut conn = tunnel
-            .open("s1")
-            .await
-            .expect("open on the reconnected tunnel");
-        let mut marker = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut marker))
-            .await
-            .expect("s1's executor never answered after the reconnect")
-            .expect("read failed");
-        assert_eq!(&marker, b"SRV1");
+        let reply = typed_call(
+            &tunnel,
+            "s1",
+            "run-1",
+            "file/read",
+            json!({ "path": "marker.txt" }),
+        )
+        .await;
+        let ToolMsg::Result { content } = reply else {
+            panic!("the call after the reconnect must return a result");
+        };
+        assert_eq!(content["content"], "SRV1");
 
         task.abort();
     }
@@ -506,8 +915,11 @@ mod tests {
     /// reconnects, restoring every session at once.
     #[tokio::test]
     async fn a_protocol_violation_tears_the_tunnel_down_and_the_node_reconnects() {
-        let (srv1_addr, _seen) = stub_executor(b"SRV1").await;
-        let manager = manager_with(&[("s1", srv1_addr.port())]);
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        tokio::fs::write(root.path().join("s1/marker.txt"), "SRV1")
+            .await
+            .unwrap();
         let (state, addr) = fake_control_plane(FirstTunnelAction::Violate).await;
         let base = format!("http://127.0.0.1:{}", addr.port());
         let task = tokio::spawn(run_node_tunnel(base, "node-1".into(), manager, None));
@@ -523,16 +935,18 @@ mod tests {
             .clone()
             .expect("the reconnected tunnel");
 
-        let mut conn = tunnel
-            .open("s1")
-            .await
-            .expect("open on the reconnected tunnel");
-        let mut marker = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut marker))
-            .await
-            .expect("s1's executor never answered after the reconnect")
-            .expect("read failed");
-        assert_eq!(&marker, b"SRV1");
+        let reply = typed_call(
+            &tunnel,
+            "s1",
+            "run-1",
+            "file/read",
+            json!({ "path": "marker.txt" }),
+        )
+        .await;
+        let ToolMsg::Result { content } = reply else {
+            panic!("the call after the reconnect must return a result");
+        };
+        assert_eq!(content["content"], "SRV1");
 
         task.abort();
     }

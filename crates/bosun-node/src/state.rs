@@ -16,11 +16,8 @@ pub struct PersistedSession {
     pub dir: Option<PathBuf>,
     #[serde(default = "default_reapable")]
     pub reapable: bool,
-    #[serde(default)]
-    pub executor_port: u16,
     #[serde(default = "default_permission")]
     pub permission: Permission,
-    pub pid: u32,
 }
 
 fn default_reapable() -> bool {
@@ -47,9 +44,7 @@ mod tests {
             git_ref: Some("main".into()),
             dir: None,
             reapable: true,
-            executor_port: 43210,
             permission: Permission::ReadOnly,
-            pid: 4242,
         };
         let json = serde_json::to_string(&session).unwrap();
         let decoded: PersistedSession = serde_json::from_str(&json).unwrap();
@@ -58,23 +53,37 @@ mod tests {
         assert_eq!(decoded.git_ref, session.git_ref);
         assert_eq!(decoded.dir, session.dir);
         assert_eq!(decoded.reapable, session.reapable);
-        assert_eq!(decoded.executor_port, session.executor_port);
         assert_eq!(decoded.permission, session.permission);
-        assert_eq!(decoded.pid, session.pid);
     }
 
     #[test]
-    fn old_state_json_without_new_fields_still_parses() {
+    fn old_state_json_with_executor_fields_still_parses() {
+        // Rows written before the in-process executor decision carried a port
+        // and pid; serde ignores the unknown fields so restore keeps working.
         let json = r#"[
-            {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"executor_port":43210,"pid":4242}
+            {"id":"s1","repo_url":"https://example.com/repo","git_ref":null,"executor_port":43210,"pid":4242,"permission":"read_write"}
         ]"#;
         let decoded: Vec<PersistedSession> = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].repo_url, Some("https://example.com/repo".into()));
         assert_eq!(decoded[0].dir, None);
         assert!(decoded[0].reapable);
-        assert_eq!(decoded[0].executor_port, 43210);
         assert_eq!(decoded[0].permission, Permission::ReadWrite);
+    }
+
+    #[test]
+    fn state_json_never_serializes_a_port_or_pid() {
+        let session = PersistedSession {
+            id: "s1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: Some(PathBuf::from("/work/s1")),
+            reapable: false,
+            permission: Permission::ReadOnly,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("executor_port"));
+        assert!(!json.contains("\"pid\""));
     }
 
     #[test]

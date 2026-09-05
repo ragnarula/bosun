@@ -17,7 +17,8 @@ pub enum TunnelError {
 
 /// Maps each node to its one outbound tunnel. A tool call opens a logical
 /// connection on the tunnel of the session's node, addressed with the session
-/// id so the node's relay can dial that session's executor.
+/// id so the node's relay can dispatch it to that session's in-process
+/// executor.
 #[derive(Clone)]
 pub struct TunnelRegistry {
     tunnels: Arc<RwLock<HashMap<String, Tunnel>>>,
@@ -51,8 +52,8 @@ impl TunnelRegistry {
     }
 
     /// Opens a logical connection for one session on its node's tunnel. The
-    /// connection names the session, so the node relay dials that session's
-    /// executor port.
+    /// connection names the session, so the node relay dispatches it to the
+    /// session's in-process executor.
     pub async fn open(&self, node: &str, session_id: &str) -> Result<LogicalStream, TunnelError> {
         let tunnel = self
             .tunnels

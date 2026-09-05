@@ -31,7 +31,7 @@ default_persona = "coder"
 cargo run -p bosun -- node --config cmd/bosun/settings/node.toml
 ```
 
-The node reads its config from `--config`. See [config.md](../config.md) for the fields. The node runs one `bosun executor` process per session from the same binary; no other runtime or provider key is needed on the node.
+The node reads its config from `--config`. See [config.md](../config.md) for the fields. Each session's executor runs in-process on the node; the `bosun executor` subcommand no longer exists, and no other runtime or provider key is needed on the node.
 
 ## Controlling Log Output
 

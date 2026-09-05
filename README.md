@@ -23,8 +23,8 @@ are tracked in [docs/sprints](docs/sprints/).
 - **🎛️ Control plane** (`bosun serve`) runs one agent loop per session and
   keeps the session store. It serves a web pane listing nodes and sessions.
 - **🖥️ Nodes** (`bosun node`) dial out to the control plane. No open inbound
-  ports are needed on a node. Each session has its own executor process on
-  the node, which runs the tools.
+  ports are needed on a node. Each session runs its tools in-process on the
+  node, scoped to the session's working copy and permission.
 - **💻 Clients** are one binary: `bosun clone` starts a session from a
   repository, `bosun dev` starts one in an existing directory on a node,
   `bosun list` shows sessions, and `bosun open` attaches to a live session.

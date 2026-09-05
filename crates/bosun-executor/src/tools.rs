@@ -477,17 +477,11 @@ pub async fn webfetch(url: &str) -> Result<String, ToolError> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-pub fn permission_from_str(s: &str) -> Option<Permission> {
-    let normalized = s.replace('-', "_");
-    match normalized.as_str() {
-        "read_only" => Some(Permission::ReadOnly),
-        "read_write" => Some(Permission::ReadWrite),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
     use bosun_test_support::git_quiet;
     use bosun_test_support::init_repo;
 
@@ -960,41 +954,63 @@ mod tests {
 
     #[tokio::test]
     async fn webfetch_returns_body_from_local_server() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app =
-            axum::Router::new().route("/", axum::routing::get(|| async { "hello from axum" }));
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let body = serve_once(Arc::from(&b"hello from axum"[..])).await;
 
-        let body = webfetch(&format!("http://{addr}/")).await.unwrap();
-        assert_eq!(body, "hello from axum");
+        let fetched = webfetch(&format!("http://{}/", body.addr)).await.unwrap();
+        assert_eq!(fetched, "hello from axum");
     }
 
     #[tokio::test]
     async fn webfetch_truncates_bodies_larger_than_1_mib() {
+        let body = serve_once(Arc::from(vec![b'x'; 2 * MAX_BODY_BYTES])).await;
+
+        let fetched = webfetch(&format!("http://{}/", body.addr)).await.unwrap();
+        assert!(
+            fetched.len() <= MAX_BODY_BYTES,
+            "body was {} bytes, cap is {MAX_BODY_BYTES}",
+            fetched.len()
+        );
+        assert!(!fetched.is_empty());
+    }
+
+    /// One HTTP/1.1 response with `body` served per connection, until the
+    /// listener is dropped.
+    struct ServedBody {
+        addr: SocketAddr,
+        _guard: tokio::task::JoinHandle<()>,
+    }
+
+    async fn serve_once(body: Arc<[u8]>) -> ServedBody {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let big = "x".repeat(2 * MAX_BODY_BYTES);
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::get(move || {
-                let big = big.clone();
-                async move { big }
-            }),
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+        let guard = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    use tokio::io::AsyncWriteExt;
+                    let mut buf = [0u8; 4096];
+                    let mut read = 0;
+                    while let Ok(n) = stream.read(&mut buf[read..]).await {
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let header =
+                        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
         });
-
-        let body = webfetch(&format!("http://{addr}/")).await.unwrap();
-        assert!(
-            body.len() <= MAX_BODY_BYTES,
-            "body was {} bytes, cap is {MAX_BODY_BYTES}",
-            body.len()
-        );
-        assert!(!body.is_empty());
+        ServedBody {
+            addr,
+            _guard: guard,
+        }
     }
 
     #[tokio::test]
@@ -1006,23 +1022,6 @@ mod tests {
                 "url: {url}"
             );
         }
-    }
-
-    #[test]
-    fn permission_from_str_maps_known_values() {
-        assert_eq!(permission_from_str("read_only"), Some(Permission::ReadOnly));
-        assert_eq!(
-            permission_from_str("read_write"),
-            Some(Permission::ReadWrite)
-        );
-        // Hyphenated forms normalize to snake_case.
-        assert_eq!(permission_from_str("read-only"), Some(Permission::ReadOnly));
-        assert_eq!(
-            permission_from_str("read-write"),
-            Some(Permission::ReadWrite)
-        );
-        assert_eq!(permission_from_str("admin"), None);
-        assert_eq!(permission_from_str(""), None);
     }
 
     #[test]
