@@ -69,6 +69,7 @@
     position: fixed;
     left: 50%;
     bottom: 20px;
+    z-index: 20;
     transform: translateX(-50%);
     max-width: calc(100% - 40px);
     background: var(--panel-2);
@@ -179,29 +180,30 @@
   }
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: default; }
+  /* The new-session composer is a bottom sheet pinned to the viewport's
+     bottom edge: recents and the pickers on top, Start under the thumb.
+     The home list stays visible above it, so there is no scrim. */
   #new-session-form {
-    display: grid;
-    gap: 10px;
-    padding: 14px;
-    border-bottom: 1px solid var(--border);
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   }
   #new-session-form[hidden] { display: none; }
-  #new-session-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
-  #new-session-form input, #new-session-form select, #new-session-form textarea {
-    background: var(--bg);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 7px 9px;
-    font: inherit;
+  .sheet-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 16px;
   }
-  #new-session-form .actions { display: flex; gap: 8px; }
-  #recent-sessions {
-    display: grid;
-    gap: 4px;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--border);
-  }
+  #recent-sessions { display: grid; gap: 4px; }
   #recent-sessions[hidden] { display: none; }
   .recent-title {
     font-size: 11px;
@@ -216,15 +218,18 @@
     gap: 4px 10px;
     align-items: baseline;
     width: 100%;
+    min-height: 44px;
     text-align: left;
     background: none;
     border: none;
     border-radius: 0;
     border-bottom: 1px solid var(--border);
-    padding: 6px 0;
+    padding: 10px 12px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
   }
   .recent-entry:last-child { border-bottom: none; }
-  .recent-entry:hover { background: none; border-color: var(--border); }
+  .recent-entry:active { background: var(--panel-2); }
   .recent-entry > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .recent-node { font-weight: 600; }
   .recent-dir {
@@ -234,13 +239,68 @@
   }
   .recent-persona { color: var(--muted); font-size: 12px; }
   .recent-time { color: var(--muted); font-size: 12px; }
-  .recent-prompt {
-    grid-column: 1 / -1;
+  /* Choices, not text: every picker is a thumb-width chip with :active
+     feedback. One tap selects; the picked node's directory belongs to it. */
+  .composer { display: grid; gap: 16px; }
+  .composer-row { display: grid; gap: 6px; }
+  .composer-label {
+    font-size: 11px;
+    font-weight: 500;
     color: var(--muted);
-    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
   }
-  .dir-pick { display: flex; gap: 6px; }
-  .dir-pick input { flex: 1; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    min-height: 44px;
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--text);
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .chip:active { background: var(--panel); border-color: var(--accent); }
+  .chip.selected { border-color: var(--accent); color: var(--accent); }
+  .chip:disabled { opacity: 0.45; cursor: default; }
+  .chip.down { color: var(--muted); }
+  #form-node[hidden], #form-persona[hidden] { display: none; }
+  .composer select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 10px;
+    font: inherit;
+  }
+  .dir-pick { display: flex; gap: 8px; align-items: center; }
+  #form-dir {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  #form-dir:empty::before { content: 'choose a directory'; }
+  .sheet-actions {
+    flex: 0 0 auto;
+    display: grid;
+    gap: 8px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .sheet-actions button {
+    width: 100%;
+    min-height: 44px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .sheet-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  .sheet-actions .start { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
   #dir-browser {
     display: grid;
     gap: 8px;
@@ -441,8 +501,7 @@
     main { padding: 0 12px 16px; }
     #status { padding: 3px 12px 7px; }
     button { min-height: 40px; padding: 8px 14px; }
-    #new-session-form input, #new-session-form select, #new-session-form textarea,
-    .input-row textarea { font-size: 16px; }
+    .composer select, .input-row textarea { font-size: 16px; }
     .session-item { min-height: 48px; }
     .session-row { min-height: 48px; }
     #session-list .children-toggle { min-height: 44px; }
@@ -493,38 +552,42 @@
   <section class="panel">
     <h2>Sessions <button id="btn-new-session" type="button">New session</button></h2>
     <form id="new-session-form" hidden>
-      <label>Node
-        <select id="form-node" required></select>
-      </label>
-      <label>Dir
-        <span class="dir-pick">
-          <input id="form-dir" type="text" required placeholder="/path/to/work" readonly>
-          <button type="button" id="btn-browse">Browse</button>
-        </span>
-      </label>
-      <div id="dir-browser" hidden>
-        <div class="dir-browser-head">
-          <span id="dir-path">browse roots</span>
-          <button type="button" id="btn-dir-up" disabled>Up</button>
-          <button type="button" id="btn-dir-use" disabled>Use this directory</button>
-          <button type="button" id="btn-dir-close">Close</button>
+      <div class="sheet-body">
+        <div id="recent-sessions" hidden></div>
+        <div class="composer" id="composer">
+          <div class="composer-row">
+            <span class="composer-label">Node</span>
+            <div class="chip-row" id="node-chips"></div>
+            <select id="form-node" hidden></select>
+          </div>
+          <div class="composer-row">
+            <span class="composer-label">Directory</span>
+            <div class="dir-pick">
+              <span id="form-dir"></span>
+              <button type="button" id="btn-browse">Browse</button>
+            </div>
+            <div id="dir-browser" hidden>
+              <div class="dir-browser-head">
+                <span id="dir-path">browse roots</span>
+                <button type="button" id="btn-dir-up" disabled>Up</button>
+                <button type="button" id="btn-dir-use" disabled>Use this directory</button>
+                <button type="button" id="btn-dir-close">Close</button>
+              </div>
+              <div id="dir-entries"></div>
+            </div>
+          </div>
+          <div class="composer-row">
+            <span class="composer-label">Persona</span>
+            <div class="chip-row" id="persona-chips"></div>
+            <select id="form-persona" hidden></select>
+          </div>
         </div>
-        <div id="dir-entries"></div>
       </div>
-      <label>Persona
-        <select id="form-persona">
-          <option value="">default persona</option>
-        </select>
-      </label>
-      <label>Prompt
-        <textarea id="form-prompt" rows="3" placeholder="optional first instruction"></textarea>
-      </label>
-      <div class="actions">
-        <button type="submit">Start</button>
+      <div class="sheet-actions">
+        <button type="submit" class="start">Start</button>
         <button type="button" id="btn-cancel-new-session">Cancel</button>
       </div>
     </form>
-    <div id="recent-sessions" hidden></div>
     <div id="session-list" hidden></div>
   </section>
 </main>
@@ -576,6 +639,7 @@ const sessionListEl = $('session-list');
 const newSessionBtn = $('btn-new-session');
 const newSessionForm = $('new-session-form');
 const cancelNewSessionBtn = $('btn-cancel-new-session');
+const nodeChips = $('node-chips');
 const formNode = $('form-node');
 const formDir = $('form-dir');
 const btnBrowse = $('btn-browse');
@@ -585,8 +649,8 @@ const btnDirUp = $('btn-dir-up');
 const btnDirUse = $('btn-dir-use');
 const btnDirClose = $('btn-dir-close');
 const dirEntries = $('dir-entries');
+const personaChips = $('persona-chips');
 const formPersona = $('form-persona');
-const formPrompt = $('form-prompt');
 const recentList = $('recent-sessions');
 const view = $('session-view');
 const viewId = $('view-id');
@@ -620,6 +684,14 @@ let sending = false;
 let dirNode = null;   // the node the directory browser is looking at
 let dirPath = null;   // null = the node's browse roots
 let dirListing = null;
+
+// The composer's chosen directory is a plain span, not an input: `value`
+// keeps the submit-facing property, textContent is what the user sees, and
+// an empty setter restores the `:empty::before` placeholder.
+function setDir(value) {
+  formDir.value = value;
+  formDir.textContent = value;
+}
 
 originEl.textContent = location.origin;
 
@@ -683,29 +755,73 @@ healthStrip.addEventListener('keydown', (event) => {
   }
 });
 
+let personaSelected = ''; // the chip persona picked in the composer
+let personaInitialized = false; // whether the last-used persona has been applied
+
 function renderNodeOptions() {
   const signature = nodes.map((node) => node.name + (node.up ? 'up' : 'down')).join(',');
   if (signature === nodeOptionsSignature) return;
   nodeOptionsSignature = signature;
-  const selected = formNode.value;
-  formNode.textContent = '';
-  const placeholder = document.createElement('option');
-  placeholder.value = '';
-  placeholder.textContent = 'choose a node';
-  formNode.appendChild(placeholder);
-  for (const node of nodes) {
-    const option = document.createElement('option');
-    option.value = node.name;
-    option.textContent = node.name + (node.up ? '' : ' (down)');
-    formNode.appendChild(option);
-  }
-  if (!selected) return;
-  if (nodes.some((node) => node.name === selected)) {
-    formNode.value = selected;
+  const up = nodes.filter((node) => node.up);
+  const tooMany = up.length > NODE_CHIP_LIMIT;
+  if (tooMany) {
+    formNode.hidden = false;
+    nodeChips.hidden = true;
+    nodeChips.textContent = '';
+    const selected = formNode.value;
+    formNode.textContent = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'choose a node';
+    formNode.appendChild(placeholder);
+    for (const node of nodes) {
+      const option = document.createElement('option');
+      option.value = node.name;
+      option.textContent = node.name + (node.up ? '' : ' (down)');
+      formNode.appendChild(option);
+    }
+    if (selected && nodes.some((node) => node.name === selected)) {
+      formNode.value = selected;
+    }
     return;
   }
-  // The picked node vanished: reuse the change listener to drop the stale dir pick.
-  formNode.dispatchEvent(new Event('change'));
+  formNode.hidden = true;
+  formNode.textContent = '';
+  if (up.length === 1) {
+    // One live node is pre-selected; a pick from a node that just dropped is
+    // dropped with its directory, exactly like a manual switch.
+    if (formNode.value !== up[0].name) formNode.dispatchEvent(new Event('change'));
+    formNode.value = up[0].name;
+  } else if (formNode.value && !nodes.some((node) => node.name === formNode.value)) {
+    // The picked node vanished: reuse the change listener to drop the stale
+    // dir pick.
+    formNode.dispatchEvent(new Event('change'));
+  }
+  renderNodeChips();
+}
+
+function renderNodeChips() {
+  nodeChips.hidden = false;
+  nodeChips.textContent = '';
+  for (const node of nodes) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip';
+    chip.textContent = node.name;
+    if (!node.up) {
+      chip.className = 'chip down';
+      chip.disabled = true;
+    }
+    if (node.up && node.name === formNode.value) chip.classList.add('selected');
+    chip.addEventListener('click', () => {
+      // A picked directory belongs to one node; switching nodes drops it via
+      // the same change listener the select keeps firing.
+      if (formNode.value !== node.name) formNode.dispatchEvent(new Event('change'));
+      formNode.value = node.name;
+      renderNodeChips();
+    });
+    nodeChips.appendChild(chip);
+  }
 }
 
 function renderPersonaOptions() {
@@ -714,12 +830,21 @@ function renderPersonaOptions() {
   placeholder.value = '';
   placeholder.textContent = 'default persona';
   formPersona.appendChild(placeholder);
+  const names = [];
   for (const persona of personas) {
     const option = document.createElement('option');
     option.value = persona.name;
     option.textContent = persona.name + (persona.default ? ' (default)' : '');
     formPersona.appendChild(option);
+    names.push(persona.name);
   }
+  if (personaSelected && !names.includes(personaSelected)) {
+    // The picked persona vanished from the configured catalog: fall back to
+    // default rather than leaving a dead selection on the wire.
+    personaSelected = '';
+  }
+  formPersona.value = personaSelected;
+  renderPersonaChips();
 
   const selected = personaName.value;
   personaName.textContent = '';
@@ -736,6 +861,27 @@ function renderPersonaOptions() {
   if (selected) personaName.value = selected;
 }
 
+function renderPersonaChips() {
+  personaChips.textContent = '';
+  personaChips.appendChild(personaChip('', 'default'));
+  for (const persona of personas) {
+    personaChips.appendChild(personaChip(persona.name, persona.name));
+  }
+}
+
+function personaChip(name, label) {
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'chip';
+  chip.textContent = label;
+  if (name === formPersona.value) chip.classList.add('selected');
+  chip.addEventListener('click', () => {
+    personaSelected = name;
+    renderPersonaOptions();
+  });
+  return chip;
+}
+
 let personasFetching = false;
 async function refreshPersonas() {
   if (personasFetching) return;
@@ -744,6 +890,14 @@ async function refreshPersonas() {
     const response = await fetch('/personas');
     if (!response.ok) throw new Error('HTTP ' + response.status);
     personas = await response.json();
+    if (!personaInitialized) {
+      // Apply the last-used persona now that the catalog is known: the load
+      // happens after the fetch resolves, so a stale or vanished name falls
+      // back to default inside renderPersonaOptions.
+      const last = loadLastPersona();
+      personaSelected = personas.some((persona) => persona.name === last) ? last : '';
+      personaInitialized = true;
+    }
     renderPersonaOptions();
   } catch (error) {
     showStatus('personas: ' + error.message);
@@ -875,13 +1029,52 @@ function renderSessions() {
   }
 }
 
-// Recently-created session settings, kept in localStorage so the create
-// panel can offer them back. Only the settings the form collects are
-// stored: node, dir, persona and prompt, against the time the session was
-// started. A new session's settings go to the front; duplicates drop, so a
-// reuse moves the entry rather than repeating it.
+// Recently-created session settings, kept in localStorage so the composer
+// can offer them back. Only the choices the sheet collects are stored:
+// node, dir, persona and the time the session was started. A new session's
+// settings go to the front; duplicates drop, so a reuse moves the entry
+// rather than repeating it.
 const RECENT_KEY = 'bosun.recent-sessions';
 const RECENT_LIMIT = 5;
+// Node picker: chips while few nodes are up, a select when the list grows
+// past this. The constant is `~4 up nodes` from the story.
+const NODE_CHIP_LIMIT = 4;
+// The last persona a session started with, persisted so the sheet can
+// pre-select it. "" means default; cleared when the user starts with the
+// default persona.
+const LAST_PERSONA_KEY = 'bosun.last-persona';
+
+function loadLastPersona() {
+  try {
+    return localStorage.getItem(LAST_PERSONA_KEY) || '';
+  } catch (error) {
+    return '';
+  }
+}
+
+function rememberLastPersona(persona) {
+  try {
+    localStorage.setItem(LAST_PERSONA_KEY, persona);
+  } catch (error) {
+    // Private mode or a full quota: the last persona is forgotten for this
+    // page load.
+  }
+}
+
+function clearLastPersona() {
+  try {
+    localStorage.removeItem(LAST_PERSONA_KEY);
+  } catch (error) {
+  }
+}
+
+// Re-reads the node roster and rebuilds the picker. Force-disables the
+// signature shortcut so a node that came up or went down while the sheet was
+// closed is reflected in the chips the moment it opens.
+function refreshNodeOptions() {
+  nodeOptionsSignature = null;
+  renderNodeOptions();
+}
 
 function loadRecents() {
   try {
@@ -903,38 +1096,59 @@ function saveRecents(recents) {
 
 function rememberCurrentSettings() {
   const persona = formPersona.value.trim();
-  const prompt = formPrompt.value.trim();
   const recents = loadRecents().filter((entry) =>
     !(entry.node === formNode.value && entry.dir === formDir.value.trim()
-      && entry.persona === persona && entry.prompt === prompt)
+      && entry.persona === persona)
   );
   recents.unshift({
     node: formNode.value,
     dir: formDir.value.trim(),
     persona,
-    prompt,
     time: Math.floor(Date.now() / 1000),
   });
   saveRecents(recents);
-  if (!newSessionForm.hidden) renderRecents();
+  if (newSessionForm.hidden) return;
+  // A dead node is never offered: a recent whose node is gone is dropped
+  // rather than revived as a broken choice.
+  saveRecents(loadRecents().filter((entry) =>
+    nodes.some((node) => node.name === entry.node)
+  ));
+  renderRecents();
 }
 
 function useRecent(entry) {
   formNode.value = entry.node;
-  formDir.value = entry.dir;
-  formPersona.value = entry.persona;
-  formPrompt.value = entry.prompt;
+  setDir(entry.dir);
+  // The composer's persona chips are driven by personaSelected; renderPersonaOptions
+  // overwrites the select with it, so the recent's persona must be applied to the
+  // chip state, not just the select value.
+  personaSelected = personas.some((persona) => persona.name === entry.persona)
+    ? entry.persona
+    : '';
+  formPersona.value = personaSelected;
+  // When the node roster has not changed since the last render, the signature
+  // shortcut would skip rebuilds; force both pickers to re-render so the chips
+  // reflect the recent's value instead of the previous selection.
+  renderNodeOptions();
+  renderNodeChips();
+  renderPersonaOptions();
   dirBrowser.hidden = true;
   if (window.matchMedia('(max-width: 640px)').matches) {
-    formNode.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  } else {
-    formNode.focus();
+    newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
   renderRecents();
 }
 
 function renderRecents() {
-  const recents = loadRecents();
+  const recents = loadRecents()
+    .filter((entry) => entry.node && entry.dir)
+    .map((entry) => {
+      // Legacy entries carry the removed prompt field; drop it so no recent
+      // row shows text the composer no longer has.
+      const copy = Object.assign({}, entry);
+      if (Object.prototype.hasOwnProperty.call(copy, 'prompt')) delete copy.prompt;
+      return copy;
+    });
   if (recents.length === 0 || newSessionForm.hidden) {
     recentList.hidden = true;
     return;
@@ -963,12 +1177,6 @@ function renderRecents() {
     time.className = 'recent-time';
     time.textContent = ago(entry.time);
     button.appendChild(time);
-    if (entry.prompt) {
-      const prompt = document.createElement('span');
-      prompt.className = 'recent-prompt';
-      prompt.textContent = entry.prompt;
-      button.appendChild(prompt);
-    }
     button.addEventListener('click', () => useRecent(entry));
     recentList.appendChild(button);
   }
@@ -1032,19 +1240,22 @@ async function refreshSessions() {
 
 newSessionBtn.addEventListener('click', () => {
   newSessionForm.hidden = !newSessionForm.hidden;
-  renderRecents();
   if (!newSessionForm.hidden) {
+    // The composer rebuilds its choices in the sheet each time the sheet
+    // opens, so a node or persona list that changed while it was closed is
+    // picked up; a dead node's recent is never offered.
+    refreshNodeOptions();
+    renderPersonaOptions();
+    renderRecents();
     if (window.matchMedia('(max-width: 640px)').matches) {
       newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } else {
-      formNode.focus();
     }
   }
 });
 
 // A picked directory belongs to one node; switch nodes, drop the pick.
 formNode.addEventListener('change', () => {
-  formDir.value = '';
+  setDir('');
   dirBrowser.hidden = true;
 });
 
@@ -1069,7 +1280,7 @@ btnDirUp.addEventListener('click', () => {
 
 btnDirUse.addEventListener('click', () => {
   if (dirPath === null) return;
-  formDir.value = dirPath;
+  setDir(dirPath);
   dirBrowser.hidden = true;
 });
 
@@ -1120,7 +1331,7 @@ function renderDirs() {
     use.type = 'button';
     use.textContent = 'Use';
     use.addEventListener('click', () => {
-      formDir.value = entry.path;
+      setDir(entry.path);
       dirBrowser.hidden = true;
     });
     row.appendChild(open);
@@ -1130,30 +1341,40 @@ function renderDirs() {
 }
 
 cancelNewSessionBtn.addEventListener('click', () => {
+  // Cancel hides the sheet without resetting the composer: the picks and the
+  // directory browsing state survive, ready for the next open.
   newSessionForm.hidden = true;
-  newSessionForm.reset();
-  dirBrowser.hidden = true;
   renderRecents();
 });
 
 newSessionForm.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (!formNode.value) {
+    toastError('new session: choose a node first');
+    return;
+  }
+  if (!formDir.value.trim()) {
+    toastError('new session: choose a directory first');
+    return;
+  }
   const body = {
     node: formNode.value,
     dir: formDir.value.trim(),
   };
   const persona = formPersona.value.trim();
   if (persona) body.persona = persona;
-  const prompt = formPrompt.value.trim();
-  if (prompt) body.prompt = prompt;
   try {
     // A directory-based session on the node: the executor starts there and
     // the loop can run tools immediately.
     const response = await post('/dev', body);
     const session = await response.json();
+    if (persona) {
+      rememberLastPersona(persona);
+    } else {
+      clearLastPersona();
+    }
     rememberCurrentSettings();
     newSessionForm.hidden = true;
-    newSessionForm.reset();
     renderRecents();
     await refreshSessions();
     openSession(session.id);
@@ -1897,7 +2118,6 @@ function handleFrame(frame) {
 refreshNodes();
 refreshSessions();
 refreshPersonas();
-renderRecents();
 setInterval(refreshNodes, 5000);
 setInterval(refreshSessions, 3000);
 setInterval(refreshPersonas, 30000);
