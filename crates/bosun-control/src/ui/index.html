@@ -536,33 +536,48 @@
   #transcript .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* Tool traffic: one inline row per call, glyph + name + args, with the
      payload collapsed until clicked. The result nests under its call as a
-     bordered block, so a call and its outcome read as one unit. */
+     bordered block, so a call and its outcome read as one unit. Rows and
+     clipped results are touch targets: feedback on :active, never hover. */
   #transcript .tool {
     background: var(--panel-2);
     border-radius: 6px;
-    padding: 2px 8px;
+    padding: 8px 10px;
     display: block;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 13px;
   }
-  #transcript .tool:hover { background: var(--border); }
+  #transcript .tool:active { background: var(--border); }
   #transcript .tool .glyph { color: var(--muted); margin-right: 6px; }
   #transcript .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
   #transcript .tool.open .toggle { color: var(--accent); }
   #transcript .tool-result {
     margin: 0 0 6px 20px;
     border-left: 2px solid var(--border);
-    padding: 2px 0 2px 10px;
+    padding: 4px 0 4px 10px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  #transcript .tool-result.clipped { cursor: pointer; color: var(--muted); }
-  #transcript .tool-result.clipped:hover { color: var(--text); }
+  #transcript .tool-result.clipped {
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    color: var(--muted);
+    border-left: 2px solid var(--accent);
+  }
+  #transcript .tool-result.clipped:active { color: var(--text); }
+  #transcript .tool-result.clipped .expand-hint {
+    color: var(--accent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    display: block;
+  }
   /* An error result stays red even when clipped; the muted affordance must
      not hide that the tool failed. */
   #transcript .tool-result.error { color: var(--error); }
-  #transcript .tool-result.error.clipped:hover { color: var(--error); }
+  #transcript .tool-result.error:active { color: var(--error); }
+  #transcript .tool-result.error .expand-hint { color: var(--error); }
   #transcript .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
   #transcript .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
   #transcript .error { color: var(--error); }
@@ -581,12 +596,6 @@
     color: var(--accent);
     cursor: pointer;
     text-decoration: underline;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  #transcript .model-call {
-    color: var(--muted);
-    opacity: 0.65;
-    font-size: 12px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   #transcript .unknown { color: var(--muted); font-size: 12px; }
@@ -815,6 +824,7 @@
     <button type="button" id="btn-sheet-close" title="Close actions">✕</button>
   </div>
   <div class="view-sheet-row">
+    <span class="view-sheet-note" id="view-sheet-meta"></span>
     <button type="button" id="btn-permission">Switch to read-only</button>
     <span class="view-sheet-note" id="view-permission"></span>
   </div>
@@ -881,6 +891,7 @@ const viewIdCopy = $('view-id-copy');
 const watchBanner = $('watch-banner');
 const btnWatchOpen = $('btn-watch-open');
 const viewPermission = $('view-permission');
+const viewSheetMeta = $('view-sheet-meta');
 const inputRow = $('input-row');
 const btnInterrupt = $('btn-interrupt');
 const btnPermission = $('btn-permission');
@@ -1758,6 +1769,11 @@ function updateHeader(session) {
   viewDir.textContent = session.dir;
   viewIdCopy.textContent = session.id;
   updatePermissionBadge(session.permission);
+  // Model and persona are session facts, shown once in the ⋯ sheet; the
+  // transcript never repeats them as separator lines.
+  viewSheetMeta.textContent = [session.persona, session.model]
+    .filter((part) => part)
+    .join(' · ');
   // The switch dropdown preselects the session's current persona, so the
   // "switch persona" action reads as a dropdown rather than a blank field.
   if (session.persona && personas.some((persona) => persona.name === session.persona)) {
@@ -2075,18 +2091,21 @@ function appendToolResult(name, payload, error) {
   line.appendChild(body);
   if (preview !== text) {
     line.classList.add('clipped');
-    line.title = 'click to expand';
+    const hint = document.createElement('span');
+    hint.className = 'expand-hint';
+    hint.textContent = 'tap to expand';
+    line.appendChild(hint);
     line.addEventListener('click', () => {
       if (line.classList.contains('expanded')) {
         body.textContent = preview;
+        hint.textContent = 'tap to expand';
         line.classList.remove('expanded');
         line.classList.add('clipped');
-        line.title = 'click to expand';
       } else {
         body.textContent = text;
+        hint.textContent = 'tap to collapse';
         line.classList.add('expanded');
         line.classList.remove('clipped');
-        line.title = 'click to collapse';
       }
       scrollToBottom();
     });
@@ -2472,31 +2491,26 @@ function renderMessage(message) {
   }
 }
 
-function renderModelCall(event) {
-  const detail = [];
-  if (event.input_tokens != null) detail.push('in=' + event.input_tokens);
-  if (event.output_tokens != null) detail.push('out=' + event.output_tokens);
-  const suffix = detail.length > 0 ? ' ' + detail.join(' ') : '';
-  appendLine('model-call', '— ' + event.model + suffix + ' —');
-}
-
 function handleEvent(event) {
   switch (event.kind) {
     case 'message':
       renderMessage(event.message);
       break;
     case 'state':
-      appendLine('state', '* ' + event.state);
+      // The current state lives once, in the header dot; a transcript line
+      // would repeat what is already on screen.
       viewStateDot.className = 'dot ' + event.state;
       break;
     case 'permission':
       updatePermissionBadge(event.permission);
       break;
     case 'persona':
-      appendLine('state', '* persona: ' + event.persona);
+      // The persona lives once, in the ⋯ sheet's metadata row; nothing is
+      // added to the transcript.
       break;
     case 'model_call':
-      renderModelCall(event);
+      // Model calls are metering history, not conversation: the model is a
+      // session fact shown in the ⋯ sheet. No separator line is appended.
       break;
   }
 }
