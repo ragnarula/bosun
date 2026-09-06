@@ -602,6 +602,32 @@
     border-top: 1px solid var(--border);
   }
   .input-row[hidden] { display: none; }
+  /* While an ask with options is the live question, the options render as
+     thumb-width chips above the textarea; a tap answers the question. The
+     transcript keeps the durable ask record below. */
+  #ask-sheet {
+    display: grid;
+    gap: 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  #ask-sheet[hidden] { display: none; }
+  .ask-question { font-size: 13px; color: var(--text); }
+  .ask-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ask-chips button {
+    min-height: 44px;
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--text);
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .ask-chips button:active { background: var(--panel); border-color: var(--accent); }
+  .ask-or-type { color: var(--muted); font-size: 12px; }
   .input-row textarea {
     flex: 1;
     resize: vertical;
@@ -713,6 +739,11 @@
     <button type="button" id="btn-watch-open">Open to act</button>
   </div>
   <div class="input-row" id="input-row">
+    <div id="ask-sheet" hidden>
+      <div class="ask-question" id="ask-question"></div>
+      <div class="ask-chips" id="ask-chips"></div>
+      <div class="ask-or-type">or type an answer below</div>
+    </div>
     <textarea id="input" rows="3" placeholder="Message (Ctrl+Enter to send, Enter for a new line; while a question is on screen, sending answers it)"></textarea>
     <button id="btn-send" type="button">Send</button>
     <button id="btn-redirect" type="button" title="Send as a new instruction instead of answering the question on screen">Redirect</button>
@@ -798,6 +829,9 @@ const transcript = $('transcript');
 const input = $('input');
 const btnSend = $('btn-send');
 const btnRedirect = $('btn-redirect');
+const askSheet = $('ask-sheet');
+const askQuestion = $('ask-question');
+const askChips = $('ask-chips');
 
 let nodes = [];
 let nodeOptionsSignature = null;
@@ -1548,6 +1582,7 @@ function closeSession() {
   liveEl = null;
   transcript.textContent = '';
   input.value = '';
+  clearAskChips();
   view.hidden = true;
 }
 
@@ -1671,6 +1706,26 @@ btnWatchOpen.addEventListener('click', () => {
   openSession(ownerId || current);
 });
 
+function clearAskChips() {
+  askSheet.hidden = true;
+  askQuestion.textContent = '';
+  askChips.textContent = '';
+}
+
+// A tap on an ask option answers the question exactly like a typed message.
+async function answer(text) {
+  clearAskChips();
+  if (sending || !text.trim()) return;
+  try {
+    await post('/sessions/' + encodeURIComponent(current) + '/messages', {
+      content: text,
+      redirect: false,
+    });
+  } catch (error) {
+    toastError('answer: ' + error.message);
+  }
+}
+
 async function send(redirect) {
   if (sending || !input.value.trim()) return;
   sending = true;
@@ -1682,6 +1737,7 @@ async function send(redirect) {
       redirect: !!redirect,
     });
     input.value = '';
+    clearAskChips();
   } catch (error) {
     toastError('send: ' + error.message);
   } finally {
@@ -2206,6 +2262,22 @@ function renderMessage(message) {
         answer.className = 'answer';
         answer.textContent = 'answered: ' + block.answer;
         box.appendChild(answer);
+        // An answered ask is history, not a live question: the input row
+        // must not keep an open chip set for it.
+        clearAskChips();
+      } else if (block.options && block.options.length > 0) {
+        // The live question: its options become thumb-width chips in the
+        // input area, so answering is one tap, never typing.
+        askQuestion.textContent = block.message;
+        askChips.textContent = '';
+        for (const option of block.options) {
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.textContent = option;
+          chip.addEventListener('click', () => answer(option));
+          askChips.appendChild(chip);
+        }
+        askSheet.hidden = false;
       }
       transcript.appendChild(box);
       scrollToBottom();
