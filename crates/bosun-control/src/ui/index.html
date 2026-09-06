@@ -20,7 +20,7 @@
     --ok: #4ed48e;
     --warn: #e0a94b;
     /* One-handed floor: every interactive target is at least this tall. */
-    --touch-min-height: var(--touch-min-height);
+    --touch-min-height: 44px;
   }
   * { box-sizing: border-box; }
   * { -webkit-tap-highlight-color: transparent; }
@@ -223,6 +223,8 @@
   .dot.running, .dot.creating { background: var(--ok); }
   .dot.interrupted, .dot.stopped { background: var(--error); }
   .dot.waiting_for_input { background: var(--warn); }
+  .dot.up { background: var(--ok); }
+  .dot.down { background: var(--error); }
   button {
     background: var(--panel-2);
     color: var(--text);
@@ -826,12 +828,12 @@
     <span>Session actions</span>
     <button type="button" id="btn-sheet-close" title="Close actions">✕</button>
   </div>
-  <div class="view-sheet-row">
+  <div class="view-sheet-row" id="row-permission">
     <span class="view-sheet-note" id="view-sheet-meta"></span>
     <button type="button" id="btn-permission">Switch to read-only</button>
     <span class="view-sheet-note" id="view-permission"></span>
   </div>
-  <div class="view-sheet-row">
+  <div class="view-sheet-row" id="row-persona">
     <select id="persona-name">
       <option value="">switch persona…</option>
     </select>
@@ -841,10 +843,10 @@
     <span class="view-sheet-copy" id="view-id-copy" title="Session id"></span>
     <button type="button" id="btn-copy-id">Copy session id</button>
   </div>
-  <div class="view-sheet-row">
+  <div class="view-sheet-row" id="row-interrupt">
     <button type="button" id="btn-interrupt">Interrupt</button>
   </div>
-  <div class="view-sheet-row">
+  <div class="view-sheet-row" id="row-stop">
     <button type="button" id="btn-stop" class="danger">Stop</button>
   </div>
 </div>
@@ -853,6 +855,10 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
+
+// Thin-client narrow viewport check; the pane keeps the same sheets at any
+// width, only the focus/scroll behavior differs on small screens.
+const isNarrow = () => window.innerWidth <= 640;
 
 const originEl = $('origin');
 const statusEl = $('status');
@@ -882,7 +888,7 @@ const formPersona = $('form-persona');
 const recentList = $('recent-sessions');
 const view = $('session-view');
 const viewStateDot = $('view-state-dot');
-const viewMain = $('view-main');
+
 const viewNode = $('view-node');
 const viewDir = $('view-dir');
 const btnBack = $('btn-back');
@@ -895,6 +901,10 @@ const watchBanner = $('watch-banner');
 const btnWatchOpen = $('btn-watch-open');
 const viewPermission = $('view-permission');
 const viewSheetMeta = $('view-sheet-meta');
+const rowPermission = $('row-permission');
+const rowPersona = $('row-persona');
+const rowInterrupt = $('row-interrupt');
+const rowStop = $('row-stop');
 const inputRow = $('input-row');
 const btnInterrupt = $('btn-interrupt');
 const btnPermission = $('btn-permission');
@@ -1451,7 +1461,7 @@ function useRecent(entry) {
   renderNodeChips();
   renderPersonaOptions();
   dirBrowser.hidden = true;
-  if (window.matchMedia('(max-width: 640px)').matches) {
+  if (isNarrow()) {
     newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
   renderRecents();
@@ -1565,7 +1575,7 @@ newSessionBtn.addEventListener('click', () => {
     refreshNodeOptions();
     renderPersonaOptions();
     renderRecents();
-    if (window.matchMedia('(max-width: 640px)').matches) {
+    if (isNarrow()) {
       newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }
@@ -1792,11 +1802,10 @@ function updateHeader(session) {
   const watchOnly = !!session.parent_id;
   inputRow.hidden = watchOnly;
   watchBanner.hidden = !watchOnly;
-  btnPermission.disabled = watchOnly;
-  personaName.disabled = watchOnly;
-  btnPersona.disabled = watchOnly;
-  btnInterrupt.disabled = watchOnly;
-  btnStop.disabled = watchOnly;
+  rowPermission.hidden = watchOnly;
+  rowPersona.hidden = watchOnly;
+  rowInterrupt.hidden = watchOnly;
+  rowStop.hidden = watchOnly;
 }
 
 function updatePermissionBadge(permission) {
@@ -1889,8 +1898,9 @@ function clearAskChips() {
 
 // A tap on an ask option answers the question exactly like a typed message.
 async function answer(text) {
-  clearAskChips();
   if (sending || !text.trim()) return;
+  clearAskChips();
+  sending = true;
   try {
     await post('/sessions/' + encodeURIComponent(current) + '/messages', {
       content: text,
@@ -1898,6 +1908,8 @@ async function answer(text) {
     });
   } catch (error) {
     toastError('answer: ' + error.message);
+  } finally {
+    sending = false;
   }
 }
 
