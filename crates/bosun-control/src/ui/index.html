@@ -313,10 +313,36 @@
   #dir-browser[hidden] { display: none; }
   .dir-browser-head { display: flex; align-items: center; gap: 8px; }
   .dir-browser-head #dir-path { flex: 1; color: var(--muted); word-break: break-all; }
-  #dir-entries { display: grid; gap: 4px; max-height: 260px; overflow-y: auto; }
-  .dir-entry { display: flex; align-items: center; gap: 8px; padding: 4px 6px; }
-  .dir-entry:hover { background: var(--border); }
+  .dir-browser-head .dir-close {
+    min-height: 44px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .dir-browser-head .dir-close:active { background: var(--panel-2); border-color: var(--accent); }
+  .dir-browser-actions {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: 8px;
+  }
+  .dir-browser-actions button {
+    min-height: 44px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .dir-browser-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #dir-entries { display: grid; gap: 4px; max-height: 220px; overflow-y: auto; }
+  /* One row per directory: the whole row is the tap target, with :active
+     feedback instead of a hover. A repo is marked so the user can still
+     tell it apart at a glance. */
+  .dir-entry {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .dir-entry:active { background: var(--border); }
   .dir-entry .dir-name { flex: 1; word-break: break-all; }
+  .dir-entry .dir-repo { color: var(--accent); font-size: 11px; }
   #session-view {
     position: fixed;
     inset: 0;
@@ -569,11 +595,13 @@
             <div id="dir-browser" hidden>
               <div class="dir-browser-head">
                 <span id="dir-path">browse roots</span>
-                <button type="button" id="btn-dir-up" disabled>Up</button>
-                <button type="button" id="btn-dir-use" disabled>Use this directory</button>
-                <button type="button" id="btn-dir-close">Close</button>
+                <button type="button" id="btn-dir-close" class="dir-close">Close</button>
               </div>
               <div id="dir-entries"></div>
+              <div class="dir-browser-actions">
+                <button type="button" id="btn-dir-up" disabled>Up</button>
+                <button type="button" id="btn-dir-use" disabled>Use this directory</button>
+              </div>
             </div>
           </div>
           <div class="composer-row">
@@ -1316,26 +1344,32 @@ function renderDirs() {
   for (const entry of entries) {
     const row = document.createElement('div');
     row.className = 'dir-entry';
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
     const name = document.createElement('span');
     name.className = 'dir-name';
-    name.textContent = entry.name + (entry.is_repo ? ' [repo]' : '');
+    name.textContent = entry.name;
     row.appendChild(name);
-    const open = document.createElement('button');
-    open.type = 'button';
-    open.textContent = 'Open';
-    open.addEventListener('click', () => {
+    if (entry.is_repo) {
+      const repo = document.createElement('span');
+      repo.className = 'dir-repo';
+      repo.textContent = 'repo';
+      row.appendChild(repo);
+    }
+    // The whole row descends into the entry in one tap; "Use this
+    // directory" is the single pinned confirm, so a row never needs a
+    // second button.
+    const descend = () => {
       dirPath = entry.path;
       loadDirs();
+    };
+    row.addEventListener('click', descend);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        descend();
+      }
     });
-    const use = document.createElement('button');
-    use.type = 'button';
-    use.textContent = 'Use';
-    use.addEventListener('click', () => {
-      setDir(entry.path);
-      dirBrowser.hidden = true;
-    });
-    row.appendChild(open);
-    row.appendChild(use);
     dirEntries.appendChild(row);
   }
 }
