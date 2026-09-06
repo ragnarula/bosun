@@ -19,8 +19,11 @@
     --error: #ff7070;
     --ok: #4ed48e;
     --warn: #e0a94b;
+    /* One-handed floor: every interactive target is at least this tall. */
+    --touch-min-height: var(--touch-min-height);
   }
   * { box-sizing: border-box; }
+  * { -webkit-tap-highlight-color: transparent; }
   body {
     margin: 0;
     background: var(--bg);
@@ -46,7 +49,7 @@
     gap: 8px;
     margin: 10px 0 14px;
     padding: 12px 14px;
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -269,7 +272,7 @@
     gap: 4px 10px;
     align-items: baseline;
     width: 100%;
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     text-align: left;
     background: none;
     border: none;
@@ -303,7 +306,7 @@
   }
   .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
   .chip {
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     padding: 8px 14px;
     border: 1px solid var(--border);
     border-radius: 999px;
@@ -347,7 +350,7 @@
   }
   .sheet-actions button {
     width: 100%;
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
   .sheet-actions button:active { background: var(--panel-2); border-color: var(--accent); }
@@ -365,7 +368,7 @@
   .dir-browser-head { display: flex; align-items: center; gap: 8px; }
   .dir-browser-head #dir-path { flex: 1; color: var(--muted); word-break: break-all; }
   .dir-browser-head .dir-close {
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
   .dir-browser-head .dir-close:active { background: var(--panel-2); border-color: var(--accent); }
@@ -375,7 +378,7 @@
     gap: 8px;
   }
   .dir-browser-actions button {
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
   .dir-browser-actions button:active { background: var(--panel-2); border-color: var(--accent); }
@@ -469,7 +472,7 @@
   .view-sheet-row { display: grid; gap: 8px; padding: 12px 16px; }
   .view-sheet-row button {
     width: 100%;
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
   .view-sheet-row button:active { background: var(--panel-2); border-color: var(--accent); }
@@ -518,7 +521,7 @@
   #watch-banner .watch-note { color: var(--muted); font-size: 13px; }
   #watch-banner button {
     width: 100%;
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
   #watch-banner button:active { background: var(--panel-2); border-color: var(--accent); }
@@ -677,7 +680,7 @@
   .ask-question { font-size: 13px; color: var(--text); }
   .ask-chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .ask-chips button {
-    min-height: 44px;
+    min-height: var(--touch-min-height);
     padding: 8px 14px;
     border: 1px solid var(--border);
     border-radius: 999px;
@@ -706,10 +709,10 @@
     .composer select, .input-row textarea { font-size: 16px; }
     .session-item { min-height: 48px; }
     .session-row { min-height: 48px; }
-    #session-list .children-toggle { min-height: 44px; }
-    #session-list .child-row { min-height: 44px; }
+    #session-list .children-toggle { min-height: var(--touch-min-height); }
+    #session-list .child-row { min-height: var(--touch-min-height); }
     #dir-entries .dir-entry {
-      min-height: 44px;
+      min-height: var(--touch-min-height);
       padding: 5px 8px;
       -webkit-tap-highlight-color: transparent;
     }
