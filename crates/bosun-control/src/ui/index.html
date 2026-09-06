@@ -18,6 +18,7 @@
     --mono: #9fb7cc;
     --error: #ff7070;
     --ok: #4ed48e;
+    --warn: #e0a94b;
   }
   * { box-sizing: border-box; }
   body {
@@ -37,14 +38,50 @@
   header.top h1 { margin: 0; font-size: 18px; }
   header.top .origin { color: var(--muted); font-size: 13px; }
   #status { min-height: 20px; padding: 3px 20px 7px; color: var(--muted); font-size: 12px; }
-  main {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-    padding: 0 20px 20px;
-    align-items: start;
+  /* One-line node health, tappable: it opens the Machines tab, which a later
+     sprint builds. Until then the tap answers with a status toast. */
+  #health-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 14px;
+    padding: 12px 14px;
+    min-height: 44px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
   }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  #health-strip:active { background: var(--panel-2); }
+  #health-strip .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  #health-strip .health-dot.down { background: var(--error); }
+  #health-strip .health-text { font-size: 13px; color: var(--muted); }
+  #health-strip::after {
+    content: '›';
+    color: var(--muted);
+  }
+  main { padding: 0 20px 20px; }
+  /* User-facing errors and confirmations land here, at the bottom where a
+     thumb-heavy page reads last. It auto-hides; background poll errors stay
+     in #status as always. */
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 20px;
+    transform: translateX(-50%);
+    max-width: calc(100% - 40px);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 13px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  }
+  #toast[hidden] { display: none; }
+  #toast.error { border-color: var(--error); color: var(--error); }
+  #toast.ok { border-color: var(--ok); color: var(--ok); }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
   .panel h2 {
     display: flex;
@@ -59,19 +96,78 @@
     color: var(--muted);
     border-bottom: 1px solid var(--border);
   }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 7px 14px; text-align: left; border-bottom: 1px solid var(--border); }
-  th {
-    font-size: 11px;
-    font-weight: 500;
+  /* One session per row: a whole-row tap target with the session's short id,
+     node/dir pair, persona tag and age. Children nest one level deep under a
+     `N children` toggle on the parent row. */
+  #session-list { padding: 0 0 8px; }
+  #session-list[hidden] { display: none; }
+  #session-list .empty {
     color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    font-size: 13px;
+    padding: 12px 14px;
   }
-  tbody tr:last-child td { border-bottom: none; }
-  tbody tr.clickable { cursor: pointer; }
-  tbody tr.clickable:hover { background: var(--panel-2); }
-  .empty { color: var(--muted); }
+  .session-item { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+  .session-row {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0;
+    padding: 12px 14px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .session-row:active { background: var(--panel-2); }
+  .session-row .row-main { flex: 1; min-width: 0; }
+  .session-row .row-node {
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-row .row-meta { display: block; font-size: 12px; color: var(--muted); }
+  .session-row .row-time { display: block; font-size: 12px; color: var(--muted); }
+  .children-toggle {
+    margin: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-size: 12px;
+    background: var(--panel-2);
+    color: var(--muted);
+    flex: 0 0 auto;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .children-toggle:active { background: var(--panel); border-color: var(--accent); }
+  .children-toggle.open { color: var(--accent); border-color: var(--accent); }
+  #session-list .child-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px 10px 26px;
+    border-bottom: 1px solid var(--border);
+    background: none;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #session-list .child-row[hidden] { display: none; }
+  #session-list .child-row .child-note {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .dot.running, .dot.creating { background: var(--ok); }
+  .dot.interrupted, .dot.stopped { background: var(--error); }
+  .dot.waiting_for_input { background: var(--warn); }
   button {
     background: var(--panel-2);
     color: var(--text);
@@ -83,9 +179,6 @@
   }
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: default; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .dot.up { background: var(--ok); }
-  .dot.down { background: var(--error); }
   #new-session-form {
     display: grid;
     gap: 10px;
@@ -350,9 +443,10 @@
     button { min-height: 40px; padding: 8px 14px; }
     #new-session-form input, #new-session-form select, #new-session-form textarea,
     .input-row textarea { font-size: 16px; }
-    tbody tr.clickable { -webkit-tap-highlight-color: transparent; }
-    tbody tr.clickable:active { background: var(--panel-2); }
-    tbody tr.clickable td { padding-top: 12px; padding-bottom: 12px; }
+    .session-item { min-height: 48px; }
+    .session-row { min-height: 48px; }
+    #session-list .children-toggle { min-height: 44px; }
+    #session-list .child-row { min-height: 44px; }
     #dir-entries .dir-entry {
       min-height: 44px;
       padding: 5px 8px;
@@ -380,7 +474,6 @@
     .input-row { padding: 12px 14px; }
   }
   @media (max-width: 560px) {
-    .col-model, .col-permission { display: none; }
     #view-persona, #view-permission, #view-watch { display: none; }
     .view-meta .muted { display: none; }
   }
@@ -392,16 +485,11 @@
   <span class="origin" id="origin"></span>
 </header>
 <div id="status"></div>
+<div id="health-strip" role="button" tabindex="0">
+  <span class="health-dot" id="health-dot"></span>
+  <span class="health-text" id="health-text"></span>
+</div>
 <main>
-  <section class="panel">
-    <h2>Nodes</h2>
-    <table>
-      <thead>
-        <tr><th>Name</th><th>Status</th><th>Last seen</th></tr>
-      </thead>
-      <tbody id="nodes-body"></tbody>
-    </table>
-  </section>
   <section class="panel">
     <h2>Sessions <button id="btn-new-session" type="button">New session</button></h2>
     <form id="new-session-form" hidden>
@@ -437,14 +525,11 @@
       </div>
     </form>
     <div id="recent-sessions" hidden></div>
-    <table>
-      <thead>
-        <tr><th>Id</th><th>Node</th><th class="col-model">Model</th><th>State</th><th class="col-permission">Permission</th></tr>
-      </thead>
-      <tbody id="sessions-body"></tbody>
-    </table>
+    <div id="session-list" hidden></div>
   </section>
 </main>
+
+<div id="toast" hidden></div>
 
 <div id="session-view" hidden>
   <header class="view-header">
@@ -483,8 +568,11 @@ const $ = (id) => document.getElementById(id);
 
 const originEl = $('origin');
 const statusEl = $('status');
-const nodesBody = $('nodes-body');
-const sessionsBody = $('sessions-body');
+const healthStrip = $('health-strip');
+const healthDot = $('health-dot');
+const healthText = $('health-text');
+const toastEl = $('toast');
+const sessionListEl = $('session-list');
 const newSessionBtn = $('btn-new-session');
 const newSessionForm = $('new-session-form');
 const cancelNewSessionBtn = $('btn-cancel-new-session');
@@ -539,49 +627,61 @@ function showStatus(text) {
   statusEl.textContent = text;
 }
 
+let toastTimer = null;
+
+// A transient bottom-line notice for user actions: errors and confirmations.
+// Background fetch failures keep showing in #status, which does not compete
+// with a thumb's work; the toast is for the messages the user caused.
+function showToast(text, kind) {
+  toastEl.textContent = text;
+  toastEl.className = kind || '';
+  toastEl.hidden = false;
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toastEl.hidden = true;
+    toastEl.className = '';
+  }, 3000);
+}
+
+function toastError(text) {
+  showToast(text, 'error');
+}
+
+function toastOk(text) {
+  showToast(text, 'ok');
+}
+
 function ago(secs) {
-  const diff = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - (secs || 0));
   if (diff < 60) return diff + 's ago';
   if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
   if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
   return Math.floor(diff / 86400) + 'd ago';
 }
 
-function cell(text) {
-  const td = document.createElement('td');
-  td.textContent = text;
-  return td;
-}
-
-function emptyRow(cols, text) {
-  const row = document.createElement('tr');
-  const td = document.createElement('td');
-  td.colSpan = cols;
-  td.className = 'empty';
-  td.textContent = text;
-  row.appendChild(td);
-  return row;
-}
-
-function renderNodes() {
-  nodesBody.textContent = '';
+// One line of node health on the home screen. Tapping it opens the Machines
+// tab, built by a later sprint; until then the tap answers with a status
+// toast so the strip is not a dead target.
+function renderHealth() {
+  const up = nodes.filter((node) => node.up).length;
+  const down = nodes.length - up;
+  healthDot.className = 'health-dot' + (down > 0 ? ' down' : '');
   if (nodes.length === 0) {
-    nodesBody.appendChild(emptyRow(3, 'no nodes connected'));
+    healthText.textContent = 'no nodes connected';
     return;
   }
-  for (const node of nodes) {
-    const row = document.createElement('tr');
-    row.appendChild(cell(node.name));
-    const status = document.createElement('td');
-    const dot = document.createElement('span');
-    dot.className = 'dot ' + (node.up ? 'up' : 'down');
-    status.appendChild(dot);
-    status.appendChild(document.createTextNode(node.up ? 'up' : 'down'));
-    row.appendChild(status);
-    row.appendChild(cell(ago(node.last_seen_secs)));
-    nodesBody.appendChild(row);
-  }
+  healthText.textContent = up + ' up · ' + down + ' down';
 }
+
+healthStrip.addEventListener('click', () => {
+  toastOk('machines tab arrives in a later sprint');
+});
+healthStrip.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    toastOk('machines tab arrives in a later sprint');
+  }
+});
 
 function renderNodeOptions() {
   const signature = nodes.map((node) => node.name + (node.up ? 'up' : 'down')).join(',');
@@ -656,43 +756,123 @@ function shortId(id) {
   return id.length > 8 ? id.slice(0, 8) : id;
 }
 
+// Active first, then past: newly creating, running and waiting sessions
+// float to the top, each tied by created_at; a finished or interrupted
+// session's row keeps its final state below them.
+function sessionOrderRank(session) {
+  return session.state === 'running' || session.state === 'creating' ? 0
+    : session.state === 'waiting_for_input' ? 1
+    : 2;
+}
+
+function byActiveThenNewest(a, b) {
+  const rank = sessionOrderRank(a) - sessionOrderRank(b);
+  if (rank !== 0) return rank;
+  return (b.created_at_secs || 0) - (a.created_at_secs || 0);
+}
+
+// One row per root session: a whole-row tap target with the state dot, the
+// node/dir pair, the persona tag, and the short id plus age. The full id
+// lives on the session screen, so no id is touch-invisible on home.
+function appendSessionRow(session) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'session-row';
+  const dot = document.createElement('span');
+  dot.className = 'dot ' + session.state;
+  button.appendChild(dot);
+  const main = document.createElement('span');
+  main.className = 'row-main';
+  const nodeDir = document.createElement('span');
+  nodeDir.className = 'row-node';
+  nodeDir.textContent = session.node + ' / ' + session.dir;
+  main.appendChild(nodeDir);
+  if (session.persona) {
+    const persona = document.createElement('span');
+    persona.className = 'row-meta';
+    persona.textContent = session.persona;
+    main.appendChild(persona);
+  }
+  const time = document.createElement('span');
+  time.className = 'row-time';
+  time.textContent = shortId(session.id) + ' · ' + ago(session.created_at_secs);
+  main.appendChild(time);
+  button.appendChild(main);
+  button.addEventListener('click', () => openSession(session.id));
+  return button;
+}
+
+// One banner line per child, flattened under its parent row: rows never
+// indent deeper than the one level the children tag opens. Child sessions
+// are watch-only, so the line is information, not a tap target.
+function childLine(child) {
+  const line = document.createElement('div');
+  line.className = 'child-row';
+  const dot = document.createElement('span');
+  dot.className = 'dot ' + child.state;
+  line.appendChild(dot);
+  const note = document.createElement('span');
+  note.className = 'child-note';
+  note.textContent = shortId(child.id) + ' · ' + child.state + ' · watch-only';
+  line.appendChild(note);
+  return line;
+}
+
 function renderSessions() {
-  sessionsBody.textContent = '';
+  sessionListEl.textContent = '';
   if (sessions.length === 0) {
-    sessionsBody.appendChild(emptyRow(5, 'no sessions'));
+    sessionListEl.hidden = false;
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'no sessions';
+    sessionListEl.appendChild(empty);
     return;
   }
-  // Render the tree: each root row is followed by its children, nested under
-  // the session that spawned them at any depth.
-  const byParent = new Map();
+  sessionListEl.hidden = false;
+  // Split into roots and children. owner_id is the tree root every session
+  // in one tree shares; a root owns itself, so a session with a parent never
+  // gets its own row — it always appears under its tree's row.
+  const roots = [];
+  const groups = new Map();
   for (const session of sessions) {
-    const parent = session.parent_id || '';
-    if (!byParent.has(parent)) byParent.set(parent, []);
-    byParent.get(parent).push(session);
-  }
-  const renderLevel = (parentId, depth) => {
-    const children = (byParent.get(parentId) || []).sort((a, b) =>
-      a.id < b.id ? -1 : a.id > b.id ? 1 : 0
-    );
-    for (const session of children) {
-      const row = document.createElement('tr');
-      row.className = 'clickable';
-      row.title = session.id;
-      row.appendChild(cell('  '.repeat(depth) + shortId(session.id)));
-      row.appendChild(cell(session.node));
-      const model = cell(session.model);
-      model.className = 'col-model';
-      row.appendChild(model);
-      row.appendChild(cell(session.state));
-      const permission = cell(session.permission);
-      permission.className = 'col-permission';
-      row.appendChild(permission);
-      row.addEventListener('click', () => openSession(session.id));
-      sessionsBody.appendChild(row);
-      renderLevel(session.id, depth + 1);
+    if (session.parent_id) {
+      const owner = session.owner_id;
+      if (!groups.has(owner)) groups.set(owner, []);
+      groups.get(owner).push(session);
+    } else {
+      roots.push(session);
     }
-  };
-  renderLevel('', 0);
+  }
+  roots.sort(byActiveThenNewest);
+  for (const group of groups.values()) group.sort(byActiveThenNewest);
+  for (const root of roots) {
+    const item = document.createElement('div');
+    item.className = 'session-item';
+    item.appendChild(appendSessionRow(root));
+    const children = groups.get(root.id) || [];
+    const lines = [];
+    if (children.length > 0) {
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'children-toggle';
+      toggle.textContent = children.length === 1 ? '1 child' : children.length + ' children';
+      toggle.addEventListener('click', () => {
+        const open = toggle.classList.toggle('open');
+        toggle.textContent = open
+          ? 'hide children'
+          : (children.length === 1 ? '1 child' : children.length + ' children');
+        for (const line of lines) line.hidden = !open;
+      });
+      item.appendChild(toggle);
+    }
+    sessionListEl.appendChild(item);
+    for (const child of children) {
+      const line = childLine(child);
+      line.hidden = true;
+      lines.push(line);
+      sessionListEl.appendChild(line);
+    }
+  }
 }
 
 // Recently-created session settings, kept in localStorage so the create
@@ -821,7 +1001,7 @@ async function refreshNodes() {
     const response = await fetch('/nodes');
     if (!response.ok) throw new Error('HTTP ' + response.status);
     nodes = await response.json();
-    renderNodes();
+    renderHealth();
     renderNodeOptions();
   } catch (error) {
     showStatus('nodes: ' + error.message);
@@ -871,7 +1051,7 @@ formNode.addEventListener('change', () => {
 btnBrowse.addEventListener('click', () => {
   const node = formNode.value;
   if (!node) {
-    showStatus('choose a node first');
+    showToast('choose a node first', 'error');
     return;
   }
   dirNode = node;
@@ -978,7 +1158,7 @@ newSessionForm.addEventListener('submit', async (event) => {
     await refreshSessions();
     openSession(session.id);
   } catch (error) {
-    showStatus('new session: ' + error.message);
+    toastError('new session: ' + error.message);
   }
 });
 
@@ -1063,7 +1243,7 @@ btnInterrupt.addEventListener('click', async () => {
   try {
     await post('/sessions/' + encodeURIComponent(current) + '/interrupt', {});
   } catch (error) {
-    showStatus('interrupt: ' + error.message);
+    toastError('interrupt: ' + error.message);
   }
 });
 
@@ -1074,14 +1254,14 @@ btnPermission.addEventListener('click', async () => {
       permission: next,
     });
   } catch (error) {
-    showStatus('permission: ' + error.message);
+    toastError('permission: ' + error.message);
   }
 });
 
 btnPersona.addEventListener('click', async () => {
   const name = personaName.value;
   if (!name) {
-    showStatus('persona: pick a persona first');
+    toastError('persona: pick a persona first');
     return;
   }
   try {
@@ -1089,7 +1269,7 @@ btnPersona.addEventListener('click', async () => {
     personaName.value = '';
     await fetchSession(current);
   } catch (error) {
-    showStatus('persona: ' + error.message);
+    toastError('persona: ' + error.message);
   }
 });
 
@@ -1097,11 +1277,11 @@ btnStop.addEventListener('click', async () => {
   if (!window.confirm('Stop and delete this session?')) return;
   try {
     await post('/stop', { session_id: current });
-    showStatus('session stopped');
+    toastOk('session stopped');
     closeSession();
     await refreshSessions();
   } catch (error) {
-    showStatus('stop: ' + error.message);
+    toastError('stop: ' + error.message);
   }
 });
 
@@ -1119,7 +1299,7 @@ async function send(redirect) {
     });
     input.value = '';
   } catch (error) {
-    showStatus('send: ' + error.message);
+    toastError('send: ' + error.message);
   } finally {
     sending = false;
     btnSend.disabled = false;
