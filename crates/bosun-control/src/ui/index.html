@@ -83,6 +83,57 @@
   #toast[hidden] { display: none; }
   #toast.error { border-color: var(--error); color: var(--error); }
   #toast.ok { border-color: var(--ok); color: var(--ok); }
+  /* Machines tab: a full pane listing node health. Down nodes lead, red,
+     with their age; an up node's dot already says up, so it shows none. */
+  #machines-tab {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #machines-tab[hidden] { display: none; }
+  .machines-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .machines-head .btn-machines-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .machines-head .btn-machines-back:active { color: var(--accent); }
+  .machines-head .machines-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  #machines-list { flex: 1; background: var(--bg); }
+  #machines-list .machine-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    min-height: 48px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #machines-list .machine-row .dot { flex: 0 0 auto; }
+  #machines-list .machine-row .machine-name { flex: 1; min-width: 0; font-weight: 600; }
+  #machines-list .machine-row .machine-down {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  #machines-list .empty { color: var(--muted); padding: 16px 14px; }
+  #machines-list .machine-row.down { color: var(--error); }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
   .panel h2 {
     display: flex;
@@ -720,6 +771,14 @@
   </section>
 </main>
 
+<div id="machines-tab" hidden>
+  <div class="machines-head">
+    <button type="button" id="btn-machines-back" title="Back to sessions">‹</button>
+    <span class="machines-title">Machines</span>
+  </div>
+  <div id="machines-list"></div>
+</div>
+
 <div id="toast" hidden></div>
 
 <div id="session-view" hidden>
@@ -788,6 +847,9 @@ const healthStrip = $('health-strip');
 const healthDot = $('health-dot');
 const healthText = $('health-text');
 const toastEl = $('toast');
+const machinesTab = $('machines-tab');
+const btnMachinesBack = $('btn-machines-back');
+const machinesList = $('machines-list');
 const sessionListEl = $('session-list');
 const newSessionBtn = $('btn-new-session');
 const newSessionForm = $('new-session-form');
@@ -893,12 +955,13 @@ function ago(secs) {
 }
 
 // One line of node health on the home screen. Tapping it opens the Machines
-// tab, built by a later sprint; until then the tap answers with a status
-// toast so the strip is not a dead target.
+// tab; the strip stays on the home screen so only the tab, not home, repeats
+// node state.
 function renderHealth() {
   const up = nodes.filter((node) => node.up).length;
   const down = nodes.length - up;
   healthDot.className = 'health-dot' + (down > 0 ? ' down' : '');
+  renderMachines();
   if (nodes.length === 0) {
     healthText.textContent = 'no nodes connected';
     return;
@@ -906,15 +969,56 @@ function renderHealth() {
   healthText.textContent = up + ' up · ' + down + ' down';
 }
 
-healthStrip.addEventListener('click', () => {
-  toastOk('machines tab arrives in a later sprint');
-});
+function openMachines() {
+  machinesTab.hidden = false;
+  renderMachines();
+}
+
+function closeMachines() {
+  machinesTab.hidden = true;
+}
+
+// Down nodes lead, red, with their age; an up node's dot already says "up",
+// so its row shows nothing more — the detail is only where it matters.
+function renderMachines() {
+  machinesList.textContent = '';
+  if (nodes.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'no nodes connected';
+    machinesList.appendChild(empty);
+    return;
+  }
+  const ordered = [...nodes].sort((a, b) => (a.up ? 1 : 0) - (b.up ? 1 : 0));
+  for (const node of ordered) {
+    const row = document.createElement('div');
+    row.className = 'machine-row' + (node.up ? '' : ' down');
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + (node.up ? 'up' : 'down');
+    row.appendChild(dot);
+    const name = document.createElement('span');
+    name.className = 'machine-name';
+    name.textContent = node.name;
+    row.appendChild(name);
+    if (!node.up) {
+      const note = document.createElement('span');
+      note.className = 'machine-down';
+      note.textContent = 'down · ' + ago(node.last_seen_secs);
+      row.appendChild(note);
+    }
+    machinesList.appendChild(row);
+  }
+}
+
+healthStrip.addEventListener('click', openMachines);
 healthStrip.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' || event.key === ' ') {
     event.preventDefault();
-    toastOk('machines tab arrives in a later sprint');
+    openMachines();
   }
 });
+
+btnMachinesBack.addEventListener('click', closeMachines);
 
 let personaSelected = ''; // the chip persona picked in the composer
 let personaInitialized = false; // whether the last-used persona has been applied
