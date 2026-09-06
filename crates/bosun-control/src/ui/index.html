@@ -103,6 +103,49 @@
     font: inherit;
   }
   #new-session-form .actions { display: flex; gap: 8px; }
+  #recent-sessions {
+    display: grid;
+    gap: 4px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  #recent-sessions[hidden] { display: none; }
+  .recent-title {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .recent-entry {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    gap: 4px 10px;
+    align-items: baseline;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 6px 0;
+  }
+  .recent-entry:last-child { border-bottom: none; }
+  .recent-entry:hover { background: none; border-color: var(--border); }
+  .recent-entry > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .recent-node { font-weight: 600; }
+  .recent-dir {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .recent-persona { color: var(--muted); font-size: 12px; }
+  .recent-time { color: var(--muted); font-size: 12px; }
+  .recent-prompt {
+    grid-column: 1 / -1;
+    color: var(--muted);
+    font-size: 12px;
+  }
   .dir-pick { display: flex; gap: 6px; }
   .dir-pick input { flex: 1; }
   #dir-browser {
@@ -316,14 +359,30 @@
       -webkit-tap-highlight-color: transparent;
     }
     #dir-entries .dir-entry:active { background: var(--border); }
-    .view-header { flex-wrap: wrap; padding: 10px 12px; }
+    .view-header { flex-wrap: wrap; padding: 8px 12px; }
+    .view-header .view-meta { order: 1; width: 100%; }
+    .view-header .view-actions {
+      order: 2;
+      width: 100%;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+    }
+    .view-header .view-actions button, .view-header .view-actions select {
+      min-height: 34px;
+      padding: 5px 10px;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
     .view-actions { flex-wrap: wrap; }
     .dir-browser-head { flex-wrap: wrap; }
     #transcript { padding: 12px 14px; }
+    .view-header .id, .view-header .badge.state { flex: 0 0 auto; }
     .input-row { padding: 12px 14px; }
   }
   @media (max-width: 560px) {
     .col-model, .col-permission { display: none; }
+    #view-persona, #view-permission, #view-watch { display: none; }
+    .view-meta .muted { display: none; }
   }
 </style>
 </head>
@@ -377,6 +436,7 @@
         <button type="button" id="btn-cancel-new-session">Cancel</button>
       </div>
     </form>
+    <div id="recent-sessions" hidden></div>
     <table>
       <thead>
         <tr><th>Id</th><th>Node</th><th class="col-model">Model</th><th>State</th><th class="col-permission">Permission</th></tr>
@@ -439,6 +499,7 @@ const btnDirClose = $('btn-dir-close');
 const dirEntries = $('dir-entries');
 const formPersona = $('form-persona');
 const formPrompt = $('form-prompt');
+const recentList = $('recent-sessions');
 const view = $('session-view');
 const viewId = $('view-id');
 const viewNode = $('view-node');
@@ -634,6 +695,112 @@ function renderSessions() {
   renderLevel('', 0);
 }
 
+// Recently-created session settings, kept in localStorage so the create
+// panel can offer them back. Only the settings the form collects are
+// stored: node, dir, persona and prompt, against the time the session was
+// started. A new session's settings go to the front; duplicates drop, so a
+// reuse moves the entry rather than repeating it.
+const RECENT_KEY = 'bosun.recent-sessions';
+const RECENT_LIMIT = 5;
+
+function loadRecents() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function saveRecents(recents) {
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(recents.slice(0, RECENT_LIMIT)));
+  } catch (error) {
+    // Private mode or a full quota: the recent list degrades to in-memory
+    // for this page load.
+  }
+}
+
+function rememberCurrentSettings() {
+  const persona = formPersona.value.trim();
+  const prompt = formPrompt.value.trim();
+  const recents = loadRecents().filter((entry) =>
+    !(entry.node === formNode.value && entry.dir === formDir.value.trim()
+      && entry.persona === persona && entry.prompt === prompt)
+  );
+  recents.unshift({
+    node: formNode.value,
+    dir: formDir.value.trim(),
+    persona,
+    prompt,
+    time: Math.floor(Date.now() / 1000),
+  });
+  saveRecents(recents);
+  if (!newSessionForm.hidden) renderRecents();
+}
+
+function useRecent(entry) {
+  formNode.value = entry.node;
+  formDir.value = entry.dir;
+  formPersona.value = entry.persona;
+  formPrompt.value = entry.prompt;
+  dirBrowser.hidden = true;
+  if (window.matchMedia('(max-width: 640px)').matches) {
+    formNode.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else {
+    formNode.focus();
+  }
+  renderRecents();
+}
+
+function renderRecents() {
+  const recents = loadRecents();
+  if (recents.length === 0 || newSessionForm.hidden) {
+    recentList.hidden = true;
+    return;
+  }
+  recentList.hidden = false;
+  recentList.textContent = '';
+  recentList.appendChild(recentTitle());
+  for (const entry of recents) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'recent-entry';
+    button.title = 'Use ' + entry.node + ': ' + entry.dir;
+    const node = document.createElement('span');
+    node.className = 'recent-node';
+    node.textContent = entry.node;
+    button.appendChild(node);
+    const dir = document.createElement('span');
+    dir.className = 'recent-dir';
+    dir.textContent = entry.dir;
+    button.appendChild(dir);
+    const persona = document.createElement('span');
+    persona.className = 'recent-persona';
+    persona.textContent = entry.persona ? entry.persona : '';
+    button.appendChild(persona);
+    const time = document.createElement('span');
+    time.className = 'recent-time';
+    time.textContent = ago(entry.time);
+    button.appendChild(time);
+    if (entry.prompt) {
+      const prompt = document.createElement('span');
+      prompt.className = 'recent-prompt';
+      prompt.textContent = entry.prompt;
+      button.appendChild(prompt);
+    }
+    button.addEventListener('click', () => useRecent(entry));
+    recentList.appendChild(button);
+  }
+}
+
+function recentTitle() {
+  const title = document.createElement('div');
+  title.className = 'recent-title';
+  title.textContent = 'Recently used';
+  return title;
+}
+
 async function post(url, body) {
   const response = await fetch(url, {
     method: 'POST',
@@ -685,6 +852,7 @@ async function refreshSessions() {
 
 newSessionBtn.addEventListener('click', () => {
   newSessionForm.hidden = !newSessionForm.hidden;
+  renderRecents();
   if (!newSessionForm.hidden) {
     if (window.matchMedia('(max-width: 640px)').matches) {
       newSessionForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -785,6 +953,7 @@ cancelNewSessionBtn.addEventListener('click', () => {
   newSessionForm.hidden = true;
   newSessionForm.reset();
   dirBrowser.hidden = true;
+  renderRecents();
 });
 
 newSessionForm.addEventListener('submit', async (event) => {
@@ -802,8 +971,10 @@ newSessionForm.addEventListener('submit', async (event) => {
     // the loop can run tools immediately.
     const response = await post('/dev', body);
     const session = await response.json();
+    rememberCurrentSettings();
     newSessionForm.hidden = true;
     newSessionForm.reset();
+    renderRecents();
     await refreshSessions();
     openSession(session.id);
   } catch (error) {
@@ -1546,6 +1717,7 @@ function handleFrame(frame) {
 refreshNodes();
 refreshSessions();
 refreshPersonas();
+renderRecents();
 setInterval(refreshNodes, 5000);
 setInterval(refreshSessions, 3000);
 setInterval(refreshPersonas, 30000);
