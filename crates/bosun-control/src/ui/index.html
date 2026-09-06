@@ -352,35 +352,125 @@
     flex-direction: column;
   }
   #session-view[hidden] { display: none; }
+  /* Thin header: back, `state dot / node·dir`, and ⋯. Everything else moves
+     into the ⋯ sheet so the header never scrolls sideways. */
   .view-header {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    gap: 12px;
-    padding: 10px 20px;
+    gap: 10px;
+    padding: 10px 14px;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
   }
-  .view-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .view-meta .muted { color: var(--muted); }
-  .view-meta .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-  .badge {
-    padding: 1px 8px;
-    border-radius: 999px;
-    font-size: 12px;
-    border: 1px solid var(--border);
-    color: var(--muted);
+  .view-header .btn-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
   }
-  .badge.state { color: var(--accent); border-color: var(--accent); }
-  .view-actions { display: flex; gap: 8px; }
-  .view-actions select {
+  .view-header .btn-back:active { color: var(--accent); }
+  .view-header .view-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .view-header .view-title .dot { flex: 0 0 auto; }
+  .view-header .view-title .view-main { flex: 1; min-width: 0; }
+  .view-header .view-title .view-node { font-weight: 600; }
+  .view-header .view-title .view-dir {
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  .view-header .view-title .view-dir::before { content: ' · '; }
+  .view-header .btn-more {
+    min-height: 40px;
+    min-width: 44px;
+    background: none;
+    border: none;
+    font-size: 18px;
+    letter-spacing: 0.08em;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-header .btn-more:active { color: var(--accent); }
+  #view-sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 12;
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+  #view-sheet[hidden] { display: none; }
+  .view-sheet-row { display: grid; gap: 8px; padding: 12px 16px; }
+  .view-sheet-row button {
+    width: 100%;
+    min-height: 44px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-sheet-row button:active { background: var(--panel-2); border-color: var(--accent); }
+  .view-sheet-row .danger { color: var(--error); border-color: var(--error); }
+  .view-sheet-row select {
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 5px 8px;
+    padding: 9px 10px;
     font: inherit;
+    font-size: 16px;
   }
+  .view-sheet-note { color: var(--muted); font-size: 12px; }
+  .view-sheet-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  .view-sheet-head button {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 16px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-sheet-head button:active { color: var(--accent); }
+  /* A watch-only child renders one banner in place of the input row: the
+     child cannot be driven, only opened in its own monitor. */
+  #watch-banner {
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 12px 16px;
+    display: grid;
+    gap: 8px;
+  }
+  #watch-banner[hidden] { display: none; }
+  #watch-banner .watch-note { color: var(--muted); font-size: 13px; }
+  #watch-banner button {
+    width: 100%;
+    min-height: 44px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #watch-banner button:active { background: var(--panel-2); border-color: var(--accent); }
   #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
   #transcript .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* User and assistant messages carry a left accent gutter like opencode's
@@ -538,29 +628,13 @@
       -webkit-tap-highlight-color: transparent;
     }
     #dir-entries .dir-entry:active { background: var(--border); }
-    .view-header { flex-wrap: wrap; padding: 8px 12px; }
-    .view-header .view-meta { order: 1; width: 100%; }
-    .view-header .view-actions {
-      order: 2;
-      width: 100%;
-      flex-wrap: nowrap;
-      overflow-x: auto;
-    }
-    .view-header .view-actions button, .view-header .view-actions select {
-      min-height: 34px;
-      padding: 5px 10px;
-      white-space: nowrap;
-      flex: 0 0 auto;
-    }
-    .view-actions { flex-wrap: wrap; }
+    .view-header { padding: 8px 12px; }
     .dir-browser-head { flex-wrap: wrap; }
     #transcript { padding: 12px 14px; }
-    .view-header .id, .view-header .badge.state { flex: 0 0 auto; }
     .input-row { padding: 12px 14px; }
   }
   @media (max-width: 560px) {
-    #view-persona, #view-permission, #view-watch { display: none; }
-    .view-meta .muted { display: none; }
+    .view-header .view-title .view-dir { max-width: 40%; }
   }
 </style>
 </head>
@@ -624,31 +698,51 @@
 
 <div id="session-view" hidden>
   <header class="view-header">
-    <div class="view-meta">
-      <span class="id" id="view-id"></span>
-      <span class="muted" id="view-node"></span>
-      <span class="muted" id="view-model"></span>
-      <span class="badge" id="view-persona"></span>
-      <span class="badge" id="view-permission"></span>
-      <span class="badge" id="view-watch" hidden>watch-only</span>
-      <span class="badge state" id="view-state"></span>
+    <button type="button" class="btn-back" id="btn-back" title="Back to sessions">‹</button>
+    <div class="view-title" id="view-title">
+      <span class="dot" id="view-state-dot"></span>
+      <span class="view-main" id="view-main">
+        <span class="view-node" id="view-node"></span><span class="view-dir" id="view-dir"></span>
+      </span>
     </div>
-    <div class="view-actions">
-      <button id="btn-interrupt" type="button">Interrupt</button>
-      <button id="btn-permission" type="button">Switch to read-only</button>
-      <select id="persona-name">
-        <option value="">switch persona…</option>
-      </select>
-      <button id="btn-persona" type="button">Switch persona</button>
-      <button id="btn-stop" type="button">Stop</button>
-      <button id="btn-close" type="button">Close</button>
-    </div>
+    <button type="button" class="btn-more" id="btn-more" title="Session actions">⋯</button>
   </header>
   <div id="transcript"></div>
+  <div id="watch-banner" hidden>
+    <div class="watch-note">watching child session — it is read-only</div>
+    <button type="button" id="btn-watch-open">Open to act</button>
+  </div>
   <div class="input-row" id="input-row">
     <textarea id="input" rows="3" placeholder="Message (Ctrl+Enter to send, Enter for a new line; while a question is on screen, sending answers it)"></textarea>
     <button id="btn-send" type="button">Send</button>
     <button id="btn-redirect" type="button" title="Send as a new instruction instead of answering the question on screen">Redirect</button>
+  </div>
+</div>
+
+<div id="view-sheet" hidden>
+  <div class="view-sheet-head">
+    <span>Session actions</span>
+    <button type="button" id="btn-sheet-close" title="Close actions">✕</button>
+  </div>
+  <div class="view-sheet-row">
+    <button type="button" id="btn-permission">Switch to read-only</button>
+    <span class="view-sheet-note" id="view-permission"></span>
+  </div>
+  <div class="view-sheet-row">
+    <select id="persona-name">
+      <option value="">switch persona…</option>
+    </select>
+    <button type="button" id="btn-persona">Switch persona</button>
+  </div>
+  <div class="view-sheet-row">
+    <span class="view-sheet-copy" id="view-id-copy" title="Session id"></span>
+    <button type="button" id="btn-copy-id">Copy session id</button>
+  </div>
+  <div class="view-sheet-row">
+    <button type="button" id="btn-interrupt">Interrupt</button>
+  </div>
+  <div class="view-sheet-row">
+    <button type="button" id="btn-stop" class="danger">Stop</button>
   </div>
 </div>
 
@@ -681,20 +775,25 @@ const personaChips = $('persona-chips');
 const formPersona = $('form-persona');
 const recentList = $('recent-sessions');
 const view = $('session-view');
-const viewId = $('view-id');
+const viewStateDot = $('view-state-dot');
+const viewMain = $('view-main');
 const viewNode = $('view-node');
-const viewModel = $('view-model');
-const viewPersona = $('view-persona');
+const viewDir = $('view-dir');
+const btnBack = $('btn-back');
+const viewSheet = $('view-sheet');
+const btnMore = $('btn-more');
+const btnSheetClose = $('btn-sheet-close');
+const btnCopyId = $('btn-copy-id');
+const viewIdCopy = $('view-id-copy');
+const watchBanner = $('watch-banner');
+const btnWatchOpen = $('btn-watch-open');
 const viewPermission = $('view-permission');
-const viewWatch = $('view-watch');
-const viewState = $('view-state');
 const inputRow = $('input-row');
 const btnInterrupt = $('btn-interrupt');
 const btnPermission = $('btn-permission');
 const personaName = $('persona-name');
 const btnPersona = $('btn-persona');
 const btnStop = $('btn-stop');
-const btnClose = $('btn-close');
 const transcript = $('transcript');
 const input = $('input');
 const btnSend = $('btn-send');
@@ -1463,12 +1562,11 @@ async function fetchSession(id) {
 }
 
 function updateHeader(session) {
-  viewId.textContent = session.id;
+  viewStateDot.className = 'dot ' + session.state;
   viewNode.textContent = session.node;
-  viewModel.textContent = session.model;
-  viewPersona.textContent = session.persona || '';
+  viewDir.textContent = session.dir;
+  viewIdCopy.textContent = session.id;
   updatePermissionBadge(session.permission);
-  viewState.textContent = session.state;
   // The switch dropdown preselects the session's current persona, so the
   // "switch persona" action reads as a dropdown rather than a blank field.
   if (session.persona && personas.some((persona) => persona.name === session.persona)) {
@@ -1477,14 +1575,17 @@ function updateHeader(session) {
     personaName.value = '';
   }
   // A child session is watch-only: its transcript and state render live, but
-  // the pane offers no input path and no user actions toward it.
+  // the pane offers no input path and no user actions toward it. The input
+  // row is replaced by an "Open to act" banner, and the ⋯ sheet's control
+  // rows are disabled — the API would refuse them anyway, so they must not
+  // look actionable from a child.
   const watchOnly = !!session.parent_id;
-  viewWatch.hidden = !watchOnly;
   inputRow.hidden = watchOnly;
-  btnInterrupt.disabled = watchOnly;
+  watchBanner.hidden = !watchOnly;
   btnPermission.disabled = watchOnly;
   personaName.disabled = watchOnly;
   btnPersona.disabled = watchOnly;
+  btnInterrupt.disabled = watchOnly;
   btnStop.disabled = watchOnly;
 }
 
@@ -1540,7 +1641,35 @@ btnStop.addEventListener('click', async () => {
   }
 });
 
-btnClose.addEventListener('click', closeSession);
+// The thin header's back arrow returns to the session list; the sheet stays
+// closed until the user opens it with ⋯.
+btnBack.addEventListener('click', closeSession);
+
+btnMore.addEventListener('click', () => {
+  viewSheet.hidden = false;
+});
+
+btnSheetClose.addEventListener('click', () => {
+  viewSheet.hidden = true;
+});
+
+btnCopyId.addEventListener('click', async () => {
+  if (!viewIdCopy.textContent) return;
+  try {
+    await navigator.clipboard.writeText(viewIdCopy.textContent);
+    toastOk('session id copied');
+  } catch (error) {
+    toastError('copy failed: ' + error.message);
+  }
+});
+
+// A watch-only child can only be watched; acting on it means opening the
+// tree owner, which is the only session in the tree that accepts input.
+btnWatchOpen.addEventListener('click', () => {
+  const owner = sessions.find((session) => session.id === current);
+  const ownerId = owner && owner.owner_id ? owner.owner_id : null;
+  openSession(ownerId || current);
+});
 
 async function send(redirect) {
   if (sending || !input.value.trim()) return;
@@ -2127,7 +2256,7 @@ function handleEvent(event) {
       break;
     case 'state':
       appendLine('state', '* ' + event.state);
-      viewState.textContent = event.state;
+      viewStateDot.className = 'dot ' + event.state;
       break;
     case 'permission':
       updatePermissionBadge(event.permission);
