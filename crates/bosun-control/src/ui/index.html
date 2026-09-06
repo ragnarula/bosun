@@ -1204,6 +1204,9 @@ const NODE_CHIP_LIMIT = 4;
 // pre-select it. "" means default; cleared when the user starts with the
 // default persona.
 const LAST_PERSONA_KEY = 'bosun.last-persona';
+// The unsent chat draft, so closing a session and returning to it never
+// loses what the user was typing.
+const DRAFT_KEY = 'bosun.draft';
 
 function loadLastPersona() {
   try {
@@ -1226,6 +1229,30 @@ function clearLastPersona() {
   try {
     localStorage.removeItem(LAST_PERSONA_KEY);
   } catch (error) {
+  }
+}
+
+function saveDraft() {
+  try {
+    localStorage.setItem(DRAFT_KEY, input.value);
+  } catch (error) {
+    // Private mode or a full quota: the draft degrades to in-memory for this
+    // page load.
+  }
+}
+
+function clearDraft() {
+  try {
+    localStorage.removeItem(DRAFT_KEY);
+  } catch (error) {
+  }
+}
+
+function loadDraft() {
+  try {
+    return localStorage.getItem(DRAFT_KEY) || '';
+  } catch (error) {
+    return '';
   }
 }
 
@@ -1278,8 +1305,20 @@ function rememberCurrentSettings() {
 }
 
 function useRecent(entry) {
-  formNode.value = entry.node;
-  setDir(entry.dir);
+  // A dead node is never offered: a recent whose node is gone is re-offered
+  // against the first live node with the directory dropped, so the reuse
+  // never lands on a broken choice. The persona survives the fallback.
+  const live = nodes.filter((node) => node.up);
+  const node = nodes.some((node) => node.name === entry.node && node.up)
+    ? entry.node
+    : live.length > 0 ? live[0].name : '';
+  if (node !== entry.node) {
+    setDir('');
+    toastOk('node ' + entry.node + ' is gone — pick a directory');
+  } else {
+    setDir(entry.dir);
+  }
+  formNode.value = node;
   // The composer's persona chips are driven by personaSelected; renderPersonaOptions
   // overwrites the select with it, so the recent's persona must be applied to the
   // chip state, not just the select value.
@@ -1542,6 +1581,15 @@ newSessionForm.addEventListener('submit', async (event) => {
     }
     rememberCurrentSettings();
     newSessionForm.hidden = true;
+    // The composer is cleared only by actually starting a session: cancel
+    // and close keep the picks, a successful Start retires them.
+    formNode.value = '';
+    setDir('');
+    personaSelected = '';
+    formPersona.value = '';
+    renderNodeOptions();
+    renderNodeChips();
+    renderPersonaOptions();
     renderRecents();
     await refreshSessions();
     openSession(session.id);
@@ -1570,6 +1618,9 @@ function openSession(id) {
   es.onerror = () => {
     showStatus('events: stream lost, reconnecting');
   };
+  // The chat draft survives closing the session; restore it here so the
+  // resumed session starts where the user left off.
+  input.value = loadDraft();
   if (!inputRow.hidden) input.focus();
 }
 
@@ -1581,6 +1632,7 @@ function closeSession() {
   current = null;
   liveEl = null;
   transcript.textContent = '';
+  saveDraft();
   input.value = '';
   clearAskChips();
   view.hidden = true;
@@ -1737,6 +1789,7 @@ async function send(redirect) {
       redirect: !!redirect,
     });
     input.value = '';
+    clearDraft();
     clearAskChips();
   } catch (error) {
     toastError('send: ' + error.message);
@@ -1750,6 +1803,8 @@ async function send(redirect) {
 
 btnSend.addEventListener('click', () => send(false));
 btnRedirect.addEventListener('click', () => send(true));
+// Keep the chat draft in sync with what the user is typing.
+input.addEventListener('input', saveDraft);
 input.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
