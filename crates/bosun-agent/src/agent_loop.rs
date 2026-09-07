@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::Context;
 use bosun_common::config::PersonaConfig;
@@ -39,6 +40,7 @@ use uuid::Uuid;
 use crate::provider::AskRecipient;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
+use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::skills::RemoteResolution;
 use crate::skills::Skill;
@@ -59,6 +61,16 @@ struct SessionSkills {
 
 /// Caps the summarizer output so a compaction stays cheap.
 const MAX_TOKENS: u32 = 2048;
+
+/// The wake gives up after this many consecutive empty turns. The limit is
+/// fixed so a provider that keeps answering with nothing costs at most this
+/// many model calls per wake.
+const EMPTY_TURN_LIMIT: u32 = 3;
+
+/// The pause between empty-turn retries: long enough for a transient
+/// provider blip to pass, short enough that three attempts and the failure
+/// path fit comfortably inside test timeouts.
+const EMPTY_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 const SUMMARIZATION_PROMPT: &str = "Summarize the conversation so far. Preserve: \
      decisions, file paths, commands run, tool results that still matter, and any \
@@ -192,11 +204,9 @@ pub struct LoopDeps {
 }
 
 /// State a session's loop keeps across wakes: the todo list, the cached
-/// skill and repo-standard lists, and the newest message id in the last
-/// wake's snapshot. Events newer than that are unhandled and keep their
-/// child in the manifest. The id advances at the start of a wake, so an
-/// event is surfaced by exactly one wake even if that wake fails before
-/// completing.
+/// skill and repo-standard lists, and `handled_through` — the newest message
+/// row id a completed turn has reacted to. It advances per completed turn:
+/// authored child events at or below it are handled and leave the manifest.
 #[derive(Default)]
 struct LoopState {
     todos: Vec<Value>,
@@ -205,7 +215,7 @@ struct LoopState {
     /// per session like the skills list. None until the first turn has
     /// fetched; a fetch that fails caches an empty list.
     repo_standards_cache: Option<Vec<String>>,
-    surfaced_through: i64,
+    handled_through: i64,
 }
 
 /// One child session in the per-wake manifest: id, persona, state, and its
@@ -353,11 +363,18 @@ impl InterruptSignal {
 }
 
 enum TurnOutcome {
-    /// The turn ended without tool calls. `text` is the turn's own assistant
-    /// text, so a child's completion report carries the final turn's words —
-    /// a silent final turn reports empty instead of reusing earlier text.
+    /// The turn ended with text and no tool calls. `text` is the turn's own
+    /// assistant text, so a child's completion report carries the final
+    /// turn's words.
     Finished {
         text: String,
+    },
+    /// The turn produced no text and no tool call. The outcome is a fault,
+    /// not a finished turn, so the wake retries it a bounded number of times
+    /// and then fails. `reason` is what the provider's stop event carried, so
+    /// a truncated reply logs differently from a clean empty one.
+    Empty {
+        reason: StopReason,
     },
     ToolCalls,
     /// The turn ended in an `ask`. `question` is the ask's message: a child
@@ -387,6 +404,7 @@ enum StreamEnd {
         text: String,
         tool_calls: BTreeMap<usize, AccumulatedToolCall>,
         stopped: bool,
+        stop_reason: StopReason,
     },
     Interrupted,
     Failed(anyhow::Error),
@@ -423,6 +441,20 @@ async fn handle_wake(
     if blocked {
         return Ok(());
     }
+    // A turn-shaped wake whose thread holds nothing newer than the last
+    // completed turn handled is the wake an event queued while the running
+    // wake surfaced that same event: a completed turn already covered
+    // everything up to the thread's newest row, so running the wake again
+    // would burn a model call on nothing. An empty thread is never dropped —
+    // a fresh session starts at `handled_through == 0`, and its first wake
+    // must not compare equal.
+    if wake == WakeKind::Turn {
+        let thread = deps.store.messages(session_id, false).await?;
+        let newest = thread.last().map(|(id, _)| *id).unwrap_or(0);
+        if newest > 0 && newest <= state.handled_through {
+            return Ok(());
+        }
+    }
     deps.store
         .set_state(session_id, SessionState::Running)
         .await?;
@@ -435,23 +467,30 @@ async fn handle_wake(
         .as_ref()
         .is_some_and(|session| session.parent_id.is_some());
 
-    // The wake's message window is the active thread as it stands now,
-    // shared by every turn of the wake: a turn reads it plus the messages
-    // the wake itself appends, so a child event or user message that lands
-    // mid-wake is invisible to the running turns and surfaces only in its
-    // own queued wake.
-    let mut window = deps.store.messages(session_id, false).await?;
-    // The manifest is built once per wake over the full thread — archived
-    // rows included, so a child's last authored message survives
-    // compaction. It lists the children whose state or latest authored
-    // event this wake's turns are reacting to, and stays fixed for the whole
-    // wake, so a child spawned mid-wake appears from the next wake on.
-    let messages = deps.store.messages(session_id, true).await?;
-    let live = live_children(deps, session_id, state.surfaced_through, &messages).await?;
-    state.surfaced_through = window.last().map(|(id, _)| *id).unwrap_or(0);
+    // The wake's compaction boundary, fixed when the wake begins: everything
+    // at or below it may be retired, and nothing a mid-wake writer appends
+    // above it ever may be. It must not advance with the turns, or compaction
+    // would retire the wake's own tool traffic along with the events.
+    let snapshot = deps.store.messages(session_id, false).await?;
+    let wake_boundary = snapshot.last().map(|(id, _)| *id).unwrap_or(0);
 
     let mut interrupted = false;
+    let mut consecutive_empty = 0;
+    let mut window: Vec<(i64, Message)>;
+    let mut live: Vec<LiveChild>;
+    let mut refresh_newest: i64;
     loop {
+        // Each turn refreshes the window and the manifest from the store, so
+        // an event or message that landed mid-wake is visible to the next
+        // turn, and the manifest reports each child's current state and
+        // latest authored message rather than the wake-start snapshot. The
+        // manifest is built over the full thread — archived rows included,
+        // so a child's last authored message survives compaction.
+        window = deps.store.messages(session_id, false).await?;
+        refresh_newest = window.last().map(|(id, _)| *id).unwrap_or(0);
+        let messages = deps.store.messages(session_id, true).await?;
+        live = live_children(deps, session_id, state.handled_through, &messages).await?;
+
         let signal = Arc::new(InterruptSignal::new());
         let outcome = {
             let mut turn = Box::pin(run_turn(
@@ -461,6 +500,8 @@ async fn handle_wake(
                 &live,
                 &mut window,
                 &signal,
+                wake_boundary,
+                consecutive_empty + 1,
             ));
             loop {
                 tokio::select! {
@@ -500,6 +541,96 @@ async fn handle_wake(
                 }
             }
         };
+        // An empty turn is retried with an identical request, so it must
+        // not advance the boundary: it surfaced nothing, and an advance
+        // would let the retry's rebuilt manifest drop the children the
+        // retried turn has still not reacted to. After the retries give
+        // up, the failed-turn semantics re-surface those events on the
+        // next wake.
+        if !matches!(&outcome, TurnOutcome::Empty { .. }) {
+            // The turn handled the rows its window contained: the whole
+            // refresh plus its own appends, up to the first row another
+            // writer landed mid-turn that the window never saw. Message ids
+            // are global across sessions, so a gap in the window's ids hides
+            // both foreign rows and unseen ones; the re-read thread
+            // separates them. The advance stops at the first unseen row,
+            // which keeps the wake its author queued. Covering the turn's
+            // own appends is what lets the wake an event queued mid-wake
+            // drop once the turn that surfaced it ran.
+            let thread_now = deps.store.messages(session_id, false).await?;
+            let own_appends = window
+                .iter()
+                .filter(|(id, _)| *id > refresh_newest)
+                .map(|(id, _)| *id)
+                .collect::<Vec<i64>>();
+            let mut handled_through = refresh_newest;
+            let mut own_index = 0;
+            for (id, _) in thread_now.iter() {
+                if *id <= refresh_newest {
+                    continue;
+                }
+                if own_index == own_appends.len() || *id != own_appends[own_index] {
+                    break;
+                }
+                handled_through = *id;
+                own_index += 1;
+            }
+            state.handled_through = handled_through;
+        }
+        // An empty turn is retried: nothing was recorded, so the retry sends
+        // an identical request. The count bounds the cost of a provider that
+        // keeps answering with nothing; on the last attempt the outcome
+        // becomes a failure and the existing failed-turn arm ends the wake.
+        let outcome = match outcome {
+            TurnOutcome::Empty { reason } if !interrupted => {
+                consecutive_empty += 1;
+                if consecutive_empty < EMPTY_TURN_LIMIT {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep(EMPTY_RETRY_BACKOFF) => {}
+                        event = rx.recv() => match event {
+                            Some(LoopEvent::Interrupt) => {
+                                deps.store
+                                    .mark_interrupted(session_id, InterruptCause::User)
+                                    .await?;
+                                return Ok(());
+                            }
+                            Some(LoopEvent::Wake) => {
+                                debug!(
+                                    msg = "queuing a wake that arrived during the retry backoff",
+                                    session_id = %session_id
+                                );
+                                pending.push_back(WakeKind::Turn);
+                            }
+                            Some(LoopEvent::ParentMessage) => {
+                                debug!(
+                                    msg = "queuing a parent message that arrived during the retry backoff",
+                                    session_id = %session_id
+                                );
+                                pending.push_back(WakeKind::ParentMessage);
+                            }
+                            Some(LoopEvent::UserMessage) => {
+                                debug!(
+                                    msg = "queuing a user message that arrived during the retry backoff",
+                                    session_id = %session_id
+                                );
+                                pending.push_back(WakeKind::UserMessage);
+                            }
+                            None => return Ok(()),
+                        },
+                    }
+                    continue;
+                }
+                error!(
+                    msg = "giving up after consecutive empty responses",
+                    session_id = %session_id,
+                    empty_responses = consecutive_empty,
+                    stop_reason = ?reason,
+                );
+                TurnOutcome::Failed
+            }
+            outcome => outcome,
+        };
         match outcome {
             TurnOutcome::ToolCalls if !interrupted => {}
             // A child that finished reports to its parent and stops — unless
@@ -511,7 +642,7 @@ async fn handle_wake(
                 if live_children(
                     deps,
                     session_id,
-                    state.surfaced_through,
+                    state.handled_through,
                     &deps.store.messages(session_id, true).await?,
                 )
                 .await?
@@ -589,13 +720,19 @@ async fn handle_wake(
                 }
                 return Ok(());
             }
-            TurnOutcome::ToolCalls | TurnOutcome::Interrupted | TurnOutcome::Failed => {
+            TurnOutcome::Empty { .. }
+            | TurnOutcome::ToolCalls
+            | TurnOutcome::Interrupted
+            | TurnOutcome::Failed => {
                 deps.store
                     .set_state(session_id, SessionState::Interrupted)
                     .await?;
                 return Ok(());
             }
         }
+        // Any outcome that is not an empty retry breaks the streak, so the
+        // next empty turn starts counting at one.
+        consecutive_empty = 0;
     }
 }
 
@@ -679,18 +816,19 @@ pub async fn author_child_event(
     Ok(())
 }
 
-/// The per-wake manifest of the session's children: id, persona, state, and
-/// last authored message. A child is live while it can still act (creating,
-/// running, waiting for input, interrupted) or when its latest authored
-/// event has not been surfaced by a completed wake yet (stopped, newer than
-/// `surfaced_through`). Once a wake has surfaced a stopped child's
+/// The live-children manifest of the session's children: id, persona, state,
+/// and last authored message. A child is live while it can still act
+/// (creating, running, waiting for input, interrupted) or when its latest
+/// authored event has not been handled by a completed turn yet (stopped,
+/// newer than `handled_through`). Once a turn has handled a stopped child's
 /// completion and the parent did not resume it, the child leaves the
 /// manifest. `messages` is the session's own thread, which the authored
-/// events were appended into.
+/// events were appended into. `handled_through` is the per-turn boundary
+/// that decides which authored events are unhandled.
 async fn live_children(
     deps: &LoopDeps,
     session_id: &str,
-    surfaced_through: i64,
+    handled_through: i64,
     messages: &[(i64, Message)],
 ) -> anyhow::Result<Vec<LiveChild>> {
     let children = deps.store.child_sessions(session_id).await?;
@@ -706,7 +844,7 @@ async fn live_children(
     let mut live = Vec::new();
     for child in children {
         let authored = last_authored.get(child.id.as_str());
-        let unhandled = authored.is_some_and(|(id, _)| *id > surfaced_through);
+        let unhandled = authored.is_some_and(|(id, _)| *id > handled_through);
         let can_act = !matches!(child.state, SessionState::Stopped);
         if !(can_act || unhandled) {
             continue;
@@ -721,6 +859,7 @@ async fn live_children(
     Ok(live)
 }
 
+#[allow(clippy::too_many_arguments)] // a turn needs the wake's whole context
 async fn run_turn(
     deps: &Arc<LoopDeps>,
     session_id: &str,
@@ -728,8 +867,21 @@ async fn run_turn(
     live: &[LiveChild],
     window: &mut Vec<(i64, Message)>,
     signal: &Arc<InterruptSignal>,
+    wake_boundary: i64,
+    empty_attempt: u32,
 ) -> TurnOutcome {
-    match run_turn_inner(deps, session_id, state, live, window, signal).await {
+    match run_turn_inner(
+        deps,
+        session_id,
+        state,
+        live,
+        window,
+        signal,
+        wake_boundary,
+        empty_attempt,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             error!(
@@ -742,10 +894,10 @@ async fn run_turn(
     }
 }
 
-/// Appends a message to the store and to the wake's working window, so the
-/// wake's later turns read it: the window mirrors the store's active thread
-/// minus the messages other writers appended mid-wake. Returns the appended
-/// message's row id.
+/// Appends a message to the store and to the turn's working window, so the
+/// turn's later reads see it: the window holds the store's active thread as
+/// it stood at this turn's refresh plus the turn's own appends. Returns the
+/// appended message's row id.
 async fn record_in_wake(
     deps: &LoopDeps,
     session_id: &str,
@@ -857,6 +1009,16 @@ async fn load_remote_skill(
     }
 }
 
+/// The warn message for a turn that produced nothing: a reply cut off by the
+/// output budget logs as truncated rather than as empty.
+fn empty_outcome_message(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::MaxTokens => "turn produced an empty truncated reply",
+        StopReason::StopResponse | StopReason::Other => "turn produced an empty reply",
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // a turn needs the wake's whole context
 async fn run_turn_inner(
     deps: &Arc<LoopDeps>,
     session_id: &str,
@@ -864,6 +1026,8 @@ async fn run_turn_inner(
     live: &[LiveChild],
     window: &mut Vec<(i64, Message)>,
     signal: &Arc<InterruptSignal>,
+    wake_boundary: i64,
+    empty_attempt: u32,
 ) -> anyhow::Result<TurnOutcome> {
     let session = deps
         .store
@@ -888,18 +1052,17 @@ async fn run_turn_inner(
     } else {
         AskRecipient::User
     };
-    // The wake's own appends since its snapshot are in `window`, so a turn
-    // sees the previous turns' tool traffic but nothing that landed mid-wake
-    // from another writer. `surfaced_through` is the snapshot boundary: it
-    // was fixed when the wake began, so compaction may retire everything at
-    // or below it.
+    // The window holds the store's active thread as this turn's wake read it
+    // plus the turn's own appends. `wake_boundary` is the wake's fixed
+    // boundary: compaction may retire everything at or below it, but nothing
+    // a mid-wake writer appended above it.
     let messages: Vec<Message> = maybe_compact(
         deps,
         &turn,
         session_id,
         signal,
         window,
-        state.surfaced_through,
+        wake_boundary,
         ask_recipient,
     )
     .await?;
@@ -1003,13 +1166,14 @@ async fn run_turn_inner(
         ask_recipient,
     })?;
 
-    let (text, tool_calls, stopped) =
+    let (text, tool_calls, stopped, stop_reason) =
         match collect_stream(&mut stream, deps, session_id, signal, &turn).await? {
             StreamEnd::Collected {
                 text,
                 tool_calls,
                 stopped,
-            } => (text, tool_calls, stopped),
+                stop_reason,
+            } => (text, tool_calls, stopped, stop_reason),
             StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
             StreamEnd::Failed(error) => {
                 error!(
@@ -1045,6 +1209,18 @@ async fn run_turn_inner(
     let calls: Vec<(String, String, Value)> = parse_tool_calls(tool_calls, session_id);
 
     if calls.is_empty() {
+        if text.is_empty() {
+            warn!(
+                msg = empty_outcome_message(stop_reason),
+                session_id = %session_id,
+                provider = %turn.provider.name(),
+                model = %turn.provider.model(),
+                empty_attempt = empty_attempt,
+            );
+            return Ok(TurnOutcome::Empty {
+                reason: stop_reason,
+            });
+        }
         return Ok(TurnOutcome::Finished { text });
     }
 
@@ -1550,6 +1726,7 @@ async fn collect_stream(
     let mut text = String::new();
     let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
     let mut stopped = false;
+    let mut stop_reason = StopReason::Other;
 
     loop {
         if signal.flag.load(Ordering::Acquire) {
@@ -1571,7 +1748,11 @@ async fn collect_stream(
                     }
                     call.args_delta.push_str(&args_delta);
                 }
-                Some(Ok(StreamEvent::Stop { input_tokens, output_tokens })) => {
+                Some(Ok(StreamEvent::Stop {
+                    input_tokens,
+                    output_tokens,
+                    stop_reason: reason,
+                })) => {
                     deps.store
                         .append_model_call(
                             session_id,
@@ -1589,6 +1770,7 @@ async fn collect_stream(
                         )
                         .await?;
                     stopped = true;
+                    stop_reason = reason;
                 }
                 Some(Err(error)) => return Ok(StreamEnd::Failed(anyhow::Error::new(error))),
                 None => break,
@@ -1605,6 +1787,7 @@ async fn collect_stream(
         text,
         tool_calls,
         stopped,
+        stop_reason,
     })
 }
 
@@ -1765,12 +1948,11 @@ fn resolve_ask_leaf(window: &[(i64, Message)], named: &str) -> anyhow::Result<St
 
 /// Compacts the wake's working window when it exceeds `max_window_messages`:
 /// the oldest messages are summarized by the provider, archived in the
-/// store, and replaced by a Summary message in the window. Only messages the
-/// wake was woken to process — at or below its snapshot boundary — are
-/// retired: archiving is an id range in the store, and a mid-wake message
-/// from another writer can sit between ids the wake never saw. On a
-/// summarizer failure or interrupt the store is left untouched and the full
-/// window is returned.
+/// store, and replaced by a Summary message in the window. Only messages at
+/// or below the wake's fixed boundary are retired: archiving is an id range
+/// in the store, and a mid-wake message from another writer can sit between
+/// ids the wake never saw. On a summarizer failure or interrupt the store is
+/// left untouched and the full window is returned.
 async fn maybe_compact(
     deps: &Arc<LoopDeps>,
     turn: &TurnModel,
@@ -1895,7 +2077,7 @@ async fn summarize_tail(
                 Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
                 // A summarizer that calls tools contributes no text.
                 Some(Ok(StreamEvent::ToolCallDelta { .. })) => {}
-                Some(Ok(StreamEvent::Stop { input_tokens: input, output_tokens: output })) => {
+                Some(Ok(StreamEvent::Stop { input_tokens: input, output_tokens: output, .. })) => {
                     input_tokens = Some(input);
                     output_tokens = Some(output);
                     stopped = true;
@@ -2029,6 +2211,10 @@ fn skill_ad_line(skill: &Skill) -> String {
         .collect();
     format!("- {} ({}): {}", skill.name, provenance, description)
 }
+/// The rule a supervising session reads beside the live-children manifest: a
+/// child's authored event wakes the parked session, so waiting for a child
+/// costs nothing and a message to a child is always for a reason.
+const WAITING_RULE: &str = "Each child's report or ask wakes this session; to wait for a child, end your turn. Message a child only to answer, redirect, or cancel it.";
 
 /// Builds the system prompt: the persona's role text when it has one (the
 /// built-in default otherwise), then the session's live context — the
@@ -2087,6 +2273,8 @@ fn system_prompt(
                 state_name(child.state)
             ));
         }
+        prompt.push_str("\n\n");
+        prompt.push_str(WAITING_RULE);
     }
     prompt
 }
@@ -2132,6 +2320,7 @@ mod tests {
     use crate::provider::Provider;
     use crate::provider::ProviderCall;
     use crate::provider::ProviderError;
+    use crate::provider::StopReason;
     use crate::provider::StreamEvent;
 
     fn session(id: &str) -> Session {
@@ -2728,6 +2917,15 @@ mod tests {
         }
     }
 
+    /// A clean [`StreamEvent::Stop`]; most tests do not exercise the reason.
+    fn stop(input_tokens: u64, output_tokens: u64) -> StreamEvent {
+        StreamEvent::Stop {
+            input_tokens,
+            output_tokens,
+            stop_reason: StopReason::StopResponse,
+        }
+    }
+
     #[tokio::test]
     async fn wake_streams_text_commits_a_message_and_waits_for_input() {
         let dir = tempdir().unwrap();
@@ -2737,10 +2935,7 @@ mod tests {
         let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hello".into()),
-            StreamEvent::Stop {
-                input_tokens: 5,
-                output_tokens: 2,
-            },
+            stop(5, 2),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -2801,10 +2996,7 @@ mod tests {
         // One million tokens at $3/$15 per million: $3.00 + $15.00 = $18.00.
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1_000_000,
-                output_tokens: 1_000_000,
-            },
+            stop(1_000_000, 1_000_000),
         ]]));
         let deps = Arc::new(test_deps_with_prices(
             &store,
@@ -2895,10 +3087,7 @@ mod tests {
                 name: Some("ask".into()),
                 args_delta: r#"{"message":"continue?","options":["yes","no"]}"#.into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 3,
-                output_tokens: 2,
-            },
+            stop(3, 2),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -3013,17 +3202,11 @@ mod tests {
                     args_delta: r#"{"items":[{"id":"1","content":"write tests","status":"todo"},{"id":"2","content":"fix the bug","status":"in_progress"}]}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 5,
-                    output_tokens: 3,
-                },
+                stop(5, 3),
             ],
             vec![
                 StreamEvent::TextDelta("working on it".into()),
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
         ]));
         let deps = Arc::new(test_deps(
@@ -3134,18 +3317,9 @@ mod tests {
                     name: Some("skill".into()),
                     args_delta: r#"{"name":"my-skill"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("loaded".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("loaded".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -3245,18 +3419,9 @@ mod tests {
                     name: Some("skill".into()),
                     args_delta: r#"{"name":"nope"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let tools = Arc::new(MockTools::new(default_outcome()).serving(
             "skills",
@@ -3445,6 +3610,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             vec![
@@ -3452,6 +3618,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             // A reference call reads one chunk of the same package.
@@ -3465,6 +3632,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             vec![
@@ -3472,6 +3640,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             // An ambiguous short name errors and names every candidate.
@@ -3485,6 +3654,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             vec![
@@ -3492,6 +3662,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             // The full address loads the remote checkout even though the
@@ -3506,6 +3677,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             vec![
@@ -3513,6 +3685,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
         ]));
@@ -3524,20 +3697,34 @@ mod tests {
         ));
         let handle = spawn_loop("s-skill-remote".into(), deps);
 
-        // Each skill call runs one wake: the call's turn, then the text turn
-        // the result feeds back into, then the session waits.
-        for _ in 0..4 {
+        // A wake only runs a turn when the thread holds something newer than
+        // the last completed turn handled, so each skill call's two-turn pair
+        // needs its own wake with new content: a user message between the
+        // pairs is what makes the next wake run.
+        for step in 0..4 {
             handle.send(LoopEvent::Wake);
-        }
-
-        wait_for("all four skill calls to feed back", {
-            let provider = provider.clone();
-            move || {
+            let expected = (step + 1) * 2;
+            wait_for("the skill call and its feed-back turn to run", {
                 let provider = provider.clone();
-                async move { provider.captured_calls().len() == 8 }
+                move || {
+                    let provider = provider.clone();
+                    async move { provider.captured_calls().len() == expected }
+                }
+            })
+            .await;
+            if step < 3 {
+                store
+                    .append_message(
+                        "s-skill-remote",
+                        Role::User,
+                        &Block::Text {
+                            text: "next".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
             }
-        })
-        .await;
+        }
 
         let tool_calls = store.tool_calls("s-skill-remote").await.unwrap();
         assert_eq!(tool_calls.len(), 4);
@@ -3701,6 +3888,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
             vec![
@@ -3708,6 +3896,7 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 },
             ],
         ]));
@@ -3731,6 +3920,19 @@ mod tests {
             }
         })
         .await;
+        // A wake with nothing newer than a completed turn handled runs no
+        // turn, so the second turn needs new content: a user message resumes
+        // the session, as a user reply would from the chat pane.
+        store
+            .append_message(
+                "s-remote-skill",
+                Role::User,
+                &Block::Text {
+                    text: "go on".into(),
+                },
+            )
+            .await
+            .unwrap();
         handle.send(LoopEvent::Wake);
         wait_for("the second turn to run", {
             let provider = provider.clone();
@@ -3809,6 +4011,7 @@ mod tests {
             StreamEvent::Stop {
                 input_tokens: 1,
                 output_tokens: 1,
+                stop_reason: StopReason::StopResponse,
             },
         ]]));
         let deps = Arc::new(test_deps(
@@ -3891,6 +4094,7 @@ mod tests {
             StreamEvent::Stop {
                 input_tokens: 1,
                 output_tokens: 1,
+                stop_reason: StopReason::StopResponse,
             },
         ]]));
         let deps = Arc::new(test_deps(
@@ -3946,18 +4150,9 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"cargo test"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("tests pass".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("tests pass".into()), stop(1, 1)],
         ]));
         let tools = Arc::new(MockTools::new(default_outcome()).serving(
             "repo_standards",
@@ -4041,10 +4236,7 @@ mod tests {
         // fetches the same presence list for its own system prompt.
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("child report".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let tools = Arc::new(MockTools::new(default_outcome()).serving(
             "repo_standards",
@@ -4101,18 +4293,9 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"true"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("done".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
         ]));
         // The node does not answer the presence call: the fetch retries its
         // bounded attempts, then the session runs without a notice.
@@ -4187,18 +4370,9 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"cargo build"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 6,
-                    output_tokens: 4,
-                },
+                stop(6, 4),
             ],
-            vec![
-                StreamEvent::TextDelta("build passed".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("build passed".into()), stop(1, 1)],
         ]));
         let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
         let tools = Arc::new(
@@ -4308,20 +4482,8 @@ mod tests {
         store.create_session(&session("s-resume")).await.unwrap();
 
         let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("hi".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("hi".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -4387,7 +4549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wake_during_a_turn_runs_another_turn_afterwards() {
+    async fn a_wake_during_a_turn_with_nothing_new_in_the_thread_is_dropped() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("s-midwake")).await.unwrap();
@@ -4395,22 +4557,7 @@ mod tests {
         // The delay keeps the first turn in flight while the test sends the
         // second wake, so the wake has to be queued and consumed afterwards.
         let provider = Arc::new(ScriptedProvider::with_delay(
-            vec![
-                vec![
-                    StreamEvent::TextDelta("first".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("second".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-            ],
+            vec![vec![StreamEvent::TextDelta("first".into()), stop(1, 1)]],
             Duration::from_millis(200),
         ));
         let deps = Arc::new(test_deps(
@@ -4432,17 +4579,11 @@ mod tests {
         })
         .await;
 
-        // The first turn is still in flight: the wake is queued, not dropped.
+        // The first turn is still in flight: the second wake is queued. The
+        // turn's own recorded text is all it will find in the thread, and a
+        // completed turn already handled that, so the queued wake runs
+        // nothing.
         handle.send(LoopEvent::Wake);
-
-        wait_for("both turns to run", {
-            let provider = provider.clone();
-            move || {
-                let provider = provider.clone();
-                async move { provider.captured_calls().len() == 2 }
-            }
-        })
-        .await;
 
         wait_for("the session to wait for input", || {
             let store = store.clone();
@@ -4453,6 +4594,15 @@ mod tests {
         })
         .await;
 
+        // Give a mistakenly-run second turn time to reach the provider before
+        // asserting it never did.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "a wake with nothing newer than a completed turn handled runs no turn"
+        );
+
         let messages = store.messages("s-midwake", false).await.unwrap();
         let texts: Vec<&str> = messages
             .iter()
@@ -4461,10 +4611,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            texts.contains(&"first") && texts.contains(&"second"),
-            "both turns committed their text: {texts:?}"
-        );
+        assert_eq!(texts, ["first"], "the first turn's text is recorded once");
 
         handle.stop();
     }
@@ -4495,10 +4642,7 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"sleep 100"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 2,
-                },
+                stop(2, 2),
             ]])),
             tools.clone(),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
@@ -4632,10 +4776,7 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"ls"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 3,
-                    output_tokens: 2,
-                },
+                stop(3, 2),
             ]])),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
@@ -4703,18 +4844,9 @@ mod tests {
                         name: None,
                         args_delta: "{}".into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
-                vec![
-                    StreamEvent::TextDelta("done".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
             ])),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
@@ -4772,18 +4904,9 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"continue?"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -4856,10 +4979,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -4906,10 +5026,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -4963,18 +5080,9 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"rm -rf /"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -5036,10 +5144,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -5083,10 +5188,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -5144,10 +5246,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -5201,18 +5300,9 @@ mod tests {
                     args_delta: r#"{"items":[{"id":"1","content":"write tests","status":"todo"}]}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 5,
-                    output_tokens: 3,
-                },
+                stop(5, 3),
             ],
-            vec![
-                StreamEvent::TextDelta("working on it".into()),
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("working on it".into()), stop(2, 1)],
         ]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -5337,7 +5427,9 @@ mod tests {
         );
 
         // The switch lands between turns: the stored session fields move to
-        // the reviewer persona, and the next wake runs under its model.
+        // the reviewer persona. A plain wake with nothing new in the thread
+        // is dropped, so the next turn runs on a user message, which is never
+        // dropped, and under the new persona's model.
         store
             .switch_persona(
                 "s-switch",
@@ -5348,7 +5440,7 @@ mod tests {
             )
             .await
             .unwrap();
-        handle.send(LoopEvent::Wake);
+        handle.send(LoopEvent::UserMessage);
 
         wait_for("the second turn to run under the reviewer persona", || {
             let store = store.clone();
@@ -5398,13 +5490,7 @@ mod tests {
         let delay = Duration::from_millis(300);
         let coder_provider = Arc::new(ModelNamedProvider {
             inner: ScriptedProvider::with_delay(
-                vec![vec![
-                    StreamEvent::TextDelta("working".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ]],
+                vec![vec![StreamEvent::TextDelta("working".into()), stop(1, 1)]],
                 delay,
             ),
             model: "model-a".into(),
@@ -5493,7 +5579,9 @@ mod tests {
             "the stored session already carries the switch"
         );
 
-        handle.send(LoopEvent::Wake);
+        // A plain wake with nothing new in the thread is dropped, so the
+        // next turn runs on a user message under the reviewer model.
+        handle.send(LoopEvent::UserMessage);
         wait_for("the next turn to run under the reviewer model", || {
             let store = store.clone();
             async move {
@@ -5517,13 +5605,7 @@ mod tests {
 
     /// One text turn, for providers whose exact script does not matter.
     fn one_text_script(text: &str) -> Vec<Vec<StreamEvent>> {
-        vec![vec![
-            StreamEvent::TextDelta(text.into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
-        ]]
+        vec![vec![StreamEvent::TextDelta(text.into()), stop(1, 1)]]
     }
 
     #[tokio::test]
@@ -5546,18 +5628,9 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"second"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 4,
-                    output_tokens: 2,
-                },
+                stop(4, 2),
             ],
-            vec![
-                StreamEvent::TextDelta("both ran".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("both ran".into()), stop(1, 1)],
         ]));
         let tools = Arc::new(MockTools::new(default_outcome()));
         let deps = Arc::new(test_deps(
@@ -5617,18 +5690,9 @@ mod tests {
                         name: Some("shell".into()),
                         args_delta: r#"{"command":"failing-cmd"}"#.into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 2,
-                        output_tokens: 1,
-                    },
+                    stop(2, 1),
                 ],
-                vec![
-                    StreamEvent::TextDelta("ok".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
             ])),
             Arc::new(MockTools::new(ToolOutcome {
                 content: json!({ "error": "boom" }),
@@ -5681,10 +5745,7 @@ mod tests {
             &store,
             Arc::new(ScriptedProvider::new(vec![vec![
                 StreamEvent::TextDelta("hi".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ]])),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
@@ -5740,18 +5801,9 @@ mod tests {
                         name: None,
                         args_delta: r#"build"}"#.into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 3,
-                        output_tokens: 1,
-                    },
+                    stop(3, 1),
                 ],
-                vec![
-                    StreamEvent::TextDelta("done".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
             ])),
             tools.clone(),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
@@ -5827,20 +5879,8 @@ mod tests {
 
         // The first call summarizes the retired tail, the second runs the turn.
         let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("compacted".into()),
-                StreamEvent::Stop {
-                    input_tokens: 200,
-                    output_tokens: 20,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 3,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
+            vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
         ]));
         let deps = Arc::new(test_deps_with_prices(
             &store,
@@ -5945,13 +5985,7 @@ mod tests {
             vec![Err(ProviderError::Parse {
                 detail: "boom".into(),
             })],
-            vec![
-                Ok(StreamEvent::TextDelta("ok".into())),
-                Ok(StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                }),
-            ],
+            vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(stop(1, 1))],
         ]));
         let deps = Arc::new(test_deps_with_max_window(
             &store,
@@ -6021,10 +6055,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("made the change".into()),
-            StreamEvent::Stop {
-                input_tokens: 2,
-                output_tokens: 1,
-            },
+            stop(2, 1),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -6096,7 +6127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_with_nothing_more_to_say_reports_and_stops_instead_of_hanging() {
+    async fn a_silent_child_is_retried_then_fails_with_a_failure_event() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("parent-2")).await.unwrap();
@@ -6105,13 +6136,16 @@ mod tests {
             .await
             .unwrap();
 
-        // The child's turn ends with a stop and no text and no tool calls.
+        // Every turn answers with a stop and no text and no tool calls. The
+        // empty turns are retried and then fail, so the child authors a
+        // failure event to its parent instead of an empty completion report.
         let deps = Arc::new(test_deps(
             &store,
-            Arc::new(ScriptedProvider::new(vec![vec![StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 0,
-            }]])),
+            Arc::new(ScriptedProvider::new(vec![
+                vec![stop(1, 0)],
+                vec![stop(1, 0)],
+                vec![stop(1, 0)],
+            ])),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
         ));
@@ -6119,37 +6153,49 @@ mod tests {
 
         handle.send(LoopEvent::Wake);
 
-        wait_for("the child to stop after reporting", || {
-            let store = store.clone();
-            async move {
-                let stored = store.get_session("child-2").await.unwrap().unwrap();
-                stored.state == SessionState::Stopped
-            }
-        })
+        wait_for(
+            "the child to be interrupted after three empty turns",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("child-2").await.unwrap().unwrap();
+                    stored.state == SessionState::Interrupted
+                }
+            },
+        )
         .await;
 
-        let parent_messages = store.messages("parent-2", false).await.unwrap();
-        assert_eq!(parent_messages.len(), 1);
-        let (child_id, text) = match &parent_messages[0].1.block {
-            Block::ChildEvent {
-                child_id,
-                kind: ChildEventKind::Report,
-                text,
-                ..
-            } => (child_id.as_str(), text.as_str()),
-            _ => panic!("the parent thread must show the child's completion report"),
-        };
-        assert_eq!(child_id, "child-2");
+        let stored = store.get_session("child-2").await.unwrap().unwrap();
         assert_eq!(
-            text, "",
-            "a child with nothing to say authors an empty completion report"
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "three empty turns on a child interrupt it as a crash"
+        );
+
+        let parent_messages = store.messages("parent-2", false).await.unwrap();
+        let events: Vec<(&str, &'static str, &str)> = parent_messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind,
+                    text,
+                    ..
+                } => Some((child_id.as_str(), kind.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [("child-2", "failure", CRASH_FAILURE_TEXT)],
+            "the child authors one failure event and no empty report"
         );
 
         handle.stop();
     }
 
     #[tokio::test]
-    async fn a_silent_final_turn_authors_an_empty_report_not_stale_mid_task_text() {
+    async fn a_silent_final_turn_fails_instead_of_reporting_empty() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("parent-6")).await.unwrap();
@@ -6168,9 +6214,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Turn one talks mid-task and runs a tool; the final turn then ends
-        // with a textless stop. The report must be empty, not the mid-task
-        // words of the earlier turn.
+        // Turn one talks mid-task and runs a tool; the silent final turn is
+        // then retried and fails, so the child crashes instead of reporting
+        // empty, and the mid-task words never reach the parent.
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
                 StreamEvent::TextDelta("working on it".into()),
@@ -6180,15 +6226,11 @@ mod tests {
                     name: Some("shell".into()),
                     args_delta: r#"{"command":"ls"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 0,
-            }],
+            vec![stop(1, 0)],
+            vec![stop(1, 0)],
+            vec![stop(1, 0)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -6200,14 +6242,24 @@ mod tests {
 
         handle.send(LoopEvent::Wake);
 
-        wait_for("the child to stop after reporting", || {
-            let store = store.clone();
-            async move {
-                let stored = store.get_session("child-6").await.unwrap().unwrap();
-                stored.state == SessionState::Stopped
-            }
-        })
+        wait_for(
+            "the child to be interrupted after the silent final turn",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store.get_session("child-6").await.unwrap().unwrap();
+                    stored.state == SessionState::Interrupted
+                }
+            },
+        )
         .await;
+
+        let stored = store.get_session("child-6").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "a silent final turn crashes the child"
+        );
 
         // The mid-task words stay on the child's own transcript...
         let child_messages = store.messages("child-6", false).await.unwrap();
@@ -6218,25 +6270,24 @@ mod tests {
             }),
             "the child's transcript keeps its mid-task text"
         );
-        // ... but the report to the parent carries only the silent final
-        // turn, so it is empty.
+        // ... and the parent holds one failure event and no empty report.
         let parent_messages = store.messages("parent-6", false).await.unwrap();
-        let reports: Vec<(&str, &str)> = parent_messages
+        let events: Vec<(&str, &'static str, &str)> = parent_messages
             .iter()
             .filter_map(|(_, message)| match &message.block {
                 Block::ChildEvent {
                     child_id,
-                    kind: ChildEventKind::Report,
+                    kind,
                     text,
                     ..
-                } => Some((child_id.as_str(), text.as_str())),
+                } => Some((child_id.as_str(), kind.as_str(), text.as_str())),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            reports,
-            [("child-6", "")],
-            "a silent final turn authors an empty report, not stale mid-task text"
+            events,
+            [("child-6", "failure", CRASH_FAILURE_TEXT)],
+            "the silent final turn authors a failure event, not an empty report"
         );
 
         handle.stop();
@@ -6265,19 +6316,10 @@ mod tests {
         // The second script would run a whole second turn if the wake were
         // let through; the assertions below prove it never ran.
         let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("made the change".into()),
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("made the change".into()), stop(2, 1)],
             vec![
                 StreamEvent::TextDelta("a second turn ran".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let deps = Arc::new(test_deps(
@@ -6346,10 +6388,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -6376,6 +6415,415 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_empty_response_is_retried_with_an_identical_request_and_only_the_reply_lands() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-empty-retry"))
+            .await
+            .unwrap();
+
+        // The first turn ends with a textless stop; the retry answers with a
+        // real reply. The empty turn records nothing, so the retry sends the
+        // same request again.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![stop(0, 0)],
+            vec![StreamEvent::TextDelta("the real reply".into()), stop(4, 7)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-empty-retry".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to wait for input after the retried turn", || {
+            let store = store.clone();
+            async move {
+                let stored = store
+                    .get_session("root-empty-retry")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        // The empty turn wrote nothing, so the transcript holds only the real
+        // reply's text.
+        let messages = store.messages("root-empty-retry", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["the real reply"]);
+
+        // Both calls are recorded; the empty one metered zero tokens, and it
+        // sent an identical request to the retry.
+        let calls = store.model_calls("root-empty-retry").await.unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].input_tokens, Some(0));
+        assert_eq!(calls[0].output_tokens, Some(0));
+        let captured = provider.captured_calls();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&captured[0].messages).unwrap(),
+            serde_json::to_value(&captured[1].messages).unwrap(),
+            "the retry re-sends the empty turn's request unchanged"
+        );
+        assert_eq!(
+            captured[0].system, captured[1].system,
+            "the retry re-sends the empty turn's system prompt unchanged"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn three_empty_responses_end_a_root_interrupted_as_a_crash() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-empty-crash"))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![stop(1, 0)],
+            vec![stop(1, 0)],
+            vec![stop(1, 0)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-empty-crash".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for(
+            "the root to be interrupted after three empty responses",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store
+                        .get_session("root-empty-crash")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stored.state == SessionState::Interrupted
+                }
+            },
+        )
+        .await;
+
+        let stored = store
+            .get_session("root-empty-crash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "three empty responses interrupt the session as a crash"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            3,
+            "the three empty turns each cost one model call"
+        );
+        assert!(
+            store
+                .messages("root-empty-crash", false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the empty turns record nothing in the transcript"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn three_truncated_empty_responses_fail_like_empty_ones() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-truncated-crash"))
+            .await
+            .unwrap();
+
+        // Each turn spends its whole output budget without producing text or
+        // a tool call: the fault is decided on content, so the truncation
+        // takes the same retry-and-fail path as a clean empty response.
+        let truncated = || StreamEvent::Stop {
+            input_tokens: 1,
+            output_tokens: 0,
+            stop_reason: StopReason::MaxTokens,
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![truncated()],
+            vec![truncated()],
+            vec![truncated()],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-truncated-crash".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for(
+            "the root to be interrupted after three truncated responses",
+            || {
+                let store = store.clone();
+                async move {
+                    let stored = store
+                        .get_session("root-truncated-crash")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stored.state == SessionState::Interrupted
+                }
+            },
+        )
+        .await;
+
+        let stored = store
+            .get_session("root-truncated-crash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::Crash),
+            "three truncated empty responses interrupt the session as a crash"
+        );
+        assert_eq!(provider.captured_calls().len(), 3);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_truncated_reply_with_text_still_finishes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-truncated-text"))
+            .await
+            .unwrap();
+
+        // The reply is cut off by the output budget but did emit text: the
+        // fault test is content-only, so the turn finishes instead of being
+        // retried.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("working on it".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+                stop_reason: StopReason::MaxTokens,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-truncated-text".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store
+                    .get_session("root-truncated-text")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "a truncated reply with text is not retried"
+        );
+        let messages = store.messages("root-truncated-text", false).await.unwrap();
+        assert!(
+            messages.iter().any(|(_, message)| {
+                message.role == Role::Assistant
+                    && matches!(&message.block, Block::Text { text } if text == "working on it")
+            }),
+            "the truncated turn's text is in the transcript"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn non_consecutive_empty_responses_do_not_trip_the_limit() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-empty-interleaved"))
+            .await
+            .unwrap();
+
+        let tool_call = |id: &str| StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some(id.into()),
+            name: Some("shell".into()),
+            args_delta: r#"{"command":"ls"}"#.into(),
+        };
+        // Three empty turns, each followed by a productive turn, so no two
+        // empties are consecutive: the session must finish normally instead
+        // of hitting the limit.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![stop(1, 0)],
+            vec![tool_call("call-1"), stop(2, 1)],
+            vec![stop(1, 0)],
+            vec![tool_call("call-2"), stop(2, 1)],
+            vec![stop(1, 0)],
+            vec![tool_call("call-3"), stop(2, 1)],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-empty-interleaved".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to finish normally", || {
+            let store = store.clone();
+            async move {
+                let stored = store
+                    .get_session("root-empty-interleaved")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+        assert_eq!(
+            provider.captured_calls().len(),
+            7,
+            "each script answers one turn of the wake"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_during_the_empty_retry_backoff_ends_the_turn_interrupted() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-empty-interrupt"))
+            .await
+            .unwrap();
+
+        // The second script would be consumed only if the retry ran; the
+        // interrupt during the backoff must stop the wake before it does.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![stop(1, 0)],
+            vec![
+                StreamEvent::TextDelta("the retry must never run".into()),
+                stop(1, 1),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-empty-interrupt".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        // Wait until the empty turn has ended, so the interrupt lands in the
+        // backoff rather than before the wake started.
+        wait_for("the empty turn's model call to be recorded", || {
+            let store = store.clone();
+            async move {
+                store
+                    .model_calls("root-empty-interrupt")
+                    .await
+                    .unwrap()
+                    .len()
+                    == 1
+            }
+        })
+        .await;
+        handle.send(LoopEvent::Interrupt);
+
+        wait_for("the root to be interrupted", || {
+            let store = store.clone();
+            async move {
+                let stored = store
+                    .get_session("root-empty-interrupt")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                stored.state == SessionState::Interrupted
+            }
+        })
+        .await;
+
+        let stored = store
+            .get_session("root-empty-interrupt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.interrupt_cause,
+            Some(InterruptCause::User),
+            "an interrupt during the retry backoff is a user interrupt"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "the retry never ran after the interrupt"
+        );
+
+        handle.stop();
+    }
+
+    #[test]
+    fn empty_outcome_message_distinguishes_a_truncated_reply() {
+        assert_eq!(
+            empty_outcome_message(StopReason::StopResponse),
+            empty_outcome_message(StopReason::Other),
+            "a clean empty stop and an other stop share the empty-response message"
+        );
+        assert_ne!(
+            empty_outcome_message(StopReason::MaxTokens),
+            empty_outcome_message(StopReason::StopResponse),
+            "a truncated reply logs as truncated, not as an empty response"
+        );
     }
 
     #[tokio::test]
@@ -6414,10 +6862,7 @@ mod tests {
                 name: Some("shell".into()),
                 args_delta: r#"{"command":"sleep 100"}"#.into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 2,
-                output_tokens: 1,
-            },
+            stop(2, 1),
         ]]));
         let deps_a = Arc::new(test_deps(
             &store,
@@ -6429,10 +6874,7 @@ mod tests {
 
         let provider_b = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("b done".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps_b = Arc::new(test_deps(
             &store,
@@ -6527,17 +6969,11 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"coder","instructions":"review the diff"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 3,
-                    output_tokens: 2,
-                },
+                stop(3, 2),
             ],
             vec![
                 StreamEvent::TextDelta("spawned, continuing".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let spawner = Arc::new(FakeSpawner::ok("child-4"));
@@ -6631,10 +7067,7 @@ mod tests {
         for (id, role) in [("parent-5", "root"), ("child-5", "child")] {
             let provider = Arc::new(ScriptedProvider::new(vec![vec![
                 StreamEvent::TextDelta("hi".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ]]));
             let deps = Arc::new(test_deps_with_spawner(
                 &store,
@@ -6681,10 +7114,7 @@ mod tests {
         for (id, role) in [("parent-5", "root"), ("child-5", "child")] {
             let provider = Arc::new(ScriptedProvider::new(vec![vec![
                 StreamEvent::TextDelta("hi".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ]]));
             let deps = Arc::new(test_deps_with_personas(
                 &store,
@@ -6751,18 +7181,9 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("spawned".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("spawned".into()), stop(1, 1)],
         ]));
         let spawner = Arc::new(FakeSpawner::ok("grandchild-6"));
         let deps = Arc::new(test_deps_with_spawner(
@@ -6852,17 +7273,11 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
             vec![
                 StreamEvent::TextDelta("will do it myself".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let spawner = Arc::new(FakeSpawner::failing("node n1 is not up"));
@@ -6947,18 +7362,9 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let spawner = Arc::new(FakeSpawner::failing("node n1 is not up"));
         let deps = Arc::new(test_deps_with_spawner(
@@ -7024,18 +7430,9 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"nope","instructions":"do it"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -7112,18 +7509,9 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"coder","instructions":"do it"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("ok".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -7195,27 +7583,15 @@ mod tests {
 
         let mailbox = Arc::new(TestMailbox::new());
         let root_provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("delegated".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("delegated".into()), stop(1, 1)],
             vec![
                 StreamEvent::TextDelta("thanks for the report".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("made the change".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let root_handle = spawn_loop(
             "root-t1".into(),
@@ -7383,20 +7759,8 @@ mod tests {
         .await;
 
         let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("noted".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("all done".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("noted".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("all done".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -7483,6 +7847,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_waiting_rule_is_stated_while_live_children_exist() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-tw3")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-tw3", "root-tw3"))
+            .await
+            .unwrap();
+        // The child completed before this loop starts: it is stopped and its
+        // event sits in the parent's thread, not yet surfaced, so the wake's
+        // manifest lists it.
+        store
+            .set_state("child-tw3", SessionState::Stopped)
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "root-tw3",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        deliver_child_event(
+            &store,
+            "root-tw3",
+            "child-tw3",
+            ChildEventKind::Report,
+            "the work is done",
+        )
+        .await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta("noted".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("all done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-tw3".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the wake that surfaces the event to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            calls[0].system.contains(&manifest_line(
+                "child-tw3",
+                "coder",
+                "stopped",
+                "the work is done"
+            )),
+            "the surfacing wake lists the stopped child: {}",
+            calls[0].system
+        );
+        assert!(
+            calls[0].system.contains(WAITING_RULE),
+            "a wake with live children states the waiting rule: {}",
+            calls[0].system
+        );
+
+        // The next wake — a user message — no longer lists the child: the
+        // completion was handled and the parent did not resume it, so the
+        // rule must be gone with the manifest.
+        store
+            .append_message(
+                "root-tw3",
+                Role::User,
+                &Block::Text {
+                    text: "any news?".into(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the user message's turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            !calls[1].system.contains("Live children:"),
+            "no live children remain: {}",
+            calls[1].system
+        );
+        assert!(
+            !calls[1].system.contains(WAITING_RULE),
+            "a wake without live children does not state the waiting rule: {}",
+            calls[1].system
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn a_child_event_delivered_mid_turn_is_queued_until_the_turn_ends() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -7507,20 +7985,8 @@ mod tests {
         // delivered, so the event has to queue and surface afterwards.
         let provider = Arc::new(ScriptedProvider::with_delay(
             vec![
-                vec![
-                    StreamEvent::TextDelta("working".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("reacted".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("working".into()), stop(1, 1)],
+                vec![StreamEvent::TextDelta("reacted".into()), stop(1, 1)],
             ],
             Duration::from_millis(150),
         ));
@@ -7623,7 +8089,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_burst_of_mid_turn_child_events_is_handled_serially() {
+    async fn a_burst_of_mid_turn_child_events_is_surfaced_by_one_turn_and_the_redundant_wake_is_dropped()
+     {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-t4")).await.unwrap();
@@ -7648,27 +8115,8 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::with_delay(
             vec![
-                vec![
-                    StreamEvent::TextDelta("overseeing".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("both handled".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("nothing left".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("overseeing".into()), stop(1, 1)],
+                vec![StreamEvent::TextDelta("both handled".into()), stop(1, 1)],
             ],
             Duration::from_millis(150),
         ));
@@ -7720,47 +8168,49 @@ mod tests {
         handle.send(LoopEvent::Wake);
         handle.send(LoopEvent::Wake);
 
-        wait_for("both queued wakes to run turns", {
+        // The first queued wake surfaces both events in one turn; the second
+        // queued wake finds nothing newer than the turn handled and drops, so
+        // no third model call happens.
+        wait_for("the first queued wake to surface both events", {
             let provider = provider.clone();
             move || {
                 let provider = provider.clone();
-                async move { provider.captured_calls().len() == 3 }
+                async move { provider.captured_calls().len() == 2 }
             }
         })
         .await;
 
         let calls = provider.captured_calls();
-        assert_eq!(calls.len(), 3, "the two queued wakes ran serially");
-        for call in &calls[1..] {
-            assert!(
-                call.messages.iter().any(|message| matches!(
-                    &message.block,
-                    Block::ChildEvent { child_id, .. }
-                        if child_id == "child-t4a" || child_id == "child-t4b"
-                )),
-                "every queued wake sees the burst events in the thread"
-            );
-        }
-        let first_reaction = &calls[1];
-        assert!(
-            first_reaction.system.contains(&manifest_line(
-                "child-t4a",
-                "coder",
-                "stopped",
-                "a done"
-            )) && first_reaction.system.contains(&manifest_line(
-                "child-t4b",
-                "coder",
-                "stopped",
-                "b done"
-            )),
-            "the first reaction wake lists both stopped children: {}",
-            first_reaction.system
+        assert_eq!(
+            calls.len(),
+            2,
+            "the surfacing wake ran and the redundant wake was dropped"
         );
         assert!(
-            !calls[2].system.contains("child-t4a") && !calls[2].system.contains("child-t4b"),
-            "children leave the manifest once their completions are handled: {}",
-            calls[2].system
+            calls[1].messages.iter().any(|message| matches!(
+                &message.block,
+                Block::ChildEvent { child_id, text, .. }
+                    if child_id == "child-t4a" && text == "a done"
+            )) && calls[1].messages.iter().any(|message| matches!(
+                &message.block,
+                Block::ChildEvent { child_id, text, .. }
+                    if child_id == "child-t4b" && text == "b done"
+            )),
+            "the surfacing wake's turn sees both burst events: {:#?}",
+            calls[1].messages
+        );
+        assert!(
+            calls[1]
+                .system
+                .contains(&manifest_line("child-t4a", "coder", "stopped", "a done"))
+                && calls[1].system.contains(&manifest_line(
+                    "child-t4b",
+                    "coder",
+                    "stopped",
+                    "b done"
+                )),
+            "the surfacing wake lists both stopped children: {}",
+            calls[1].system
         );
 
         wait_for("the parent to wait for input", || {
@@ -7771,6 +8221,24 @@ mod tests {
             }
         })
         .await;
+
+        let messages = store.messages("root-t4", false).await.unwrap();
+        let reports: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    kind: ChildEventKind::Report,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            ["a done", "b done"],
+            "both events sit in the parent's thread, surfaced exactly once"
+        );
 
         for child in ["child-t4a", "child-t4b"] {
             let stored = store.get_session(child).await.unwrap().unwrap();
@@ -7785,7 +8253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mid_wake_child_event_is_invisible_to_the_wake_that_is_running_and_handled_once_in_its_own()
+    async fn a_mid_wake_child_event_is_visible_to_the_running_wake_s_next_turn_and_drops_the_wake_it_queued()
      {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -7808,8 +8276,8 @@ mod tests {
         let mailbox = Arc::new(TestMailbox::new());
         // The root's first turn runs a tool; the delay keeps the rest of the
         // same wake from reading a window until the child event has landed
-        // mid-wake. The root then has one more turn in this wake, which is
-        // the turn that must not see the event.
+        // mid-wake. The wake then runs one more turn, which refreshes the
+        // window and surfaces the event.
         let root_provider = Arc::new(ScriptedProvider::with_delay(
             vec![
                 vec![
@@ -7819,41 +8287,16 @@ mod tests {
                         name: Some("shell".into()),
                         args_delta: r#"{"command":"work"}"#.into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
-                vec![
-                    StreamEvent::TextDelta("continuing".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("reacting".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("all set".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("continuing".into()), stop(1, 1)],
+                vec![StreamEvent::TextDelta("all set".into()), stop(1, 1)],
             ],
             Duration::from_millis(200),
         ));
         let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("mid-wake done".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let root_handle = spawn_loop(
             "root-mw".into(),
@@ -7891,7 +8334,7 @@ mod tests {
 
         // The child completes while the root's first turn is still in
         // flight: its event lands mid-wake and its own wake queues behind
-        // the turns of the running wake.
+        // the running wake's remaining turns.
         child_handle.send(LoopEvent::Wake);
         wait_for("the child to stop after reporting", || {
             let store = store.clone();
@@ -7902,11 +8345,14 @@ mod tests {
         })
         .await;
 
-        wait_for("the running wake's turns and the queued wake to run", {
+        // The running wake's next turn surfaces the event; the wake the
+        // event queued then finds nothing newer than a completed turn
+        // handled and drops, so no third model call happens.
+        wait_for("the running wake's second turn to run", {
             let root_provider = root_provider.clone();
             move || {
                 let root_provider = root_provider.clone();
-                async move { root_provider.captured_calls().len() == 3 }
+                async move { root_provider.captured_calls().len() == 2 }
             }
         })
         .await;
@@ -7914,8 +8360,8 @@ mod tests {
         let calls = root_provider.captured_calls();
         assert_eq!(
             calls.len(),
-            3,
-            "the wake and the queued wake ran their turns"
+            2,
+            "the running wake's next turn ran and the queued wake was dropped"
         );
         let sees_event = |call: &CapturedCall| {
             call.messages.iter().any(|message| {
@@ -7931,32 +8377,27 @@ mod tests {
             })
         };
         assert!(
-            !sees_event(&calls[0]) && !sees_event(&calls[1]),
-            "no turn of the wake the event landed in may see it: {:#?}",
-            calls
-                .iter()
-                .take(2)
-                .map(|call| &call.messages)
-                .collect::<Vec<_>>()
+            !sees_event(&calls[0]),
+            "the in-flight first turn predates the mid-wake event"
         );
         assert!(
-            sees_event(&calls[2]),
-            "the event's own queued wake surfaces the child's report once: {:#?}",
-            calls[2].messages
+            sees_event(&calls[1]),
+            "the running wake's next turn surfaces the child's report: {:#?}",
+            calls[1].messages
         );
         assert!(
-            calls[2].system.contains(&manifest_line(
+            calls[1].system.contains(&manifest_line(
                 "child-mw",
                 "coder",
                 "stopped",
                 "mid-wake done"
             )),
-            "the event's own wake lists the child with the event: {}",
-            calls[2].system
+            "the next turn's manifest reports the child's current state and latest message: {}",
+            calls[1].system
         );
 
-        // The queued wake handled the completion and did not resume the
-        // child, so the next user wake no longer lists it.
+        // The surfaced completion was not resumed, so the next user wake no
+        // longer lists the child.
         store
             .append_message(
                 "root-mw",
@@ -7972,16 +8413,16 @@ mod tests {
             let root_provider = root_provider.clone();
             move || {
                 let root_provider = root_provider.clone();
-                async move { root_provider.captured_calls().len() == 4 }
+                async move { root_provider.captured_calls().len() == 3 }
             }
         })
         .await;
 
         let calls = root_provider.captured_calls();
         assert!(
-            !calls[3].system.contains("child-mw"),
+            !calls[2].system.contains("child-mw"),
             "the child leaves the manifest once its event was handled: {}",
-            calls[3].system
+            calls[2].system
         );
 
         let parent_messages = store.messages("root-mw", false).await.unwrap();
@@ -8056,32 +8497,13 @@ mod tests {
                         name: Some("shell".into()),
                         args_delta: r#"{"command":"work"}"#.into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
                 vec![
                     StreamEvent::TextDelta("compacted the tail".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 200,
-                        output_tokens: 20,
-                    },
+                    stop(200, 20),
                 ],
-                vec![
-                    StreamEvent::TextDelta("continuing".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("reacting".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("reacting".into()), stop(1, 1)],
             ],
             Duration::from_millis(200),
         ));
@@ -8117,23 +8539,24 @@ mod tests {
         .await;
         handle.send(LoopEvent::Wake);
 
-        // The running wake then continues: its second turn exceeds the
-        // window limit and compacts the snapshot tail, and the queued wake
-        // runs the event's own turn afterwards. Call 1 is the summarizer.
+        // The running wake's second turn exceeds the window limit, compacts
+        // the snapshot tail, and reacts to the event it refreshed. The queued
+        // wake then finds nothing newer than a completed turn handled and
+        // drops. Call 1 is the summarizer.
         wait_for(
-            "the second turn, its compaction, and the queued wake to run",
+            "the second turn, its compaction, and its reaction to run",
             {
                 let provider = provider.clone();
                 move || {
                     let provider = provider.clone();
-                    async move { provider.captured_calls().len() == 4 }
+                    async move { provider.captured_calls().len() == 3 }
                 }
             },
         )
         .await;
 
         let calls = provider.captured_calls();
-        assert_eq!(calls.len(), 4, "turn, summarizer, second turn, event wake");
+        assert_eq!(calls.len(), 3, "tool turn, summarizer, and reaction turn");
         let sees_event = |call: &CapturedCall| {
             call.messages.iter().any(|message| {
                 matches!(
@@ -8148,9 +8571,9 @@ mod tests {
             })
         };
         assert!(
-            !sees_event(&calls[0]) && !sees_event(&calls[2]),
-            "the compacting wake's turns never see the mid-wake event: {:#?}",
-            calls[2].messages
+            !sees_event(&calls[0]),
+            "the in-flight first turn predates the mid-wake event: {:#?}",
+            calls[0].messages
         );
         assert!(
             calls[1]
@@ -8158,13 +8581,13 @@ mod tests {
                 .iter()
                 .any(|message| message.role == Role::User
                     && matches!(&message.block, Block::Text { text } if text.contains("assistant 4"))),
-            "the summarizer retires the snapshot tail: {:#?}",
+            "the summarizer retires the preloaded snapshot tail: {:#?}",
             calls[1].messages
         );
         assert!(
-            sees_event(&calls[3]),
-            "the event surfaces in its own queued wake, unarchived: {:#?}",
-            calls[3].messages
+            sees_event(&calls[2]),
+            "the running wake's next turn sees the mid-wake event, unarchived: {:#?}",
+            calls[2].messages
         );
 
         let active = store.messages("root-cp", false).await.unwrap();
@@ -8208,40 +8631,16 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"child-t5","text":"give me more detail"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("thanks".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("good detail".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("thanks".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("good detail".into()), stop(1, 1)],
         ]));
         let child_provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("first findings".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("first findings".into()), stop(1, 1)],
             vec![
                 StreamEvent::TextDelta("here is the detail".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let root_handle = spawn_loop(
@@ -8364,7 +8763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_child_reaches_a_running_child_which_reads_it_only_after_its_wake_and_stays_in_the_manifest()
+    async fn message_child_reaches_a_running_child_which_reads_it_on_its_next_turn_and_again_when_resumed()
      {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -8396,9 +8795,9 @@ mod tests {
 
         let mailbox = Arc::new(TestMailbox::new());
         // The child's first turn runs a tool; the delay keeps the child
-        // running while the parent's message lands behind it. The child then
-        // finishes its own wake before reading the message, in the wake the
-        // parent message started.
+        // running while the parent's message lands behind it. Each turn
+        // refreshes the child's window, so the message is visible to the
+        // child's next turn within the running wake.
         let child_provider = Arc::new(ScriptedProvider::with_delay(
             vec![
                 vec![
@@ -8408,24 +8807,12 @@ mod tests {
                         name: Some("shell".into()),
                         args_delta: r#"{"command":"review"}"#.into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
-                vec![
-                    StreamEvent::TextDelta("task done".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("task done".into()), stop(1, 1)],
                 vec![
                     StreamEvent::TextDelta("here is the detail".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
             ],
             Duration::from_millis(200),
@@ -8438,39 +8825,12 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"child-mr","text":"send a progress update"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("requested".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("done noted".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("detail noted".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("all set".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("requested".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("done noted".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("detail noted".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("all set".into()), stop(1, 1)],
         ]));
         let root_handle = spawn_loop(
             "root-mr".into(),
@@ -8553,8 +8913,8 @@ mod tests {
         })
         .await;
 
-        // The child read the parent's message only in the wake it started:
-        // its own in-flight wake finished its turns without seeing it.
+        // The child read the parent's message on its own wake's next turn, and
+        // again in the parent-message wake that resumed it for the answer.
         let child_calls = child_provider.captured_calls();
         assert_eq!(
             child_calls.len(),
@@ -8565,9 +8925,16 @@ mod tests {
             !child_calls[0]
                 .messages
                 .iter()
-                .chain(child_calls[1].messages.iter())
                 .any(|message| matches!(&message.block, Block::Text { text } if text == "send a progress update")),
-            "the child's running wake never saw the parent's message: {:#?}",
+            "the in-flight first turn predates the parent's message: {:#?}",
+            child_calls[0].messages
+        );
+        assert!(
+            child_calls[1]
+                .messages
+                .iter()
+                .any(|message| matches!(&message.block, Block::Text { text } if text == "send a progress update")),
+            "the child's running wake sees the parent's message on its next turn: {:#?}",
             child_calls[1].messages
         );
         assert!(
@@ -8686,10 +9053,7 @@ mod tests {
         ] {
             let provider = Arc::new(ScriptedProvider::new(vec![vec![
                 StreamEvent::TextDelta("hi".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ]]));
             let deps = if name.contains("without mailbox") {
                 test_deps(
@@ -8764,10 +9128,7 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"other-child","text":"hi"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -8776,10 +9137,7 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"ghost","text":"hi"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -8788,18 +9146,9 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"my-child","text":"please expand"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("done".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps_with_mailbox(
             &store,
@@ -8875,10 +9224,7 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"my-child","text":"hi"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -8887,10 +9233,7 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"ghost","text":"hi"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -8899,18 +9242,9 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"nested-t7","text":"please expand"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("done".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps_with_mailbox(
             &store,
@@ -9019,10 +9353,7 @@ mod tests {
                 name: Some("ask".into()),
                 args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -9128,24 +9459,15 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"child-s6ans","text":"yes, push to main"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("answered the child".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("noted the report".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         // The child asks its first turn, then resumes from its own thread
@@ -9158,18 +9480,9 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("pushed to main".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("pushed to main".into()), stop(1, 1)],
         ]));
         let root_handle = spawn_loop(
             "root-s6ans".into(),
@@ -9312,24 +9625,15 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: format!(r#"{{"id":"child-s6den","text":"{denial}"}}"#),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("denied the child".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("the re-ask stays pending".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let child_provider = Arc::new(ScriptedProvider::new(vec![
@@ -9341,10 +9645,7 @@ mod tests {
                     args_delta: r#"{"message":"may I push to main?","options":["yes","no"]}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -9353,10 +9654,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push to a branch instead?"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let root_handle = spawn_loop(
@@ -9487,10 +9785,7 @@ mod tests {
                     r#"{"message":"may I push?","options":["yes","no"],"child_id":"child-s6sur"}"#
                         .into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::ToolCallDelta {
@@ -9499,10 +9794,7 @@ mod tests {
                 name: Some("ask".into()),
                 args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let root_handle = spawn_loop(
             "root-s6sur".into(),
@@ -9631,10 +9923,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push to main?","options":["yes","no"],"child_id":"child-s6red"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -9643,24 +9932,15 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: format!(r#"{{"id":"child-s6red","text":"{cancel_notice}"}}"#),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("cancelled the ask".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("noted the report".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let child_provider = Arc::new(ScriptedProvider::new(vec![
@@ -9672,17 +9952,11 @@ mod tests {
                     args_delta: r#"{"message":"may I push to main?","options":["yes","no"]}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("understood — stopping the push".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let root_handle = spawn_loop(
@@ -9873,10 +10147,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"runner-s6np"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -9885,10 +10156,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"done-s6np"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -9897,18 +10165,9 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"waiter-s6np"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("noted".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("noted".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -10031,10 +10290,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"child-a-s6two"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -10044,17 +10300,11 @@ mod tests {
                     args_delta: r#"{"message":"may I refactor?","child_id":"child-b-s6two"}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("waiting on the user".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let child_provider = Arc::new(ScriptedProvider::new(vec![vec![
@@ -10064,10 +10314,7 @@ mod tests {
                 name: Some("ask".into()),
                 args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let root_handle = spawn_loop(
             "root-s6two".into(),
@@ -10187,18 +10434,9 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"continue?","options":["yes","no"]}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("continuing".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("continuing".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -10321,13 +10559,7 @@ mod tests {
         // exactly once and the root's reaction ends in the ask.
         let provider = Arc::new(ScriptedProvider::with_delay(
             vec![
-                vec![
-                    StreamEvent::TextDelta("overseeing".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
-                ],
+                vec![StreamEvent::TextDelta("overseeing".into()), stop(1, 1)],
                 vec![
                     StreamEvent::ToolCallDelta {
                         index: 0,
@@ -10335,10 +10567,7 @@ mod tests {
                         name: Some("ask".into()),
                         args_delta: r#"{"message":"may I push?","child_id":"child-s6mid"}"#.into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
             ],
             Duration::from_millis(200),
@@ -10452,10 +10681,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"foreign-child"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -10464,10 +10690,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"ghost"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -10476,10 +10699,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"proceed?"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let deps = Arc::new(test_deps(
@@ -10582,10 +10802,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","child_id":"foreign-child"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -10594,10 +10811,7 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let deps = Arc::new(test_deps(
@@ -10688,17 +10902,11 @@ mod tests {
                     name: Some("todowrite".into()),
                     args_delta: r#"{"items":[{"id":"1","content":"plan","status":"todo"}]}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
             vec![
                 StreamEvent::TextDelta("continuing without a todo list".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let deps = Arc::new(test_deps(
@@ -10752,18 +10960,9 @@ mod tests {
                     name: Some("todowrite".into()),
                     args_delta: r#"{"items":[{"id":"1","content":"plan","status":"todo"}]}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("planned".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("planned".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -10849,10 +11048,7 @@ mod tests {
         ] {
             let provider = Arc::new(ScriptedProvider::new(vec![vec![
                 StreamEvent::TextDelta("hi".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ]]));
             let deps = Arc::new(test_deps_with_spawner(
                 &store,
@@ -10899,10 +11095,7 @@ mod tests {
         // allow-list is: the catalog stays out of the prompt.
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -10971,17 +11164,11 @@ mod tests {
                         r#"{"message":"may I push?","options":["yes","no"],"child_id":"mid-s7deep"}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("noted the report".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         // The mid-level session surfaces the leaf's question to its own
@@ -10996,17 +11183,11 @@ mod tests {
                         r#"{"message":"may I push?","options":["yes","no"],"child_id":"leaf-s7deep"}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("recorded the result".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         // The leaf asks, waits for the user's answer, and completes on it.
@@ -11018,18 +11199,9 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("pushed to main".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("pushed to main".into()), stop(1, 1)],
         ]));
 
         let mailbox = Arc::new(TestMailbox::new());
@@ -11269,10 +11441,7 @@ mod tests {
                     args_delta: r#"{"message":"may I push to main?","options":["yes","no"],"child_id":"mid-s7redir"}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -11281,17 +11450,11 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: format!(r#"{{"id":"mid-s7redir","text":"{root_redirect}"}}"#),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("relayed the redirect to mid".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -11301,17 +11464,11 @@ mod tests {
                     args_delta: r#"{"message":"may I review the README instead?","options":["yes","no"],"child_id":"mid-s7redir"}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("awaiting the answer".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let mid_provider = Arc::new(ScriptedProvider::new(vec![
@@ -11324,10 +11481,7 @@ mod tests {
                         r#"{"message":"may I push to main?","options":["yes","no"],"child_id":"leaf-s7redir"}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -11336,17 +11490,11 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: format!(r#"{{"id":"leaf-s7redir","text":"{mid_relay}"}}"#),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("relayed the cancellation to the leaf".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -11357,10 +11505,7 @@ mod tests {
                         r#"{"message":"may I review the README instead?","options":["yes","no"],"child_id":"leaf-s7redir"}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let leaf_provider = Arc::new(ScriptedProvider::new(vec![
@@ -11372,10 +11517,7 @@ mod tests {
                     args_delta: r#"{"message":"may I push to main?","options":["yes","no"]}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -11386,10 +11528,7 @@ mod tests {
                         r#"{"message":"may I review the README instead?","options":["yes","no"]}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
 
@@ -11585,10 +11724,7 @@ mod tests {
             vec![
                 vec![
                     StreamEvent::TextDelta("overseeing".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
                 vec![
                     StreamEvent::ToolCallDelta {
@@ -11598,17 +11734,11 @@ mod tests {
                         args_delta: r#"{"message":"may I push?","options":["yes","no"],"child_id":"mid-s7conc"}"#
                             .into(),
                     },
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
                 vec![
                     StreamEvent::TextDelta("noted".into()),
-                    StreamEvent::Stop {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                    },
+                    stop(1, 1),
                 ],
             ],
             Duration::from_millis(300),
@@ -11628,10 +11758,7 @@ mod tests {
                         r#"{"message":"may I push?","options":["yes","no"],"child_id":"leaf-s7conc"}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::ToolCallDelta {
@@ -11642,24 +11769,15 @@ mod tests {
                         r#"{"message":"may I refactor?","options":["yes","no"],"child_id":"leaf2-s7conc"}"#
                             .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("leaf2's question must wait for leaf's".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("leaf finished".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let leaf_provider = Arc::new(ScriptedProvider::new(vec![
@@ -11670,18 +11788,9 @@ mod tests {
                     name: Some("ask".into()),
                     args_delta: r#"{"message":"may I push?","options":["yes","no"]}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("pushed to main".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("pushed to main".into()), stop(1, 1)],
         ]));
         let leaf2_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::ToolCallDelta {
@@ -11690,10 +11799,7 @@ mod tests {
                 name: Some("ask".into()),
                 args_delta: r#"{"message":"may I refactor?","options":["yes","no"]}"#.into(),
             },
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
 
         let mailbox = Arc::new(TestMailbox::new());
@@ -11959,10 +12065,7 @@ mod tests {
         let denial = "denied: never push to main directly; use a branch";
         let root_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("noted the completion".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         // The mid-level session's first wake denies the leaf and ends; the
         // leaf is still live, so the mid-level session waits instead of
@@ -11976,24 +12079,12 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: format!(r#"{{"id":"leaf-s7den","text":"{denial}"}}"#),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("denied the push".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("denied the push".into()), stop(1, 1)],
             vec![
                 StreamEvent::TextDelta("the leaf finished".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let leaf_provider = Arc::new(ScriptedProvider::new(vec![
@@ -12005,17 +12096,11 @@ mod tests {
                     args_delta: r#"{"message":"may I push to main?","options":["yes","no"]}"#
                         .into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("understood — using a branch".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
 
@@ -12141,10 +12226,7 @@ mod tests {
         // the leaf's report is handled does the mid-level session report.
         let root_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("noted the report".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let mid_provider = Arc::new(ScriptedProvider::new(vec![
             vec![
@@ -12154,32 +12236,20 @@ mod tests {
                     name: Some("spawn".into()),
                     args_delta: r#"{"persona":"coder","instructions":"write the tests"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("spawned the leaf, supervising".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("the leaf finished".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let leaf_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("tests written".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let spawner = Arc::new(FakeSpawner::ok("leaf-s7sup"));
 
@@ -12336,17 +12406,11 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
                 StreamEvent::TextDelta("made the change after all".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
             vec![
                 StreamEvent::TextDelta("an auto-resumed turn ran".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let mailbox = Arc::new(TestMailbox::new());
@@ -12474,10 +12538,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("resuming the child".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let handle = spawn_loop(
             "root-crashwake".into(),
@@ -12535,10 +12596,7 @@ mod tests {
         )]]));
         let root_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("abandoned the failed child".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let mailbox = Arc::new(TestMailbox::new());
         let child_handle = spawn_loop(
@@ -12634,7 +12692,10 @@ mod tests {
             .unwrap();
 
         // Both children report their crashes the way boot recovery reports
-        // them; the parent wakes once per report and decides each.
+        // them; the parent wakes once per report and decides each. Both
+        // failure events are in the thread when the first wake runs, so one
+        // wake decides both children; a second plain wake with nothing new
+        // is dropped.
         deliver_child_event(
             &store,
             "root-red",
@@ -12661,39 +12722,17 @@ mod tests {
                     name: Some("message_child".into()),
                     args_delta: r#"{"id":"child-red-a","text":"resume the review"}"#.into(),
                 },
-                StreamEvent::Stop {
-                    input_tokens: 2,
-                    output_tokens: 1,
-                },
+                stop(2, 1),
             ],
-            vec![
-                StreamEvent::TextDelta("child a resumed".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
-            vec![
-                StreamEvent::TextDelta("child b abandoned".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-            ],
+            vec![StreamEvent::TextDelta("child a resumed".into()), stop(1, 1)],
             vec![
                 StreamEvent::TextDelta("child a's report noted".into()),
-                StreamEvent::Stop {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
+                stop(1, 1),
             ],
         ]));
         let resumed_provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("the review is done".into()),
-            StreamEvent::Stop {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
+            stop(1, 1),
         ]]));
         let root_handle = spawn_loop(
             "root-red".into(),
@@ -12733,7 +12772,7 @@ mod tests {
                     let resumed = store.get_session("child-red-a").await.unwrap().unwrap();
                     let abandoned = store.get_session("child-red-b").await.unwrap().unwrap();
                     root.state == SessionState::WaitingForInput
-                        && calls.captured_calls().len() == 4
+                        && calls.captured_calls().len() == 3
                         && resumed.state == SessionState::Stopped
                         && abandoned.state == SessionState::Interrupted
                 }

@@ -639,6 +639,21 @@ function shortId(id) {
   return id.length > 8 ? id.slice(0, 8) : id;
 }
 
+// The count of a session's direct children that can still act. A child is
+// live for display when its state is not stopped.
+function liveChildCount(session) {
+  return sessions.filter(
+    (s) => s.parent_id === session.id && s.state !== 'stopped'
+  ).length;
+}
+
+function liveChildrenLabel(session) {
+  const count = liveChildCount(session);
+  return session.state === 'waiting_for_input' && count > 0
+    ? 'waiting for children (' + count + ')'
+    : session.state;
+}
+
 function renderSessions() {
   sessionsBody.textContent = '';
   if (sessions.length === 0) {
@@ -666,7 +681,7 @@ function renderSessions() {
       const model = cell(session.model);
       model.className = 'col-model';
       row.appendChild(model);
-      row.appendChild(cell(session.state));
+      row.appendChild(cell(liveChildrenLabel(session)));
       const permission = cell(session.permission);
       permission.className = 'col-permission';
       row.appendChild(permission);
@@ -843,9 +858,15 @@ async function refreshSessions() {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     sessions = await response.json();
     renderSessions();
-    if (current && !sessions.some((session) => session.id === current)) {
+    // The badge follows the freshest list too: a child's state changes
+    // without a state event for the open session, so the event stream alone
+    // would leave it stale between fetches.
+    const viewed = sessions.find((session) => session.id === current);
+    if (current && !viewed) {
       showStatus('session ' + current + ' ended');
       closeSession();
+    } else if (viewed) {
+      viewState.textContent = liveChildrenLabel(viewed);
     }
   } catch (error) {
     showStatus('sessions: ' + error.message);
@@ -1033,7 +1054,7 @@ function updateHeader(session) {
   viewModel.textContent = session.model;
   viewPersona.textContent = session.persona || '';
   updatePermissionBadge(session.permission);
-  viewState.textContent = session.state;
+  viewState.textContent = liveChildrenLabel(session);
   // The switch dropdown preselects the session's current persona, so the
   // "switch persona" action reads as a dropdown rather than a blank field.
   if (session.persona && personas.some((persona) => persona.name === session.persona)) {
@@ -1692,7 +1713,7 @@ function handleEvent(event) {
       break;
     case 'state':
       appendLine('state', '* ' + event.state);
-      viewState.textContent = event.state;
+      viewState.textContent = liveChildrenLabel({ id: current, state: event.state });
       break;
     case 'permission':
       updatePermissionBadge(event.permission);

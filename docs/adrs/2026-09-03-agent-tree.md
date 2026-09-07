@@ -3,6 +3,8 @@
 **Date:** 2026-09-03
 **Author:** Raghav
 
+> Superseded in part by sprint 008 (`../sprints/008-sessions-stop-stalling.md`, recorded in `../adrs/2026-09-06-mid-wake-child-visibility.md`): an event that lands mid-wake is visible to the next turn of the running wake instead of surfacing only in the wake it queued, and a parent waits for a child by ending its turn rather than with the tools it already has. The persona, ask-gating, and transport decisions stand.
+
 ## Context
 
 Sprint 002 gave Bosun its own agent sessions: a per-session loop on the control plane, one executor process per session on the node, and a session-facing configuration of models and subagent types. A "subagent type" was `{ name, model, permission }`, and `spawn_subagent` ran a nested loop on the control plane inside the parent's turn: the parent blocked until the subagent finished, the subagent's events were written into the parent's transcript as `Block::Subagent` blocks, and a subagent could not hold a system prompt, a tool allowlist, or a transcript of its own. The tool surface that carried `spawn_subagent` is recorded in `2026-08-30-tool-surface.md`, and the session states it ran on in `2026-08-30-session-states.md`; both carry supersession notes pointing here.

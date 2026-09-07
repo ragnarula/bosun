@@ -20,6 +20,7 @@ use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
+use bosun_control::api::PersonaSummary;
 use crossterm::event;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::EnableBracketedPaste;
@@ -57,10 +58,13 @@ use tokio::sync::mpsc;
 
 use crate::markdown::markdown_rows;
 use crate::state_name;
-use bosun_control::api::PersonaSummary;
 
 /// How long to wait before reconnecting after the event stream ends.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// How often the attached TUI re-fetches the child count behind the status
+/// line. A second or two of staleness is fine: the label is read, not acted
+/// on, and the state events already redraw it on change.
+const LIVE_CHILDREN_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a tool call's inline args or result may render before it is cut.
 /// The TUI row is final — there is no click to expand — so the cap is generous.
 /// The web pane clips its result preview at `TOOL_RESULT_PREVIEW` (400) instead,
@@ -532,6 +536,10 @@ pub struct App {
     pick_persona: bool,
     /// The highlighted option in the open picker.
     pick_index: usize,
+    /// The count of the attached session's direct children that can still
+    /// act, for the status line's waiting-for-children label. Refreshed
+    /// while attached from the session list.
+    live_children: usize,
 }
 
 impl App {
@@ -555,6 +563,7 @@ impl App {
             persona_error: None,
             pick_persona: false,
             pick_index: 0,
+            live_children: 0,
         }
     }
 
@@ -750,9 +759,20 @@ fn render_persona_picker(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     }
 }
 
+/// The status-line state text: a session parked while its children can still
+/// act names them, every other state renders as its wire name.
+fn state_label(session_state: SessionState, live_children: usize) -> String {
+    match (session_state, live_children) {
+        (SessionState::WaitingForInput, count) if count > 0 => {
+            format!("waiting for children ({count})")
+        }
+        (state, _) => state_name(state).to_string(),
+    }
+}
+
 fn status_line(app: &App) -> TuiLine<'static> {
     let id = clip(&app.session.id, 12);
-    let state = state_name(app.state.session_state);
+    let state = state_label(app.state.session_state, app.live_children);
     let connection = if app.connected {
         "connected"
     } else {
@@ -843,6 +863,9 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
 
     let mut app = App::new(session);
     fetch_personas(&client, cp_url, &mut app).await;
+    if let Ok(count) = live_children_count(&client, cp_url, session_id).await {
+        app.live_children = count;
+    }
     let result = run_attach(
         &mut terminal,
         &client,
@@ -1029,6 +1052,10 @@ async fn stream_events(
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<StreamOutcome> {
     tokio::pin!(stream);
+    let mut children_interval = tokio::time::interval(LIVE_CHILDREN_INTERVAL);
+    // The first tick completes immediately; the count was just fetched at
+    // attach, so skip it and tick on the real cadence from here.
+    children_interval.tick().await;
     loop {
         tokio::select! {
             event = input_rx.recv() => {
@@ -1048,6 +1075,14 @@ async fn stream_events(
                 }
                 Some(Err(_)) | None => return Ok(StreamOutcome::Reconnect),
             },
+            _ = children_interval.tick() => {
+                if let Ok(count) = live_children_count(client, cp_url, session_id).await
+                    && count != app.live_children
+                {
+                    app.live_children = count;
+                    redraw(terminal, app)?;
+                }
+            }
             _ = &mut *stop_rx => return Ok(StreamOutcome::Exited),
         }
     }
@@ -1429,6 +1464,43 @@ async fn fetch_personas(client: &reqwest::Client, cp_url: &str, app: &mut App) {
     }
 }
 
+/// The count of the attached session's direct children whose state is not
+/// `stopped`, for the status line's waiting-for-children label. The TUI has
+/// no other view of the session tree, so it polls the session list.
+async fn live_children_count(
+    client: &reqwest::Client,
+    cp_url: &str,
+    session_id: &str,
+) -> anyhow::Result<usize> {
+    // A half-open connection would otherwise hold the whole TUI: the poll
+    // runs inside the event select, so the request side gets the same timeout
+    // as the other client calls, and a miss just keeps the last count until
+    // the next tick.
+    let send = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        client.get(format!("{cp_url}/sessions")).send(),
+    )
+    .await;
+    let response = match send {
+        Ok(response) => response.context("failed to reach the control plane")?,
+        Err(_) => anyhow::bail!("sessions request timed out"),
+    };
+    let response = response
+        .error_for_status()
+        .context("the control plane returned an error")?;
+    let sessions: Vec<Session> = response
+        .json()
+        .await
+        .context("failed to parse session list")?;
+    Ok(sessions
+        .iter()
+        .filter(|session| {
+            session.parent_id.as_deref() == Some(session_id)
+                && session.state != SessionState::Stopped
+        })
+        .count())
+}
+
 /// Renders the current frame.
 fn redraw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -1458,6 +1530,20 @@ mod tests {
             vec!["one", "abcde", "fghij", "two"]
         );
         assert_eq!(wrap_text("ab", 5), vec!["ab"]);
+    }
+
+    #[test]
+    fn state_label_renders_waiting_for_children_only_when_parked_with_live_children() {
+        assert_eq!(
+            state_label(SessionState::WaitingForInput, 0),
+            "waiting_for_input"
+        );
+        assert_eq!(
+            state_label(SessionState::WaitingForInput, 2),
+            "waiting for children (2)"
+        );
+        assert_eq!(state_label(SessionState::Running, 2), "running");
+        assert_eq!(state_label(SessionState::Stopped, 1), "stopped");
     }
 
     #[test]

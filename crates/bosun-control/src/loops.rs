@@ -192,6 +192,7 @@ mod tests {
 
     use bosun_agent::provider::ProviderCall;
     use bosun_agent::provider::ProviderError;
+    use bosun_agent::provider::StopReason;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::session::Permission;
     use bosun_common::session::Session;
@@ -228,6 +229,7 @@ mod tests {
                 Ok(StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 }),
             ];
             Ok(stream::iter(items).boxed())

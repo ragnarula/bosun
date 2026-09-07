@@ -11,6 +11,7 @@ use crate::provider::Provider;
 use crate::provider::ProviderAdapter;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
+use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::provider::messages_url;
 use crate::serialize::anthropic_messages;
@@ -93,12 +94,13 @@ impl Provider for Anthropic {
     }
 }
 
-/// Token counts and in-flight tool call identities carried between SSE
-/// events.
+/// Token counts, the stop reason and in-flight tool call identities carried
+/// between SSE events.
 #[derive(Default)]
 struct AnthropicParser {
     input_tokens: u64,
     output_tokens: u64,
+    stop_reason: Option<String>,
     tool_starts: HashMap<usize, (Option<String>, Option<String>)>,
 }
 
@@ -165,12 +167,23 @@ fn parse_event(
         }
         "message_delta" => {
             parser.output_tokens = data["usage"]["output_tokens"].as_u64().unwrap_or(0);
+            if let Some(reason) = data["delta"]["stop_reason"].as_str() {
+                parser.stop_reason = Some(reason.to_string());
+            }
             Ok(Vec::new())
         }
-        "message_stop" => Ok(vec![StreamEvent::Stop {
-            input_tokens: parser.input_tokens,
-            output_tokens: parser.output_tokens,
-        }]),
+        "message_stop" => {
+            let stop_reason = match parser.stop_reason.as_deref() {
+                Some("end_turn") => StopReason::StopResponse,
+                Some("max_tokens") => StopReason::MaxTokens,
+                _ => StopReason::Other,
+            };
+            Ok(vec![StreamEvent::Stop {
+                input_tokens: parser.input_tokens,
+                output_tokens: parser.output_tokens,
+                stop_reason,
+            }])
+        }
         "error" => {
             let message = data["error"]["message"]
                 .as_str()
@@ -360,8 +373,89 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 25,
                     output_tokens: 30,
+                    stop_reason: StopReason::Other,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_reason_of_end_turn_reports_a_clean_finish() {
+        let server_events = vec![
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 3, "output_tokens": 0 } },
+                }),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": { "output_tokens": 7 },
+                }),
+            ),
+            sse("message_stop", json!({ "type": "message_stop" })),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
+
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
+        assert_eq!(
+            events,
+            vec![StreamEvent::Stop {
+                input_tokens: 3,
+                output_tokens: 7,
+                stop_reason: StopReason::StopResponse,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_reason_of_max_tokens_reports_a_truncation() {
+        let server_events = vec![
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 3, "output_tokens": 0 } },
+                }),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "max_tokens" },
+                    "usage": { "output_tokens": 7 },
+                }),
+            ),
+            sse("message_stop", json!({ "type": "message_stop" })),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
+
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
+        assert_eq!(
+            events,
+            vec![StreamEvent::Stop {
+                input_tokens: 3,
+                output_tokens: 7,
+                stop_reason: StopReason::MaxTokens,
+            }]
         );
     }
 
