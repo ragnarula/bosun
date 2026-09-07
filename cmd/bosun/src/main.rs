@@ -11,8 +11,10 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 use bosun_agent::adapters::provider_for;
+use bosun_agent::config::resolve_api_key;
 use bosun_agent::config::resolve_model;
 use bosun_agent::provider::Provider;
+use bosun_agent::provider::ProviderError;
 use bosun_common::config::CliConfig;
 use bosun_common::config::ControlConfig;
 use bosun_common::config::NodeConfig;
@@ -39,6 +41,7 @@ use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
+use bosun_control::skills_repos::GitHubClient;
 use bosun_control::tunnel::TunnelRegistry;
 use bosun_node::manager::NodeManager;
 use bosun_store::store::Store;
@@ -259,6 +262,19 @@ fn resolve_cp_url_from(flag: Option<&str>, env_url: Option<String>, stored: Stri
     flag.map(ToString::to_string).or(env_url).unwrap_or(stored)
 }
 
+/// Resolves the configured GitHub token. `env:VAR` reads the environment;
+/// any other value is a literal. An empty literal means no token, exactly
+/// like an absent one, so the client never sends an empty Authorization
+/// header. The resolved value only lives in the GitHub client and is never
+/// stored or exposed.
+fn resolve_github_token(github_token: &Option<String>) -> Result<Option<String>, ProviderError> {
+    Ok(github_token
+        .as_deref()
+        .map(resolve_api_key)
+        .transpose()?
+        .filter(|token| !token.is_empty()))
+}
+
 /// Builds the HTTP client the CLI uses to reach the control plane. When
 /// `BOSUN_CA_CERT` names a PEM file, the client trusts it, so a control plane
 /// behind a private CA (or self-signed certificate) can be reached.
@@ -290,10 +306,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 config.data_dir.display()
             )
         })?;
-    let skills_dir = config.data_dir.join("skills");
-    tokio::fs::create_dir_all(&skills_dir)
-        .await
-        .with_context(|| format!("failed to create skills directory {}", skills_dir.display()))?;
     // Prompt files are optional, but the directory exists so an operator knows
     // where to drop `<persona name>.md` files.
     let personas_dir = config.data_dir.join("personas");
@@ -338,6 +350,8 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         warn!("no personas configured; sessions cannot run");
     }
 
+    let github_token = resolve_github_token(&config.github_token)?;
+
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(
             config.node_timeout_secs,
@@ -347,8 +361,12 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         ))),
         tunnels: Arc::new(TunnelRegistry::new()),
         store,
+        github: GitHubClient::new(
+            "https://api.github.com",
+            "https://raw.githubusercontent.com",
+            github_token,
+        ),
         loops: Arc::new(AgentRegistry::new(
-            Some(skills_dir.clone()),
             providers.clone(),
             config.personas.clone(),
             prices,
@@ -356,7 +374,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         providers,
         personas: config.personas,
         default_persona: config.default_persona,
-        skills_dir: Some(skills_dir),
     });
     // The loops' `spawn` tool starts child sessions through the registry, so
     // the registry needs the node-facing handles before any loop runs.
@@ -1048,6 +1065,16 @@ mod tests {
         assert_eq!(
             resolve_cp_url_from(None, None, stored),
             "http://stored:8090"
+        );
+    }
+
+    #[test]
+    fn an_empty_github_token_literal_is_treated_as_absent() {
+        assert_eq!(resolve_github_token(&None).unwrap(), None);
+        assert_eq!(resolve_github_token(&Some("".to_string())).unwrap(), None);
+        assert_eq!(
+            resolve_github_token(&Some("a-secret-token".to_string())).unwrap(),
+            Some("a-secret-token".to_string())
         );
     }
 

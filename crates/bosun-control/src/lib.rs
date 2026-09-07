@@ -2,6 +2,7 @@ pub mod api;
 pub mod commands;
 pub mod loops;
 pub mod registry;
+pub mod skills_repos;
 pub mod spawn;
 pub mod tools;
 pub mod tunnel;

@@ -27,6 +27,7 @@ use bosun_control::api::router;
 use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
 use bosun_control::registry::NodeRegistry;
+use bosun_control::skills_repos::GitHubClient;
 use bosun_control::tunnel::TunnelRegistry;
 use bosun_node::manager::NodeManager;
 use bosun_store::store::Store;
@@ -52,8 +53,8 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>, tempfile::T
         commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
         tunnels: tunnels.clone(),
         store: store.clone(),
+        github: GitHubClient::new("http://127.0.0.1:1", "http://127.0.0.1:1", None),
         loops: Arc::new(AgentRegistry::new(
-            None,
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -61,7 +62,6 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>, tempfile::T
         providers: HashMap::new(),
         personas: HashMap::new(),
         default_persona: None,
-        skills_dir: None,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

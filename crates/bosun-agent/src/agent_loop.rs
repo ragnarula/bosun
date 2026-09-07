@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -41,18 +40,21 @@ use crate::provider::AskRecipient;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
 use crate::provider::StreamEvent;
+use crate::skills::RemoteResolution;
 use crate::skills::Skill;
 use crate::skills::fetch_working_skills;
-use crate::skills::merge_skills;
-use crate::skills::read_injected_skill;
 use crate::skills::read_working_skill;
+use crate::skills::referenced_paths;
+use crate::skills::resolve_remote;
 use crate::standards::fetch_repo_standards;
 
-/// The session's skills, discovered once and reused across turns.
+/// The session's skills, discovered once and reused across turns: the working
+/// copy's through the executor and the store's advertised remote packages.
+/// The system prompt advertises both; the `skill` tool resolves its name
+/// against the working copy first and the remote packages second.
 struct SessionSkills {
     working: Vec<Skill>,
-    injected: Vec<Skill>,
-    merged: Vec<Skill>,
+    remote: Vec<Skill>,
 }
 
 /// Caps the summarizer output so a compaction stays cheap.
@@ -166,8 +168,6 @@ pub struct LoopDeps {
     pub delta_sink: Arc<dyn DeltaSink>,
     /// Non-archived messages allowed before compaction triggers.
     pub max_window_messages: usize,
-    /// The control plane's injected skills directory, when one is configured.
-    pub injected_skills_dir: Option<PathBuf>,
     /// Configured personas, keyed by persona name. The `spawn` tool resolves
     /// its target persona from here, and a session's persona prompt is read
     /// from it at every turn.
@@ -764,6 +764,99 @@ async fn record_in_wake(
     Ok(id)
 }
 
+/// The session's two skill sources, read at the first turn and cached: the
+/// working copy's skills through the executor and the store's advertised
+/// remote packages. A failed source degrades to an empty list, so a session
+/// runs with whatever reached it.
+async fn fetch_session_skills(deps: &LoopDeps, session_id: &str) -> SessionSkills {
+    let working = fetch_working_skills(&*deps.tools, session_id)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(
+                msg = "failed to fetch skills from the node",
+                session_id = %session_id,
+                error = %error.display_chain()
+            );
+            Vec::new()
+        });
+    let remote = deps
+        .store
+        .advertised_skill_packages()
+        .await
+        .map(|ads| ads.into_iter().map(Skill::from).collect())
+        .unwrap_or_else(|error| {
+            warn!(
+                msg = "failed to fetch remote skill packages from the store",
+                session_id = %session_id,
+                error = %error.display_chain()
+            );
+            Vec::new()
+        });
+    SessionSkills { working, remote }
+}
+
+/// One remote `skill` tool answer: reads one reference chunk when the call
+/// names one, otherwise loads the package's instructions and the reference
+/// paths its body mentions.
+async fn load_remote_skill(
+    deps: &LoopDeps,
+    session_id: &str,
+    address: &str,
+    reference_path: Option<&str>,
+) -> Result<Value, anyhow::Error> {
+    if let Some(reference_path) = reference_path {
+        match deps
+            .store
+            .read_skill_reference(address, reference_path)
+            .await
+        {
+            Ok(Some(content)) => return Ok(json!({ "content": content })),
+            Ok(None) => {
+                return Err(anyhow::anyhow!(
+                    "skill reference not found: {}",
+                    reference_path
+                ));
+            }
+            Err(error) => {
+                warn!(
+                    msg = "failed to read the skill reference from the store",
+                    session_id = %session_id,
+                    address = %address,
+                    reference = %reference_path,
+                    error = %error.display_chain()
+                );
+                return Err(anyhow::anyhow!(
+                    "skill reference not found: {}",
+                    reference_path
+                ));
+            }
+        }
+    }
+    match deps.store.load_skill_package(address).await {
+        Ok(Some((instructions, paths))) => Ok(json!({
+            "content": instructions,
+            "references": referenced_paths(&instructions, &paths),
+        })),
+        Ok(None) => {
+            warn!(
+                msg = "the store no longer holds a package a skill call resolved to",
+                session_id = %session_id,
+                address = %address
+            );
+            Err(anyhow::anyhow!("skill not found"))
+        }
+        Err(error) => {
+            warn!(
+                msg = "failed to load the skill package's instructions from the store",
+                session_id = %session_id,
+                address = %address,
+                error = %error.display_chain()
+            );
+            Err(anyhow::anyhow!("skill not found"))
+        }
+    }
+}
+
 async fn run_turn_inner(
     deps: &Arc<LoopDeps>,
     session_id: &str,
@@ -831,32 +924,24 @@ async fn run_turn_inner(
         })
         .collect();
 
-    // The working-copy skill list is fetched once per session and cached, so
-    // a turn does not round-trip to the node for it. The on-demand `skill`
-    // read still goes to the executor when the model asks for it.
+    // The two skill sources are fetched once per session and cached, so a
+    // turn does not round-trip for them. The on-demand `skill` read still
+    // goes to the executor when the model asks for a working-copy skill.
     if state.skills_cache.is_none() {
-        let working = fetch_working_skills(&*deps.tools, session_id)
-            .await
-            .unwrap_or_else(|error| {
-                warn!(
-                    msg = "failed to fetch skills from the node",
-                    session_id = %session_id,
-                    error = %error.display_chain()
-                );
-                Vec::new()
-            });
-        let injected = crate::skills::injected_skills(deps.injected_skills_dir.as_deref());
-        let merged = merge_skills(working.clone(), injected.clone());
-        state.skills_cache = Some(SessionSkills {
-            working,
-            injected,
-            merged,
-        });
+        state.skills_cache = Some(fetch_session_skills(deps, session_id).await);
     }
     let cached = state.skills_cache.as_ref().expect("populated above");
     let working_skills: &[Skill] = &cached.working;
-    let injected_skills: &[Skill] = &cached.injected;
-    let skills: &[Skill] = &cached.merged;
+    let remote_skills: &[Skill] = &cached.remote;
+    // The system prompt advertises the union of both skill sources, never
+    // deduplicated by short name: a remote package whose name collides with a
+    // working-copy skill must stay discoverable under its full address.
+    let skills: Vec<Skill> = cached
+        .working
+        .iter()
+        .chain(cached.remote.iter())
+        .cloned()
+        .collect();
     // The repo-standard presence list is fetched once per session and cached,
     // like the skills list: the working copy does not change mid-session, and
     // the files' contents are read on demand with the file tools, so only the
@@ -900,7 +985,7 @@ async fn run_turn_inner(
         persona_system_prompt(deps, &session),
         repo_standards,
         &state.todos,
-        skills,
+        &skills,
         live,
         // The persona catalog is advertised only to sessions whose surface
         // includes `spawn`: it is the list of personas they may spawn.
@@ -1218,36 +1303,71 @@ async fn run_turn_inner(
             }
             "skill" => {
                 let skill_name = args["name"].as_str().unwrap_or_default();
-                let content = if working_skills.iter().any(|skill| skill.name == skill_name) {
-                    match read_working_skill(&*deps.tools, session_id, skill_name).await {
-                        Ok(Some(markdown)) => Some(json!({ "content": markdown })),
-                        Ok(None) => {
-                            warn!(
-                                msg = "the node does not know a skill it listed",
-                                session_id = %session_id,
-                                skill = %skill_name
-                            );
-                            None
-                        }
-                        Err(error) => {
-                            warn!(
-                                msg = "failed to read the skill's instructions from the node",
-                                session_id = %session_id,
-                                skill = %skill_name,
-                                error = %error.display_chain()
-                            );
-                            None
+                let reference_path = args["reference"].as_str();
+                // Resolution order: a full address matches a remote package
+                // by its address exactly; any other name reaches the working
+                // copy first, then the remote short names.
+                let outcome = async {
+                    if skill_name.starts_with("github.com/") {
+                        match resolve_remote(remote_skills, skill_name) {
+                            RemoteResolution::Exact { address } => {
+                                return load_remote_skill(
+                                    deps,
+                                    session_id,
+                                    &address,
+                                    reference_path,
+                                )
+                                .await;
+                            }
+                            _ => anyhow::bail!("skill not found"),
                         }
                     }
-                } else if injected_skills.iter().any(|skill| skill.name == skill_name) {
-                    read_injected_skill(deps.injected_skills_dir.as_deref(), skill_name)
-                        .map(|markdown| json!({ "content": markdown }))
-                } else {
-                    None
-                };
-                let (content, is_error) = match content {
-                    Some(content) => (content, false),
-                    None => (json!({ "error": "skill not found" }), true),
+                    if working_skills.iter().any(|skill| skill.name == skill_name) {
+                        if reference_path.is_some() {
+                            anyhow::bail!("{} has no reference chunks", skill_name);
+                        }
+                        match read_working_skill(&*deps.tools, session_id, skill_name).await {
+                            Ok(Some(markdown)) => {
+                                return Ok::<Value, anyhow::Error>(json!({ "content": markdown }));
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    msg = "the node does not know a skill it listed",
+                                    session_id = %session_id,
+                                    skill = %skill_name
+                                );
+                                anyhow::bail!("skill not found");
+                            }
+                            Err(error) => {
+                                warn!(
+                                    msg = "failed to read the skill's instructions from the node",
+                                    session_id = %session_id,
+                                    skill = %skill_name,
+                                    error = %error.display_chain()
+                                );
+                                anyhow::bail!("skill not found");
+                            }
+                        }
+                    }
+                    match resolve_remote(remote_skills, skill_name) {
+                        RemoteResolution::Short { address } => {
+                            return load_remote_skill(deps, session_id, &address, reference_path)
+                                .await;
+                        }
+                        RemoteResolution::Ambiguous { addresses } => {
+                            anyhow::bail!(
+                                "skill name {} is ambiguous; candidates: {}",
+                                skill_name,
+                                addresses.join(", ")
+                            );
+                        }
+                        _ => anyhow::bail!("skill not found"),
+                    }
+                }
+                .await;
+                let (content, is_error) = match outcome {
+                    Ok(content) => (content, false),
+                    Err(error) => (json!({ "error": error.to_string() }), true),
                 };
                 deps.store
                     .complete_tool_call(session_id, &id, &content, is_error)
@@ -1893,6 +2013,23 @@ fn persona_catalog(deps: &LoopDeps) -> Vec<(String, String)> {
     catalog
 }
 
+/// How many characters of a skill's description the advertisement shows; the
+/// full text loads on demand through the `skill` tool.
+const SKILL_DESCRIPTION_CAP: usize = 500;
+
+/// One skill as the system prompt advertises it: the name with its
+/// provenance — the package address for a remote package, "working copy"
+/// otherwise — and the description truncated to the advertisement cap.
+fn skill_ad_line(skill: &Skill) -> String {
+    let provenance = skill.package.as_deref().unwrap_or("working copy");
+    let description: String = skill
+        .description
+        .chars()
+        .take(SKILL_DESCRIPTION_CAP)
+        .collect();
+    format!("- {} ({}): {}", skill.name, provenance, description)
+}
+
 /// Builds the system prompt: the persona's role text when it has one (the
 /// built-in default otherwise), then the session's live context — the
 /// repo-standard files present in the working copy, the persona catalog for
@@ -1928,7 +2065,7 @@ fn system_prompt(
     if !skills.is_empty() {
         prompt.push_str("\n\nSkills available in this session:");
         for skill in skills {
-            prompt.push_str(&format!("\n- {}: {}", skill.name, skill.description));
+            prompt.push_str(&format!("\n{}", skill_ad_line(skill)));
         }
     }
     if !todos.is_empty() {
@@ -1976,6 +2113,8 @@ mod tests {
     use bosun_common::session::Permission;
     use bosun_common::session::Session;
     use bosun_common::session::SessionState;
+    use bosun_common::skills::SkillPackage;
+    use bosun_common::skills::SkillReference;
     use bosun_common::tool::ALL_TOOLS;
     use bosun_common::tool::ToolDelta;
     use bosun_store::store::RouteAnswer;
@@ -2392,7 +2531,6 @@ mod tests {
             tools,
             delta_sink: sink,
             max_window_messages,
-            injected_skills_dir: None,
             personas: HashMap::new(),
             providers: HashMap::new(),
             prices: HashMap::new(),
@@ -2419,7 +2557,6 @@ mod tests {
             tools,
             delta_sink: sink,
             max_window_messages: usize::MAX,
-            injected_skills_dir: None,
             personas,
             providers,
             prices: HashMap::new(),
@@ -3168,6 +3305,628 @@ mod tests {
         assert_eq!(
             tool_calls[0].result,
             Some(json!({ "error": "skill not found" }))
+        );
+
+        handle.stop();
+    }
+
+    /// Seeds the repos the remote `skill` paths exercise: `deploy` is unique
+    /// with reference chunks its body references, `review` is advertised from
+    /// two repos, and `checkout` is advertised while the working copy also
+    /// ships a checkout skill.
+    async fn seed_remote_skill_packages(store: &Store) {
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[
+                    SkillPackage {
+                        address: "github.com/owner/acme/tools/skills/checkout".into(),
+                        repo: "owner/acme".into(),
+                        name: "checkout".into(),
+                        description: "does checkout".into(),
+                        when_to_use: None,
+                        license: None,
+                        author: None,
+                        instructions: "check out the code".into(),
+                        references: Vec::new(),
+                        sha: "sha-1".into(),
+                    },
+                    SkillPackage {
+                        address: "github.com/owner/acme/tools/skills/review".into(),
+                        repo: "owner/acme".into(),
+                        name: "review".into(),
+                        description: "does review".into(),
+                        when_to_use: None,
+                        license: None,
+                        author: None,
+                        instructions: "review the diff".into(),
+                        references: Vec::new(),
+                        sha: "sha-1".into(),
+                    },
+                    SkillPackage {
+                        address: "github.com/owner/acme/tools/skills/deploy".into(),
+                        repo: "owner/acme".into(),
+                        name: "deploy".into(),
+                        description: "does deploy".into(),
+                        when_to_use: None,
+                        license: None,
+                        author: None,
+                        instructions: "see guides/CHECKLIST.md for the deploy steps".into(),
+                        references: vec![
+                            SkillReference {
+                                path: "guides/CHECKLIST.md".into(),
+                                content: "1. build\n2. ship".into(),
+                            },
+                            SkillReference {
+                                path: "docs/RUNBOOK.md".into(),
+                                content: "on fire: roll back".into(),
+                            },
+                        ],
+                        sha: "sha-1".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_skill_repo("corp/tools", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "corp/tools",
+                "sha-2",
+                &[SkillPackage {
+                    address: "github.com/corp/tools/skills/review".into(),
+                    repo: "corp/tools".into(),
+                    name: "review".into(),
+                    description: "corporate review".into(),
+                    when_to_use: None,
+                    license: None,
+                    author: None,
+                    instructions: "corporate review flow".into(),
+                    references: Vec::new(),
+                    sha: "sha-2".into(),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_skill_calls_serve_loads_references_and_resolution_errors() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-skill-remote"))
+            .await
+            .unwrap();
+        seed_remote_skill_packages(&store).await;
+
+        // The node's working copy ships a `checkout` skill: the short name is
+        // shadowed, while the remote package stays reachable under its full
+        // address. `deploy` and `review` exist only as remote packages.
+        let tools = Arc::new(
+            MockTools::new(default_outcome())
+                .serving(
+                    "skills",
+                    ToolOutcome {
+                        content: json!({ "skills": [
+                            {
+                                "name": "checkout",
+                                "description": "checks out a ref from the working tree",
+                            }
+                        ] }),
+                        is_error: false,
+                    },
+                )
+                .serving(
+                    "skill/read",
+                    ToolOutcome {
+                        content: json!({ "content": "working copy checkout" }),
+                        is_error: false,
+                    },
+                ),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // The unique short name loads the package and its referenced paths.
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("skill".into()),
+                    args_delta: r#"{"name":"deploy"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("loaded deploy".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            // A reference call reads one chunk of the same package.
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("skill".into()),
+                    args_delta: r#"{"name":"deploy","reference":"docs/RUNBOOK.md"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("loaded runbook".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            // An ambiguous short name errors and names every candidate.
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-3".into()),
+                    name: Some("skill".into()),
+                    args_delta: r#"{"name":"review"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("review ambiguous".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            // The full address loads the remote checkout even though the
+            // working copy shadows the short name.
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-4".into()),
+                    name: Some("skill".into()),
+                    args_delta: r#"{"name":"github.com/owner/acme/tools/skills/checkout"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("loaded checkout".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-skill-remote".into(), deps);
+
+        // Each skill call runs one wake: the call's turn, then the text turn
+        // the result feeds back into, then the session waits.
+        for _ in 0..4 {
+            handle.send(LoopEvent::Wake);
+        }
+
+        wait_for("all four skill calls to feed back", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 8 }
+            }
+        })
+        .await;
+
+        let tool_calls = store.tool_calls("s-skill-remote").await.unwrap();
+        assert_eq!(tool_calls.len(), 4);
+
+        let (call_1, call_2, call_3, call_4) = (
+            tool_calls[0].clone(),
+            tool_calls[1].clone(),
+            tool_calls[2].clone(),
+            tool_calls[3].clone(),
+        );
+
+        assert!(!call_1.is_error);
+        assert_eq!(
+            call_1.result,
+            Some(json!({
+                "content": "see guides/CHECKLIST.md for the deploy steps",
+                "references": ["guides/CHECKLIST.md"],
+            })),
+            "a short-name load returns the instructions and only the referenced paths"
+        );
+
+        assert!(!call_2.is_error);
+        assert_eq!(
+            call_2.result,
+            Some(json!({ "content": "on fire: roll back" })),
+            "a reference call returns the referenced chunk"
+        );
+
+        assert!(call_3.is_error);
+        let result_3 = call_3.result.unwrap();
+        let ambiguous = result_3["error"].as_str().unwrap();
+        assert!(
+            ambiguous.contains("github.com/owner/acme/tools/skills/review")
+                && ambiguous.contains("github.com/corp/tools/skills/review"),
+            "an ambiguous short name names every candidate address: {ambiguous}"
+        );
+
+        assert!(!call_4.is_error);
+        assert_eq!(
+            call_4.result,
+            Some(json!({ "content": "check out the code", "references": [] })),
+            "a full address loads the remote package the short name is shadowed under"
+        );
+
+        // The working-copy shadow was never read: the full-address call and
+        // the other short names all resolved to the store.
+        {
+            let calls = tools.calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.name == "skill/read")
+                    .count(),
+                0,
+                "the working copy's checkout is never read through the executor"
+            );
+            assert_eq!(
+                calls.iter().filter(|call| call.name == "skills").count(),
+                1,
+                "the skill sources are fetched once per session, not per turn"
+            );
+        }
+
+        handle.stop();
+    }
+
+    /// Seeds one advertised remote package under `owner/acme`, the way a
+    /// fetched repo leaves packages in the store.
+    async fn seed_remote_package(store: &Store) {
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[SkillPackage {
+                    address: "github.com/owner/acme/tools/skills/checkout".into(),
+                    repo: "owner/acme".into(),
+                    name: "checkout".into(),
+                    description: "does checkout".into(),
+                    when_to_use: None,
+                    license: None,
+                    author: None,
+                    instructions: "check out the code".into(),
+                    references: Vec::new(),
+                    sha: "sha-1".into(),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn skill_ad_line_renders_working_copy_provenance() {
+        let skill = Skill {
+            name: "my-skill".into(),
+            description: "Does things".into(),
+            package: None,
+        };
+        assert_eq!(
+            skill_ad_line(&skill),
+            "- my-skill (working copy): Does things"
+        );
+    }
+
+    #[test]
+    fn skill_ad_line_renders_the_package_address_for_a_remote_skill() {
+        let skill = Skill {
+            name: "checkout".into(),
+            description: "does checkout".into(),
+            package: Some("github.com/owner/acme/tools/skills/checkout".into()),
+        };
+        assert_eq!(
+            skill_ad_line(&skill),
+            "- checkout (github.com/owner/acme/tools/skills/checkout): does checkout"
+        );
+    }
+
+    #[test]
+    fn skill_ad_line_truncates_the_description_at_the_cap() {
+        let skill = Skill {
+            name: "wordy".into(),
+            description: "x".repeat(600),
+            package: None,
+        };
+        assert_eq!(
+            skill_ad_line(&skill),
+            format!("- wordy (working copy): {}", "x".repeat(500)),
+            "the advertisement keeps only the first 500 characters"
+        );
+        let unicode = Skill {
+            name: "accented".into(),
+            description: "é".repeat(600),
+            package: None,
+        };
+        assert_eq!(
+            skill_ad_line(&unicode),
+            format!("- accented (working copy): {}", "é".repeat(500)),
+            "the truncation cuts at a character boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_skill_packages_from_the_store_are_advertised_and_cached_per_session() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-remote-skill"))
+            .await
+            .unwrap();
+        seed_remote_package(&store).await;
+
+        // The node lists no working-copy skills; the store supplies the
+        // remote package.
+        let tools = instant_tools();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("turn one".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("turn two".into()),
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-remote-skill".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the first turn's system prompt to carry the remote ad", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move {
+                    let calls = provider.captured_calls();
+                    calls.len() == 1 && calls[0].system.contains("checkout")
+                }
+            }
+        })
+        .await;
+        handle.send(LoopEvent::Wake);
+        wait_for("the second turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-remote-skill").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert!(
+                call.system
+                    .contains("checkout (github.com/owner/acme/tools/skills/checkout)"),
+                "the system prompt advertises the remote package with its address"
+            );
+            assert!(
+                call.system.contains("does checkout"),
+                "the system prompt carries the remote package's description"
+            );
+        }
+
+        // The skills round trip went to the executor once across both turns:
+        // the second turn's advertisement came from the per-session cache,
+        // which also holds the store's remote packages.
+        let tool_calls = tools.calls.lock().unwrap();
+        assert_eq!(
+            tool_calls
+                .iter()
+                .filter(|call| call.name == "skills")
+                .count(),
+            1,
+            "the skill sources are fetched once per session, not per turn"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_remote_package_colliding_with_a_working_copy_skill_is_still_advertised() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-checkout-collision"))
+            .await
+            .unwrap();
+        seed_remote_package(&store).await;
+
+        // The node lists a working-copy `checkout` skill; the store
+        // advertises a remote `checkout` package with the same short name.
+        // The system prompt must carry both, each under its own provenance.
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "skills",
+            ToolOutcome {
+                content: json!({ "skills": [
+                        {
+                            "name": "checkout",
+                            "description": "checks out a ref from the working tree",
+                        }
+                    ] }),
+                is_error: false,
+            },
+        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("turn one".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-checkout-collision".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .system
+                .contains("- checkout (working copy): checks out a ref from the working tree"),
+            "the system prompt advertises the working-copy skill: {}",
+            calls[0].system
+        );
+        assert!(
+            calls[0].system.contains(
+                "- checkout (github.com/owner/acme/tools/skills/checkout): does checkout"
+            ),
+            "the system prompt also advertises the colliding remote package with its address: {}",
+            calls[0].system
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn remote_packages_sharing_a_short_name_from_different_addresses_are_all_advertised() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-remote-collision"))
+            .await
+            .unwrap();
+        seed_remote_package(&store).await;
+        store
+            .insert_skill_repo("corp/tools", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "corp/tools",
+                "sha-1",
+                &[SkillPackage {
+                    address: "github.com/corp/tools/skills/checkout".into(),
+                    repo: "corp/tools".into(),
+                    name: "checkout".into(),
+                    description: "corporate checkout".into(),
+                    when_to_use: None,
+                    license: None,
+                    author: None,
+                    instructions: "check out the code".into(),
+                    references: Vec::new(),
+                    sha: "sha-1".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Two repos advertise a `checkout` package from different addresses;
+        // neither may shadow the other in the system prompt.
+        let tools = instant_tools();
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("turn one".into()),
+            StreamEvent::Stop {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-remote-collision".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].system.contains(
+                "- checkout (github.com/owner/acme/tools/skills/checkout): does checkout"
+            ),
+            "the system prompt advertises the first remote package with its address: {}",
+            calls[0].system
+        );
+        assert!(
+            calls[0]
+                .system
+                .contains("- checkout (github.com/corp/tools/skills/checkout): corporate checkout"),
+            "the system prompt also advertises the colliding package from the other repo: {}",
+            calls[0].system
         );
 
         handle.stop();

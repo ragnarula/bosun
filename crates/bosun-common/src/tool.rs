@@ -205,8 +205,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill".into(),
-            description: "Load a skill's instructions into context. Skills are discovered from the working repo and the control plane.".into(),
-            schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+            description: "Load a skill's instructions into context. Skills come from the working repo and from remote packages. `name` is the short name when unique, or a full package address like `github.com/owner/repo/<path...>/skills/<name>`. A load returns the instructions plus the reference paths the body references; `reference` returns that chunk.".into(),
+            schema: json!({"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}),
         },
         ToolSpec {
             name: "spawn".into(),
@@ -354,6 +354,18 @@ mod tests {
             json!({"type": "string"})
         );
         assert!(ask.description.contains("child_id"));
+    }
+
+    #[test]
+    fn skill_schema_keeps_name_required_and_allows_an_optional_reference() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let skill = tools.iter().find(|tool| tool.name == "skill").unwrap();
+        assert_eq!(skill.schema["required"], json!(["name"]));
+        assert_eq!(
+            skill.schema["properties"]["reference"],
+            json!({"type": "string"})
+        );
+        assert!(skill.description.contains("reference"));
     }
 
     #[test]

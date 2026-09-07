@@ -23,6 +23,10 @@ pub struct ControlConfig {
     pub models: HashMap<String, ModelConfig>,
     pub personas: HashMap<String, PersonaConfig>,
     pub default_persona: Option<String>,
+    /// Token for fetching private skill repos from GitHub: a literal, or
+    /// `"env:VAR"` read from the environment at boot like a model `api_key`.
+    /// Never serialized back to TOML or exposed through the API.
+    pub github_token: Option<String>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -114,6 +118,7 @@ impl Default for ControlConfig {
             models: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
+            github_token: None,
         }
     }
 }
@@ -311,6 +316,14 @@ mod tests {
     fn sparse_config_keeps_the_data_dir_default() {
         let config: ControlConfig = toml::from_str("listen_addr = \"0.0.0.0:9000\"").unwrap();
         assert_eq!(config.data_dir, PathBuf::from("data"));
+    }
+
+    #[test]
+    fn github_token_defaults_to_none_and_parses_a_value() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(config.github_token, None);
+        let config: ControlConfig = toml::from_str("github_token = \"env:GITHUB_TOKEN\"").unwrap();
+        assert_eq!(config.github_token.as_deref(), Some("env:GITHUB_TOKEN"));
     }
 
     #[test]

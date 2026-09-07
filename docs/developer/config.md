@@ -18,7 +18,8 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `node_timeout_secs` | `30` | Polls older than this mark a node down |
 | `tls_cert` | none | PEM certificate chain. When set with `tls_key`, the control plane serves HTTPS |
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
-| `data_dir` | `data` | Directory for the SQLite store, injected skills, and persona prompt files |
+| `data_dir` | `data` | Directory for the SQLite store and persona prompt files |
+| `github_token` | none | Optional GitHub token, a literal or `env:VAR` read from the environment at boot. Sent as the `Authorization` header when the control plane fetches or updates skill repositories; private repos need it, public repos do not. Never stored or exposed; see skill repositories below |
 | `models` | none | Named model entries (see `ModelConfig` below). Sessions never name one directly; a persona's `model` does |
 | `personas` | none | Named personas (see `PersonaConfig` below) |
 | `default_persona` | none | Persona sessions use when the request does not name one |
@@ -51,7 +52,7 @@ A persona's role/behaviour prompt lives outside the TOML: when
 `<data dir>/personas/<name>.md` exists, its text is read at boot and becomes
 the persona's system prompt for sessions under it. Without a file the session
 runs on the built-in default system text. The personas directory is created at
-boot like the skills directory; the prompt files themselves are optional.
+boot; the prompt files themselves are optional.
 
 `bosun clone` and `bosun dev` take `--persona <name>`; the persona's model,
 permission, and allowed-tool set are resolved onto the session at creation
@@ -79,6 +80,24 @@ stored session permission is authoritative. An unknown persona is refused with
 persona; the tree-wide child rules arrive with the tree itself.
 
 See `crates/bosun-common/src/config.rs` for the current fields and defaults.
+
+### Skill repositories
+
+Skills come from GitHub repositories that the operator manages in the web pane:
+add, remove, and update happen there, and the store holds the repo list. The
+web pane lists each repo with the ref it tracks, the commit SHA it was
+indexed at, the number of packages, and the last error. Adding a repo fetches
+it immediately; Update re-resolves the tracked ref to a commit and, when the
+SHA changed, atomically replaces that repo's packages. A disabled repo stops
+advertising its packages but keeps them stored.
+
+A skill is a Bosun Skill Package with an identity like
+`github.com/owner/repo/<path...>/skills/<name>`, served to sessions from the
+store. The `skill` tool advertises these beside the working copy's own skills
+and loads a package's instructions or one of its reference chunks on demand.
+See `docs/adrs/2026-09-06-skill-package-standard.md` for the standard and
+`docs/adrs/2026-09-06-remote-skill-packages.md` for the acquisition and storage
+model.
 
 ## Node
 

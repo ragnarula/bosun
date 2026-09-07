@@ -41,7 +41,11 @@ pub fn resolve_model(
     })
 }
 
-fn resolve_api_key(api_key: &str) -> Result<String, ProviderError> {
+/// Resolves a config value following the `api_key` convention: `env:VAR`
+/// reads `VAR` from the environment (missing or empty is an error), anything
+/// else is used literally. Model `api_key`s and the control plane's
+/// `github_token` resolve through this at boot.
+pub fn resolve_api_key(api_key: &str) -> Result<String, ProviderError> {
     match api_key.strip_prefix("env:") {
         Some(var) => match std::env::var(var) {
             Ok(value) if !value.is_empty() => Ok(value),

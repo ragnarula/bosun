@@ -23,6 +23,7 @@ use axum::response::Response;
 use axum::response::sse::Event as SseEvent;
 use axum::response::sse::KeepAlive;
 use axum::response::sse::Sse;
+use axum::routing::delete;
 use axum::routing::get;
 use axum::routing::post;
 use bosun_agent::agent_loop::CRASH_FAILURE_TEXT;
@@ -40,6 +41,7 @@ use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
+use bosun_common::skills::SkillRepo;
 use bosun_common::tunnel::Tunnel;
 use bosun_common::types::CloneRequest;
 use bosun_common::types::CommandResult;
@@ -72,6 +74,9 @@ use crate::commands::CommandQueue;
 use crate::loops::AgentRegistry;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
+use crate::skills_repos::GitHubClient;
+use crate::skills_repos::SkillsFetchError;
+use crate::skills_repos::fetch_and_index;
 use crate::tools::set_executor_permission;
 use crate::tunnel::TunnelRegistry;
 
@@ -112,7 +117,20 @@ pub enum ApiError {
 
     #[error("persona {persona} references model {model} which is not configured")]
     PersonaModelNotFound { persona: String, model: String },
-
+    #[error("skill repo {repo} already exists")]
+    RepoAlreadyExists { repo: String },
+    #[error("skill repo {repo} was not found")]
+    RepoNotFound { repo: String },
+    #[error(
+        "skill package {address} belongs to repo {package_repo}, not the repo being replaced ({repo})"
+    )]
+    PackageRepoMismatch {
+        repo: String,
+        address: String,
+        package_repo: String,
+    },
+    #[error("failed to fetch skill repo: {0}")]
+    SkillRepoFetch(#[from] SkillsFetchError),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -121,6 +139,17 @@ impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::SessionNotFound { id } => ApiError::SessionNotFound { id },
+            StoreError::RepoAlreadyExists { repo } => ApiError::RepoAlreadyExists { repo },
+            StoreError::RepoNotFound { repo } => ApiError::RepoNotFound { repo },
+            StoreError::PackageRepoMismatch {
+                repo,
+                address,
+                package_repo,
+            } => ApiError::PackageRepoMismatch {
+                repo,
+                address,
+                package_repo,
+            },
             StoreError::Internal(error) => ApiError::Internal(error),
         }
     }
@@ -133,14 +162,38 @@ impl IntoResponse for ApiError {
             | ApiError::NodePredatesAutoUpdate { .. }
             | ApiError::NoPersona
             | ApiError::PersonaNotFound { .. }
-            | ApiError::PersonaModelNotFound { .. } => {
+            | ApiError::PersonaModelNotFound { .. }
+            | ApiError::PackageRepoMismatch { .. } => {
                 (StatusCode::BAD_REQUEST, Some(self.to_string()))
             }
             ApiError::NodeRejected { .. } | ApiError::NodeUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
             ApiError::ChildIsWatchOnly { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
-            ApiError::SessionNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
+            ApiError::SessionNotFound { .. } | ApiError::RepoNotFound { .. } => {
+                (StatusCode::NOT_FOUND, Some(self.to_string()))
+            }
+            ApiError::RepoAlreadyExists { .. } => (StatusCode::CONFLICT, Some(self.to_string())),
+            // A failed repo fetch maps its skills-fetch error kind to the
+            // status the fetch failed with: a repo or ref GitHub does not
+            // have is 404, a malformed repo 400, an indexing problem 422, a
+            // broken upstream 502, and an internal failure 500.
+            ApiError::SkillRepoFetch(error) => match error {
+                SkillsFetchError::RepositoryNotFound { .. }
+                | SkillsFetchError::RefNotFound { .. } => {
+                    (StatusCode::NOT_FOUND, Some(error.to_string()))
+                }
+                SkillsFetchError::MalformedRepo { .. } => {
+                    (StatusCode::BAD_REQUEST, Some(error.to_string()))
+                }
+                SkillsFetchError::Index { .. } | SkillsFetchError::TreeTruncated { .. } => {
+                    (StatusCode::UNPROCESSABLE_ENTITY, Some(error.to_string()))
+                }
+                SkillsFetchError::HttpStatus { .. } | SkillsFetchError::Network { .. } => {
+                    (StatusCode::BAD_GATEWAY, Some(error.to_string()))
+                }
+                SkillsFetchError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+            },
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
 
@@ -158,14 +211,17 @@ pub struct AppState {
     pub commands: Arc<CommandQueue>,
     pub tunnels: Arc<TunnelRegistry>,
     pub store: Store,
+
+    /// The GitHub client the skill-repo routes fetch through. Built at boot
+    /// from the resolved `github_token` and injected in tests to point at a
+    /// stub.
+    pub github: GitHubClient,
     pub loops: Arc<AgentRegistry>,
     pub providers: HashMap<String, Arc<dyn Provider>>,
     /// Configured personas, keyed by persona name.
     pub personas: HashMap<String, PersonaConfig>,
     /// The persona sessions use when a request names none.
     pub default_persona: Option<String>,
-    /// Skills injected into every session from the control plane's data dir.
-    pub skills_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -301,6 +357,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/nodes/{name}/update", post(node_update))
         .route("/stop", post(stop))
         .route("/tunnel/node/{node}", get(tunnel))
+        .route("/skills/repos", get(skill_repos).post(add_skill_repo))
+        .route("/skills/repos/{repo}", delete(remove_skill_repo))
+        .route("/skills/repos/{repo}/update", post(update_skill_repo))
+        .route("/skills/repos/{repo}/enabled", post(set_skill_repo_enabled))
         .fallback(not_found)
         .layer(from_fn(add_version_header))
         .with_state(state)
@@ -803,7 +863,91 @@ async fn stop(
     }
     Ok(StatusCode::NO_CONTENT)
 }
+// Skill-repo management: the store is the source of truth for the repo list,
+// and the GitHub client fetches and indexes a repo when it is added or
+// updated. A fetch failure becomes an ApiError through From<SkillsFetchError>
+// and is recorded on the repo row by fetch_and_index, so the pane can show it.
+// The repo path param carries `owner/name` percent-encoded (`%2F`) and is
+// decoded by the Path extractor.
+#[instrument(skip(state))]
 
+async fn skill_repos(State(state): State<Arc<AppState>>) -> Result<Json<Vec<SkillRepo>>, ApiError> {
+    Ok(Json(state.store.list_skill_repos().await?))
+}
+#[derive(Debug, Deserialize)]
+
+struct AddSkillRepoRequest {
+    repo: String,
+
+    /// The branch, tag, or sha to track; the host's default branch when
+    /// absent.
+    #[serde(default)]
+    r#ref: Option<String>,
+}
+#[instrument(skip(state))]
+
+async fn add_skill_repo(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddSkillRepoRequest>,
+) -> Result<Json<SkillRepo>, ApiError> {
+    state
+        .store
+        .insert_skill_repo(&req.repo, "github.com", req.r#ref.as_deref())
+        .await?;
+    let _ = fetch_and_index(&state.github, &state.store, &req.repo, req.r#ref.as_deref()).await?;
+    Ok(Json(skill_repo_row(&state, &req.repo).await?))
+}
+#[instrument(skip(state))]
+
+async fn update_skill_repo(
+    State(state): State<Arc<AppState>>,
+    AxumPath(repo): AxumPath<String>,
+) -> Result<Json<SkillRepo>, ApiError> {
+    let row = skill_repo_row(&state, &repo).await?;
+    let _ = fetch_and_index(&state.github, &state.store, &repo, row.r#ref.as_deref()).await?;
+    Ok(Json(skill_repo_row(&state, &repo).await?))
+}
+#[derive(Debug, Deserialize)]
+
+struct SetSkillRepoEnabledRequest {
+    enabled: bool,
+}
+#[instrument(skip(state))]
+
+async fn set_skill_repo_enabled(
+    State(state): State<Arc<AppState>>,
+    AxumPath(repo): AxumPath<String>,
+    Json(req): Json<SetSkillRepoEnabledRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .store
+        .set_skill_repo_enabled(&repo, req.enabled)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+#[instrument(skip(state))]
+
+async fn remove_skill_repo(
+    State(state): State<Arc<AppState>>,
+    AxumPath(repo): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.store.remove_skill_repo(&repo).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One stored skill repo row, or a 404 when the repo is not tracked. The
+/// update route reads the stored ref through this, so an unknown repo never
+/// reaches the GitHub client.
+async fn skill_repo_row(state: &AppState, repo: &str) -> Result<SkillRepo, ApiError> {
+    let row = state
+        .store
+        .get_skill_repo(repo)
+        .await?
+        .ok_or_else(|| ApiError::RepoNotFound {
+            repo: repo.to_string(),
+        })?;
+    Ok(row)
+}
 #[derive(Debug, Deserialize)]
 struct AddMessageRequest {
     content: String,
@@ -1255,6 +1399,7 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use bosun_agent::adapters::provider_for;
     use bosun_agent::config::ResolvedModel;
+    use bosun_agent::config::resolve_api_key;
     use bosun_agent::provider::ProviderCall;
     use bosun_agent::provider::ProviderError;
     use bosun_agent::provider::StreamEvent;
@@ -1267,6 +1412,7 @@ mod tests {
     use bosun_common::types::UpdateStatus;
     use bosun_test_support::stub_backend;
     use bosun_test_support::wait_for;
+    use bytes::Bytes;
     use futures_util::stream::BoxStream;
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
@@ -1322,15 +1468,16 @@ mod tests {
     }
 
     /// A control-plane state backed by a fresh store in `dir`, with no models
-    /// configured.
+    /// configured and a GitHub client aimed at a dead port: tests that never
+    /// fetch use this.
     fn test_state(dir: &tempfile::TempDir) -> Arc<AppState> {
         Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -1338,7 +1485,6 @@ mod tests {
             providers: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
-            skills_dir: None,
         })
     }
 
@@ -1492,8 +1638,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -1523,7 +1669,6 @@ mod tests {
                 })
                 .collect(),
             default_persona: default_persona.map(ToString::to_string),
-            skills_dir: None,
         })
     }
 
@@ -1563,8 +1708,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 providers.clone(),
                 personas.clone(),
                 HashMap::new(),
@@ -1572,7 +1717,6 @@ mod tests {
             providers,
             personas,
             default_persona: default_persona.map(ToString::to_string),
-            skills_dir: None,
         })
     }
 
@@ -2490,8 +2634,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: store.clone(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -2508,7 +2652,6 @@ mod tests {
                 },
             )]),
             default_persona: Some("test".into()),
-            skills_dir: None,
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -2674,8 +2817,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: store.clone(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -2692,7 +2835,6 @@ mod tests {
                 },
             )]),
             default_persona: Some("reviewer".into()),
-            skills_dir: None,
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -2808,7 +2950,6 @@ mod tests {
             ),
         ]);
         let loops = Arc::new(AgentRegistry::new(
-            None,
             providers.clone(),
             personas.clone(),
             HashMap::new(),
@@ -2818,11 +2959,11 @@ mod tests {
             commands: commands.clone(),
             tunnels: tunnels.clone(),
             store: store.clone(),
+            github: dead_github(),
             loops,
             providers,
             personas,
             default_persona: Some("coder".into()),
-            skills_dir: None,
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -3097,7 +3238,6 @@ mod tests {
             ),
         ]);
         let loops = Arc::new(AgentRegistry::new(
-            None,
             providers.clone(),
             personas.clone(),
             HashMap::new(),
@@ -3107,11 +3247,11 @@ mod tests {
             commands: commands.clone(),
             tunnels: tunnels.clone(),
             store: store.clone(),
+            github: dead_github(),
             loops,
             providers,
             personas,
             default_persona: Some("coder".into()),
-            skills_dir: None,
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -3305,7 +3445,6 @@ mod tests {
         ]);
         let tunnels = Arc::new(TunnelRegistry::new());
         let loops = Arc::new(AgentRegistry::new(
-            None,
             providers.clone(),
             HashMap::new(),
             HashMap::new(),
@@ -3329,11 +3468,11 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels,
             store: store.clone(),
+            github: dead_github(),
             loops,
             providers,
             personas: HashMap::new(),
             default_persona: None,
-            skills_dir: None,
         });
         (state, store, root.id, child.id)
     }
@@ -3625,7 +3764,6 @@ mod tests {
         ]);
         let tunnels = Arc::new(TunnelRegistry::new());
         let loops = Arc::new(AgentRegistry::new(
-            None,
             providers.clone(),
             HashMap::new(),
             HashMap::new(),
@@ -3648,11 +3786,11 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels,
             store: store.clone(),
+            github: dead_github(),
             loops,
             providers,
             personas: HashMap::new(),
             default_persona: None,
-            skills_dir: None,
         });
         (state, store, root.id, mid.id, leaf.id)
     }
@@ -3942,8 +4080,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: store.clone(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 personas.clone(),
                 HashMap::new(),
@@ -3951,7 +4089,6 @@ mod tests {
             providers: HashMap::from([("test".to_string(), provider)]),
             personas,
             default_persona: Some("coder".into()),
-            skills_dir: None,
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -4397,8 +4534,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels,
             store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -4422,7 +4559,6 @@ mod tests {
                 ),
             ]),
             default_persona: Some("coder".into()),
-            skills_dir: None,
         });
         let store = state.store.clone();
         state.store.create_session(&session("s1")).await.unwrap();
@@ -4572,8 +4708,8 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
             store: store.clone(),
+            github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
-                None,
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -4590,7 +4726,6 @@ mod tests {
                 },
             )]),
             default_persona: Some("test".into()),
-            skills_dir: None,
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -5188,7 +5323,6 @@ mod tests {
         ]);
         let tunnels = Arc::new(TunnelRegistry::new());
         let loops = Arc::new(AgentRegistry::new(
-            None,
             providers.clone(),
             HashMap::new(),
             HashMap::new(),
@@ -5207,11 +5341,11 @@ mod tests {
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels,
             store: store.clone(),
+            github: dead_github(),
             loops,
             providers,
             personas: HashMap::new(),
             default_persona: None,
-            skills_dir: None,
         });
         (
             state,
@@ -5730,5 +5864,758 @@ mod tests {
             panic!("the queued command must be a stop");
         };
         assert_eq!(session_id, "child2-s8s");
+    }
+    // Skill-repo management routes, tested end to end against a local GitHub
+    // stub: the AppState's GitHubClient points at the stub, and the stub's
+    // route table is mutable so a test can move the upstream between calls.
+
+    /// A GitHub client aimed at a dead port; route tests that never fetch use
+    /// this, so a route that touches the network fails the test instead of
+    /// hanging.
+    fn dead_github() -> GitHubClient {
+        GitHubClient::new("http://127.0.0.1:1", "http://127.0.0.1:1", None)
+    }
+
+    /// A control-plane state whose GitHub client points at a stub.
+    fn state_with_github(dir: &tempfile::TempDir, github: GitHubClient) -> Arc<AppState> {
+        Arc::new(AppState {
+            registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
+            commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
+            tunnels: Arc::new(TunnelRegistry::new()),
+            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            github,
+            loops: Arc::new(AgentRegistry::new(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )),
+            providers: HashMap::new(),
+            personas: HashMap::new(),
+            default_persona: None,
+        })
+    }
+
+    /// One canned response the GitHub stub serves for a request path.
+    #[derive(Clone)]
+
+    struct StubResponse {
+        status: u16,
+        reason: &'static str,
+        body: Bytes,
+    }
+
+    fn text_response(status: u16, reason: &'static str, body: &str) -> StubResponse {
+        StubResponse {
+            status,
+            reason,
+            body: Bytes::from(body.to_string()),
+        }
+    }
+
+    fn ok(body: &str) -> StubResponse {
+        text_response(200, "OK", body)
+    }
+
+    fn ok_owned(body: String) -> StubResponse {
+        text_response(200, "OK", &body)
+    }
+
+    /// One request the GitHub stub served: the path (query stripped) and
+    /// whether it carried a bearer authorization header.
+    struct StubHit {
+        path: String,
+        bearer: bool,
+    }
+
+    /// A local GitHub stub that maps each request path (query stripped) to a
+    /// canned response and answers 404 for everything else, served over raw
+    /// TCP so the test sees exactly what the client sent. The route table is
+    /// shared mutable state, so a test can move the upstream between calls.
+    async fn github_stub(
+        routes: Arc<Mutex<HashMap<String, StubResponse>>>,
+        hits: Arc<Mutex<Vec<StubHit>>>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (routes, hits) = (routes.clone(), hits.clone());
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    use tokio::io::AsyncWriteExt;
+                    let mut buf = [0u8; 4096];
+                    let mut read = 0;
+                    while let Ok(n) = stream.read(&mut buf[read..]).await {
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                        if buf[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf[..read]).into_owned();
+                    let Some(request_line) = head.split('\n').next() else {
+                        return;
+                    };
+                    let parts: Vec<&str> = request_line.split(' ').collect();
+                    let target = if parts.len() >= 2 { parts[1] } else { "" };
+                    let path = target
+                        .split_once('?')
+                        .map(|(path, _)| path)
+                        .unwrap_or(target);
+                    hits.lock().unwrap().push(StubHit {
+                        path: path.to_string(),
+                        bearer: header_value(&head, "authorization")
+                            .unwrap_or_default()
+                            .split_once(' ')
+                            .map(|(scheme, _)| scheme)
+                            .unwrap_or_default()
+                            .eq_ignore_ascii_case("bearer"),
+                    });
+                    let response = routes
+                        .lock()
+                        .unwrap()
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| text_response(404, "Not Found", "not found"));
+                    // Each response closes the connection, so reqwest opens a
+                    // fresh one per request instead of racing a reused socket.
+                    let header = format!(
+                        "HTTP/1.1 {} {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.status,
+                        response.reason,
+                        response.body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(response.body.as_ref()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.split('\n').find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if key.trim().eq_ignore_ascii_case(name) {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// A GitHub client pointed at the stub's address.
+    fn client_at(addr: SocketAddr, token: Option<String>) -> GitHubClient {
+        let base = format!("http://{addr}");
+        GitHubClient::new(base.as_str(), base.as_str(), token)
+    }
+
+    fn repo_json(default_branch: &str) -> String {
+        serde_json::to_string(&json!({
+            "default_branch": default_branch,
+            "full_name": "owner/acme",
+        }))
+        .unwrap()
+    }
+
+    fn commit_json(sha: &str) -> String {
+        serde_json::to_string(&json!({
+            "sha": sha,
+            "commit": { "message": "the commit" },
+        }))
+        .unwrap()
+    }
+
+    fn tree_json(truncated: bool, tree: Vec<Value>) -> String {
+        serde_json::to_string(&json!({
+            "truncated": truncated,
+            "tree": tree,
+        }))
+        .unwrap()
+    }
+
+    fn tree_dir(path: &str) -> Value {
+        json!({
+            "path": path,
+            "mode": "040000",
+            "type": "tree",
+            "sha": "tree-sha",
+        })
+    }
+
+    fn tree_blob(path: &str, size: i64) -> Value {
+        json!({
+            "path": path,
+            "mode": "100644",
+            "type": "blob",
+            "size": size,
+            "sha": "blob-sha",
+        })
+    }
+
+    /// The route table for a repo with one package at `sha`, tracked on `main`.
+    fn one_package_routes(sha: &str) -> HashMap<String, StubResponse> {
+        HashMap::from([
+            (
+                "/repos/owner/acme/commits/main".to_string(),
+                ok_owned(commit_json(sha)),
+            ),
+            (
+                format!("/repos/owner/acme/git/trees/{sha}"),
+                ok_owned(tree_json(
+                    false,
+                    vec![
+                        tree_dir("skills"),
+                        tree_dir("skills/alpha"),
+                        tree_blob("skills/alpha/SKILL.md", 40),
+                    ],
+                )),
+            ),
+            (
+                format!("/owner/acme/{sha}/skills/alpha/SKILL.md"),
+                ok("---\ndescription: Does alpha\n---\n\nDo alpha things.\n"),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn the_skill_repos_endpoint_lists_an_empty_store() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let repos: Value = response.json().await.unwrap();
+        assert_eq!(repos.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn adding_a_skill_repo_fetches_packages_and_lists_the_row() {
+        let routes = Arc::new(Mutex::new(HashMap::from([
+            ("/repos/owner/acme".to_string(), ok_owned(repo_json("main"))),
+            (
+                "/repos/owner/acme/commits/main".to_string(),
+                ok_owned(commit_json("sha1234")),
+            ),
+            (
+                "/repos/owner/acme/git/trees/sha1234".to_string(),
+                ok_owned(tree_json(
+                    false,
+                    vec![
+                        tree_dir("skills"),
+                        tree_dir("skills/alpha"),
+                        tree_blob("skills/alpha/SKILL.md", 40),
+                    ],
+                )),
+            ),
+            (
+                "/owner/acme/sha1234/skills/alpha/SKILL.md".to_string(),
+                ok("---\ndescription: Does alpha\n---\n\nDo alpha things.\n"),
+            ),
+        ])));
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stub = github_stub(routes, hits.clone()).await;
+        let dir = tempdir().unwrap();
+        let state = state_with_github(&dir, client_at(stub, None));
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/skills/repos"))
+            .json(&json!({ "repo": "owner/acme" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let added: Value = response.json().await.unwrap();
+        assert_eq!(added["repo"], "owner/acme");
+        assert_eq!(added["sha"], "sha1234");
+        assert_eq!(added["package_count"], 1);
+        assert_eq!(added["enabled"], true);
+        assert_eq!(added["last_error"], serde_json::Value::Null);
+        // The add resolved the default branch, then fetched the commit, the
+        // tree, and the package file.
+        let requested: Vec<String> = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|hit| hit.path.clone())
+            .collect();
+        assert_eq!(requested.len(), 4);
+        assert!(requested[0] == "/repos/owner/acme", "{requested:?}");
+        assert!(
+            requested[1] == "/repos/owner/acme/commits/main",
+            "{requested:?}"
+        );
+        let repos: Value = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repos.as_array().unwrap().len(), 1);
+        assert_eq!(repos[0]["repo"], "owner/acme");
+        assert_eq!(
+            repos[0]["ref"],
+            serde_json::Value::Null,
+            "a repo added without a ref tracks the default branch"
+        );
+        // The package is stored and loads through the store.
+        let (instructions, paths) = state
+            .store
+            .load_skill_package("github.com/owner/acme/skills/alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instructions, "\n\nDo alpha things.\n");
+        assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adding_a_duplicate_skill_repo_is_a_conflict() {
+        let routes = Arc::new(Mutex::new(HashMap::from([
+            ("/repos/owner/acme".to_string(), ok_owned(repo_json("main"))),
+            (
+                "/repos/owner/acme/commits/main".to_string(),
+                ok_owned(commit_json("sha1234")),
+            ),
+            (
+                "/repos/owner/acme/git/trees/sha1234".to_string(),
+                ok_owned(tree_json(
+                    false,
+                    vec![tree_blob("skills/alpha/SKILL.md", 40)],
+                )),
+            ),
+            (
+                "/owner/acme/sha1234/skills/alpha/SKILL.md".to_string(),
+                ok("---\ndescription: Does alpha\n---\n\nDo alpha things.\n"),
+            ),
+        ])));
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stub = github_stub(routes, hits.clone()).await;
+        let dir = tempdir().unwrap();
+        let state = state_with_github(&dir, client_at(stub, None));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/skills/repos");
+        let response = client
+            .post(&url)
+            .json(&json!({ "repo": "owner/acme" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = client
+            .post(&url)
+            .json(&json!({ "repo": "owner/acme" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("already exists"), "{text}");
+        // The conflict was refused before any fetch: the stub saw exactly the
+        // first add's four requests.
+        assert_eq!(hits.lock().unwrap().len(), 4);
+        let repos: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(repos.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adding_a_malformed_skill_repo_is_bad_request_and_records_last_error() {
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stub = github_stub(routes, hits.clone()).await;
+        let dir = tempdir().unwrap();
+        let state = state_with_github(&dir, client_at(stub, None));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/skills/repos"))
+            .json(&json!({ "repo": "a/b/c" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("malformed"), "{text}");
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "no request reaches the stub"
+        );
+        // The row is stored with the failure, so the pane can show it.
+        let repos: Value = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repos[0]["repo"], "a/b/c");
+        assert_eq!(repos[0]["sha"], serde_json::Value::Null);
+        assert!(
+            repos[0]["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("malformed"),
+            "the last error records the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_an_unknown_skill_repo_404s_and_records_last_error() {
+        // An empty route table: the default-branch call answers 404, which
+        // the client reports as a missing repository.
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stub = github_stub(routes, hits.clone()).await;
+        let dir = tempdir().unwrap();
+        let state = state_with_github(&dir, client_at(stub, None));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/skills/repos"))
+            .json(&json!({ "repo": "owner/ghost" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("owner/ghost"), "{text}");
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            1,
+            "the add resolves the default branch and stops at the 404"
+        );
+        let repos: Value = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repos[0]["repo"], "owner/ghost");
+        assert_eq!(repos[0]["sha"], serde_json::Value::Null);
+        assert_eq!(repos[0]["package_count"], 0);
+        assert!(
+            repos[0]["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("was not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_a_skill_repo_refetches_the_tracked_ref_and_replaces_packages() {
+        let routes = Arc::new(Mutex::new(HashMap::from([
+            (
+                "/repos/owner/acme/commits/main".to_string(),
+                ok_owned(commit_json("sha1")),
+            ),
+            (
+                "/repos/owner/acme/git/trees/sha1".to_string(),
+                ok_owned(tree_json(
+                    false,
+                    vec![
+                        tree_dir("skills"),
+                        tree_dir("skills/alpha"),
+                        tree_blob("skills/alpha/SKILL.md", 40),
+                    ],
+                )),
+            ),
+            (
+                "/owner/acme/sha1/skills/alpha/SKILL.md".to_string(),
+                ok("---\ndescription: Does alpha\n---\n\nversion one instructions.\n"),
+            ),
+        ])));
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stub = github_stub(routes.clone(), hits.clone()).await;
+        let dir = tempdir().unwrap();
+        let state = state_with_github(&dir, client_at(stub, None));
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/skills/repos"))
+            .json(&json!({ "repo": "owner/acme", "ref": "main" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["sha"], "sha1");
+        // The upstream moves main to a second commit that replaces the alpha
+        // package and adds a beta one.
+        routes.lock().unwrap().insert(
+            "/repos/owner/acme/commits/main".to_string(),
+            ok_owned(commit_json("sha2")),
+        );
+        routes.lock().unwrap().insert(
+            "/repos/owner/acme/git/trees/sha2".to_string(),
+            ok_owned(tree_json(
+                false,
+                vec![
+                    tree_dir("skills"),
+                    tree_dir("skills/alpha"),
+                    tree_blob("skills/alpha/SKILL.md", 40),
+                    tree_dir("skills/beta"),
+                    tree_blob("skills/beta/SKILL.md", 44),
+                ],
+            )),
+        );
+        routes.lock().unwrap().insert(
+            "/owner/acme/sha2/skills/alpha/SKILL.md".to_string(),
+            ok("---\ndescription: Does alpha better\n---\n\nversion two instructions.\n"),
+        );
+        routes.lock().unwrap().insert(
+            "/owner/acme/sha2/skills/beta/SKILL.md".to_string(),
+            ok("---\ndescription: Does beta\n---\n\nbeta instructions.\n"),
+        );
+        let response = client
+            .post(format!("http://{addr}/skills/repos/owner%2Facme/update"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: Value = response.json().await.unwrap();
+        assert_eq!(updated["sha"], "sha2");
+        assert_eq!(updated["package_count"], 2);
+        // The old version is gone: the alpha package holds the second
+        // commit's instructions and the beta package exists.
+        let (instructions, _) = state
+            .store
+            .load_skill_package("github.com/owner/acme/skills/alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instructions, "\n\nversion two instructions.\n");
+        assert!(
+            state
+                .store
+                .load_skill_package("github.com/owner/acme/skills/beta")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // The update re-resolved the stored ref and never asked for the
+        // default branch or the first commit's tree.
+        let requested: Vec<String> = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|hit| hit.path.clone())
+            .collect();
+        assert!(
+            !requested
+                .iter()
+                .any(|path| path.as_str() == "/repos/owner/acme"),
+            "the update must not resolve the default branch: {requested:?}"
+        );
+        assert!(
+            requested
+                .iter()
+                .any(|path| path.as_str() == "/repos/owner/acme/commits/main"),
+            "the update must re-resolve the tracked ref: {requested:?}"
+        );
+        assert!(
+            requested
+                .iter()
+                .any(|path| path.as_str() == "/repos/owner/acme/git/trees/sha2"),
+            "the update must fetch the new commit's tree: {requested:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_an_unknown_skill_repo_is_not_found() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/skills/repos/owner%2Facme/update"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let text = response.text().await.unwrap();
+        assert!(
+            text.contains("owner/acme") && text.contains("was not found"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_skill_repo_deletes_it_and_its_packages() {
+        let routes = Arc::new(Mutex::new(one_package_routes("sha1234")));
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stub = github_stub(routes, hits).await;
+        let dir = tempdir().unwrap();
+        let state = state_with_github(&dir, client_at(stub, None));
+        let store = state.store.clone();
+        store
+            .insert_skill_repo("owner/acme", "github.com", Some("main"))
+            .await
+            .unwrap();
+        fetch_and_index(&state.github, &store, "owner/acme", Some("main"))
+            .await
+            .unwrap();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .delete(format!("http://{addr}/skills/repos/owner%2Facme"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let repos: Value = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repos.as_array().unwrap().len(), 0);
+        assert!(
+            store.advertised_skill_packages().await.unwrap().is_empty(),
+            "the packages disappear with the repo"
+        );
+        // Removing again is a 404: the row and its packages are gone.
+        let response = client
+            .delete(format!("http://{addr}/skills/repos/owner%2Facme"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_skill_repo_enabled_toggle_flips_a_repo() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        state
+            .store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/skills/repos/owner%2Facme/enabled");
+        let response = client
+            .post(&url)
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let repos: Value = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repos[0]["enabled"], false);
+        let response = client
+            .post(&url)
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let repos: Value = client
+            .get(format!("http://{addr}/skills/repos"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repos[0]["enabled"], true);
+        // An unknown repo toggles to a 404.
+        let response = client
+            .post(format!("http://{addr}/skills/repos/owner%2Facme2/enabled"))
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_env_var_github_token_reaches_fetches_as_a_bearer_token() {
+        let var = "BOSUN_TEST_GITHUB_TOKEN";
+        unsafe {
+            std::env::set_var(var, "a-secret-token");
+        }
+        // With a token the file fetch goes through the API contents endpoint
+        // instead of the public raw host.
+        let routes = Arc::new(Mutex::new(HashMap::from([
+            (
+                "/repos/owner/acme/commits/main".to_string(),
+                ok_owned(commit_json("sha1234")),
+            ),
+            (
+                "/repos/owner/acme/git/trees/sha1234".to_string(),
+                ok_owned(tree_json(
+                    false,
+                    vec![
+                        tree_dir("skills"),
+                        tree_dir("skills/alpha"),
+                        tree_blob("skills/alpha/SKILL.md", 40),
+                    ],
+                )),
+            ),
+            (
+                "/repos/owner/acme/contents/skills/alpha/SKILL.md".to_string(),
+                ok("---\ndescription: Does alpha\n---\n\nDo alpha things.\n"),
+            ),
+        ])));
+        let hits = Arc::new(Mutex::new(Vec::<StubHit>::new()));
+        let stub = github_stub(routes, hits.clone()).await;
+        let dir = tempdir().unwrap();
+        let resolved = resolve_api_key(&format!("env:{var}")).unwrap();
+        let state = state_with_github(&dir, client_at(stub, Some(resolved)));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/skills/repos"))
+            .json(&json!({ "repo": "owner/acme", "ref": "main" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["package_count"], 1);
+        // Every request carried the resolved token.
+        let requested: Vec<String> = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|hit| hit.path.clone())
+            .collect();
+        let recorded = hits.lock().unwrap();
+        assert!(
+            recorded.iter().all(|hit| hit.bearer),
+            "every fetch request must carry the token: {requested:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|hit| hit.path == "/repos/owner/acme/contents/skills/alpha/SKILL.md"),
+            "a token-backed fetch reads files through the contents endpoint"
+        );
+        unsafe {
+            std::env::remove_var(var);
+        }
     }
 }

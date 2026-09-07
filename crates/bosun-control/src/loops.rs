@@ -3,7 +3,6 @@
 //! and forwards events from the session API.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -38,8 +37,6 @@ const MAX_WINDOW_MESSAGES: usize = 80;
 pub struct AgentRegistry {
     loops: RwLock<HashMap<String, LoopHandle>>,
     live: RwLock<HashMap<String, broadcast::Sender<String>>>,
-    /// Skills injected by the control plane, passed to every started loop.
-    pub skills_dir: Option<PathBuf>,
     /// Providers for persona models, keyed by model name.
     pub providers: HashMap<String, Arc<dyn Provider>>,
     /// Configured personas, keyed by persona name. The loop resolves the
@@ -55,7 +52,6 @@ pub struct AgentRegistry {
 
 impl AgentRegistry {
     pub fn new(
-        skills_dir: Option<PathBuf>,
         providers: HashMap<String, Arc<dyn Provider>>,
         personas: HashMap<String, PersonaConfig>,
         prices: HashMap<String, (f64, f64)>,
@@ -63,7 +59,6 @@ impl AgentRegistry {
         Self {
             loops: RwLock::new(HashMap::new()),
             live: RwLock::new(HashMap::new()),
-            skills_dir,
             providers,
             personas,
             prices,
@@ -118,7 +113,6 @@ impl AgentRegistry {
             }),
             delta_sink: Arc::new(LiveSink { tx: sender }),
             max_window_messages: MAX_WINDOW_MESSAGES,
-            injected_skills_dir: self.skills_dir.clone(),
             personas: self.personas.clone(),
             providers: self.providers.clone(),
             prices: self.prices.clone(),
@@ -182,7 +176,7 @@ pub struct LiveSink {
 
 impl Default for AgentRegistry {
     fn default() -> Self {
-        Self::new(None, HashMap::new(), HashMap::new(), HashMap::new())
+        Self::new(HashMap::new(), HashMap::new(), HashMap::new())
     }
 }
 
@@ -266,7 +260,6 @@ mod tests {
             .unwrap();
 
         let registry = Arc::new(AgentRegistry::new(
-            None,
             HashMap::new(),
             HashMap::new(),
             HashMap::from([("mock-model".to_string(), (3.0, 15.0))]),
@@ -338,7 +331,6 @@ mod tests {
             .unwrap();
 
         let registry = Arc::new(AgentRegistry::new(
-            None,
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

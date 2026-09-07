@@ -1,9 +1,6 @@
 //! Skill discovery: the working copy's skills are fetched from the node's
-//! executor, while the control plane's injected skills are read from its own
-//! data directory.
+//! executor, while remote skill packages come from the store.
 
-use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -103,90 +100,211 @@ pub async fn read_working_skill(
     Ok(Some(content))
 }
 
-/// The control plane's injected skills, from its own data directory.
-pub fn injected_skills(dir: Option<&Path>) -> Vec<Skill> {
-    match dir {
-        Some(dir) => bosun_common::skills::parse_skill_dir(dir),
-        None => Vec::new(),
+/// How a `skill` call's `name` resolved against the session's remote
+/// packages. `Exact` and `Short` carry the package address the handler
+/// loads; `Ambiguous` and `None` describe the misses it reports.
+pub enum RemoteResolution {
+    /// `name` was the full address of one remote package.
+    Exact { address: String },
+    /// `name` matched exactly one remote package's short name; the matched
+    /// package's address.
+    Short { address: String },
+    /// `name` is the short name of several remote packages; every candidate
+    /// address.
+    Ambiguous { addresses: Vec<String> },
+    /// No remote package matched.
+    None,
+}
+
+/// Resolves the `skill` tool's `name` against the remote packages. A full
+/// address (`github.com/...`) matches a package's address exactly and never
+/// falls back to a short-name match; any other name is matched by short
+/// name, which is unique, ambiguous, or unknown.
+pub fn resolve_remote(remote: &[Skill], name: &str) -> RemoteResolution {
+    if name.starts_with("github.com/") {
+        let Some(matched) = remote
+            .iter()
+            .find(|skill| skill.package.as_deref() == Some(name))
+        else {
+            return RemoteResolution::None;
+        };
+        let address = matched
+            .package
+            .as_deref()
+            .expect("an advertised remote package names its address")
+            .to_string();
+        return RemoteResolution::Exact { address };
+    }
+    let mut addresses = Vec::new();
+    for skill in remote {
+        if skill.name == name {
+            addresses.push(
+                skill
+                    .package
+                    .as_deref()
+                    .expect("an advertised remote package names its address")
+                    .to_string(),
+            );
+        }
+    }
+    match addresses.len() {
+        0 => RemoteResolution::None,
+        1 => RemoteResolution::Short {
+            address: addresses[0].clone(),
+        },
+        _ => RemoteResolution::Ambiguous { addresses },
     }
 }
 
-pub fn read_injected_skill(dir: Option<&Path>, name: &str) -> Option<String> {
-    dir.and_then(|dir| bosun_common::skills::read_skill_markdown(dir, name))
-}
-
-/// Working-copy skills shadow injected ones with the same name; sorted.
-pub fn merge_skills(working: Vec<Skill>, injected: Vec<Skill>) -> Vec<Skill> {
-    let mut by_name = BTreeMap::new();
-    // The injected skills are inserted first, so a working-copy skill with
-    // the same name replaces the injected one on the later insert.
-    for skill in injected {
-        by_name.insert(skill.name.clone(), skill);
-    }
-    for skill in working {
-        by_name.insert(skill.name.clone(), skill);
-    }
-    by_name.into_values().collect()
+/// The reference paths the instructions body mentions, in the paths' input
+/// order: a path counts when the body contains it verbatim or contains its
+/// last path segment, and no path is listed twice.
+pub fn referenced_paths(instructions: &str, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            let last_segment = path
+                .split('/')
+                .next_back()
+                .expect("a reference path has a last segment");
+            instructions.contains(path.as_str()) || instructions.contains(last_segment)
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
     use super::*;
 
-    /// Writes a skill's directory and SKILL.md.
-    fn write_skill(root: &Path, name: &str, content: &str) {
-        let dir = root.join(name);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("SKILL.md"), content).unwrap();
+    fn remote_package(name: &str, address: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: "does things".into(),
+            package: Some(address.into()),
+        }
     }
 
     #[test]
-    fn injected_skills_and_merge_work() {
-        let dir = tempdir().unwrap();
-        let skills_root = dir.path().join("injected");
-        write_skill(
-            &skills_root,
-            "zeta",
-            "---\nname: zeta\ndescription: zeta skill\n---\n\nZeta body",
-        );
-        write_skill(
-            &skills_root,
-            "alpha",
-            "---\nname: alpha\ndescription: alpha skill\n---\n\nAlpha body",
-        );
+    fn resolve_remote_matches_a_full_address_exactly() {
+        let remote = vec![
+            remote_package("checkout", "github.com/owner/acme/tools/skills/checkout"),
+            remote_package("deploy", "github.com/owner/acme/tools/skills/deploy"),
+        ];
+        let RemoteResolution::Exact { address } =
+            resolve_remote(&remote, "github.com/owner/acme/tools/skills/checkout")
+        else {
+            panic!("a full address must resolve to the matching package");
+        };
+        assert_eq!(address, "github.com/owner/acme/tools/skills/checkout");
+    }
 
-        let injected = injected_skills(Some(&skills_root));
-        assert_eq!(injected.len(), 2);
-        assert_eq!(injected[0].name, "alpha");
-        assert_eq!(injected[0].description, "alpha skill");
-        assert_eq!(injected[1].name, "zeta");
-        assert_eq!(injected[1].description, "zeta skill");
-        assert!(injected_skills(None).is_empty());
+    #[test]
+    fn resolve_remote_resolves_a_unique_short_name_to_its_address() {
+        let remote = vec![
+            remote_package("checkout", "github.com/owner/acme/tools/skills/checkout"),
+            remote_package("deploy", "github.com/owner/acme/tools/skills/deploy"),
+        ];
+        let RemoteResolution::Short { address } = resolve_remote(&remote, "deploy") else {
+            panic!("a unique short name must resolve to the matched package");
+        };
+        assert_eq!(address, "github.com/owner/acme/tools/skills/deploy");
+    }
 
-        let merged = merge_skills(
-            vec![Skill {
-                name: "alpha".into(),
-                description: "working alpha".into(),
-            }],
-            injected.clone(),
-        );
-        assert_eq!(merged.len(), 2);
+    #[test]
+    fn resolve_remote_reports_an_ambiguous_short_name_with_every_candidate_address() {
+        let remote = vec![
+            remote_package("checkout", "github.com/corp/tools/skills/checkout"),
+            remote_package("checkout", "github.com/owner/acme/tools/skills/checkout"),
+        ];
+        let RemoteResolution::Ambiguous { addresses } = resolve_remote(&remote, "checkout") else {
+            panic!("a shared short name must resolve as ambiguous");
+        };
         assert_eq!(
-            merged[0].description, "working alpha",
-            "a working-copy skill shadows the injected one with the same name"
+            addresses,
+            [
+                "github.com/corp/tools/skills/checkout",
+                "github.com/owner/acme/tools/skills/checkout",
+            ]
         );
-        assert_eq!(merged[1].name, "zeta");
+    }
 
-        assert!(
-            read_injected_skill(Some(&skills_root), "alpha")
-                .unwrap()
-                .contains("Alpha body")
+    #[test]
+    fn resolve_remote_finds_nothing_for_an_unknown_name() {
+        let remote = vec![remote_package(
+            "checkout",
+            "github.com/owner/acme/tools/skills/checkout",
+        )];
+        assert!(matches!(
+            resolve_remote(&remote, "nope"),
+            RemoteResolution::None
+        ));
+    }
+
+    #[test]
+    fn a_full_address_never_falls_back_to_a_short_name() {
+        // A package whose *name* looks like a full address is not reachable
+        // by that name: a full address only matches a package's address.
+        let remote = vec![
+            remote_package(
+                "github.com/owner/wrong/skills/checkout",
+                "github.com/owner/acme/tools/skills/checkout",
+            ),
+            remote_package("deploy", "github.com/owner/acme/tools/skills/deploy"),
+        ];
+        assert!(matches!(
+            resolve_remote(&remote, "github.com/owner/wrong/skills/checkout"),
+            RemoteResolution::None
+        ));
+    }
+
+    #[test]
+    fn referenced_paths_keeps_paths_present_verbatim_in_the_body() {
+        let paths = vec!["guides/CHECKLIST.md".into(), "docs/RUNBOOK.md".into()];
+        assert_eq!(
+            referenced_paths("Read guides/CHECKLIST.md first.", &paths),
+            ["guides/CHECKLIST.md"]
         );
-        assert_eq!(read_injected_skill(Some(&skills_root), "absent"), None);
-        assert_eq!(read_injected_skill(None, "alpha"), None);
+    }
+
+    #[test]
+    fn referenced_paths_matches_a_path_by_its_last_segment_alone() {
+        let paths = vec!["guides/FORMS.md".into(), "docs/RUNBOOK.md".into()];
+        assert_eq!(
+            referenced_paths("Fill in FORMS.md before continuing.", &paths),
+            ["guides/FORMS.md"]
+        );
+    }
+
+    #[test]
+    fn referenced_paths_returns_empty_when_the_body_references_no_path() {
+        let paths = vec!["guides/CHECKLIST.md".into()];
+        assert_eq!(
+            referenced_paths("Just do the thing.", &paths),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn referenced_paths_keeps_the_input_order() {
+        let paths = vec![
+            "z/LAST.md".into(),
+            "a/FIRST.md".into(),
+            "m/MIDDLE.md".into(),
+        ];
+        assert_eq!(
+            referenced_paths("Do a/FIRST.md, then m/MIDDLE.md and LAST.md.", &paths),
+            ["z/LAST.md", "a/FIRST.md", "m/MIDDLE.md"],
+            "the paths keep their input order, not the body's mention order"
+        );
+    }
+
+    #[test]
+    fn referenced_paths_does_not_duplicate_a_path_that_matches_both_ways() {
+        let paths = vec!["guides/ASK.md".into(), "docs/OTHER.md".into()];
+        assert_eq!(
+            referenced_paths("Read guides/ASK.md and ASK.md again.", &paths),
+            ["guides/ASK.md"]
+        );
     }
 }

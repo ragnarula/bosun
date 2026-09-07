@@ -17,6 +17,9 @@ use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
+use bosun_common::skills::SkillAd;
+use bosun_common::skills::SkillPackage;
+use bosun_common::skills::SkillRepo;
 use rusqlite::params;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,6 +32,18 @@ pub enum StoreError {
     Internal(#[from] anyhow::Error),
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
+    #[error("skill repo {repo} already exists")]
+    RepoAlreadyExists { repo: String },
+    #[error("skill repo {repo} was not found")]
+    RepoNotFound { repo: String },
+    #[error(
+        "skill package {address} belongs to repo {package_repo}, not the repo being replaced ({repo})"
+    )]
+    PackageRepoMismatch {
+        repo: String,
+        address: String,
+        package_repo: String,
+    },
 }
 
 /// One recorded model call. `started_at_secs` is when the call was appended.
@@ -159,6 +174,36 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE TABLE IF NOT EXISTS skill_repos (
+  repo TEXT PRIMARY KEY,
+  host TEXT NOT NULL DEFAULT 'github.com',
+  ref TEXT,
+  sha TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  added_at_secs INTEGER NOT NULL,
+  updated_at_secs INTEGER,
+  last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS skill_packages (
+  address TEXT PRIMARY KEY,
+  repo TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  when_to_use TEXT,
+  license TEXT,
+  author TEXT,
+  instructions TEXT NOT NULL,
+  sha TEXT NOT NULL,
+  updated_at_secs INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_packages_name ON skill_packages(name);
+CREATE INDEX IF NOT EXISTS idx_skill_packages_repo ON skill_packages(repo);
+CREATE TABLE IF NOT EXISTS skill_references (
+  package TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content TEXT NOT NULL,
+  PRIMARY KEY (package, path)
+);
 ";
 
 impl Store {
@@ -251,6 +296,22 @@ impl Store {
         blocking(self.conn.clone(), move |conn| {
             ensure_session_exists(conn, &session_id)?;
             f(conn, &session_id)
+        })
+        .await
+    }
+
+    /// Runs `f` on the shared connection after checking the skill repo row
+    /// exists, so writes to a repo or its packages fail with `RepoNotFound`
+    /// instead of silently succeeding or inserting orphan rows.
+    async fn with_skill_repo<T, F>(&self, repo: &str, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection, &str) -> Result<T, anyhow::Error> + Send + 'static,
+    {
+        let repo = repo.to_string();
+        blocking(self.conn.clone(), move |conn| {
+            ensure_skill_repo_exists(conn, &repo)?;
+            f(conn, &repo)
         })
         .await
     }
@@ -918,6 +979,361 @@ impl Store {
         })
         .await
     }
+
+    /// Records a skill repo with `ref` NULL meaning the host's default
+    /// branch. Errors when the repo is already tracked, so the add route can
+    /// answer 409 without guessing from the database error.
+    pub async fn insert_skill_repo(
+        &self,
+        repo: &str,
+        host: &str,
+        r#ref: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let repo = repo.to_string();
+        let host = host.to_string();
+        let r#ref = r#ref.map(str::to_string);
+        self.with_conn(move |conn| {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM skill_repos WHERE repo = ?1)",
+                    [&repo],
+                    |row| row.get(0),
+                )
+                .context("failed to check skill repo existence")?;
+            if exists {
+                return Err(anyhow::Error::new(StoreError::RepoAlreadyExists { repo }));
+            }
+            conn.execute(
+                "INSERT INTO skill_repos (repo, host, ref, added_at_secs) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    repo,
+                    host,
+                    r#ref,
+                    bosun_common::time::unix_secs(SystemTime::now()),
+                ],
+            )
+            .context("failed to insert skill repo")?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_skill_repo_enabled(
+        &self,
+        repo: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let repo = repo.to_string();
+        self.with_skill_repo(&repo, move |conn, repo| {
+            conn.execute(
+                "UPDATE skill_repos SET enabled = ?1 WHERE repo = ?2",
+                params![enabled, repo],
+            )
+            .context("failed to update the skill repo enabled flag")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Replaces a repo's packages and references in one transaction: the old
+    /// rows are deleted, the new packages and their reference rows are
+    /// inserted, and the repo row is refreshed with the indexed SHA — all or
+    /// nothing, so a failed insert leaves the previous index in place. Every
+    /// package must name the replaced repo; one that names another would be
+    /// stored under that repo, so the call fails before the transaction.
+    pub async fn replace_skill_repo(
+        &self,
+        repo: &str,
+        sha: &str,
+        packages: &[SkillPackage],
+    ) -> Result<(), StoreError> {
+        let repo = repo.to_string();
+        let sha = sha.to_string();
+        let packages = packages.to_vec();
+        self.with_skill_repo(&repo, move |conn, repo| {
+            if let Some(package) = packages.iter().find(|package| package.repo != repo) {
+                return Err(anyhow::Error::new(StoreError::PackageRepoMismatch {
+                    repo: repo.to_string(),
+                    address: package.address.clone(),
+                    package_repo: package.repo.clone(),
+                }));
+            }
+            let tx = transaction(conn)?;
+            tx.execute(
+                "DELETE FROM skill_references WHERE package IN
+                   (SELECT address FROM skill_packages WHERE repo = ?1)",
+                [&repo],
+            )
+            .context("failed to delete the repo's skill references")?;
+            tx.execute("DELETE FROM skill_packages WHERE repo = ?1", [&repo])
+                .context("failed to delete the repo's skill packages")?;
+            let indexed_at_secs = bosun_common::time::unix_secs(SystemTime::now());
+            for package in &packages {
+                tx.execute(
+                    "INSERT INTO skill_packages (address, repo, name, description, when_to_use, license, author, instructions, sha, updated_at_secs)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        package.address,
+                        package.repo,
+                        package.name,
+                        package.description,
+                        package.when_to_use,
+                        package.license,
+                        package.author,
+                        package.instructions,
+                        package.sha,
+                        indexed_at_secs,
+                    ],
+                )
+                .with_context(|| {
+                    format!("failed to insert skill package {}", package.address)
+                })?;
+                for reference in &package.references {
+                    tx.execute(
+                        "INSERT INTO skill_references (package, path, content) VALUES (?1, ?2, ?3)",
+                        params![package.address, reference.path, reference.content],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to insert skill reference {}#{}",
+                            package.address, reference.path
+                        )
+                    })?;
+                }
+            }
+            tx.execute(
+                "UPDATE skill_repos SET sha = ?1, updated_at_secs = ?2, last_error = NULL
+                 WHERE repo = ?3",
+                params![sha, bosun_common::time::unix_secs(SystemTime::now()), repo],
+            )
+            .context("failed to update the skill repo after replace")?;
+            tx.commit().context("failed to commit the skill repo replace")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records a failed fetch on the repo row without touching its stored
+    /// packages.
+    pub async fn set_skill_repo_error(
+        &self,
+        repo: &str,
+        last_error: &str,
+    ) -> Result<(), StoreError> {
+        let repo = repo.to_string();
+        let last_error = last_error.to_string();
+        self.with_skill_repo(&repo, move |conn, repo| {
+            conn.execute(
+                "UPDATE skill_repos SET last_error = ?1 WHERE repo = ?2",
+                params![last_error, repo],
+            )
+            .context("failed to record the skill repo error")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Clears a repo's recorded fetch error without touching its packages: a
+    /// fresh resolve that names the commit already indexed is a success.
+    pub async fn clear_skill_repo_error(&self, repo: &str) -> Result<(), StoreError> {
+        let repo = repo.to_string();
+        self.with_skill_repo(&repo, move |conn, repo| {
+            conn.execute(
+                "UPDATE skill_repos SET last_error = NULL WHERE repo = ?1",
+                params![repo],
+            )
+            .context("failed to clear the skill repo error")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes the repo row, its packages, and their references in one
+    /// transaction.
+    pub async fn remove_skill_repo(&self, repo: &str) -> Result<(), StoreError> {
+        let repo = repo.to_string();
+        self.with_skill_repo(&repo, move |conn, repo| {
+            let tx = transaction(conn)?;
+            tx.execute(
+                "DELETE FROM skill_references WHERE package IN
+                   (SELECT address FROM skill_packages WHERE repo = ?1)",
+                [&repo],
+            )
+            .context("failed to delete the repo's skill references")?;
+            tx.execute("DELETE FROM skill_packages WHERE repo = ?1", [&repo])
+                .context("failed to delete the repo's skill packages")?;
+            tx.execute("DELETE FROM skill_repos WHERE repo = ?1", [&repo])
+                .context("failed to delete the skill repo")?;
+            tx.commit()
+                .context("failed to commit the skill repo removal")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Lists the skill repos sorted by repo, each with the count of its
+    /// packages folded into the same query, so the management route needs one
+    /// read.
+    pub async fn list_skill_repos(&self) -> Result<Vec<SkillRepo>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.repo, r.host, r.ref, r.sha, r.enabled, r.added_at_secs,
+                            r.updated_at_secs, r.last_error,
+                            (SELECT COUNT(*) FROM skill_packages p WHERE p.repo = r.repo)
+                              AS package_count
+                     FROM skill_repos r ORDER BY r.repo",
+                )
+                .context("failed to prepare skill repo list query")?;
+            let mut rows = stmt.query([]).context("failed to query skill repos")?;
+            let mut repos = Vec::new();
+            while let Some(row) = rows.next().context("failed to read skill repo row")? {
+                repos.push(skill_repo_from_row(row)?);
+            }
+            Ok(repos)
+        })
+        .await
+    }
+
+    /// One tracked skill repo row, or None when the repo is not tracked.
+    pub async fn get_skill_repo(&self, repo: &str) -> Result<Option<SkillRepo>, StoreError> {
+        let repo = repo.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.repo, r.host, r.ref, r.sha, r.enabled, r.added_at_secs,
+                            r.updated_at_secs, r.last_error,
+                            (SELECT COUNT(*) FROM skill_packages p WHERE p.repo = r.repo)
+                              AS package_count
+                     FROM skill_repos r WHERE r.repo = ?1",
+                )
+                .context("failed to prepare skill repo query")?;
+            let mut rows = stmt.query([repo]).context("failed to query skill repo")?;
+            match rows.next().context("failed to read skill repo row")? {
+                Some(row) => Ok(Some(skill_repo_from_row(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// The packages of enabled repos, sorted by address: the loop's
+    /// advertisement source.
+    pub async fn advertised_skill_packages(&self) -> Result<Vec<SkillAd>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.address, p.name, p.description
+                     FROM skill_packages p
+                     JOIN skill_repos r ON r.repo = p.repo
+                     WHERE r.enabled = 1
+                     ORDER BY p.address",
+                )
+                .context("failed to prepare advertised skill package query")?;
+            let mut rows = stmt
+                .query([])
+                .context("failed to query advertised skill packages")?;
+            let mut ads = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .context("failed to read advertised skill package row")?
+            {
+                ads.push(SkillAd {
+                    address: row.get("address")?,
+                    name: row.get("name")?,
+                    description: row.get("description")?,
+                });
+            }
+            Ok(ads)
+        })
+        .await
+    }
+
+    /// Every package with the short `name`, across all repos. The caller
+    /// decides enabled filtering and what ambiguity means.
+    pub async fn skill_packages_by_name(&self, name: &str) -> Result<Vec<SkillAd>, StoreError> {
+        let name = name.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT address, name, description FROM skill_packages
+                     WHERE name = ?1 ORDER BY address",
+                )
+                .context("failed to prepare skill package lookup")?;
+            let mut rows = stmt
+                .query([name])
+                .context("failed to query skill packages")?;
+            let mut ads = Vec::new();
+            while let Some(row) = rows.next().context("failed to read skill package row")? {
+                ads.push(SkillAd {
+                    address: row.get("address")?,
+                    name: row.get("name")?,
+                    description: row.get("description")?,
+                });
+            }
+            Ok(ads)
+        })
+        .await
+    }
+
+    /// The package's instructions and the sorted paths of its reference
+    /// chunks, when the package exists.
+    pub async fn load_skill_package(
+        &self,
+        address: &str,
+    ) -> Result<Option<(String, Vec<String>)>, StoreError> {
+        let address = address.to_string();
+        self.with_conn(move |conn| {
+            let row = conn.query_row(
+                "SELECT instructions FROM skill_packages WHERE address = ?1",
+                [&address],
+                |row| row.get::<_, String>(0),
+            );
+            let instructions = match row {
+                Ok(instructions) => instructions,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let mut stmt = conn
+                .prepare("SELECT path FROM skill_references WHERE package = ?1 ORDER BY path")
+                .context("failed to prepare skill reference path query")?;
+            let mut rows = stmt
+                .query([&address])
+                .context("failed to query skill reference paths")?;
+            let mut paths = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .context("failed to read skill reference path row")?
+            {
+                paths.push(row.get(0)?);
+            }
+            Ok(Some((instructions, paths)))
+        })
+        .await
+    }
+
+    /// One reference chunk's content, addressed by package and path.
+    pub async fn read_skill_reference(
+        &self,
+        address: &str,
+        path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let address = address.to_string();
+        let path = path.to_string();
+        self.with_conn(move |conn| {
+            let row = conn.query_row(
+                "SELECT content FROM skill_references WHERE package = ?1 AND path = ?2",
+                params![address, path],
+                |row| row.get::<_, String>(0),
+            );
+            match row {
+                Ok(content) => Ok(Some(content)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await
+    }
 }
 
 fn transaction(
@@ -1089,6 +1505,26 @@ fn ensure_session_exists(conn: &rusqlite::Connection, id: &str) -> Result<(), an
     }
 }
 
+/// Checks that the skill repo row exists, so repo writes fail with
+/// `RepoNotFound` instead of silently succeeding or inserting orphan
+/// packages.
+fn ensure_skill_repo_exists(conn: &rusqlite::Connection, repo: &str) -> Result<(), anyhow::Error> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM skill_repos WHERE repo = ?1)",
+            [repo],
+            |row| row.get(0),
+        )
+        .context("failed to check skill repo existence")?;
+    if exists {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(StoreError::RepoNotFound {
+            repo: repo.to_string(),
+        }))
+    }
+}
+
 /// Whether `column` is one of `table`'s columns, for additive migrations.
 fn column_exists(
     conn: &rusqlite::Connection,
@@ -1130,6 +1566,20 @@ fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
             .transpose()?,
         created_at_secs: row.get("created_at_secs")?,
         prompt: row.get("prompt")?,
+    })
+}
+
+fn skill_repo_from_row(row: &rusqlite::Row) -> Result<SkillRepo, anyhow::Error> {
+    Ok(SkillRepo {
+        repo: row.get("repo")?,
+        host: row.get("host")?,
+        r#ref: row.get("ref")?,
+        sha: row.get("sha")?,
+        enabled: row.get("enabled")?,
+        added_at_secs: row.get("added_at_secs")?,
+        updated_at_secs: row.get("updated_at_secs")?,
+        last_error: row.get("last_error")?,
+        package_count: row.get("package_count")?,
     })
 }
 
@@ -1232,6 +1682,9 @@ mod tests {
                 "model_calls",
                 "pending_asks",
                 "sessions",
+                "skill_packages",
+                "skill_references",
+                "skill_repos",
                 "tool_calls"
             ]
         );
@@ -2358,5 +2811,684 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pending_asks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    /// A skill package with the given references; fields the tests do not
+    /// assert on carry fixed values.
+    fn package(address: &str, repo: &str, name: &str, references: &[(&str, &str)]) -> SkillPackage {
+        SkillPackage {
+            address: address.to_string(),
+            repo: repo.to_string(),
+            name: name.to_string(),
+            description: format!("does {name}"),
+            when_to_use: Some("use when needed".to_string()),
+            license: Some("MIT".to_string()),
+            author: Some("the author".to_string()),
+            instructions: format!("how to {name}"),
+            references: references
+                .iter()
+                .map(|(path, content)| bosun_common::skills::SkillReference {
+                    path: path.to_string(),
+                    content: content.to_string(),
+                })
+                .collect(),
+            sha: format!("sha-of-{name}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_packages_round_trip() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", Some("main"))
+            .await
+            .unwrap();
+        let error = store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::RepoAlreadyExists { repo } if repo == "owner/acme"),
+            "unexpected error: {error}"
+        );
+
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[
+                    package(
+                        "github.com/owner/acme/tools/skills/checkout",
+                        "owner/acme",
+                        "checkout",
+                        &[
+                            ("REFERENCE.md", "reference text"),
+                            ("FORMS.md", "form text"),
+                        ],
+                    ),
+                    package(
+                        "github.com/owner/acme/tools/skills/review",
+                        "owner/acme",
+                        "review",
+                        &[],
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The advertisement lists the enabled repo's packages, sorted by
+        // address.
+        assert_eq!(
+            store.advertised_skill_packages().await.unwrap(),
+            [
+                SkillAd {
+                    address: "github.com/owner/acme/tools/skills/checkout".into(),
+                    name: "checkout".into(),
+                    description: "does checkout".into(),
+                },
+                SkillAd {
+                    address: "github.com/owner/acme/tools/skills/review".into(),
+                    name: "review".into(),
+                    description: "does review".into(),
+                },
+            ]
+        );
+
+        // Short-name lookup returns every package with that name, sorted by
+        // address.
+        let by_name = store.skill_packages_by_name("checkout").await.unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(
+            by_name[0].address,
+            "github.com/owner/acme/tools/skills/checkout"
+        );
+        assert!(
+            store
+                .skill_packages_by_name("missing")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Loading returns the instructions and the sorted reference paths.
+        let (instructions, paths) = store
+            .load_skill_package("github.com/owner/acme/tools/skills/checkout")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instructions, "how to checkout");
+        assert_eq!(paths, ["FORMS.md", "REFERENCE.md"]);
+
+        // A reference chunk is one row, read by package and path.
+        assert_eq!(
+            store
+                .read_skill_reference(
+                    "github.com/owner/acme/tools/skills/checkout",
+                    "REFERENCE.md"
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("reference text")
+        );
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/ghost")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_skill_reference("github.com/owner/acme/tools/skills/checkout", "ghost.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_a_skill_repo_hides_its_advertisements_but_keeps_rows() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[],
+                )],
+            )
+            .await
+            .unwrap();
+
+        store
+            .set_skill_repo_enabled("owner/acme", false)
+            .await
+            .unwrap();
+        assert!(store.advertised_skill_packages().await.unwrap().is_empty());
+
+        // The rows stay: the repo is still listed as disabled and its package
+        // still loads.
+        let repos = store.list_skill_repos().await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert!(!repos[0].enabled);
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .set_skill_repo_enabled("owner/acme", true)
+            .await
+            .unwrap();
+        let advertised = store.advertised_skill_packages().await.unwrap();
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0].address, "github.com/owner/acme/skills/a");
+    }
+
+    #[tokio::test]
+    async fn replace_skill_repo_swaps_a_repos_packages_in_one_transaction() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[("OLD.md", "old reference")],
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .set_skill_repo_error("owner/acme", "previous failure")
+            .await
+            .unwrap();
+
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-2",
+                &[package(
+                    "github.com/owner/acme/skills/b",
+                    "owner/acme",
+                    "b",
+                    &[("NEW.md", "new reference")],
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The old package is gone with its references.
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The new package carried exactly its own references.
+        let (instructions, paths) = store
+            .load_skill_package("github.com/owner/acme/skills/b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instructions, "how to b");
+        assert_eq!(paths, ["NEW.md"]);
+        assert_eq!(
+            store
+                .read_skill_reference("github.com/owner/acme/skills/b", "NEW.md")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new reference")
+        );
+        assert!(
+            store
+                .read_skill_reference("github.com/owner/acme/skills/b", "OLD.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // The repo row carries the new sha, a fresh timestamp and no error.
+        let repos = store.list_skill_repos().await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].sha.as_deref(), Some("sha-2"));
+        assert_eq!(repos[0].last_error, None);
+        assert_eq!(repos[0].package_count, 1);
+        assert!(repos[0].updated_at_secs.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_package_insert_rolls_back_the_repos_old_rows_and_sha() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[("A.md", "a content")],
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The second replace carries two packages with the same address; the
+        // address's primary key makes the second insert fail after the first
+        // package of the same batch was already inserted inside the
+        // transaction.
+        store
+            .insert_skill_repo("owner/beta", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/beta",
+                "sha-1",
+                &[package(
+                    "github.com/owner/beta/skills/b",
+                    "owner/beta",
+                    "b",
+                    &[],
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/beta",
+                "sha-2",
+                &[
+                    package("github.com/owner/beta/skills/c", "owner/beta", "c", &[]),
+                    package("github.com/owner/beta/skills/c", "owner/beta", "c", &[]),
+                ],
+            )
+            .await
+            .unwrap_err();
+
+        // beta keeps exactly its old package and sha; nothing from the failed
+        // replace survives, and acme's package is untouched.
+        let (_, paths) = store
+            .load_skill_package("github.com/owner/beta/skills/b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(paths.is_empty());
+        assert!(
+            store
+                .load_skill_package("github.com/owner/beta/skills/c")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let beta = store
+            .list_skill_repos()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.repo == "owner/beta")
+            .unwrap();
+        assert_eq!(beta.sha.as_deref(), Some("sha-1"));
+        assert_eq!(beta.package_count, 1);
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_skill_repo_rejects_a_package_that_names_another_repo_before_any_write() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[("A.md", "a content")],
+                )],
+            )
+            .await
+            .unwrap();
+
+        // A package whose repo names another repo would be stored under that
+        // repo, so the call fails before its transaction starts.
+        let error = store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-2",
+                &[package(
+                    "github.com/owner/acme/skills/b",
+                    "owner/beta",
+                    "b",
+                    &[],
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            StoreError::PackageRepoMismatch {
+                repo,
+                address,
+                package_repo,
+            } if repo == "owner/acme"
+                && address == "github.com/owner/acme/skills/b"
+                && package_repo == "owner/beta"
+        ));
+
+        // Nothing changed: the old index survives and the mismatched package
+        // was never stored.
+        let (_, paths) = store
+            .load_skill_package("github.com/owner/acme/skills/a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths, ["A.md"]);
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let repos = store.list_skill_repos().await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].sha.as_deref(), Some("sha-1"));
+        assert_eq!(repos[0].package_count, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_skill_repo_deletes_the_repo_its_packages_and_its_references() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let store = Store::open(&path).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[("A.md", "a content")],
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_skill_repo("owner/other", "github.com", None)
+            .await
+            .unwrap();
+
+        store.remove_skill_repo("owner/acme").await.unwrap();
+
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.skill_packages_by_name("a").await.unwrap().is_empty());
+        let repos = store.list_skill_repos().await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].repo, "owner/other");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let references: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skill_references", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(references, 0);
+    }
+
+    #[tokio::test]
+    async fn set_skill_repo_error_records_the_message_and_leaves_packages_intact() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[("A.md", "a content")],
+                )],
+            )
+            .await
+            .unwrap();
+
+        store
+            .set_skill_repo_error("owner/acme", "fetch failed: 500 from github")
+            .await
+            .unwrap();
+
+        let repos = store.list_skill_repos().await.unwrap();
+        assert_eq!(
+            repos[0].last_error.as_deref(),
+            Some("fetch failed: 500 from github")
+        );
+        assert!(
+            store
+                .load_skill_package("github.com/owner/acme/skills/a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.advertised_skill_packages().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_skill_repo_returns_one_row_or_none() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        assert!(
+            store.get_skill_repo("owner/acme").await.unwrap().is_none(),
+            "an untracked repo has no row"
+        );
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", Some("main"))
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[("A.md", "a content")],
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .set_skill_repo_error("owner/acme", "fetch failed")
+            .await
+            .unwrap();
+
+        let row = store.get_skill_repo("owner/acme").await.unwrap().unwrap();
+        assert_eq!(row.repo, "owner/acme");
+        assert_eq!(row.sha.as_deref(), Some("sha-1"));
+        assert_eq!(row.package_count, 1);
+        assert_eq!(row.last_error.as_deref(), Some("fetch failed"));
+
+        // The stored row matches the list view exactly.
+        assert_eq!(store.list_skill_repos().await.unwrap()[0], row);
+    }
+
+    #[tokio::test]
+    async fn clear_skill_repo_error_clears_the_recorded_error_but_keeps_packages() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_skill_repo("owner/acme", "github.com", None)
+            .await
+            .unwrap();
+        store
+            .replace_skill_repo(
+                "owner/acme",
+                "sha-1",
+                &[package(
+                    "github.com/owner/acme/skills/a",
+                    "owner/acme",
+                    "a",
+                    &[],
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .set_skill_repo_error("owner/acme", "fetch failed: 500 from github")
+            .await
+            .unwrap();
+
+        store.clear_skill_repo_error("owner/acme").await.unwrap();
+
+        let repos = store.list_skill_repos().await.unwrap();
+        assert_eq!(repos[0].last_error, None);
+        assert_eq!(repos[0].sha.as_deref(), Some("sha-1"));
+        assert!(store.advertised_skill_packages().await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn skill_repo_writes_on_an_unknown_repo_fail_with_repo_not_found() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        let error = store
+            .replace_skill_repo(
+                "owner/ghost",
+                "sha-1",
+                &[package(
+                    "github.com/owner/ghost/skills/a",
+                    "owner/ghost",
+                    "a",
+                    &[],
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            StoreError::RepoNotFound { repo } if repo == "owner/ghost"
+        ));
+
+        let error = store.remove_skill_repo("owner/ghost").await.unwrap_err();
+        assert!(matches!(error, StoreError::RepoNotFound { ref repo } if repo == "owner/ghost"));
+
+        let error = store
+            .set_skill_repo_enabled("owner/ghost", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::RepoNotFound { ref repo } if repo == "owner/ghost"));
+
+        let error = store
+            .set_skill_repo_error("owner/ghost", "fetch failed")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::RepoNotFound { ref repo } if repo == "owner/ghost"));
+
+        let error = store
+            .clear_skill_repo_error("owner/ghost")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::RepoNotFound { ref repo } if repo == "owner/ghost"));
+
+        // The failed writes changed nothing and inserted no orphan rows.
+        assert!(store.list_skill_repos().await.unwrap().is_empty());
+        assert!(store.advertised_skill_packages().await.unwrap().is_empty());
+        assert!(store.skill_packages_by_name("a").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_has_no_skill_repos_or_packages() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        assert!(store.list_skill_repos().await.unwrap().is_empty());
+        assert!(store.advertised_skill_packages().await.unwrap().is_empty());
+        assert!(
+            store
+                .skill_packages_by_name("anything")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_skill_package("github.com/owner/repo/skills/nope")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_skill_reference("github.com/owner/repo/skills/nope", "A.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
