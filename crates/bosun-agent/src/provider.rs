@@ -48,6 +48,18 @@ impl AskRecipient {
     }
 }
 
+/// Why a provider ended a completion. A truncated reply is distinguishable
+/// from a clean finish, so the loop can treat it as a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The model finished its reply normally.
+    StopResponse,
+    /// The reply was cut off by the output-token budget.
+    MaxTokens,
+    /// Any other reason, or no reason reported.
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),
@@ -60,6 +72,7 @@ pub enum StreamEvent {
     Stop {
         input_tokens: u64,
         output_tokens: u64,
+        stop_reason: StopReason,
     },
 }
 

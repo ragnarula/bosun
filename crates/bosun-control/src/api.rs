@@ -1257,6 +1257,7 @@ mod tests {
     use bosun_agent::config::ResolvedModel;
     use bosun_agent::provider::ProviderCall;
     use bosun_agent::provider::ProviderError;
+    use bosun_agent::provider::StopReason;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
     use bosun_common::tool::ToolMsg;
@@ -1315,6 +1316,7 @@ mod tests {
                 Ok(StreamEvent::Stop {
                     input_tokens: 1,
                     output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
                 }),
             ];
             Ok(stream::iter(items).boxed())
@@ -5456,15 +5458,17 @@ mod tests {
         // stopped by the user and must author nothing on recovery.
         let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
             Arc::new(Mutex::new(VecDeque::from(vec![
-                // The root's re-decision wakes: resume child-a, abandon
-                // child-b, then react to child-a's completion report.
+                // The root's re-decision wake surfaces both failure events,
+                // so one wake resumes child-a and passes on child-b; a second
+                // crash wake has nothing newer than a completed turn handled
+                // and is dropped. The wake after child-a's report reacts to
+                // it.
                 vec![tool_call_fragment(
                     "call-1",
                     "message_child",
                     r#"{"id":"child-s8c-a","text":"resume the review"}"#,
                 )],
                 vec![text_chunk("child a resumed")],
-                vec![text_chunk("child b abandoned")],
                 vec![text_chunk("child a's report noted")],
             ])));
         let a_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
@@ -5543,7 +5547,7 @@ mod tests {
                     let a = store.get_session("child-s8c-a").await.unwrap().unwrap();
                     let b = store.get_session("child-s8c-b").await.unwrap().unwrap();
                     root.state == SessionState::WaitingForInput
-                        && store.model_calls("root-s8c").await.unwrap().len() == 4
+                        && store.model_calls("root-s8c").await.unwrap().len() == 3
                         && a.state == SessionState::Stopped
                         && b.state == SessionState::Interrupted
                 }

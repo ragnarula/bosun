@@ -9,6 +9,7 @@ use crate::provider::Provider;
 use crate::provider::ProviderAdapter;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
+use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::provider::messages_url;
 use crate::serialize::openai_messages;
@@ -71,12 +72,14 @@ impl Provider for OpenAi {
     }
 }
 
-/// Token counts and the stop guard shared by the usage chunk and the
-/// `[DONE]` marker, so a completion emits exactly one [`StreamEvent::Stop`].
+/// Token counts, the terminal reason and the stop guard shared by the usage
+/// chunk and the `[DONE]` marker, so a completion emits exactly one
+/// [`StreamEvent::Stop`].
 #[derive(Default)]
 struct OpenAiParser {
     input_tokens: u64,
     output_tokens: u64,
+    finish_reason: Option<String>,
     stopped: bool,
 }
 
@@ -86,16 +89,22 @@ impl OpenAiParser {
             return None;
         }
         self.stopped = true;
+        let stop_reason = match self.finish_reason.as_deref() {
+            Some("stop") => StopReason::StopResponse,
+            Some("length") => StopReason::MaxTokens,
+            _ => StopReason::Other,
+        };
         Some(StreamEvent::Stop {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            stop_reason,
         })
     }
 }
 
 /// Turn one SSE chunk into [`StreamEvent`]s. The `[DONE]` marker and the
 /// final usage chunk both stop the completion; empty deltas are skipped.
-/// A chunk may carry several tool call fragments, one per index.
+/// A chunk may carry text, tool call fragments, one per index, or both.
 fn parse_event(
     event: &SseEvent,
     parser: &mut OpenAiParser,
@@ -116,37 +125,41 @@ fn parse_event(
     let Some(choices) = chunk["choices"].as_array() else {
         return Ok(Vec::new());
     };
+    if let Some(first) = choices.first()
+        && let Some(reason) = first["finish_reason"].as_str()
+    {
+        parser.finish_reason = Some(reason.to_string());
+    }
     for choice in choices {
         let delta = &choice["delta"];
+        let mut events = Vec::new();
         if let Some(text) = delta["content"].as_str()
             && !text.is_empty()
         {
-            return Ok(vec![StreamEvent::TextDelta(text.to_string())]);
+            events.push(StreamEvent::TextDelta(text.to_string()));
         }
-        let Some(calls) = delta["tool_calls"].as_array() else {
-            continue;
-        };
-        let mut tool_events = Vec::new();
-        for call in calls {
-            let index = call["index"].as_u64().unwrap_or(0) as usize;
-            let id = call["id"].as_str().map(str::to_string);
-            let name = call["function"]["name"].as_str().map(str::to_string);
-            let args_delta = call["function"]["arguments"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            if id.is_none() && name.is_none() && args_delta.is_empty() {
-                continue;
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for call in calls {
+                let index = call["index"].as_u64().unwrap_or(0) as usize;
+                let id = call["id"].as_str().map(str::to_string);
+                let name = call["function"]["name"].as_str().map(str::to_string);
+                let args_delta = call["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if id.is_none() && name.is_none() && args_delta.is_empty() {
+                    continue;
+                }
+                events.push(StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    args_delta,
+                });
             }
-            tool_events.push(StreamEvent::ToolCallDelta {
-                index,
-                id,
-                name,
-                args_delta,
-            });
         }
-        if !tool_events.is_empty() {
-            return Ok(tool_events);
+        if !events.is_empty() {
+            return Ok(events);
         }
     }
     Ok(Vec::new())
@@ -291,6 +304,132 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 10,
                     output_tokens: 5,
+                    stop_reason: StopReason::Other,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finish_reason_of_stop_reports_a_clean_finish() {
+        let server_events = vec![
+            sse(json!({
+                "choices": [{ "index": 0, "delta": { "content": "Hi" } }],
+            })),
+            sse(json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            })),
+            sse(json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 },
+            })),
+            sse(json!("[DONE]")),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+
+        let events = collect_stream(&provider, provider_call("gpt-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("Hi".into()),
+                StreamEvent::Stop {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                    stop_reason: StopReason::StopResponse,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finish_reason_of_length_reports_a_truncation() {
+        let server_events = vec![
+            sse(json!({
+                "choices": [{ "index": 0, "delta": { "content": "Bye" } }],
+            })),
+            sse(json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }],
+            })),
+            sse(json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 },
+            })),
+            sse(json!("[DONE]")),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+
+        let events = collect_stream(&provider, provider_call("gpt-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("Bye".into()),
+                StreamEvent::Stop {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                    stop_reason: StopReason::MaxTokens,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_content_and_a_tool_call_emits_both() {
+        let server_events = vec![
+            sse(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "Hel",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "shell", "arguments": "{\"c" },
+                        }],
+                    },
+                }],
+            })),
+            sse(json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+            })),
+            sse(json!("[DONE]")),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+
+        let events = collect_stream(&provider, provider_call("gpt-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("Hel".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("shell".into()),
+                    args_delta: "{\"c".into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    stop_reason: StopReason::Other,
                 },
             ]
         );
