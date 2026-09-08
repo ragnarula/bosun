@@ -583,6 +583,12 @@
     font-size: 12px;
   }
   .view-header .view-title .view-dir::before { content: ' · '; }
+  .view-header .view-title .view-waiting {
+    display: block;
+    font-size: 12px;
+    color: var(--warn);
+  }
+  .view-header .view-title .view-waiting[hidden] { display: none; }
   .view-header .btn-more {
     min-height: 40px;
     min-width: 44px;
@@ -964,6 +970,7 @@
       <span class="dot" id="view-state-dot"></span>
       <span class="view-main" id="view-main">
         <span class="view-node" id="view-node"></span><span class="view-dir" id="view-dir"></span>
+        <span class="view-waiting" id="view-waiting" hidden></span>
       </span>
     </div>
     <button type="button" class="btn-more" id="btn-more" title="Session actions">⋯</button>
@@ -1066,6 +1073,7 @@ const viewStateDot = $('view-state-dot');
 
 const viewNode = $('view-node');
 const viewDir = $('view-dir');
+const viewWaiting = $('view-waiting');
 const btnBack = $('btn-back');
 const viewSheet = $('view-sheet');
 const btnMore = $('btn-more');
@@ -1606,6 +1614,24 @@ function shortSha(sha) {
   return sha.length > 8 ? sha.slice(0, 8) : sha;
 }
 
+// The count of a session's direct children that can still act. A child is
+// live for display when its state is not stopped.
+function liveChildCount(session) {
+  return sessions.filter(
+    (s) => s.parent_id === session.id && s.state !== 'stopped'
+  ).length;
+}
+
+// A waiting session with live children announces that it is waiting for
+// them; any other state is named by its dot alone. The freshest list wins,
+// so a child's report is reflected here between polls.
+function liveChildrenLabel(session) {
+  const count = liveChildCount(session);
+  return session.state === 'waiting_for_input' && count > 0
+    ? 'waiting for children (' + count + ')'
+    : session.state;
+}
+
 // Active first, then past: newly creating, running and waiting sessions
 // float to the top, each tied by created_at; a finished or interrupted
 // session's row keeps its final state below them.
@@ -1647,6 +1673,14 @@ function appendSessionRow(session) {
   time.className = 'row-time';
   time.textContent = shortId(session.id) + ' · ' + ago(session.created_at_secs);
   main.appendChild(time);
+  // A waiting session names who it is waiting for; any other state is the
+  // dot's job alone, so nothing repeats on the row.
+  if (liveChildrenLabel(session) !== session.state) {
+    const waiting = document.createElement('span');
+    waiting.className = 'row-meta';
+    waiting.textContent = liveChildrenLabel(session);
+    main.appendChild(waiting);
+  }
   button.appendChild(main);
   button.addEventListener('click', () => openSession(session.id));
   return button;
@@ -1962,9 +1996,18 @@ async function refreshSessions() {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     sessions = await response.json();
     renderSessions();
-    if (current && !sessions.some((session) => session.id === current)) {
+    // The waiting label follows the freshest list too: a child's state
+    // changes without a state event for the open session, so the event
+    // stream alone would leave it stale between fetches.
+    const viewed = sessions.find((session) => session.id === current);
+    if (current && !viewed) {
       showStatus('session ' + current + ' ended');
       closeSession();
+    } else if (viewed && !view.hidden) {
+      viewStateDot.className = 'dot ' + viewed.state;
+      const waiting = liveChildrenLabel(viewed);
+      viewWaiting.hidden = waiting === viewed.state;
+      viewWaiting.textContent = waiting;
     }
   } catch (error) {
     showStatus('sessions: ' + error.message);
@@ -2188,6 +2231,11 @@ function updateHeader(session) {
   viewNode.textContent = session.node;
   viewDir.textContent = session.dir;
   viewIdCopy.textContent = session.id;
+  // The state dot names the state; a waiting session adds who it waits for,
+  // and it is hidden the instant there is nothing left to wait on.
+  const waiting = liveChildrenLabel(session);
+  viewWaiting.hidden = waiting === session.state;
+  viewWaiting.textContent = waiting;
   updatePermissionBadge(session.permission);
   // Model and persona are session facts, shown once in the ⋯ sheet; the
   // transcript never repeats them as separator lines.
@@ -2922,6 +2970,11 @@ function handleEvent(event) {
       // The current state lives once, in the header dot; a transcript line
       // would repeat what is already on screen.
       viewStateDot.className = 'dot ' + event.state;
+      if (current) {
+        const waiting = liveChildrenLabel({ id: current, state: event.state });
+        viewWaiting.hidden = waiting === event.state;
+        viewWaiting.textContent = waiting;
+      }
       break;
     case 'permission':
       updatePermissionBadge(event.permission);
