@@ -200,18 +200,31 @@
   #skills-list { flex: 1; background: var(--bg); overflow-y: auto; }
   #skills-list .empty { color: var(--muted); padding: 16px 14px; }
   #skills-list .repo-row { padding: 12px 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
-  #skills-list .repo-main { display: flex; align-items: center; gap: 10px; min-height: 24px; }
-  #skills-list .repo-main .repo-name {
+  .repo-primary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: var(--touch-min-height);
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .repo-primary:active .repo-name { color: var(--accent); }
+  .repo-primary .repo-name {
     flex: 1;
     min-width: 0;
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text);
   }
-  #skills-list .repo-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  #skills-list .repo-meta { display: block; font-size: 12px; color: var(--muted); }
   #skills-list .repo-error { color: var(--error); font-size: 12px; }
-  #skills-list .repo-actions { display: flex; gap: 8px; }
+  #skills-list .repo-actions { display: flex; gap: 8px; margin-top: 10px; }
   #skills-list .repo-actions button {
     flex: 1;
     min-height: var(--touch-min-height);
@@ -345,6 +358,7 @@
   .dot.running, .dot.creating { background: var(--ok); }
   .dot.interrupted, .dot.stopped { background: var(--error); }
   .dot.waiting_for_input { background: var(--warn); }
+  .dot.warn { background: var(--warn); }
   .dot.up { background: var(--ok); }
   .dot.down { background: var(--error); }
   button {
@@ -1211,25 +1225,20 @@ btnMachinesBack.addEventListener('click', closeMachines);
 // it, and a per-repo row's primary tap Updates the repo while the buttons
 // under it toggle enable/disable and remove. State is one status dot and a
 // package count per row, so the pane reads at a glance.
-function refreshSkillRepos() {
+async function refreshSkillRepos() {
   if (skillReposFetching) return;
   skillReposFetching = true;
-  fetch('/skills/repos')
-    .then((response) => {
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      return response.json();
-    })
-    .then((repos) => {
-      skillRepos = repos;
-      renderSkillsStrip();
-      renderSkillRepos();
-    })
-    .catch((error) => {
-      showStatus('skills: ' + error.message);
-    })
-    .finally(() => {
-      skillReposFetching = false;
-    });
+  try {
+    const response = await fetch('/skills/repos');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    skillRepos = await response.json();
+    renderSkillsStrip();
+    renderSkillRepos();
+  } catch (error) {
+    showStatus('skills: ' + error.message);
+  } finally {
+    skillReposFetching = false;
+  }
 }
 
 function renderSkillsStrip() {
@@ -1305,7 +1314,10 @@ btnSkillRepoAdd.addEventListener('click', async () => {
     skillsAdd.hidden = true;
     await refreshSkillRepos();
   } catch (error) {
+    // A failed add still stores the repo row with its last_error, so refresh
+    // the list to show it; a retry would 409 'already exists' otherwise.
     showToast('add skill repo: ' + error.message, 'error');
+    await refreshSkillRepos();
   } finally {
     btnSkillRepoAdd.disabled = false;
   }
@@ -1340,14 +1352,17 @@ function renderSkillRepos() {
     const row = document.createElement('div');
     row.className = 'repo-row';
 
-    const main = document.createElement('div');
-    main.className = 'repo-main';
-    main.appendChild(repoDot(repo));
+    const primary = document.createElement('button');
+    primary.type = 'button';
+    primary.className = 'repo-primary';
+    primary.title = 'update ' + repo.repo;
+    primary.appendChild(repoDot(repo));
     const name = document.createElement('span');
     name.className = 'repo-name';
     name.textContent = repo.repo;
-    main.appendChild(name);
-    row.appendChild(main);
+    primary.appendChild(name);
+    primary.addEventListener('click', () => updateSkillRepo(repo));
+    row.appendChild(primary);
 
     const meta = document.createElement('div');
     meta.className = 'repo-meta';
@@ -1362,13 +1377,12 @@ function renderSkillRepos() {
       error.textContent = repo.last_error;
       row.appendChild(error);
     }
-
-    const actions = document.createElement('div');
-    actions.className = 'repo-actions';
     const update = document.createElement('button');
     update.type = 'button';
     update.textContent = 'Update';
     update.addEventListener('click', () => updateSkillRepo(repo));
+    const actions = document.createElement('div');
+    actions.className = 'repo-actions';
     actions.appendChild(update);
     const toggle = document.createElement('button');
     toggle.type = 'button';
