@@ -137,6 +137,128 @@
   }
   #machines-list .empty { color: var(--muted); padding: 16px 14px; }
   #machines-list .machine-row.down { color: var(--error); }
+  /* Skill repos: a home-screen strip like the health one, and a full-pane
+     sheet (machines-tab pattern). One repo per touch-sized row; the primary
+     tap Updates it (the repeated action), and the per-row buttons under the
+     name hold enable/disable and remove. A package count and a status dot
+     say the state without a table. */
+  #skills-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 14px;
+    padding: 12px 14px;
+    min-height: var(--touch-min-height);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  #skills-strip:active { background: var(--panel-2); }
+  #skills-strip .skills-strip-icon { color: var(--accent); font-size: 15px; }
+  #skills-strip .skills-strip-text { flex: 1; font-size: 13px; }
+  #skills-strip::after { content: '›'; color: var(--muted); }
+  #skills-tab {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #skills-tab[hidden] { display: none; }
+  .skills-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .skills-head .btn-skills-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .skills-head .btn-skills-back:active { color: var(--accent); }
+  .skills-head .skills-title { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); }
+  .skills-head .btn-skills-add {
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+    background: var(--accent);
+    border: none;
+    color: var(--text);
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 0 14px;
+  }
+  .skills-head .btn-skills-add:active { filter: brightness(1.2); }
+  #skills-list { flex: 1; background: var(--bg); overflow-y: auto; }
+  #skills-list .empty { color: var(--muted); padding: 16px 14px; }
+  #skills-list .repo-row { padding: 12px 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
+  #skills-list .repo-main { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+  #skills-list .repo-main .repo-name {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #skills-list .repo-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  #skills-list .repo-error { color: var(--error); font-size: 12px; }
+  #skills-list .repo-actions { display: flex; gap: 8px; }
+  #skills-list .repo-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #skills-list .repo-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #skills-list .repo-actions .danger { color: var(--error); border-color: var(--error); }
+  /* The add-repo card: one text field for the address, and an optional ref
+     revealed on demand. The address is identity, not prose, so it stays a
+     single input even though the pane's rule keeps text to the chat box. */
+  #skills-add {
+    padding: 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    gap: 10px;
+  }
+  #skills-add[hidden] { display: none; }
+  #skills-add label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  #skills-add input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 11px;
+    font: inherit;
+    font-size: 16px;
+  }
+  #skills-add .skills-add-actions { display: flex; gap: 8px; }
+  #skills-add .skills-add-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #skills-add .skills-add-actions .primary { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
+  #skills-add .skills-add-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #skills-add .btn-ref-toggle {
+    background: none;
+    border: none;
+    color: var(--muted);
+    text-align: left;
+    padding: 0;
+    min-height: 24px;
+    font-size: 12px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #skills-add .btn-ref-toggle:active { color: var(--accent); }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
   .panel h2 {
     display: flex;
@@ -739,6 +861,10 @@
   <span class="health-dot" id="health-dot"></span>
   <span class="health-text" id="health-text"></span>
 </div>
+<div id="skills-strip" role="button" tabindex="0">
+  <span class="skills-strip-icon">✦</span>
+  <span class="skills-strip-text" id="skills-strip-text">skill repos</span>
+</div>
 <main>
   <section class="panel">
     <h2>Sessions <button id="btn-new-session" type="button">New session</button></h2>
@@ -791,6 +917,28 @@
     <span class="machines-title">Machines</span>
   </div>
   <div id="machines-list"></div>
+</div>
+
+<div id="skills-tab" hidden>
+  <div class="skills-head">
+    <button type="button" id="btn-skills-back" title="Back to sessions">‹</button>
+    <span class="skills-title">Skill repos</span>
+    <button type="button" id="btn-skills-add">Add repo</button>
+  </div>
+  <div id="skills-add" hidden>
+    <label>Repo
+      <input id="form-skill-repo" type="text" placeholder="owner/repo" autocomplete="off">
+    </label>
+    <label id="skill-ref-label" hidden>Branch, tag, or sha
+      <input id="form-skill-ref" type="text" placeholder="default branch" autocomplete="off">
+    </label>
+    <button type="button" id="btn-ref-toggle" class="btn-ref-toggle">track a branch, tag, or sha</button>
+    <div class="skills-add-actions">
+      <button type="button" id="btn-skill-repo-add" class="primary">Add</button>
+      <button type="button" id="btn-skill-repo-cancel">Cancel</button>
+    </div>
+  </div>
+  <div id="skills-list"></div>
 </div>
 
 <div id="toast" hidden></div>
@@ -869,6 +1017,19 @@ const toastEl = $('toast');
 const machinesTab = $('machines-tab');
 const btnMachinesBack = $('btn-machines-back');
 const machinesList = $('machines-list');
+const skillsStrip = $('skills-strip');
+const skillsStripText = $('skills-strip-text');
+const skillsTab = $('skills-tab');
+const btnSkillsBack = $('btn-skills-back');
+const btnSkillsAdd = $('btn-skills-add');
+const skillsList = $('skills-list');
+const skillsAdd = $('skills-add');
+const formSkillRepo = $('form-skill-repo');
+const formSkillRef = $('form-skill-ref');
+const skillRefLabel = $('skill-ref-label');
+const btnRefToggle = $('btn-ref-toggle');
+const btnSkillRepoAdd = $('btn-skill-repo-add');
+const btnSkillRepoCancel = $('btn-skill-repo-cancel');
 const sessionListEl = $('session-list');
 const newSessionBtn = $('btn-new-session');
 const newSessionForm = $('new-session-form');
@@ -931,6 +1092,8 @@ let sending = false;
 let dirNode = null;   // the node the directory browser is looking at
 let dirPath = null;   // null = the node's browse roots
 let dirListing = null;
+let skillRepos = [];
+let skillReposFetching = false;
 
 // The composer's chosen directory is a plain span, not an input: `value`
 // keeps the submit-facing property, textContent is what the user sees, and
@@ -1043,6 +1206,232 @@ healthStrip.addEventListener('keydown', (event) => {
 });
 
 btnMachinesBack.addEventListener('click', closeMachines);
+
+// The skill-repos sheet: the strip on home opens it, the head's back closes
+// it, and a per-repo row's primary tap Updates the repo while the buttons
+// under it toggle enable/disable and remove. State is one status dot and a
+// package count per row, so the pane reads at a glance.
+function refreshSkillRepos() {
+  if (skillReposFetching) return;
+  skillReposFetching = true;
+  fetch('/skills/repos')
+    .then((response) => {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    })
+    .then((repos) => {
+      skillRepos = repos;
+      renderSkillsStrip();
+      renderSkillRepos();
+    })
+    .catch((error) => {
+      showStatus('skills: ' + error.message);
+    })
+    .finally(() => {
+      skillReposFetching = false;
+    });
+}
+
+function renderSkillsStrip() {
+  if (skillRepos.length === 0) {
+    skillsStripText.textContent = 'skill repos · none yet';
+    return;
+  }
+  const packages = skillRepos.reduce((sum, repo) => sum + repo.package_count, 0);
+  skillsStripText.textContent = skillRepos.length + ' repo'
+    + (skillRepos.length === 1 ? '' : 's')
+    + ' · ' + packages + ' package' + (packages === 1 ? '' : 's');
+}
+
+function openSkills() {
+  skillsTab.hidden = false;
+  refreshSkillRepos();
+}
+
+function closeSkills() {
+  skillsTab.hidden = true;
+  skillsAdd.hidden = true;
+}
+
+skillsStrip.addEventListener('click', openSkills);
+skillsStrip.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    openSkills();
+  }
+});
+
+btnSkillsBack.addEventListener('click', closeSkills);
+
+btnSkillsAdd.addEventListener('click', () => {
+  skillsAdd.hidden = !skillsAdd.hidden;
+  if (!skillsAdd.hidden) formSkillRepo.focus();
+});
+
+btnRefToggle.addEventListener('click', () => {
+  skillRefLabel.hidden = !skillRefLabel.hidden;
+  btnRefToggle.textContent = skillRefLabel.hidden
+    ? 'track a branch, tag, or sha'
+    : 'track the default branch';
+  if (!skillRefLabel.hidden) formSkillRef.focus();
+});
+
+btnSkillRepoCancel.addEventListener('click', () => {
+  skillsAdd.hidden = true;
+  formSkillRepo.value = '';
+  formSkillRef.value = '';
+});
+
+btnSkillRepoAdd.addEventListener('click', async () => {
+  const repo = formSkillRepo.value.trim();
+  if (!repo) {
+    showToast('enter a repo like owner/repo', 'error');
+    return;
+  }
+  const ref = skillRefLabel.hidden ? '' : formSkillRef.value.trim();
+  btnSkillRepoAdd.disabled = true;
+  try {
+    const response = await fetch('/skills/repos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo, ref: ref || undefined }),
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    toastOk('added ' + repo);
+    formSkillRepo.value = '';
+    formSkillRef.value = '';
+    skillRefLabel.hidden = true;
+    btnRefToggle.textContent = 'track a branch, tag, or sha';
+    skillsAdd.hidden = true;
+    await refreshSkillRepos();
+  } catch (error) {
+    showToast('add skill repo: ' + error.message, 'error');
+  } finally {
+    btnSkillRepoAdd.disabled = false;
+  }
+});
+
+formSkillRepo.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    btnSkillRepoAdd.click();
+  }
+});
+
+// One status dot: up (enabled, no error), down (disabled), error. A disabled
+// repo keeps its packages stored but stops advertising them; re-enabling is
+// one tap and needs no fetch.
+function repoDot(repo) {
+  const dot = document.createElement('span');
+  dot.className = 'dot ' + (repo.last_error ? 'down' : repo.enabled ? 'up' : 'warn');
+  return dot;
+}
+
+function renderSkillRepos() {
+  skillsList.textContent = '';
+  if (skillRepos.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'no skill repos yet — add one to pull skills from GitHub';
+    skillsList.appendChild(empty);
+    return;
+  }
+  for (const repo of skillRepos) {
+    const row = document.createElement('div');
+    row.className = 'repo-row';
+
+    const main = document.createElement('div');
+    main.className = 'repo-main';
+    main.appendChild(repoDot(repo));
+    const name = document.createElement('span');
+    name.className = 'repo-name';
+    name.textContent = repo.repo;
+    main.appendChild(name);
+    row.appendChild(main);
+
+    const meta = document.createElement('div');
+    meta.className = 'repo-meta';
+    meta.textContent = repo.package_count + ' package'
+      + (repo.package_count === 1 ? '' : 's')
+      + ' · ' + (repo.ref || 'default branch')
+      + (repo.sha ? ' · ' + shortSha(repo.sha) : '');
+    row.appendChild(meta);
+    if (repo.last_error) {
+      const error = document.createElement('div');
+      error.className = 'repo-error';
+      error.textContent = repo.last_error;
+      row.appendChild(error);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'repo-actions';
+    const update = document.createElement('button');
+    update.type = 'button';
+    update.textContent = 'Update';
+    update.addEventListener('click', () => updateSkillRepo(repo));
+    actions.appendChild(update);
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.textContent = repo.enabled ? 'Disable' : 'Enable';
+    toggle.addEventListener('click', () => setSkillRepoEnabled(repo));
+    actions.appendChild(toggle);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'danger';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => removeSkillRepo(repo));
+    actions.appendChild(remove);
+    row.appendChild(actions);
+
+    skillsList.appendChild(row);
+  }
+}
+
+async function updateSkillRepo(repo) {
+  try {
+    const response = await fetch(
+      '/skills/repos/' + encodeURIComponent(repo.repo) + '/update',
+      { method: 'POST' }
+    );
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    toastOk('updated ' + repo.repo);
+    await refreshSkillRepos();
+  } catch (error) {
+    showToast('update ' + repo.repo + ': ' + error.message, 'error');
+  }
+}
+
+async function setSkillRepoEnabled(repo) {
+  try {
+    const response = await fetch(
+      '/skills/repos/' + encodeURIComponent(repo.repo) + '/enabled',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !repo.enabled }),
+      }
+    );
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    await refreshSkillRepos();
+  } catch (error) {
+    showToast('skill repo: ' + error.message, 'error');
+  }
+}
+
+async function removeSkillRepo(repo) {
+  if (!window.confirm('Remove skill repo ' + repo.repo + ' and its packages?')) return;
+  try {
+    const response = await fetch(
+      '/skills/repos/' + encodeURIComponent(repo.repo),
+      { method: 'DELETE' }
+    );
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    toastOk('removed ' + repo.repo);
+    await refreshSkillRepos();
+  } catch (error) {
+    showToast('remove skill repo: ' + error.message, 'error');
+  }
+}
 
 let personaSelected = ''; // the chip persona picked in the composer
 let personaInitialized = false; // whether the last-used persona has been applied
@@ -1197,6 +1586,10 @@ async function refreshPersonas() {
 
 function shortId(id) {
   return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+function shortSha(sha) {
+  return sha.length > 8 ? sha.slice(0, 8) : sha;
 }
 
 // Active first, then past: newly creating, running and waiting sessions
@@ -2541,9 +2934,11 @@ function handleFrame(frame) {
 refreshNodes();
 refreshSessions();
 refreshPersonas();
+refreshSkillRepos();
 setInterval(refreshNodes, 5000);
 setInterval(refreshSessions, 3000);
 setInterval(refreshPersonas, 30000);
+setInterval(refreshSkillRepos, 30000);
 </script>
 </body>
 </html>
