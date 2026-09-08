@@ -869,6 +869,31 @@
   @media (max-width: 560px) {
     .view-header .view-title .view-dir { max-width: 40%; }
   }
+  /* Desktop: the session actions become a small popup under the ⋯ button
+     instead of a bottom sheet. The head row (⋯ + ✕) is a mobile affordance;
+     on a pointer the popup is dismissed by clicking elsewhere or Escape. */
+  @media (min-width: 900px) {
+    #view-sheet {
+      position: fixed;
+      top: 52px;
+      right: 20px;
+      bottom: auto;
+      left: auto;
+      width: 280px;
+      max-height: calc(100vh - 70px);
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+    }
+    #view-sheet .view-sheet-head {
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      z-index: 1;
+      border-radius: 10px 10px 0 0;
+    }
+  }
 </style>
 </head>
 <body>
@@ -1457,6 +1482,10 @@ async function removeSkillRepo(repo) {
 
 let personaSelected = ''; // the chip persona picked in the composer
 let personaInitialized = false; // whether the last-used persona has been applied
+// The composer's node pick lives here, not in the hidden #form-node select:
+// the select is cleared of options below the many-nodes threshold, so its
+// value cannot hold the pick. Mirrors personaSelected.
+let selectedNode = '';
 
 function renderNodeOptions() {
   const signature = nodes.map((node) => node.name + (node.up ? 'up' : 'down')).join(',');
@@ -1468,7 +1497,6 @@ function renderNodeOptions() {
     formNode.hidden = false;
     nodeChips.hidden = true;
     nodeChips.textContent = '';
-    const selected = formNode.value;
     formNode.textContent = '';
     const placeholder = document.createElement('option');
     placeholder.value = '';
@@ -1480,8 +1508,8 @@ function renderNodeOptions() {
       option.textContent = node.name + (node.up ? '' : ' (down)');
       formNode.appendChild(option);
     }
-    if (selected && nodes.some((node) => node.name === selected)) {
-      formNode.value = selected;
+    if (selectedNode && nodes.some((node) => node.name === selectedNode)) {
+      formNode.value = selectedNode;
     }
     return;
   }
@@ -1490,12 +1518,13 @@ function renderNodeOptions() {
   if (up.length === 1) {
     // One live node is pre-selected; a pick from a node that just dropped is
     // dropped with its directory, exactly like a manual switch.
-    if (formNode.value !== up[0].name) formNode.dispatchEvent(new Event('change'));
-    formNode.value = up[0].name;
-  } else if (formNode.value && !nodes.some((node) => node.name === formNode.value)) {
+    if (selectedNode !== up[0].name) onNodeChange();
+    selectedNode = up[0].name;
+  } else if (selectedNode && !nodes.some((node) => node.name === selectedNode)) {
     // The picked node vanished: reuse the change listener to drop the stale
     // dir pick.
-    formNode.dispatchEvent(new Event('change'));
+    onNodeChange();
+    selectedNode = '';
   }
   renderNodeChips();
 }
@@ -1512,12 +1541,17 @@ function renderNodeChips() {
       chip.className = 'chip down';
       chip.disabled = true;
     }
-    if (node.up && node.name === formNode.value) chip.classList.add('selected');
+    if (node.up && node.name === selectedNode) chip.classList.add('selected');
     chip.addEventListener('click', () => {
       // A picked directory belongs to one node; switching nodes drops it via
       // the same change listener the select keeps firing.
-      if (formNode.value !== node.name) formNode.dispatchEvent(new Event('change'));
-      formNode.value = node.name;
+      if (selectedNode !== node.name) onNodeChange();
+      selectedNode = node.name;
+      if (formNode.value !== node.name) {
+        // Keep the hidden select (shown only in the many-nodes case) in
+        // sync so a submit/browse after a re-render reads the same node.
+        formNode.value = node.name;
+      }
       renderNodeChips();
     });
     nodeChips.appendChild(chip);
@@ -1854,11 +1888,11 @@ function saveRecents(recents) {
 function rememberCurrentSettings() {
   const persona = formPersona.value.trim();
   const recents = loadRecents().filter((entry) =>
-    !(entry.node === formNode.value && entry.dir === formDir.value.trim()
+    !(entry.node === selectedNode && entry.dir === formDir.value.trim()
       && entry.persona === persona)
   );
   recents.unshift({
-    node: formNode.value,
+    node: selectedNode,
     dir: formDir.value.trim(),
     persona,
     time: Math.floor(Date.now() / 1000),
@@ -1887,7 +1921,7 @@ function useRecent(entry) {
   } else {
     setDir(entry.dir);
   }
-  formNode.value = node;
+  selectedNode = node;
   // The composer's persona chips are driven by personaSelected; renderPersonaOptions
   // overwrites the select with it, so the recent's persona must be applied to the
   // chip state, not just the select value.
@@ -2031,14 +2065,24 @@ newSessionBtn.addEventListener('click', () => {
   }
 });
 
-// A picked directory belongs to one node; switch nodes, drop the pick.
-formNode.addEventListener('change', () => {
+// A picked directory belongs to one node; switch nodes, drop the pick. Fired
+// by renderNodeOptions and the chip clicks; the hidden select's own change
+// event (many-nodes case) does the same work.
+function onNodeChange() {
   setDir('');
   dirBrowser.hidden = true;
+}
+formNode.addEventListener('change', () => {
+  // The visible select's choice becomes the composer's pick.
+  if (formNode.value !== selectedNode) {
+    onNodeChange();
+    selectedNode = formNode.value;
+    renderNodeChips();
+  }
 });
 
 btnBrowse.addEventListener('click', () => {
-  const node = formNode.value;
+  const node = selectedNode;
   if (!node) {
     showToast('choose a node first', 'error');
     return;
@@ -2133,7 +2177,7 @@ cancelNewSessionBtn.addEventListener('click', () => {
 
 newSessionForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!formNode.value) {
+  if (!selectedNode) {
     toastError('new session: choose a node first');
     return;
   }
@@ -2142,7 +2186,7 @@ newSessionForm.addEventListener('submit', async (event) => {
     return;
   }
   const body = {
-    node: formNode.value,
+    node: selectedNode,
     dir: formDir.value.trim(),
   };
   const persona = formPersona.value.trim();
@@ -2161,7 +2205,7 @@ newSessionForm.addEventListener('submit', async (event) => {
     newSessionForm.hidden = true;
     // The composer is cleared only by actually starting a session: cancel
     // and close keep the picks, a successful Start retires them.
-    formNode.value = '';
+    selectedNode = '';
     setDir('');
     personaSelected = '';
     formPersona.value = '';
@@ -2321,6 +2365,20 @@ btnBack.addEventListener('click', closeSession);
 
 btnMore.addEventListener('click', () => {
   viewSheet.hidden = false;
+});
+
+// On desktop the actions are a popup: clicking anywhere else, or Escape,
+// dismisses it. Mobile keeps the full bottom sheet, which has its own ✕.
+document.addEventListener('click', (event) => {
+  if (viewSheet.hidden || isNarrow()) return;
+  if (viewSheet.contains(event.target) || event.target === btnMore) return;
+  viewSheet.hidden = true;
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !viewSheet.hidden && !isNarrow()) {
+    viewSheet.hidden = true;
+  }
 });
 
 btnSheetClose.addEventListener('click', () => {
