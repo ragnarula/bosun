@@ -15,13 +15,15 @@ from a terminal client 💻 or the web pane 🌐.
 ## 🧭 Status
 
 Single-user MVP. There is no security model and no scalability story yet:
-run it on a network you trust 🔒. The current sprint and the planned roadmap
-are tracked in [docs/sprints](docs/sprints/).
+run it on a network you trust 🔒. Remote skill packages shipped: skills come
+from GitHub repositories the operator manages in the web pane and reach
+sessions through the `skill` tool. The current sprint and the planned
+roadmap are tracked in [docs/sprints](docs/sprints/).
 
 ## ⚙️ How it works
 
-- **🎛️ Control plane** (`bosun serve`) runs one agent loop per session and
-  keeps the session store. It serves a web pane listing nodes and sessions.
+- **🎛️ Control plane** (`bosun serve`) runs one agent loop per session,
+  keeps the session store, and manages skill repositories in the web pane.
 - **🖥️ Nodes** (`bosun node`) dial out to the control plane. No open inbound
   ports are needed on a node. Each session runs its tools in-process on the
   node, scoped to the session's working copy and permission.
@@ -30,6 +32,10 @@ are tracked in [docs/sprints](docs/sprints/).
   `bosun list` shows sessions, and `bosun open` attaches to a live session.
 - **🧠 Sessions** hold their own transcript, store, and model calls. Tool
   output streams back to the client live; assistant text renders as markdown.
+- **Skills** are packages fetched from GitHub repositories the operator adds
+  in the web pane, stored in the session store, and loaded on demand through
+  the `skill` tool beside the working copy's own skills. Versions are commit
+  SHAs; an update re-resolves the tracked ref and replaces the packages.
 - **🔄 Updates** flow from the control plane to nodes, and the CLI
   self-updates from GitHub Releases.
 
@@ -81,8 +87,8 @@ command with `--cp-url`, stored with `bosun config set`, or exported as
 `BOSUN_CP_URL` 🌐.
 
 The web pane is served at the control-plane root (`/` or `/ui`). Open it in a
-browser to see the node list, start a session, and follow its live
-transcript 🍿.
+browser to see the node list, start a session, follow its live transcript,
+and manage skill repositories 🍿.
 
 ## 📚 Documentation
 
