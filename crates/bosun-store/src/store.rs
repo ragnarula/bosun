@@ -941,7 +941,27 @@ impl Store {
                     },
                 },
             )?;
-            record_ask_answer(&tx, session_id, binding.ask_message_id, &answer)?;
+            if let Some(answered) =
+                record_ask_answer(&tx, session_id, binding.ask_message_id, &answer)?
+            {
+                // The answer resolves a raised ask on the raising session's own
+                // stream: the surfaced Ask block the user saw is now answered,
+                // so a client that replays from the start (or is connected and
+                // polls) sees the resolved form and stops offering the live
+                // question. The messages row was updated above; this is the
+                // matching durable event.
+                append_event(
+                    &tx,
+                    session_id,
+                    "answered ask",
+                    &Event::Message {
+                        message: Message {
+                            role: Role::Assistant,
+                            block: answered,
+                        },
+                    },
+                )?;
+            }
             tx.execute(
                 "DELETE FROM pending_asks WHERE session_id = ?1",
                 [session_id],
@@ -949,6 +969,58 @@ impl Store {
             .context("failed to clear the pending ask")?;
             tx.commit().context("failed to commit the routed answer")?;
             Ok(RouteAnswer::Routed { leaf_id })
+        })
+        .await
+    }
+
+    /// Records that the user rejected the question on screen instead of
+    /// answering it, in one transaction: the durable rejection marker is
+    /// appended to the session's own thread and, when the ask is a raised
+    /// child question, its binding is cleared so the user's next message is
+    /// not routed to that child as an answer. The marker is a user message so
+    /// the session's model reads it when the user's next message wakes it.
+    /// No wake is issued here; the session keeps waiting until the user gives
+    /// further input. Returns false when the session's thread does not end in
+    /// an unanswered question, which the caller reports as a conflict.
+    pub async fn reject_ask(&self, session_id: &str, marker: &str) -> Result<bool, StoreError> {
+        let marker = marker.to_string();
+        self.with_session(session_id, move |conn, session_id| {
+            let tx = transaction(conn)?;
+            let last = tx.query_row(
+                "SELECT block FROM messages WHERE session_id = ?1 AND archived = 0
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            );
+            let last = match last {
+                Ok(raw) => raw,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            let last: Block =
+                serde_json::from_str(&last).context("failed to parse the last message block")?;
+            let is_unanswered_ask = matches!(&last, Block::Ask { answer: None, .. });
+            if !is_unanswered_ask {
+                return Ok(false);
+            }
+            // A raised question binds this session to its direct child; the
+            // rejection ends that raise, so the user's next message is a new
+            // instruction, not a routed answer to the raised child.
+            tx.execute(
+                "DELETE FROM pending_asks WHERE session_id = ?1",
+                params![session_id],
+            )
+            .context("failed to clear the rejected pending ask")?;
+            insert_message(
+                &tx,
+                session_id,
+                &Message {
+                    role: Role::User,
+                    block: Block::Text { text: marker },
+                },
+            )?;
+            tx.commit().context("failed to commit the rejected ask")?;
+            Ok(true)
         })
         .await
     }
@@ -1413,13 +1485,15 @@ fn read_pending_ask(
 /// Records the user's answer on the surfaced Ask block the binding names.
 /// Compaction archives the block's row but never deletes it, so the update
 /// always finds it; a block that is no longer an ask, or one that already
-/// carries an answer, is left alone.
+/// carries an answer, is left alone. Returns the answered block so the caller
+/// can append a durable answered-ask event, which replays as the ask's
+/// resolved form on the raising session's stream.
 fn record_ask_answer(
     conn: &rusqlite::Connection,
     session_id: &str,
     message_id: i64,
     answer: &str,
-) -> Result<(), anyhow::Error> {
+) -> Result<Option<Block>, anyhow::Error> {
     let row = conn.query_row(
         "SELECT block FROM messages WHERE id = ?1 AND session_id = ?2",
         params![message_id, session_id],
@@ -1427,7 +1501,7 @@ fn record_ask_answer(
     );
     let raw = match row {
         Ok(raw) => raw,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let block: Block = serde_json::from_str(&raw).context("failed to parse message block")?;
@@ -1438,10 +1512,10 @@ fn record_ask_answer(
         answer: recorded,
     } = block
     else {
-        return Ok(());
+        return Ok(None);
     };
     if recorded.is_some() {
-        return Ok(());
+        return Ok(None);
     }
     let answered = Block::Ask {
         message,
@@ -1458,7 +1532,7 @@ fn record_ask_answer(
         ],
     )
     .context("failed to record the ask answer")?;
-    Ok(())
+    Ok(Some(answered))
 }
 
 /// Runs `f` against the shared connection on a blocking thread, converting the
@@ -2651,6 +2725,30 @@ mod tests {
             RouteAnswer::NoBinding,
             "a second answer routes nowhere"
         );
+
+        // The resolution reaches the raising session's stream durably: a
+        // client that replays from the start sees the surfaced ask followed by
+        // its answered form, so it never re-offers the resolved question.
+        let events = store.events_after("root-1", 0).await.unwrap();
+        let ask_events: Vec<&Block> = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                Event::Message { message } => match &message.block {
+                    block @ Block::Ask { .. } => Some(block),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ask_events.len(),
+            2,
+            "the raised ask replays as its surface and its answered form"
+        );
+        let Block::Ask { answer: second, .. } = ask_events[1] else {
+            unreachable!("a filtered ask block");
+        };
+        assert_eq!(second.as_deref(), Some("yes, push to main"));
     }
 
     #[tokio::test]
@@ -2716,6 +2814,141 @@ mod tests {
                 |(_, message)| matches!(&message.block, Block::Text { text } if text == "yes")
             ),
             "the answer is not routed to the direct child as a substitute"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_raised_ask_appends_the_marker_and_clears_the_binding() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .create_session(&child_session("mid-1", "root-1"))
+            .await
+            .unwrap();
+        let ask_id = store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &surfaced_ask("mid-1", "may I push?"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_pending_ask("root-1", "mid-1", "leaf-1", "may I push?", ask_id)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .reject_ask("root-1", "user rejected the question")
+                .await
+                .unwrap(),
+            "a question on screen is rejected"
+        );
+
+        // The marker is the thread's last message, so a client replay never
+        // re-offers the ask, and no later user message routes to the leaf as
+        // an answer to it.
+        let messages = store.messages("root-1", false).await.unwrap();
+        assert_eq!(messages.len(), 2, "the ask plus the rejection marker");
+        let (_, last) = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(
+            matches!(&last.block, Block::Text { text } if text == "user rejected the question"),
+            "the marker reads as a rejection: {messages:?}"
+        );
+        assert!(
+            store.get_pending_ask("root-1").await.unwrap().is_none(),
+            "the rejection clears the raise so the next message is not routed"
+        );
+        assert_eq!(
+            store.route_answer("root-1", "yes").await.unwrap(),
+            RouteAnswer::NoBinding,
+            "after a rejection the next message is a new instruction, not an answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_an_own_ask_appends_the_marker_without_a_binding() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "which approach?".into(),
+                    options: vec!["a".into(), "b".into()],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .reject_ask("root-1", "user rejected the question")
+                .await
+                .unwrap()
+        );
+        let messages = store.messages("root-1", false).await.unwrap();
+        let (_, last) = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(
+            matches!(&last.block, Block::Text { text } if text == "user rejected the question")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_with_no_question_on_screen_appends_nothing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-1")).await.unwrap();
+        store
+            .append_message(
+                "root-1",
+                Role::User,
+                &Block::Text {
+                    text: "hello".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !store
+                .reject_ask("root-1", "user rejected the question")
+                .await
+                .unwrap(),
+            "a session with no live question has nothing to reject"
+        );
+        assert_eq!(
+            store.messages("root-1", false).await.unwrap().len(),
+            1,
+            "the rejection marker is not appended"
+        );
+        // A resolved (answered) ask is history, not a live question.
+        store
+            .append_message(
+                "root-1",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "done?".into(),
+                    options: vec![],
+                    child_id: None,
+                    answer: Some("yes".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .reject_ask("root-1", "user rejected the question")
+                .await
+                .unwrap()
         );
     }
 

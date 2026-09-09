@@ -680,6 +680,13 @@
     color: var(--user);
   }
   #transcript .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
+  /* A rejected question leaves a durable note, not a typed message: muted and
+     italic, so it never reads as words the user composed. */
+  #transcript .msg.user.rejected {
+    color: var(--muted);
+    font-style: italic;
+    border-left-color: var(--border);
+  }
   #transcript .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* Tool traffic: one inline row per call, glyph + name + args, with the
      payload collapsed until clicked. The result nests under its call as a
@@ -802,40 +809,23 @@
   #transcript .md-li { margin: 2px 0; }
   #transcript .md-marker { color: var(--muted); }
   .input-row {
-    display: flex;
+    display: grid;
     gap: 10px;
     padding: 14px 20px;
     background: var(--panel);
     border-top: 1px solid var(--border);
   }
   .input-row[hidden] { display: none; }
-  /* While an ask with options is the live question, the options render as
-     thumb-width chips above the textarea; a tap answers the question. The
-     transcript keeps the durable ask record below. */
-  #ask-sheet {
-    display: grid;
-    gap: 8px;
-    background: var(--panel-2);
-    border: 1px solid var(--accent);
-    border-radius: 8px;
-    padding: 10px 12px;
+  /* The normal chat box: one row with the textarea and Send. It yields the
+     whole composer while a question is on screen, so ask and chat are never
+     editable at the same time. */
+  .chat-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
   }
-  #ask-sheet[hidden] { display: none; }
-  .ask-question { font-size: 13px; color: var(--text); }
-  .ask-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-  .ask-chips button {
-    min-height: var(--touch-min-height);
-    padding: 8px 14px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--panel-2);
-    color: var(--text);
-    -webkit-tap-highlight-color: transparent;
-    cursor: pointer;
-  }
-  .ask-chips button:active { background: var(--panel); border-color: var(--accent); }
-  .ask-or-type { color: var(--muted); font-size: 12px; }
-  .input-row textarea {
+  .chat-row[hidden] { display: none; }
+  .chat-row textarea {
     flex: 1;
     resize: vertical;
     background: var(--bg);
@@ -845,12 +835,100 @@
     padding: 9px 11px;
     font: inherit;
   }
+  .chat-row textarea:focus, .ask-free textarea:focus { outline: none; border-color: var(--accent); }
+  /* A live question is the composer: the question, its options as thumb-width
+     chips, a Dismiss control to reject it, and an optional free-text answer.
+     The transcript keeps the durable ask record above. */
+  #ask-sheet {
+    display: grid;
+    gap: 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  #ask-sheet[hidden] { display: none; }
+  .ask-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .ask-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .ask-dismiss {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 13px;
+    min-height: var(--touch-min-height);
+    padding: 0 4px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ask-dismiss:active { color: var(--accent); }
+  .ask-question {
+    font-size: 14px;
+    color: var(--text);
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+  .ask-question .ask-from { color: var(--muted); font-size: 12px; }
+  .ask-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ask-chips[hidden] { display: none; }
+  .ask-chips button {
+    flex: 1 1 auto;
+    min-height: var(--touch-min-height);
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 15px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .ask-chips button:active { background: var(--border); border-color: var(--accent); }
+  .ask-type-toggle {
+    background: none;
+    border: none;
+    color: var(--accent);
+    text-align: left;
+    padding: 0;
+    min-height: var(--touch-min-height);
+    font-size: 13px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ask-type-toggle[hidden] { display: none; }
+  .ask-free { display: grid; gap: 8px; }
+  .ask-free[hidden] { display: none; }
+  .ask-free textarea {
+    flex: 1;
+    resize: vertical;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font: inherit;
+  }
+  .ask-free-actions { display: flex; gap: 8px; }
+  .ask-free-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ask-free-actions .primary { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
   @media (max-width: 640px) {
     header.top { flex-wrap: wrap; padding: 10px 12px; }
     main { padding: 0 12px 16px; }
     #status { padding: 3px 12px 7px; }
     button { min-height: 40px; padding: 8px 14px; }
-    .composer select, .input-row textarea { font-size: 16px; }
+    .composer select, .input-row textarea, .ask-free textarea { font-size: 16px; }
     .session-item { min-height: 48px; }
     .session-row { min-height: 48px; }
     #session-list .children-toggle { min-height: var(--touch-min-height); }
@@ -1007,13 +1085,25 @@
   </div>
   <div class="input-row" id="input-row">
     <div id="ask-sheet" hidden>
+      <div class="ask-head">
+        <span class="ask-label">Question</span>
+        <button type="button" id="btn-ask-dismiss" class="ask-dismiss" title="Reject the question; your next message becomes an instruction">Dismiss</button>
+      </div>
       <div class="ask-question" id="ask-question"></div>
       <div class="ask-chips" id="ask-chips"></div>
-      <div class="ask-or-type">or type an answer below</div>
+      <button type="button" id="btn-ask-type" class="ask-type-toggle" hidden>Answer in your own words</button>
+      <div class="ask-free" id="ask-free" hidden>
+        <textarea id="ask-input" rows="2" placeholder="Type your answer; Enter to send"></textarea>
+        <div class="ask-free-actions">
+          <button type="button" id="btn-ask-send" class="primary">Answer</button>
+          <button type="button" id="btn-ask-back">Back to options</button>
+        </div>
+      </div>
     </div>
-    <textarea id="input" rows="3" placeholder="Message (Ctrl+Enter to send, Enter for a new line; while a question is on screen, sending answers it)"></textarea>
-    <button id="btn-send" type="button">Send</button>
-    <button id="btn-redirect" type="button" title="Send as a new instruction instead of answering the question on screen">Redirect</button>
+    <div class="chat-row" id="chat-row">
+      <textarea id="input" rows="3" placeholder="Message"></textarea>
+      <button id="btn-send" type="button">Send</button>
+    </div>
   </div>
 </div>
 
@@ -1121,11 +1211,25 @@ const btnPersona = $('btn-persona');
 const btnStop = $('btn-stop');
 const transcript = $('transcript');
 const input = $('input');
+const chatRow = $('chat-row');
 const btnSend = $('btn-send');
-const btnRedirect = $('btn-redirect');
 const askSheet = $('ask-sheet');
 const askQuestion = $('ask-question');
 const askChips = $('ask-chips');
+const btnAskDismiss = $('btn-ask-dismiss');
+const btnAskType = $('btn-ask-type');
+const askFree = $('ask-free');
+const askInput = $('ask-input');
+const btnAskSend = $('btn-ask-send');
+const btnAskBack = $('btn-ask-back');
+
+// The last durable message block seen, and the transcript box for the most
+// recent ask. `lastMsg` decides whether a question is live on screen; the box
+// is kept so the durable answered-ask event updates the record in place
+// instead of duplicating it. Only one question can be live at a time.
+let lastMsg = null;
+let openAskBox = null;
+let askSyncTimer = null;
 
 let nodes = [];
 let nodeOptionsSignature = null;
@@ -2253,10 +2357,18 @@ function closeSession() {
   }
   current = null;
   liveEl = null;
+  lastMsg = null;
+  openAskBox = null;
+  if (askSyncTimer) window.clearTimeout(askSyncTimer);
+  askSyncTimer = null;
   transcript.textContent = '';
   saveDraft();
   input.value = '';
-  clearAskChips();
+  askSheet.hidden = true;
+  askQuestion.textContent = '';
+  askChips.textContent = '';
+  askFree.hidden = true;
+  chatRow.hidden = false;
   view.hidden = true;
 }
 
@@ -2403,16 +2515,82 @@ btnWatchOpen.addEventListener('click', () => {
   openSession(ownerId || current);
 });
 
-function clearAskChips() {
+// Mirrors `bosun_control::api::USER_REJECTED_TEXT`; the pane styles the line
+// as a user action, never as words the user typed.
+const USER_REJECTED_TEXT = 'user rejected the question';
+
+// ---- Ask composer ----
+// The footer has two modes and shows one at a time: the chat row for ordinary
+// messages, and the ask composer while a question is live. A live question is
+// answered by tapping an option (or typing in the free-answer field); Dismiss
+// rejects it without answering, leaving a durable note in the transcript and
+// returning to the chat row. The session keeps waiting until the user sends
+// its next message.
+
+function showChatComposer() {
   askSheet.hidden = true;
+  chatRow.hidden = false;
+}
+
+function renderAskComposer(ask) {
   askQuestion.textContent = '';
+  if (ask.child_id) {
+    const from = document.createElement('span');
+    from.className = 'ask-from';
+    from.textContent = 'child ' + ask.child_id + ' asks — ';
+    askQuestion.appendChild(from);
+  }
+  askQuestion.appendChild(document.createTextNode(ask.message));
   askChips.textContent = '';
+  askFree.hidden = true;
+  btnAskBack.hidden = true;
+  if (ask.options && ask.options.length > 0) {
+    for (const option of ask.options) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.textContent = option;
+      chip.addEventListener('click', () => answer(option));
+      askChips.appendChild(chip);
+    }
+    askChips.hidden = false;
+    btnAskType.hidden = false;
+  } else {
+    // An open question has no options to tap: the free-answer field is the
+    // composer itself.
+    askChips.hidden = true;
+    btnAskType.hidden = true;
+    askFree.hidden = false;
+    askInput.focus();
+  }
+  askSheet.hidden = false;
+  chatRow.hidden = true;
+}
+
+function applyAskComposer() {
+  if (view.hidden || inputRow.hidden) return;
+  const block = lastMsg;
+  const live = block && block.kind === 'ask' && !block.answer ? block : null;
+  if (live) {
+    renderAskComposer(live);
+  } else {
+    showChatComposer();
+  }
+}
+
+// A replay or live burst can deliver many messages quickly; the ask composer
+// only reflects the settled end of the stream, so a resolved question never
+// flashes as live mid-replay.
+function scheduleAskSync() {
+  if (askSyncTimer) window.clearTimeout(askSyncTimer);
+  askSyncTimer = window.setTimeout(applyAskComposer, 250);
 }
 
 // A tap on an ask option answers the question exactly like a typed message.
 async function answer(text) {
-  if (sending || !text.trim()) return;
-  clearAskChips();
+  if (sending || !text.trim() || !current) return;
+  // An answer resolves the live question; leave the ask composer immediately.
+  // The durable event that confirms it re-syncs the composer on arrival.
+  showChatComposer();
   sending = true;
   try {
     await post('/sessions/' + encodeURIComponent(current) + '/messages', {
@@ -2421,42 +2599,92 @@ async function answer(text) {
     });
   } catch (error) {
     toastError('answer: ' + error.message);
+    scheduleAskSync();
   } finally {
     sending = false;
   }
 }
 
-async function send(redirect) {
+// Reject the question on screen: the durable note lands in the transcript,
+// the binding is cleared, and the model is not woken — the session keeps
+// waiting until the user types its next message.
+async function dismissAsk() {
+  if (sending || !current) return;
+  showChatComposer();
+  sending = true;
+  try {
+    const response = await fetch(
+      '/sessions/' + encodeURIComponent(current) + '/reject',
+      { method: 'POST' }
+    );
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+  } catch (error) {
+    toastError('dismiss: ' + error.message);
+    scheduleAskSync();
+  } finally {
+    sending = false;
+  }
+}
+
+btnAskDismiss.addEventListener('click', dismissAsk);
+
+btnAskType.addEventListener('click', () => {
+  askChips.hidden = true;
+  btnAskType.hidden = true;
+  askFree.hidden = false;
+  btnAskBack.hidden = false;
+  askInput.focus();
+});
+
+btnAskBack.addEventListener('click', () => {
+  askFree.hidden = true;
+  btnAskBack.hidden = true;
+  if (lastMsg && lastMsg.options && lastMsg.options.length > 0) {
+    askChips.hidden = false;
+    btnAskType.hidden = false;
+  }
+});
+
+btnAskSend.addEventListener('click', () => {
+  const text = askInput.value.trim();
+  askInput.value = '';
+  answer(text);
+});
+
+askInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    btnAskSend.click();
+  }
+});
+
+async function send() {
   if (sending || !input.value.trim()) return;
   sending = true;
   btnSend.disabled = true;
-  btnRedirect.disabled = true;
   try {
     await post('/sessions/' + encodeURIComponent(current) + '/messages', {
       content: input.value,
-      redirect: !!redirect,
+      redirect: false,
     });
     input.value = '';
     clearDraft();
-    clearAskChips();
   } catch (error) {
     toastError('send: ' + error.message);
   } finally {
     sending = false;
     btnSend.disabled = false;
-    btnRedirect.disabled = false;
     input.focus();
   }
 }
 
-btnSend.addEventListener('click', () => send(false));
-btnRedirect.addEventListener('click', () => send(true));
+btnSend.addEventListener('click', send);
 // Keep the chat draft in sync with what the user is typing.
 input.addEventListener('input', saveDraft);
 input.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
-    send(false);
+    send();
   }
 });
 
@@ -2661,6 +2889,9 @@ function readableValue(value) {
 function appendMsg(role, text) {
   const paragraph = document.createElement('p');
   paragraph.className = 'msg ' + role;
+  // A rejection is a durable user action, not a typed message; it renders
+  // as a muted note so it never reads as words the user composed.
+  if (role === 'user' && text === USER_REJECTED_TEXT) paragraph.classList.add('rejected');
   paragraph.textContent = text;
   transcript.appendChild(paragraph);
   scrollToBottom();
@@ -2898,8 +3129,62 @@ function closeLive() {
   liveEl = null;
 }
 
+function askBoxKey(block) {
+  return (block.child_id || '') + '\u0000' + block.message;
+}
+
+// The durable ask record in the transcript. When an ask is answered, the
+// control plane appends a matching answered-ask event after the surface it
+// resolves; the box updates in place so the same question never renders twice.
+function renderAskBox(block) {
+  const key = askBoxKey(block);
+  if (openAskBox && openAskBox.key === key && !openAskBox.answered) {
+    if (block.answer) {
+      const note = document.createElement('div');
+      note.className = 'answer';
+      note.textContent = 'answered: ' + block.answer;
+      openAskBox.el.appendChild(note);
+      openAskBox.answered = true;
+      scrollToBottom();
+    }
+    return;
+  }
+  const box = document.createElement('div');
+  box.className = 'ask';
+  const question = document.createElement('div');
+  if (block.child_id) {
+    const to = document.createElement('span');
+    to.className = 'ask-to';
+    to.textContent = 'child ' + block.child_id + ' asks: ';
+    question.appendChild(to);
+  }
+  question.appendChild(document.createTextNode(block.message));
+  box.appendChild(question);
+  const options = document.createElement('ul');
+  options.className = 'options';
+  for (const option of block.options || []) {
+    const item = document.createElement('li');
+    item.textContent = option;
+    options.appendChild(item);
+  }
+  box.appendChild(options);
+  if (block.answer) {
+    const note = document.createElement('div');
+    note.className = 'answer';
+    note.textContent = 'answered: ' + block.answer;
+    box.appendChild(note);
+  }
+  transcript.appendChild(box);
+  scrollToBottom();
+  openAskBox = { key, el: box, answered: !!block.answer };
+}
+
 function renderMessage(message) {
   const block = message.block;
+  lastMsg = block;
+  // Any message that is not itself the pending ask closes the previous ask's
+  // record: it is history once the stream has moved past it.
+  if (block.kind !== 'ask') openAskBox = null;
   if (message.role === 'assistant' && block.kind === 'text') {
     if (liveEl) {
       const container = document.createElement('div');
@@ -2908,9 +3193,11 @@ function renderMessage(message) {
       liveEl.replaceWith(container);
       liveEl = null;
       scrollToBottom();
+      scheduleAskSync();
       return;
     }
     appendAssistant(block.text);
+    scheduleAskSync();
     return;
   }
   // Tool-streamed output streams into a live assistant paragraph while the
@@ -2943,52 +3230,9 @@ function renderMessage(message) {
       appendToolResult(block.name, payload, block.is_error);
       break;
     }
-    case 'ask': {
-      const box = document.createElement('div');
-      box.className = 'ask';
-      const question = document.createElement('div');
-      if (block.child_id) {
-        const to = document.createElement('span');
-        to.className = 'ask-to';
-        to.textContent = 'child ' + block.child_id + ' asks: ';
-        question.appendChild(to);
-      }
-      question.appendChild(document.createTextNode(block.message));
-      box.appendChild(question);
-      const options = document.createElement('ul');
-      options.className = 'options';
-      for (const option of block.options || []) {
-        const item = document.createElement('li');
-        item.textContent = option;
-        options.appendChild(item);
-      }
-      box.appendChild(options);
-      if (block.answer) {
-        const answer = document.createElement('div');
-        answer.className = 'answer';
-        answer.textContent = 'answered: ' + block.answer;
-        box.appendChild(answer);
-        // An answered ask is history, not a live question: the input row
-        // must not keep an open chip set for it.
-        clearAskChips();
-      } else if (block.options && block.options.length > 0) {
-        // The live question: its options become thumb-width chips in the
-        // input area, so answering is one tap, never typing.
-        askQuestion.textContent = block.message;
-        askChips.textContent = '';
-        for (const option of block.options) {
-          const chip = document.createElement('button');
-          chip.type = 'button';
-          chip.textContent = option;
-          chip.addEventListener('click', () => answer(option));
-          askChips.appendChild(chip);
-        }
-        askSheet.hidden = false;
-      }
-      transcript.appendChild(box);
-      scrollToBottom();
+    case 'ask':
+      renderAskBox(block);
       break;
-    }
     case 'summary':
       appendLine('summary', block.text);
       break;
@@ -3017,6 +3261,7 @@ function renderMessage(message) {
       appendLine('unknown', JSON.stringify(block));
       break;
   }
+  scheduleAskSync();
 }
 
 function handleEvent(event) {

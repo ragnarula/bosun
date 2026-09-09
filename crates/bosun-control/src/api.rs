@@ -112,6 +112,9 @@ pub enum ApiError {
     #[error("no persona configured")]
     NoPersona,
 
+    #[error("{0}")]
+    Conflict(String),
+
     #[error("persona {persona} is not configured")]
     PersonaNotFound { persona: String },
 
@@ -170,6 +173,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
             ApiError::ChildIsWatchOnly { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
+            ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::SessionNotFound { .. } | ApiError::RepoNotFound { .. } => {
                 (StatusCode::NOT_FOUND, Some(self.to_string()))
             }
@@ -346,6 +350,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions", get(sessions).post(create_session))
         .route("/sessions/{id}", get(session_detail))
         .route("/sessions/{id}/messages", post(add_message))
+        .route("/sessions/{id}/reject", post(reject_ask))
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/permission", post(set_permission))
         .route("/sessions/{id}/persona", post(switch_persona))
@@ -948,6 +953,12 @@ async fn skill_repo_row(state: &AppState, repo: &str) -> Result<SkillRepo, ApiEr
         })?;
     Ok(row)
 }
+/// The durable line a rejected question leaves in the transcript. Styled as a
+/// user action note by both clients (mirror the literal in
+/// `crates/bosun-control/src/ui/index.html`); it is read by the session's
+/// model, so the words stay literal and stable.
+pub const USER_REJECTED_TEXT: &str = "user rejected the question";
+
 #[derive(Debug, Deserialize)]
 struct AddMessageRequest {
     content: String,
@@ -1006,6 +1017,31 @@ async fn add_message(
     // the wake must reach the loop even while the owner's own interrupt holds.
     state.loops.send(&id, LoopEvent::UserMessage);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Records that the user rejected the question on screen rather than
+/// answering it. The rejection marker is appended to the session's thread and
+/// the session keeps waiting for input; its model is not woken, so no turn
+/// runs until the user sends their next message. When the user does, the
+/// marker precedes it in the thread and in the transcript. 409 when the
+/// session has no unanswered question on screen.
+#[instrument(skip(state))]
+async fn reject_ask(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id });
+    };
+    ensure_root(&session)?;
+    if state.store.reject_ask(&id, USER_REJECTED_TEXT).await? {
+        info!(session_id = %id, "the user rejected the question on screen");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::Conflict(format!(
+            "no question is on screen for session {id}"
+        )))
+    }
 }
 
 /// The interrupt ladder is root-only. While the root's own session is
@@ -3710,6 +3746,124 @@ mod tests {
             store.get_pending_ask(&root_id).await.unwrap().is_none(),
             "the binding is cleared once the ask is answered"
         );
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_surfaced_ask_parks_the_session_until_the_user_sends_input() {
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![vec![tool_call_fragment(
+                "call-1",
+                "ask",
+                r#"{"message":"may I push?","options":["yes","no"],"child_id":"child-s6"}"#,
+            )]])));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![vec![tool_call_fragment(
+                "call-1",
+                "ask",
+                r#"{"message":"may I push?","options":["yes","no"]}"#,
+            )]])));
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, child_id) =
+            state_with_child_tree(&dir, root_scripts, child_scripts).await;
+        state.loops.wake(&child_id);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        wait_for("the child to ask and the root to surface the bound ask", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let stored = store.get_session(&root_id).await.unwrap().unwrap();
+                    stored.state == SessionState::WaitingForInput
+                        && store.get_pending_ask(&root_id).await.unwrap().is_some()
+                }
+            }
+        })
+        .await;
+
+        // The user rejects the question instead of answering.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/reject"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The rejection appends the marker, clears the binding, and parks the
+        // session: no model turn runs until the user gives further input.
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        assert!(
+            root_messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::Text { text } if text == USER_REJECTED_TEXT
+            )),
+            "the rejection marker lands in the transcript: {root_messages:?}"
+        );
+        assert!(
+            store.get_pending_ask(&root_id).await.unwrap().is_none(),
+            "the raised binding is cleared by the rejection"
+        );
+        let stored = store.get_session(&root_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::WaitingForInput,
+            "the session waits, not runs"
+        );
+        assert_eq!(
+            store.model_calls(&root_id).await.unwrap().len(),
+            1,
+            "the rejection wakes no model turn"
+        );
+
+        // The next user message is a new instruction; it is not routed to the
+        // child as an answer to the rejected question.
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/messages"))
+            .json(&json!({ "content": "review the README instead" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let child_messages = store.messages(&child_id, false).await.unwrap();
+        assert!(
+            !child_messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::Text { text } if text == "review the README instead"
+            )),
+            "the instruction is not routed to the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_with_no_live_question_conflicts() {
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, _child_id) = state_with_child_tree(
+            &dir,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+        .await;
+        store
+            .append_message(
+                &root_id,
+                Role::User,
+                &Block::Text {
+                    text: "hello".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/reject"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     /// Builds a control-plane state whose root, its child, and that child's

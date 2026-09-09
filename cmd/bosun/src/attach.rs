@@ -21,6 +21,7 @@ use bosun_common::session::Role;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
 use bosun_control::api::PersonaSummary;
+use bosun_control::api::USER_REJECTED_TEXT;
 use crossterm::event;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::EnableBracketedPaste;
@@ -86,6 +87,9 @@ pub enum LineKind {
     ToolCall,
     ToolResult,
     Ask,
+    /// The durable note a rejected question leaves: a user action, not a
+    /// typed message.
+    Rejected,
     Summary,
     ChildEvent,
     ModelCall,
@@ -99,6 +103,17 @@ pub struct Line {
     pub text: String,
 }
 
+/// A question the attached session is live-asking: the last durable message
+/// is an unanswered ask, so the session is waiting for an answer. While it is
+/// set, the input box title names the ask, Enter answers it, and an empty
+/// ^R rejects it instead of sending nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAsk {
+    pub message: String,
+    pub options: Vec<String>,
+    pub child_id: Option<String>,
+}
+
 /// The client's view of a session: the durable transcript, the input line,
 /// and the stream cursor for reconnects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +124,9 @@ pub struct ClientState {
     pub pending_delta: Option<String>,
     pub permission: Permission,
     pub session_state: SessionState,
+    /// The question the session is live-asking, when its last message is an
+    /// unanswered ask. Cleared the moment any other message resolves it.
+    pub live_ask: Option<LiveAsk>,
 }
 
 impl ClientState {
@@ -120,6 +138,7 @@ impl ClientState {
             pending_delta: None,
             permission,
             session_state,
+            live_ask: None,
         }
     }
 
@@ -150,6 +169,21 @@ impl ClientState {
             // next, so any streaming text from the prior turn is stale.
             self.pending_delta = None;
         }
+        if let Event::Message { message } = event {
+            self.live_ask = match &message.block {
+                Block::Ask {
+                    message,
+                    options,
+                    child_id,
+                    answer: None,
+                } => Some(LiveAsk {
+                    message: message.clone(),
+                    options: options.clone(),
+                    child_id: child_id.clone(),
+                }),
+                _ => None,
+            };
+        }
         for line in event_lines(event) {
             self.push_line(line);
         }
@@ -165,6 +199,12 @@ impl ClientState {
     }
 
     fn push_line(&mut self, line: Line) {
+        // A routed answer replays the resolved ask right after the surface it
+        // supersedes; the surface is already on screen, so an identical ask
+        // line is skipped rather than duplicated.
+        if line.kind == LineKind::Ask && self.lines.last() == Some(&line) {
+            return;
+        }
         if self.lines.len() >= MAX_LINES {
             self.lines.remove(0);
         }
@@ -184,6 +224,15 @@ fn child_event_verb(kind: ChildEventKind) -> &'static str {
 /// Maps a durable event to the transcript lines it contributes.
 fn event_lines(event: &Event) -> Vec<Line> {
     match event {
+        Event::Message { message }
+            if message.role == Role::User
+                && matches!(&message.block, Block::Text { text } if text == USER_REJECTED_TEXT) =>
+        {
+            vec![Line {
+                kind: LineKind::Rejected,
+                text: USER_REJECTED_TEXT.to_string(),
+            }]
+        }
         Event::Message { message } => {
             let kind = match message.role {
                 Role::User => LineKind::User,
@@ -447,6 +496,7 @@ fn prefix_for(line: &Line) -> Cow<'static, str> {
         LineKind::ToolCall => Cow::Owned(format!("  {} ", tool_glyph(&line.text))),
         LineKind::ToolResult => Cow::Borrowed("    ↳ "),
         LineKind::Ask => Cow::Borrowed("  ? "),
+        LineKind::Rejected => Cow::Borrowed("  ~ "),
         LineKind::Summary => Cow::Borrowed("── "),
         LineKind::ChildEvent => Cow::Borrowed("  ⤷ "),
         LineKind::ModelCall => Cow::Borrowed("  ◆ "),
@@ -489,6 +539,7 @@ fn kind_color(kind: LineKind) -> Color {
         LineKind::ToolCall => Color::Magenta,
         LineKind::ToolResult => Color::Blue,
         LineKind::Ask => Color::Yellow,
+        LineKind::Rejected => Color::DarkGray,
         LineKind::Summary | LineKind::ChildEvent | LineKind::ModelCall => Color::DarkGray,
         LineKind::Status => Color::Cyan,
     }
@@ -661,15 +712,18 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let inner_width = input.width.saturating_sub(2) as usize;
     let input_widget = if interactive {
         let (text, _tail_len) = input_row(&app.state.input, inner_width);
-        Paragraph::new(text).block(
-            TuiBlock::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll",
-                    Style::default().fg(Color::DarkGray),
-                )),
-        )
-        .wrap(Wrap { trim: false })
+        let title = if app.state.live_ask.is_some() {
+            "question — Enter answers · ^R rejects · esc/^C interrupt".to_string()
+        } else {
+            "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll".to_string()
+        };
+        Paragraph::new(text)
+            .block(
+                TuiBlock::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(title, Style::default().fg(Color::Yellow))),
+            )
+            .wrap(Wrap { trim: false })
     } else {
         Paragraph::new(TuiLine::from(Span::styled(
             "watch-only: this session is a child; it renders here but accepts no input. esc/^C/^Q quit · pgup/pgdn scroll",
@@ -1198,9 +1252,17 @@ async fn handle_key(
         }
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Ok(Action::Exit),
         // Ctrl-R sends the input as a redirect: "new instruction, not an
-        // answer", for when a child's surfaced question is on screen.
+        // answer", for when a child's surfaced question is on screen. With an
+        // empty input while a question is live it rejects the question
+        // instead: the durable note lands in the transcript and the session
+        // keeps waiting for the user's next message.
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            submit_input(app, client, cp_url, session_id, true).await
+            if app.state.input.is_empty() && app.state.live_ask.is_some() {
+                reject_question(app, client, cp_url, session_id).await;
+                Ok(Action::Continue)
+            } else {
+                submit_input(app, client, cp_url, session_id, true).await
+            }
         }
         // Esc interrupts like Ctrl-C; Ctrl-Q and /exit quit.
         KeyCode::Esc => {
@@ -1340,6 +1402,34 @@ async fn send_message(
         app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("send failed: {error}"),
+        });
+    }
+}
+
+async fn reject_question(app: &mut App, client: &reqwest::Client, cp_url: &str, session_id: &str) {
+    // The durable note the reject endpoint appends comes back over the event
+    // stream as a Rejected line; only a failure needs a local status line.
+    let send = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        client
+            .post(format!("{cp_url}/sessions/{session_id}/reject"))
+            .send(),
+    )
+    .await;
+    let result = match send {
+        Ok(result) => result.and_then(reqwest::Response::error_for_status),
+        Err(_) => {
+            app.state.push_line(Line {
+                kind: LineKind::Status,
+                text: "request timed out".into(),
+            });
+            return;
+        }
+    };
+    if let Err(error) = result {
+        app.state.push_line(Line {
+            kind: LineKind::Status,
+            text: format!("reject failed: {error}"),
         });
     }
 }
@@ -1978,6 +2068,118 @@ mod tests {
         assert_eq!(state.lines.len(), 2);
     }
 
+    fn ask_event(ask: Block) -> Event {
+        Event::Message {
+            message: Message {
+                role: Role::Assistant,
+                block: ask,
+            },
+        }
+    }
+
+    #[test]
+    fn live_ask_tracks_the_last_unanswered_question_and_clears_on_resolution() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+
+        // A surfaced ask becomes the live question.
+        let ask = Block::Ask {
+            message: "may I push?".into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: Some("child-1".into()),
+            answer: None,
+        };
+        assert!(state.apply_event(1, &ask_event(ask.clone())));
+        assert_eq!(
+            state.live_ask,
+            Some(LiveAsk {
+                message: "may I push?".into(),
+                options: vec!["yes".into(), "no".into()],
+                child_id: Some("child-1".into()),
+            })
+        );
+
+        // Its answered form (appended durably by a routed answer) clears the
+        // live question and, because the replay is identical to the surface,
+        // is not duplicated as a second transcript line.
+        let answered = Block::Ask {
+            message: "may I push?".into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: Some("child-1".into()),
+            answer: Some("yes".into()),
+        };
+        assert!(state.apply_event(2, &ask_event(answered)));
+        assert_eq!(state.live_ask, None, "a resolved ask is not live");
+        assert_eq!(state.lines.len(), 1, "the resolved ask does not duplicate");
+        assert_eq!(state.lines[0].kind, LineKind::Ask);
+    }
+
+    #[test]
+    fn an_answered_own_ask_and_other_messages_clear_the_live_question() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        let ask = Block::Ask {
+            message: "which approach?".into(),
+            options: vec!["a".into(), "b".into()],
+            child_id: None,
+            answer: None,
+        };
+        assert!(state.apply_event(1, &ask_event(ask)));
+        assert!(state.live_ask.is_some());
+
+        // The user's answer to an own question is an ordinary text message;
+        // the durable note of a rejection is one too. Both clear the live ask.
+        let user_text = Event::Message {
+            message: Message {
+                role: Role::User,
+                block: Block::Text {
+                    text: USER_REJECTED_TEXT.into(),
+                },
+            },
+        };
+        assert!(state.apply_event(2, &user_text));
+        assert_eq!(state.live_ask, None);
+        assert_eq!(
+            state.lines.last(),
+            Some(&Line {
+                kind: LineKind::Rejected,
+                text: USER_REJECTED_TEXT.to_string(),
+            }),
+            "the rejection renders as a user action note, not a typed message"
+        );
+    }
+
+    #[test]
+    fn event_lines_renders_the_rejection_marker_as_a_rejection_line() {
+        let marker = Event::Message {
+            message: Message {
+                role: Role::User,
+                block: Block::Text {
+                    text: USER_REJECTED_TEXT.into(),
+                },
+            },
+        };
+        assert_eq!(
+            event_lines(&marker),
+            vec![Line {
+                kind: LineKind::Rejected,
+                text: USER_REJECTED_TEXT.to_string(),
+            }]
+        );
+        // Ordinary user text stays a user line.
+        let plain = Event::Message {
+            message: Message {
+                role: Role::User,
+                block: Block::Text { text: "go".into() },
+            },
+        };
+        assert_eq!(
+            event_lines(&plain),
+            vec![Line {
+                kind: LineKind::User,
+                text: "go".into(),
+            }]
+        );
+    }
+
     #[test]
     fn permission_events_update_the_state() {
         let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
@@ -2190,6 +2392,44 @@ mod tests {
             persona_switch_target("/persona").is_none(),
             "the bare form still names nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_ctrl_r_rejects_a_live_question_and_leaves_ordinary_input_alone() {
+        let client = reqwest::Client::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+
+        // A live question with an empty input: ^R rejects it (the local
+        // server errors, so the failure is recorded; the key still routes to
+        // the reject endpoint rather than sending nothing).
+        let mut app = App::new(test_session());
+        app.state.live_ask = Some(LiveAsk {
+            message: "may I push?".into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: None,
+        });
+        let action = handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Char('r')))
+            .await
+            .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(
+            app.state
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with("reject failed")
+                    || line.text.starts_with("request timed out")),
+            "empty ^R on a live question issues a reject: {:?}",
+            app.state.lines
+        );
+
+        // With no live question an empty ^R is a plain redirect submit, which
+        // sends nothing and records nothing.
+        let mut app = App::new(test_session());
+        let action = handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Char('r')))
+            .await
+            .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(app.state.lines.is_empty(), "no request leaves the client");
     }
 
     fn test_session() -> Session {
