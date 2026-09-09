@@ -462,7 +462,7 @@ mod tests {
             &cp_tunnel,
             "s1",
             "run-1",
-            "file/read",
+            "file_read",
             json!({ "path": "marker.txt" }),
         )
         .await;
@@ -475,7 +475,7 @@ mod tests {
             &cp_tunnel,
             "s2",
             "run-2",
-            "file/read",
+            "file_read",
             json!({ "path": "marker.txt" }),
         )
         .await;
@@ -490,7 +490,7 @@ mod tests {
             &cp_tunnel,
             "s1",
             "run-3",
-            "file/write",
+            "file_write",
             json!({ "path": "mine.txt", "content": "one" }),
         )
         .await;
@@ -499,7 +499,7 @@ mod tests {
             &cp_tunnel,
             "s1",
             "run-4",
-            "file/read",
+            "file_read",
             json!({ "path": "mine.txt" }),
         )
         .await;
@@ -552,7 +552,7 @@ mod tests {
             &cp_tunnel,
             "s1",
             "run-1",
-            "file/read",
+            "file_read",
             json!({ "path": "absent.txt" }),
         )
         .await;
@@ -899,7 +899,7 @@ mod tests {
             &tunnel,
             "s1",
             "run-1",
-            "file/read",
+            "file_read",
             json!({ "path": "marker.txt" }),
         )
         .await;
@@ -939,7 +939,7 @@ mod tests {
             &tunnel,
             "s1",
             "run-1",
-            "file/read",
+            "file_read",
             json!({ "path": "marker.txt" }),
         )
         .await;

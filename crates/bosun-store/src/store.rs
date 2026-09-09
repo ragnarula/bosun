@@ -1604,7 +1604,7 @@ mod tests {
             parent_id: None,
             owner_id: id.to_string(),
             permission: Permission::ReadWrite,
-            allowed_tools: "shell, file/read".to_string(),
+            allowed_tools: "shell, file_read".to_string(),
             state: SessionState::Running,
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
@@ -1624,7 +1624,7 @@ mod tests {
             parent_id: Some(parent.id),
             owner_id: owner.to_string(),
             permission: Permission::ReadOnly,
-            allowed_tools: "file/read, grep".to_string(),
+            allowed_tools: "file_read, grep".to_string(),
             state: SessionState::Creating,
             prompt: Some("review the change".to_string()),
             ..session(id)
@@ -1757,7 +1757,7 @@ mod tests {
                 "reviewer",
                 "cheap",
                 Permission::ReadOnly,
-                "file/read, grep",
+                "file_read, grep",
             )
             .await
             .unwrap();
@@ -1766,7 +1766,7 @@ mod tests {
         assert_eq!(stored.persona.as_deref(), Some("reviewer"));
         assert_eq!(stored.model, "cheap");
         assert_eq!(stored.permission, Permission::ReadOnly);
-        assert_eq!(stored.allowed_tools, "file/read, grep");
+        assert_eq!(stored.allowed_tools, "file_read, grep");
         assert_eq!(
             stored.state,
             session("a").state,
@@ -1781,7 +1781,7 @@ mod tests {
         store.create_session(&session("a")).await.unwrap();
 
         store
-            .switch_persona("a", "reviewer", "cheap", Permission::ReadOnly, "file/read")
+            .switch_persona("a", "reviewer", "cheap", Permission::ReadOnly, "file_read")
             .await
             .unwrap();
 

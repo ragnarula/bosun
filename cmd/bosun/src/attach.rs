@@ -466,8 +466,8 @@ fn prefix_for(line: &Line) -> Cow<'static, str> {
 fn tool_glyph(text: &str) -> &'static str {
     match text.split_whitespace().next().unwrap_or_default() {
         "shell" => "$",
-        "file/read" => "→",
-        "file/write" | "edit" => "✎",
+        "file_read" => "→",
+        "file_write" | "edit" => "✎",
         "grep" => "⌕",
         "glob" => "✱",
         "ask" => "?",

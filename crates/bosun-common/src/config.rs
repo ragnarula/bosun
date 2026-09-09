@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::session::Permission;
 use crate::tool::ALL_TOOLS;
+use crate::tool::invalid_canonical_tool_names;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -41,6 +42,13 @@ impl ControlConfig {
     /// all at once.
     pub fn validate_personas(&self) -> Result<(), PersonaConfigError> {
         let mut problems = Vec::new();
+        // The canonical surface is fixed; a name a strict provider would
+        // reject must fail startup, not every turn it is advertised.
+        for name in invalid_canonical_tool_names() {
+            problems.push(format!(
+                "canonical tool name {name} violates the provider name pattern (1-64 of [a-zA-Z0-9_-])"
+            ));
+        }
         let mut names: Vec<&String> = self.personas.keys().collect();
         names.sort();
         for name in names {
@@ -419,7 +427,7 @@ mod tests {
             [personas.coder]
             model = "main"
             permission = "read_write"
-            allowed_tools = "shell, file/read, git"
+            allowed_tools = "shell, file_read, git"
 
             [personas.looker]
             model = "main"

@@ -2484,8 +2484,8 @@ function toolGlyph(name) {
   // step with the canonical tool list in `crates/bosun-common/src/tool.rs`.
   const glyphs = {
     shell: '$',
-    'file/read': '→',
-    'file/write': '✎',
+    'file_read': '→',
+    'file_write': '✎',
     edit: '✎',
     grep: '⌕',
     glob: '✱',
@@ -2517,8 +2517,8 @@ function toolSummary(name, args) {
       const command = s(args.command);
       return command ? name + ' ' + clip(command, TOOL_SUMMARY_LIMIT) : name;
     }
-    case 'file/read':
-    case 'file/write':
+    case 'file_read':
+    case 'file_write':
     case 'edit':
       return name + (s(args.path) ? ' ' + clip(s(args.path), TOOL_SUMMARY_LIMIT) : '');
     case 'grep':

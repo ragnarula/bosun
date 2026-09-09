@@ -2831,7 +2831,7 @@ mod tests {
                 PersonaConfig {
                     model: "test".into(),
                     permission: Permission::ReadOnly,
-                    allowed_tools: "file/read, grep".into(),
+                    allowed_tools: "file_read, grep".into(),
                     description: "Reviews without touching".into(),
                     system_prompt: None,
                 },
@@ -2857,7 +2857,7 @@ mod tests {
         let session: Value = response.json().await.unwrap();
         assert_eq!(session["model"], "test");
         assert_eq!(session["permission"], "read_only");
-        assert_eq!(session["allowed_tools"], "file/read, grep");
+        assert_eq!(session["allowed_tools"], "file_read, grep");
         assert_eq!(
             session["persona"], "reviewer",
             "the default persona is stored on the session"
@@ -4154,7 +4154,7 @@ mod tests {
                 ),
                 (
                     "reviewer".to_string(),
-                    persona_config("cheap", Permission::ReadOnly, "file/read, grep", None),
+                    persona_config("cheap", Permission::ReadOnly, "file_read, grep", None),
                 ),
             ]),
             Some("coder"),
@@ -4176,7 +4176,7 @@ mod tests {
         assert_eq!(stored.persona.as_deref(), Some("reviewer"));
         assert_eq!(stored.model, "cheap");
         assert_eq!(stored.permission, Permission::ReadOnly);
-        assert_eq!(stored.allowed_tools, "file/read, grep");
+        assert_eq!(stored.allowed_tools, "file_read, grep");
 
         let session: Value = client
             .get(format!("http://{addr}/sessions/s1"))
@@ -4296,7 +4296,7 @@ mod tests {
                 persona_config(
                     "beta",
                     Permission::ReadOnly,
-                    "file/read, grep",
+                    "file_read, grep",
                     Some("You are the reviewer persona."),
                 ),
             ),

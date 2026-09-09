@@ -159,12 +159,12 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         },
         ToolSpec {
-            name: "file/read".into(),
+            name: "file_read".into(),
             description: "Read a file from the session's working copy.".into(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         },
         ToolSpec {
-            name: "file/write".into(),
+            name: "file_write".into(),
             description: "Write a file in the session's working copy, replacing its content.".into(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
@@ -224,7 +224,7 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         Permission::ReadWrite => all,
         Permission::ReadOnly => all
             .into_iter()
-            .filter(|tool| !matches!(tool.name.as_str(), "shell" | "file/write" | "edit"))
+            .filter(|tool| !matches!(tool.name.as_str(), "shell" | "file_write" | "edit"))
             .collect(),
     }
 }
@@ -238,11 +238,41 @@ pub struct UnknownToolsError {
     pub unknown: Vec<String>,
 }
 
+/// Whether a tool name matches the pattern every tool-calling spec requires:
+/// `^[a-zA-Z0-9_-]{1,64}$`. OpenAI and Anthropic MUST enforce it; MCP is
+/// loosest and still stops at the dot. A name outside it makes a strict
+/// provider reject the whole request with a 400.
+pub fn tool_name_is_valid(name: &str) -> bool {
+    let mut length = 0;
+    for byte in name.bytes() {
+        if !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+            return false;
+        }
+        length += 1;
+    }
+    length > 0 && length <= 64
+}
+
+/// The canonical tool names that violate the provider name pattern, if any.
+/// The surface is static, so the control plane checks this at boot and a bad
+/// name fails startup, never a per-request provider 400.
+pub fn invalid_canonical_tool_names() -> Vec<String> {
+    canonical_tools(Permission::ReadWrite)
+        .into_iter()
+        .filter(|tool| !tool_name_is_valid(&tool.name))
+        .map(|tool| tool.name)
+        .collect()
+}
+
 /// Parses a persona's `allowed_tools` value into the tool names it allows.
 /// `"*"` allows every canonical tool (`Ok(None)`); anything else is a list of
 /// canonical names split on commas and whitespace. Unknown names come back as
 /// errors so a typo fails boot validation instead of silently narrowing the
 /// tool set; duplicates are dropped.
+///
+/// Two legacy names are folded onto their canonical form: sessions created
+/// before `file/read` and `file/write` were renamed to `file_read` and
+/// `file_write` keep their stored allowlists working.
 pub fn parse_allowed_tools(value: &str) -> Result<Option<Vec<String>>, UnknownToolsError> {
     if value.trim() == ALL_TOOLS {
         return Ok(None);
@@ -254,9 +284,14 @@ pub fn parse_allowed_tools(value: &str) -> Result<Option<Vec<String>>, UnknownTo
     let mut names = Vec::new();
     let mut unknown = Vec::new();
     for raw in value.split([',', ' ', '\t', '\n']) {
-        let name = raw.trim();
+        let mut name = raw.trim();
         if name.is_empty() {
             continue;
+        }
+        match name {
+            "file/read" => name = "file_read",
+            "file/write" => name = "file_write",
+            _ => {}
         }
         if names.iter().any(|n| n == name) || unknown.iter().any(|n| n == name) {
             continue;
@@ -286,8 +321,8 @@ mod tests {
             names,
             vec![
                 "shell",
-                "file/read",
-                "file/write",
+                "file_read",
+                "file_write",
                 "edit",
                 "grep",
                 "glob",
@@ -313,7 +348,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "file/read",
+                "file_read",
                 "grep",
                 "glob",
                 "ask",
@@ -377,10 +412,10 @@ mod tests {
 
     #[test]
     fn allowed_tools_splits_on_commas_and_whitespace() {
-        let parsed = parse_allowed_tools("shell, file/read  grep\nglob").unwrap();
+        let parsed = parse_allowed_tools("shell, file_read  grep\nglob").unwrap();
         assert_eq!(
             parsed.unwrap(),
-            ["shell", "file/read", "grep", "glob"],
+            ["shell", "file_read", "grep", "glob"],
             "names keep their given order"
         );
     }
@@ -401,7 +436,7 @@ mod tests {
 
     #[test]
     fn allowed_tools_rejects_unknown_names_in_order() {
-        let err = parse_allowed_tools("shell, websurf, file/read, nope").unwrap_err();
+        let err = parse_allowed_tools("shell, websurf, file_read, nope").unwrap_err();
         assert_eq!(err.unknown, ["websurf", "nope"]);
         assert_eq!(err.to_string(), "unknown tool name(s): websurf, nope");
     }
@@ -415,11 +450,43 @@ mod tests {
     }
 
     #[test]
+    fn every_canonical_name_matches_the_provider_pattern() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        assert!(
+            tools.iter().all(|tool| tool_name_is_valid(&tool.name)),
+            "invalid names: {:?}",
+            invalid_canonical_tool_names()
+        );
+        // The pattern is one to 64 of [a-zA-Z0-9_-].
+        assert!(tool_name_is_valid("file_read"));
+        assert!(tool_name_is_valid("a"));
+        assert!(tool_name_is_valid(&"a".repeat(64)));
+        assert!(!tool_name_is_valid(""));
+        assert!(!tool_name_is_valid("file/read"));
+        assert!(!tool_name_is_valid("file.read"));
+        assert!(!tool_name_is_valid("file read"));
+        assert!(!tool_name_is_valid(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn legacy_slash_tool_names_fold_onto_the_renamed_canonical_names() {
+        // Sessions created before the rename stored "file/read" and
+        // "file/write" in their allowlists; parsing must keep them running on
+        // the renamed tools.
+        let parsed = parse_allowed_tools("file/read, file/write, grep").unwrap();
+        assert_eq!(parsed.unwrap(), ["file_read", "file_write", "grep"]);
+        assert_eq!(
+            parse_allowed_tools("file/read").unwrap().unwrap(),
+            ["file_read"]
+        );
+    }
+
+    #[test]
     fn tool_ops_and_msgs_round_trip_snake_case() {
         for op in [
             ToolOp::Call {
                 run_id: "run-1".into(),
-                tool: "file/read".into(),
+                tool: "file_read".into(),
                 args: json!({ "path": "a.txt" }),
             },
             ToolOp::Cancel {

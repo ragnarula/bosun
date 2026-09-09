@@ -167,7 +167,7 @@ pub async fn run_call(
     }
 
     let result = match tool {
-        "file/read" => {
+        "file_read" => {
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return Err(ExecutorError::BadArgument { key: "path" });
             };
@@ -176,9 +176,9 @@ pub async fn run_call(
                 .await
                 .map(|content| json!({ "content": content }))
         }
-        "file/write" => {
+        "file_write" => {
             if permission != Permission::ReadWrite {
-                return Err(ToolError::ReadOnly { tool: "file/write" }.into());
+                return Err(ToolError::ReadOnly { tool: "file_write" }.into());
             }
             let (Some(path), Some(content)) = (
                 args.get("path").and_then(Value::as_str),
@@ -705,18 +705,18 @@ mod tests {
         let outcome = call(
             &state,
             "run-1",
-            "file/write",
+            "file_write",
             json!({ "path": "hello.txt", "content": "hi there" }),
         )
         .await
         .expect("write should succeed");
         assert!(matches!(outcome, CallOutcome::Result { content } if content == json!({})));
 
-        let outcome = call(&state, "run-2", "file/read", json!({ "path": "hello.txt" }))
+        let outcome = call(&state, "run-2", "file_read", json!({ "path": "hello.txt" }))
             .await
             .expect("read should succeed");
         let CallOutcome::Result { content } = outcome else {
-            panic!("file/read must not stream");
+            panic!("file_read must not stream");
         };
         assert_eq!(content, json!({ "content": "hi there" }));
     }
@@ -729,7 +729,7 @@ mod tests {
         call(
             &state,
             "run-1",
-            "file/write",
+            "file_write",
             json!({ "path": "f.txt", "content": "hello world" }),
         )
         .await
@@ -745,11 +745,11 @@ mod tests {
         .expect("edit should succeed");
         assert!(matches!(outcome, CallOutcome::Result { content } if content["replaced"] == true));
 
-        let outcome = call(&state, "run-3", "file/read", json!({ "path": "f.txt" }))
+        let outcome = call(&state, "run-3", "file_read", json!({ "path": "f.txt" }))
             .await
             .unwrap();
         let CallOutcome::Result { content } = outcome else {
-            panic!("file/read must not stream");
+            panic!("file_read must not stream");
         };
         assert_eq!(content["content"], "hello there");
 
@@ -775,7 +775,7 @@ mod tests {
 
         for (tool, args) in [
             ("shell", json!({ "command": "echo hi" })),
-            ("file/write", json!({ "path": "f.txt", "content": "x" })),
+            ("file_write", json!({ "path": "f.txt", "content": "x" })),
             ("edit", json!({ "path": "f.txt", "old": "a", "new": "b" })),
         ] {
             let error = call_error(&state, "run-1", tool, args).await;
@@ -789,7 +789,7 @@ mod tests {
             call(
                 &state,
                 "run-2",
-                "file/read",
+                "file_read",
                 json!({ "path": "needle.txt" })
             )
             .await
@@ -1211,7 +1211,7 @@ mod tests {
         let state = state(dir.path(), Permission::ReadWrite);
 
         for path in ["../escape", "/etc/hosts"] {
-            let error = call_error(&state, "run-1", "file/read", json!({ "path": path })).await;
+            let error = call_error(&state, "run-1", "file_read", json!({ "path": path })).await;
             assert!(
                 matches!(
                     error,
@@ -1358,7 +1358,7 @@ mod tests {
         let error = call_error(&state, "run-1", "nope", json!({})).await;
         assert!(matches!(error, ExecutorError::UnknownTool { tool } if tool == "nope"));
 
-        let error = call_error(&state, "run-2", "file/read", json!({})).await;
+        let error = call_error(&state, "run-2", "file_read", json!({})).await;
         assert!(matches!(error, ExecutorError::BadArgument { key: "path" }));
     }
 

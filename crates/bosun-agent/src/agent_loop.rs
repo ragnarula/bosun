@@ -5056,9 +5056,9 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect();
         assert!(!names.contains(&"shell"));
-        assert!(!names.contains(&"file/write"));
+        assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"edit"));
-        assert!(names.contains(&"file/read"));
+        assert!(names.contains(&"file_read"));
         assert!(names.contains(&"ask"));
 
         handle.stop();
@@ -5069,7 +5069,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
-            .create_session(&session_allowing("s-allow", "file/read, grep, glob"))
+            .create_session(&session_allowing("s-allow", "file_read, grep, glob"))
             .await
             .unwrap();
 
@@ -5102,7 +5102,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect();
-        assert_eq!(names, ["file/read", "grep", "glob"]);
+        assert_eq!(names, ["file_read", "grep", "glob"]);
         assert!(
             !names.contains(&"spawn"),
             "an allow-list without spawn does not advertise it"
@@ -5116,7 +5116,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
-            .create_session(&session_allowing("s-refuse", "file/read"))
+            .create_session(&session_allowing("s-refuse", "file_read"))
             .await
             .unwrap();
 
@@ -5418,7 +5418,7 @@ mod tests {
             Permission::ReadOnly,
             "You are the reviewer persona.",
         );
-        reviewer.allowed_tools = "file/read".into();
+        reviewer.allowed_tools = "file_read".into();
         let coder_provider = Arc::new(ModelNamedProvider::new(
             one_text_script("coder turn"),
             "model-a",
@@ -5485,7 +5485,7 @@ mod tests {
                 "reviewer",
                 "model-b",
                 Permission::ReadOnly,
-                "file/read",
+                "file_read",
             )
             .await
             .unwrap();
@@ -5515,7 +5515,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.clone())
                 .collect::<Vec<_>>(),
-            ["file/read"],
+            ["file_read"],
             "the reviewer's tool schema is rebuilt from its allowed_tools"
         );
         assert!(
@@ -5552,7 +5552,7 @@ mod tests {
         coder.system_prompt = Some("You are the coder persona.".into());
         let mut reviewer = persona("model-b", Permission::ReadOnly);
         reviewer.system_prompt = Some("You are the reviewer persona.".into());
-        reviewer.allowed_tools = "file/read".into();
+        reviewer.allowed_tools = "file_read".into();
         let personas = HashMap::from([
             ("coder".to_string(), coder),
             ("reviewer".to_string(), reviewer),
@@ -5592,7 +5592,7 @@ mod tests {
                 "reviewer",
                 "model-b",
                 Permission::ReadOnly,
-                "file/read",
+                "file_read",
             )
             .await
             .unwrap();
@@ -11096,7 +11096,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_session(&session_allowing("read-cat", "file/read, grep"))
+            .create_session(&session_allowing("read-cat", "file_read, grep"))
             .await
             .unwrap();
 

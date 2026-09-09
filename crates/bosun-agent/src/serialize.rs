@@ -274,7 +274,7 @@ mod tests {
                 role: Role::User,
                 block: Block::ToolResult {
                     id: "call-1".into(),
-                    name: "file/read".into(),
+                    name: "file_read".into(),
                     is_error: false,
                     content: json!("file content"),
                 },
@@ -332,7 +332,7 @@ mod tests {
                 role: Role::Assistant,
                 block: Block::ToolResult {
                     id: "call-5".into(),
-                    name: "file/write".into(),
+                    name: "file_write".into(),
                     is_error: false,
                     content: json!({ "ok": true }),
                 },
@@ -352,7 +352,7 @@ mod tests {
                 }),
             },
             ToolSpec {
-                name: "file/read".into(),
+                name: "file_read".into(),
                 description: "Read a file.".into(),
                 schema: json!({
                     "type": "object",
@@ -399,7 +399,7 @@ mod tests {
                 },
             },
             {
-                "name": "file/read",
+                "name": "file_read",
                 "description": "Read a file.",
                 "input_schema": {
                     "type": "object",
@@ -458,7 +458,7 @@ mod tests {
             {
                 "type": "function",
                 "function": {
-                    "name": "file/read",
+                    "name": "file_read",
                     "description": "Read a file.",
                     "parameters": {
                         "type": "object",

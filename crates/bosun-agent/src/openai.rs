@@ -469,7 +469,7 @@ mod tests {
                                 "index": 1,
                                 "id": "b",
                                 "type": "function",
-                                "function": { "name": "file/read", "arguments": "{\"p" },
+                                "function": { "name": "file_read", "arguments": "{\"p" },
                             },
                         ],
                     },
@@ -529,7 +529,7 @@ mod tests {
                 StreamEvent::ToolCallDelta {
                     index: 1,
                     id: Some("b".into()),
-                    name: Some("file/read".into()),
+                    name: Some("file_read".into()),
                     args_delta: "{\"p".into(),
                 },
                 StreamEvent::ToolCallDelta {

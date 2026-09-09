@@ -33,7 +33,7 @@ use bosun_node::manager::NodeManager;
 use bosun_store::store::Store;
 use serde_json::json;
 
-/// The asset sits at the file/read cap (1 MiB), comfortably above the tunnel's
+/// The asset sits at the file_read cap (1 MiB), comfortably above the tunnel's
 /// per-connection flow-control window (512 KiB), so a large response must
 /// pause and resume against window updates.
 const ASSET_LEN: usize = 1_000_000;
@@ -134,7 +134,7 @@ async fn node_with_sessions(
 }
 
 /// Opens a logical connection on the node's tunnel for one session and runs
-/// one typed `file/read` call, returning the terminal reply. Returns `None`
+/// one typed `file_read` call, returning the terminal reply. Returns `None`
 /// while the tunnel is not yet registered.
 async fn tunnel_read(tunnels: &TunnelRegistry, session_id: &str, path: &str) -> Option<ToolMsg> {
     let mut conn: LogicalStream = tunnels.open("node-1", session_id).await.ok()?;
@@ -142,7 +142,7 @@ async fn tunnel_read(tunnels: &TunnelRegistry, session_id: &str, path: &str) -> 
         &mut conn,
         &ToolOp::Call {
             run_id: "run-1".into(),
-            tool: "file/read".into(),
+            tool: "file_read".into(),
             args: json!({ "path": path }),
         },
     )
@@ -169,14 +169,14 @@ async fn tunnel_read(tunnels: &TunnelRegistry, session_id: &str, path: &str) -> 
 
 fn content_len(reply: &ToolMsg) -> usize {
     let ToolMsg::Result { content } = reply else {
-        panic!("file/read must return a result: {reply:?}");
+        panic!("file_read must return a result: {reply:?}");
     };
     content["content"].as_str().unwrap().len()
 }
 
 fn content(reply: &ToolMsg) -> String {
     let ToolMsg::Result { content } = reply else {
-        panic!("file/read must return a result: {reply:?}");
+        panic!("file_read must return a result: {reply:?}");
     };
     content["content"].as_str().unwrap().to_string()
 }

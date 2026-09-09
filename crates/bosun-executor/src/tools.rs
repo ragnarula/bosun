@@ -154,7 +154,7 @@ pub const REPO_STANDARD_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
 /// The repo-standard files that exist at the working-copy root, in
 /// [`REPO_STANDARD_FILES`] order. Presence only: the response never carries
-/// the files' contents, which the model reads on demand with `file/read`.
+/// the files' contents, which the model reads on demand with `file_read`.
 pub fn repo_standards_present(session_dir: &Path) -> Vec<&'static str> {
     REPO_STANDARD_FILES
         .into_iter()
