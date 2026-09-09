@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -38,6 +40,12 @@ use tracing::warn;
 use crate::manager::NodeManager;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
+/// The next suffix for a spilled file's name. The suffix keeps two spills in
+/// the same session from overwriting each other even when a caller reuses a
+/// run id, so the file a `Spilled` frame names always holds that frame's
+/// content.
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps the node's one outbound tunnel to the control plane open. On any
 /// failure the connection is re-established after a short delay; the node's
@@ -156,7 +164,12 @@ async fn relay_connection(event: OpenEvent, manager: Arc<NodeManager>, tunnel: T
 }
 
 /// Dispatches one tool call and writes its response frames back over the
-/// connection.
+/// connection. A JSON result larger than the spill limits is written to a
+/// file in the session's working copy and replaced by a `Spilled` frame
+/// naming the file and a short preview, so the model's context stays bounded
+/// and the full content stays readable through `file_read`. A shell run
+/// streams its output live up to the same byte budget, then spills the full
+/// file at the end (see [`relay_shell_stream`]).
 async fn relay_call(
     logical: LogicalStream,
     state: &Arc<ExecutorState>,
@@ -168,7 +181,33 @@ async fn relay_call(
     let mut logical = logical;
     match outcome {
         Ok(CallOutcome::Result { content }) => {
-            if let Err(error) = write_tool_frame(&mut logical, &ToolMsg::Result { content }).await {
+            // A JSON result spills on its serialized text: the model reads the
+            // file instead of a value the size of a novel in its context.
+            let text = match &content {
+                Value::String(text) => text.clone(),
+                other => serde_json::to_string(other).expect("a result value serializes"),
+            };
+            let frame = if bosun_common::tool::should_spill(&text) {
+                match spill_to_file(state, run_id, tool, &text).await {
+                    Ok(file) => ToolMsg::Spilled {
+                        file,
+                        preview: preview(&text),
+                        exit_code: None,
+                    },
+                    Err(error) => {
+                        warn!(
+                            run_id = %run_id,
+                            tool = %tool,
+                            error = %error,
+                            "failed to spill a large tool result"
+                        );
+                        ToolMsg::Result { content }
+                    }
+                }
+            } else {
+                ToolMsg::Result { content }
+            };
+            if let Err(error) = write_tool_frame(&mut logical, &frame).await {
                 debug!(
                     run_id = %run_id,
                     tool = %tool,
@@ -178,7 +217,7 @@ async fn relay_call(
             }
         }
         Ok(CallOutcome::Shell(stream)) => {
-            relay_shell_stream(logical, stream).await;
+            relay_shell_stream(logical, state, run_id, tool, stream).await;
         }
         Err(error) => {
             match &error {
@@ -212,25 +251,92 @@ async fn relay_call(
 }
 
 /// Forwards a shell run's streamed events as frames until it ends with a done
-/// code. While streaming, the control plane's end of the connection is
+/// code. The model's context stays bounded: output is forwarded live only up
+/// to the spill byte budget, and whatever streams past it is still
+/// accumulated. When the run ends and the accumulated output exceeds the
+/// spill limits, the full output is written to a file in the session's
+/// working copy and a `Spilled` frame is sent instead of `Done`; the model
+/// reads the file with `file_read` when it needs what the live stream cut
+/// off. While streaming, the control plane's end of the connection is
 /// watched: when it closes, the stream is dropped, whose guard kills the
 /// shell's process group and deregisters the run.
-async fn relay_shell_stream(logical: LogicalStream, mut stream: ShellStream) {
+async fn relay_shell_stream(
+    logical: LogicalStream,
+    state: &Arc<ExecutorState>,
+    run_id: &str,
+    tool: &str,
+    mut stream: ShellStream,
+) {
     let (mut reader, mut writer) = tokio::io::split(logical);
     let mut buf = [0u8; 1024];
+    // The full streamed output, kept so a run that exceeds the spill limits
+    // can be written to a file at the end.
+    let mut output = String::new();
+    // The streamed bytes forwarded live to the control plane. Past the spill
+    // byte budget nothing more is forwarded, so the model's context stays
+    // bounded even though the run keeps producing output. The run still ends
+    // as a spill (any output over the budget is at least this big), so the
+    // full output stays reachable through `file_read`.
+    let mut forwarded = 0usize;
     loop {
         tokio::select! {
             event = stream.next() => {
                 let Some(event) = event else { break };
-                let (frame, terminal) = match event {
-                    ShellEvent::Out(text) => (ToolMsg::Event { text }, false),
-                    ShellEvent::Done(exit_code) => (ToolMsg::Done { exit_code }, true),
-                };
-                if write_tool_frame(&mut writer, &frame).await.is_err() {
-                    break;
-                }
-                if terminal {
-                    break;
+                match event {
+                    ShellEvent::Out(text) => {
+                        output.push_str(&text);
+                        let budget = bosun_common::tool::SPILL_BYTE_LIMIT;
+                        if forwarded < budget {
+                            let chunk = text
+                                .chars()
+                                .take(budget - forwarded)
+                                .collect::<String>();
+                            forwarded += chunk.len();
+                            if write_tool_frame(&mut writer, &ToolMsg::Event { text: chunk })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    ShellEvent::Done(exit_code) => {
+                        // A small shell run ends as today. A large one spills:
+                        // the file holds the full output, the preview names it.
+                        if bosun_common::tool::should_spill(&output) {
+                            match spill_to_file(state, run_id, tool, &output).await {
+                                Ok(file) => {
+                                    let _ = write_tool_frame(
+                                        &mut writer,
+                                        &ToolMsg::Spilled {
+                                            file,
+                                            preview: preview(&output),
+                                            exit_code: Some(exit_code),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        run_id = %run_id,
+                                        tool = %tool,
+                                        error = %error,
+                                        "failed to spill a large shell output"
+                                    );
+                                    let _ = write_tool_frame(
+                                        &mut writer,
+                                        &ToolMsg::Done { exit_code },
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else {
+                            if write_tool_frame(&mut writer, &ToolMsg::Done { exit_code }).await.is_err() {
+                                break;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             read = reader.read(&mut buf) => {
@@ -245,6 +351,56 @@ async fn relay_shell_stream(logical: LogicalStream, mut stream: ShellStream) {
             }
         }
     }
+}
+
+/// Writes `content` to `<session_dir>/tool-output/<run_id>-<tool>-<seq>.txt`
+/// and returns the path relative to the working copy that `file_read`
+/// resolves. A result spilled here stays in the session's working copy, so
+/// the model can read the whole thing on demand without it leaving the node.
+/// The per-node sequence suffix makes the name unique per spill even when a
+/// caller reuses a run id, so an earlier spill is never overwritten and the
+/// file a `Spilled` frame names always holds that frame's content.
+async fn spill_to_file(
+    state: &Arc<ExecutorState>,
+    run_id: &str,
+    tool: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    let dir = state.session_dir.join("tool-output");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    // A tool name like `file/read` and a run id from the wire must not become
+    // nested paths in the spilled file's name.
+    let tool_slug = tool.replace('/', "-").replace("..", "-");
+    let run_slug = run_id.replace(['/', '\\'], "-").replace("..", "-");
+    let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!("{run_slug}-{tool_slug}-{seq}.txt");
+    let path = dir.join(&file_name);
+    tokio::fs::write(&path, content)
+        .await
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(format!("tool-output/{file_name}"))
+}
+
+/// The leading portion of a spilled result kept inline as the preview. The
+/// preview is capped by bytes, not characters: its purpose is to bound how
+/// much of the result sits in the model's context.
+fn preview(text: &str) -> String {
+    let mut out = String::new();
+    let mut bytes = 0usize;
+    for character in text.chars() {
+        let character_bytes = character.len_utf8();
+        if bytes + character_bytes > bosun_common::tool::SPILLED_PREVIEW_BYTES {
+            break;
+        }
+        bytes += character_bytes;
+        out.push(character);
+    }
+    if text.len() > bosun_common::tool::SPILLED_PREVIEW_BYTES {
+        out.push_str("\n… (spilled; read the file for the full output)");
+    }
+    out
 }
 
 async fn connect_tunnel(
@@ -432,7 +588,8 @@ mod tests {
                 ToolMsg::Ack
                 | ToolMsg::Error { .. }
                 | ToolMsg::Result { .. }
-                | ToolMsg::Done { .. } => {
+                | ToolMsg::Done { .. }
+                | ToolMsg::Spilled { .. } => {
                     return message;
                 }
                 ToolMsg::Event { .. } => {}
@@ -607,6 +764,136 @@ mod tests {
             events.iter().any(|text| text.contains("hello")),
             "the streamed output must carry the shell's output: {events:?}"
         );
+
+        relay.abort();
+    }
+
+    /// A shell run whose output exceeds the spill limits ends with a Spilled
+    /// frame instead of Done: the full output lands in a file under the
+    /// session's working copy, and the frame names it with a short preview.
+    #[tokio::test]
+    async fn a_large_shell_run_spills_its_output_to_a_file() {
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
+        let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
+
+        let mut conn = cp_tunnel.open("s1").await.expect("open for s1");
+        // Each line is padded well past the spill byte budget, so the run
+        // spills on bytes as well as on line count: the live frames stop at
+        // the byte budget while the spilled file holds the whole output.
+        let command = format!(
+            "for i in $(seq 1 {}); do echo line-$i-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; done",
+            bosun_common::tool::SPILL_LINE_LIMIT + 10
+        );
+        write_tool_frame(
+            &mut conn,
+            &ToolOp::Call {
+                run_id: "run-big".into(),
+                tool: "shell".into(),
+                args: json!({ "command": command }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut terminal = None;
+        while terminal.is_none() {
+            let message = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_tool_frame::<_, ToolMsg>(&mut conn),
+            )
+            .await
+            .expect("the shell stream hung")
+            .expect("read failed")
+            .expect("the connection closed before the terminal frame");
+            match message {
+                ToolMsg::Event { text } => events.push(text),
+                ToolMsg::Spilled {
+                    file,
+                    preview,
+                    exit_code,
+                } => {
+                    assert_eq!(exit_code, Some(0));
+                    assert!(file.starts_with("tool-output/"), "{file}");
+                    assert!(
+                        preview.len() <= bosun_common::tool::SPILLED_PREVIEW_BYTES
+                            + 64, /* the ellipsis suffix */
+                        "preview stays short"
+                    );
+                    terminal = Some((file, preview));
+                }
+                other => panic!("unexpected frame in a spilled shell stream: {other:?}"),
+            }
+        }
+        let (file, preview) = terminal.unwrap();
+        assert!(
+            preview.contains("line-1"),
+            "the preview starts with the output's head: {preview}"
+        );
+        let full = tokio::fs::read_to_string(root.path().join("s1").join(&file))
+            .await
+            .expect("the spilled file exists under the session's working copy");
+        assert!(full.contains("line-1"));
+        assert!(full.contains("line-2001"), "the file holds the whole output");
+        // The live frames stop at the spill byte budget: only the head
+        // reaches the control plane, so the model's context stays bounded
+        // while the run streams. The spilled file holds what the live stream
+        // cut off.
+        let forwarded: usize = events.iter().map(String::len).sum();
+        assert!(
+            forwarded <= bosun_common::tool::SPILL_BYTE_LIMIT + 64,
+            "live forwarding stops at the spill budget"
+        );
+        assert!(
+            forwarded < full.len(),
+            "live forwarding is capped below the file"
+        );
+
+        relay.abort();
+    }
+
+    /// A non-streaming result whose text exceeds the spill limits is replaced
+    /// by a Spilled frame naming a file that holds the full content.
+    #[tokio::test]
+    async fn a_large_result_spills_its_content_to_a_file() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("s1")).await.unwrap();
+        let big = "x".repeat(bosun_common::tool::SPILL_BYTE_LIMIT + 1);
+        tokio::fs::write(root.join("s1/big.txt"), &big).await.unwrap();
+
+        let manager = manager_with(root, &["s1"]).await;
+        let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
+        let relay = tokio::spawn(relay_tunnel(node_tunnel, opens, manager));
+
+        let message = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-big",
+            "file_read",
+            json!({ "path": "big.txt" }),
+        )
+        .await;
+        let ToolMsg::Spilled {
+            file,
+            preview,
+            exit_code,
+        } = message
+        else {
+            panic!("a large result must spill: {message:?}");
+        };
+        assert_eq!(exit_code, None, "a non-shell result carries no exit code");
+        assert!(file.starts_with("tool-output/"), "{file}");
+        let full = tokio::fs::read_to_string(root.join("s1").join(&file))
+            .await
+            .expect("the spilled file exists under the session's working copy");
+        // The spilled file holds the result's serialized text, the form the
+        // model would otherwise have read in context.
+        assert!(full.contains(&big), "the file holds the full result text");
+        assert!(full.len() > bosun_common::tool::SPILL_BYTE_LIMIT);
+        assert!(preview.len() <= bosun_common::tool::SPILLED_PREVIEW_BYTES + 64);
 
         relay.abort();
     }

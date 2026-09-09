@@ -61,6 +61,36 @@ pub enum ToolMsg {
     Event { text: String },
     /// A shell run ended; carries its exit code.
     Done { exit_code: i32 },
+    /// A tool's result was too large to keep inline and was spilled to a file
+    /// in the session's working copy. `file` is the path relative to the
+    /// working copy the model can read with `file_read`; `preview` is the
+    /// leading portion of the output, capped at `SPILLED_PREVIEW_BYTES`.
+    /// `exit_code` is the shell run's code when the spill came from a shell
+    /// run, and None for a non-streaming result.
+    Spilled {
+        file: String,
+        preview: String,
+        exit_code: Option<i32>,
+    },
+}
+
+/// A tool result is spilled to a file instead of kept inline when its text
+/// exceeds this many lines. The threshold prevents a result from overwhelming
+/// the model context; the spilled file holds the whole output.
+pub const SPILL_LINE_LIMIT: usize = 2000;
+/// A tool result is spilled to a file instead of kept inline when its text
+/// exceeds this many bytes. A single-line dump can be thousands of characters
+/// while staying under the line count; the byte threshold bounds that too.
+pub const SPILL_BYTE_LIMIT: usize = 50 * 1024;
+/// The leading portion of a spilled result kept inline as the preview, after
+/// the file name it was spilled to.
+pub const SPILLED_PREVIEW_BYTES: usize = 512;
+
+/// Whether a tool result's text is large enough to spill to a file. Either
+/// threshold on its own is enough: a result of many lines is a context flood,
+/// and a result of many bytes is one even when it is a single line.
+pub fn should_spill(text: &str) -> bool {
+    text.lines().count() > SPILL_LINE_LIMIT || text.len() > SPILL_BYTE_LIMIT
 }
 
 /// Largest serialized tool frame, in bytes. Both ends enforce it: the writer
@@ -524,6 +554,11 @@ mod tests {
             ToolMsg::Result { content: json!({}) },
             ToolMsg::Event { text: "hi".into() },
             ToolMsg::Done { exit_code: 3 },
+            ToolMsg::Spilled {
+                file: "tool-output/run-1.txt".into(),
+                preview: "head".into(),
+                exit_code: None,
+            },
         ] {
             let json = serde_json::to_value(&msg).unwrap();
             let decoded: ToolMsg = serde_json::from_value(json.clone()).unwrap();
@@ -532,6 +567,30 @@ mod tests {
 
         let json = serde_json::to_value(ToolMsg::Done { exit_code: 3 }).unwrap();
         assert_eq!(json["msg"], "done");
+        let json = serde_json::to_value(ToolMsg::Spilled {
+            file: "tool-output/run-1.txt".into(),
+            preview: "head".into(),
+            exit_code: None,
+        })
+        .unwrap();
+        assert_eq!(json["msg"], "spilled");
+    }
+
+    #[test]
+    fn should_spill_flags_long_or_large_text_only() {
+        assert!(!should_spill("short line\n"));
+        assert!(!should_spill(&"x".repeat(SPILL_BYTE_LIMIT - 1)));
+        assert!(should_spill(&"x".repeat(SPILL_BYTE_LIMIT + 1)));
+        let mut lines = String::new();
+        for i in 0..(SPILL_LINE_LIMIT + 1) {
+            lines.push_str(&format!("line {i}\n"));
+        }
+        assert!(should_spill(&lines));
+        let mut under = String::new();
+        for i in 0..SPILL_LINE_LIMIT {
+            under.push_str(&format!("line {i}\n"));
+        }
+        assert!(!should_spill(&under));
     }
 
     #[tokio::test]

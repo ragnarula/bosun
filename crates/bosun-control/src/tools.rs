@@ -149,6 +149,31 @@ async fn call_tool(
                     is_error: exit_code != 0,
                 });
             }
+            ToolMsg::Spilled {
+                file,
+                preview,
+                exit_code,
+            } => {
+                // The node spilled a large result to a file in the session's
+                // working copy; the model reads the whole thing with
+                // `file_read`. The result carries the file name and a short
+                // preview so the model knows what happened without loading
+                // the file first. A spilled shell run keeps its exit code.
+                return Ok(match exit_code {
+                    Some(exit_code) => ToolOutcome {
+                        content: json!({
+                            "file": file,
+                            "preview": preview,
+                            "exit_code": exit_code,
+                        }),
+                        is_error: exit_code != 0,
+                    },
+                    None => ToolOutcome {
+                        content: json!({ "file": file, "preview": preview }),
+                        is_error: false,
+                    },
+                });
+            }
             ToolMsg::Ack => {
                 warn!(
                     msg = "executor answered a tool call with an ack",
@@ -338,6 +363,11 @@ mod tests {
                                 .await;
                                 Some(ToolMsg::Done { exit_code })
                             }
+                            "spill" => Some(ToolMsg::Spilled {
+                                file: "tool-output/run-big-file-read.txt".into(),
+                                preview: "head".into(),
+                                exit_code: args["exit_code"].as_i64().and_then(|code| i32::try_from(code).ok()),
+                            }),
                             other => Some(ToolMsg::Error {
                                 message: format!("unknown tool {other}"),
                             }),
@@ -425,11 +455,11 @@ mod tests {
 
         let outcome = executor
             .call(
-                session_id,
+                session_id.clone(),
                 "run-3".into(),
                 "forbidden".into(),
                 json!({}),
-                delta_tx,
+                delta_tx.clone(),
             )
             .await
             .unwrap();
@@ -439,6 +469,45 @@ mod tests {
             outcome.content,
             json!({ "error": "read-only tool refused" })
         );
+    }
+
+    #[tokio::test]
+    async fn a_spilled_reply_becomes_a_file_and_preview_result() {
+        let (executor, session_id, _node, _cancels, _permissions) = stub_node().await;
+        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+
+        let outcome = executor
+            .call(
+                session_id.clone(),
+                "run-big".into(),
+                "spill".into(),
+                json!({}),
+                delta_tx.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.content,
+            json!({ "file": "tool-output/run-big-file-read.txt", "preview": "head" })
+        );
+        assert!(!outcome.is_error);
+
+        let spilled = executor
+            .call(
+                session_id.clone(),
+                "run-big-shell".into(),
+                "spill".into(),
+                json!({ "exit_code": 3 }),
+                delta_tx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            spilled.content,
+            json!({ "file": "tool-output/run-big-file-read.txt", "preview": "head", "exit_code": 3 })
+        );
+        assert!(spilled.is_error);
     }
 
     #[tokio::test]

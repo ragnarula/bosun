@@ -1,11 +1,19 @@
 //! One node tunnel carries tool calls for every session on the node. Two
 //! sessions sharing a node reach their own executors concurrently over the
-//! tunnel, and large results over one logical connection do not stall the
-//! other (the original flow-control regression: concurrent streams over one
-//! tunnel stalled after roughly 800 KiB of a large response). Mirrors the
-//! reported deployment: a control plane, a node that dials out over one
-//! tunnel and hosts in-process executors, and tool calls over logical
-//! connections on the same tunnel at the same time.
+//! tunnel, and a large tool response over one logical connection does not
+//! stall the other (the original flow-control regression: concurrent streams
+//! over one tunnel stalled after roughly 800 KiB of a large response).
+//! Mirrors the reported deployment: a control plane, a node that dials out
+//! over one tunnel and hosts in-process executors, and tool calls over
+//! logical connections on the same tunnel at the same time.
+//!
+//! A large tool response now never travels as one big frame: the node spills
+//! it to a file in the session's working copy and answers with a short
+//! `Spilled` frame instead. The concurrency guarantee these tests guard is
+//! therefore that concurrent calls all *complete* promptly — each oversized
+//! read ends in a `Spilled` reply naming a file whose content is the full
+//! body, and the sibling small reads return `Result` bodies — rather than
+//! that a multi-hundred-KiB body streams across the tunnel.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -33,9 +41,9 @@ use bosun_node::manager::NodeManager;
 use bosun_store::store::Store;
 use serde_json::json;
 
-/// The asset sits at the file_read cap (1 MiB), comfortably above the tunnel's
-/// per-connection flow-control window (512 KiB), so a large response must
-/// pause and resume against window updates.
+/// The oversized asset: a file this large cannot come back inline in one
+/// result frame, so reading it ends in a `Spilled` reply. The file_read cap
+/// (1 MiB) bounds the file; the spill cap bounds what travels as frames.
 const ASSET_LEN: usize = 1_000_000;
 const INDEX_A: &str = "index page from executor A";
 const INDEX_B: &str = "index page from executor B";
@@ -159,10 +167,12 @@ async fn tunnel_read(tunnels: &TunnelRegistry, session_id: &str, path: &str) -> 
                 _ => return None,
             };
         match message {
-            ToolMsg::Result { .. } | ToolMsg::Error { .. } | ToolMsg::Done { .. } => {
+            // `Result` is a small inline body, `Spilled` is a large one the
+            // node wrote to a file; both end the reply.
+            ToolMsg::Result { .. } | ToolMsg::Error { .. } | ToolMsg::Spilled { .. } => {
                 return Some(message);
             }
-            ToolMsg::Ack | ToolMsg::Event { .. } => {}
+            ToolMsg::Done { .. } | ToolMsg::Ack | ToolMsg::Event { .. } => {}
         }
     }
 }
@@ -213,10 +223,29 @@ async fn concurrent_streams_over_one_node_tunnel_deliver_both_bodies() {
     let asset = asset.expect("asset read failed");
     assert_eq!(content(&index), INDEX_A, "index body mismatch");
 
-    let asset_len = tokio::time::timeout(Duration::from_secs(10), async { content_len(&asset) })
-        .await
-        .expect("asset download stalled");
-    assert_eq!(asset_len, ASSET_LEN, "asset body truncated");
+    // The oversized asset is spilled: the reply names a file in the session's
+    // working copy instead of carrying a megabyte in the frame. The small
+    // read completed alongside it, which is what the concurrency regression
+    // guards.
+    let asset_len = tokio::time::timeout(Duration::from_secs(10), async {
+        match &asset {
+            ToolMsg::Spilled { file, .. } => {
+                let raw = tokio::fs::read_to_string(work.path().join(&session_id).join(file))
+                    .await
+                    .expect("the spilled file exists under the session's working copy");
+                // A spilled result file holds the result's serialized JSON,
+                // exactly the value the model would otherwise have seen
+                // inline; a `file/read` result is {"content": "<body>"}.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&raw).expect("the spilled file holds JSON");
+                parsed["content"].as_str().unwrap().len()
+            }
+            _ => panic!("an oversized asset must spill: {asset:?}"),
+        }
+    })
+    .await
+    .expect("asset read stalled");
+    assert_eq!(asset_len, ASSET_LEN, "the spilled file holds the full asset");
 }
 
 /// Two sessions share the node's one tunnel: each session's call reaches its
@@ -256,16 +285,21 @@ async fn two_sessions_on_one_node_reach_their_own_executors_concurrently() {
     let (from_a, from_b) = tokio::join!(from_a, from_b);
     let from_a = from_a.expect("session A's read failed");
     let from_b = from_b.expect("session B's read failed");
-    assert_eq!(
-        content_len(&from_a),
-        ASSET_LEN,
-        "session A's asset truncated"
-    );
-    assert_eq!(
-        content_len(&from_b),
-        ASSET_LEN,
-        "session B's asset truncated"
-    );
+    for (reply, session_id) in [(from_a, &session_a), (from_b, &session_b)] {
+        let ToolMsg::Spilled { file, .. } = &reply else {
+            panic!("an oversized asset must spill: {reply:?}");
+        };
+        let raw = tokio::fs::read_to_string(work.path().join(session_id).join(file))
+            .await
+            .expect("the spilled file exists under the session's working copy");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("the spilled file holds JSON");
+        assert_eq!(
+            parsed["content"].as_str().unwrap().len(),
+            ASSET_LEN,
+            "session's asset truncated"
+        );
+    }
 
     // Confirm session routing on the same tunnel: each session's small index
     // names its own working copy.
