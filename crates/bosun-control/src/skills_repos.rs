@@ -483,8 +483,7 @@ fn package_root_of(path: &str) -> Option<String> {
     // segments between the two may be empty (`skills/<dir>`) or category
     // directories (`skills/<category>/<dir>`).
     segments[..segments.len() - 1]
-        .iter()
-        .any(|segment| *segment == "skills")
+        .contains(&"skills")
         .then(|| package_path.to_string())
 }
 
