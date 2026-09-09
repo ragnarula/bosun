@@ -836,9 +836,9 @@
     font: inherit;
   }
   .chat-row textarea:focus, .ask-free textarea:focus { outline: none; border-color: var(--accent); }
-  /* A live question is the composer: the question, its options as thumb-width
-     chips, a Dismiss control to reject it, and an optional free-text answer.
-     The transcript keeps the durable ask record above. */
+  /* A live question is the composer: its options as thumb-width chips, a
+     Dismiss control to reject it, and an optional free-text answer. The
+     durable ask record with the question stays in the transcript above. */
   #ask-sheet {
     display: grid;
     gap: 10px;
@@ -871,13 +871,6 @@
     -webkit-tap-highlight-color: transparent;
   }
   .ask-dismiss:active { color: var(--accent); }
-  .ask-question {
-    font-size: 14px;
-    color: var(--text);
-    line-height: 1.4;
-    overflow-wrap: anywhere;
-  }
-  .ask-question .ask-from { color: var(--muted); font-size: 12px; }
   .ask-chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .ask-chips[hidden] { display: none; }
   .ask-chips button {
@@ -1089,7 +1082,6 @@
         <span class="ask-label">Question</span>
         <button type="button" id="btn-ask-dismiss" class="ask-dismiss" title="Reject the question; your next message becomes an instruction">Dismiss</button>
       </div>
-      <div class="ask-question" id="ask-question"></div>
       <div class="ask-chips" id="ask-chips"></div>
       <button type="button" id="btn-ask-type" class="ask-type-toggle" hidden>Answer in your own words</button>
       <div class="ask-free" id="ask-free" hidden>
@@ -1214,7 +1206,6 @@ const input = $('input');
 const chatRow = $('chat-row');
 const btnSend = $('btn-send');
 const askSheet = $('ask-sheet');
-const askQuestion = $('ask-question');
 const askChips = $('ask-chips');
 const btnAskDismiss = $('btn-ask-dismiss');
 const btnAskType = $('btn-ask-type');
@@ -2365,7 +2356,6 @@ function closeSession() {
   saveDraft();
   input.value = '';
   askSheet.hidden = true;
-  askQuestion.textContent = '';
   askChips.textContent = '';
   askFree.hidden = true;
   chatRow.hidden = false;
@@ -2533,14 +2523,6 @@ function showChatComposer() {
 }
 
 function renderAskComposer(ask) {
-  askQuestion.textContent = '';
-  if (ask.child_id) {
-    const from = document.createElement('span');
-    from.className = 'ask-from';
-    from.textContent = 'child ' + ask.child_id + ' asks — ';
-    askQuestion.appendChild(from);
-  }
-  askQuestion.appendChild(document.createTextNode(ask.message));
   askChips.textContent = '';
   askFree.hidden = true;
   btnAskBack.hidden = true;
