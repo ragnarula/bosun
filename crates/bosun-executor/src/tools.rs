@@ -1,3 +1,6 @@
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -9,6 +12,8 @@ use bosun_common::session::Permission;
 use bosun_common::skills::Skill;
 use bosun_common::skills::parse_skill_dir;
 use bosun_common::skills::read_skill_markdown;
+use bosun_common::tool::SPILL_BYTE_LIMIT;
+use bosun_common::tool::SPILL_LINE_LIMIT;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
@@ -47,6 +52,10 @@ pub enum ToolError {
     NotFound { path: String },
     #[error("file {path} exceeds {MAX_FILE_BYTES} bytes")]
     FileTooLarge { path: String },
+    #[error(
+        "file {path} is too large to read in one call; pass offset and limit to read a range of lines"
+    )]
+    ReadTooLarge { path: String },
     #[error("the text to replace was not found")]
     OldTextNotFound,
     #[error("search exceeded {limit} matches")]
@@ -112,24 +121,138 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     normalized
 }
 
-pub fn read_file(session_dir: &Path, path: &str) -> Result<String, ToolError> {
+/// Reads a line window of a file. `offset` is the 1-based number of the first
+/// line to return and `limit` the maximum number of lines; a `None` limit reads
+/// to the end of the file. The raw window never exceeds the spill limits
+/// (`SPILL_LINE_LIMIT` lines and `SPILL_BYTE_LIMIT` bytes), so the caller can
+/// return it inline; the executor additionally caps the serialized result, so
+/// a `file_read` never spills to a file in the working copy. A read whose
+/// window would exceed the raw limits is refused instead, so the model pages a
+/// large file with offset and limit. The file is streamed, so a file of any
+/// size costs memory bounded by the window, not by the file.
+pub fn read_file(
+    session_dir: &Path,
+    path: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<String, ToolError> {
     let resolved = resolve_path(session_dir, path)?;
     if !resolved.is_file() {
         return Err(ToolError::NotFound {
             path: path.to_string(),
         });
     }
-    let metadata = resolved
-        .metadata()
-        .with_context(|| format!("failed to stat {}", resolved.display()))?;
-    if metadata.len() > MAX_FILE_BYTES as u64 {
-        return Err(ToolError::FileTooLarge {
-            path: path.to_string(),
-        });
+    let file =
+        File::open(&resolved).with_context(|| format!("failed to read {}", resolved.display()))?;
+    let mut reader = BufReader::new(file);
+
+    // Skip the lines before the window. Lines are 1-based, so `offset - 1`
+    // lines precede `offset`.
+    let mut before = offset.saturating_sub(1);
+    while before > 0 {
+        if !skip_line(&mut reader)
+            .with_context(|| format!("failed to read {}", resolved.display()))?
+        {
+            break;
+        }
+        before -= 1;
     }
-    let bytes = std::fs::read(&resolved)
-        .with_context(|| format!("failed to read {}", resolved.display()))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+
+    let mut content = Vec::new();
+    let mut lines_read = 0usize;
+    loop {
+        if let Some(limit) = limit
+            && lines_read >= limit
+        {
+            break;
+        }
+        match read_window_line(&mut reader, &mut content)
+            .with_context(|| format!("failed to read {}", resolved.display()))?
+        {
+            WindowLine::None => break,
+            WindowLine::Overflow => {
+                return Err(ToolError::ReadTooLarge {
+                    path: path.to_string(),
+                });
+            }
+            WindowLine::Newline | WindowLine::Eof => {
+                lines_read += 1;
+                if lines_read > SPILL_LINE_LIMIT {
+                    return Err(ToolError::ReadTooLarge {
+                        path: path.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&content).into_owned())
+}
+
+/// Discards one line without buffering it, so a skipped line of any length
+/// costs constant memory. Returns whether a line was consumed; an unterminated
+/// final line at EOF counts, exactly like a newline-terminated one.
+fn skip_line<R: BufRead>(reader: &mut R) -> std::io::Result<bool> {
+    let mut saw_bytes = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(saw_bytes);
+        }
+        saw_bytes = true;
+        if let Some(pos) = buf.iter().position(|&byte| byte == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(true);
+        }
+        let len = buf.len();
+        reader.consume(len);
+    }
+}
+
+/// How one read line ended.
+enum WindowLine {
+    /// A newline-terminated line was appended to the window.
+    Newline,
+    /// An unterminated final line was appended to the window at EOF.
+    Eof,
+    /// EOF before any bytes: no line.
+    None,
+    /// The line would push the window past `SPILL_BYTE_LIMIT` bytes.
+    Overflow,
+}
+
+/// Appends one line of the file to the window. The window never grows past
+/// `SPILL_BYTE_LIMIT` bytes: a line that would push it over that cap stops the
+/// read with `Overflow` without buffering the rest of the line.
+fn read_window_line<R: BufRead>(
+    reader: &mut R,
+    content: &mut Vec<u8>,
+) -> std::io::Result<WindowLine> {
+    let start_len = content.len();
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return if content.len() > start_len {
+                Ok(WindowLine::Eof)
+            } else {
+                Ok(WindowLine::None)
+            };
+        }
+        if let Some(pos) = buf.iter().position(|&byte| byte == b'\n') {
+            let take = pos + 1;
+            if content.len() + take > SPILL_BYTE_LIMIT {
+                return Ok(WindowLine::Overflow);
+            }
+            content.extend_from_slice(&buf[..take]);
+            reader.consume(take);
+            return Ok(WindowLine::Newline);
+        }
+        if content.len() + buf.len() > SPILL_BYTE_LIMIT {
+            return Ok(WindowLine::Overflow);
+        }
+        content.extend_from_slice(buf);
+        let consumed = buf.len();
+        reader.consume(consumed);
+    }
 }
 
 /// The session's skills as parsed metadata, sorted by name. Skills live in
@@ -487,6 +610,11 @@ mod tests {
 
     use super::*;
 
+    /// Reads a whole file with the default window: no offset and no limit.
+    fn read_all(root: &Path, path: &str) -> Result<String, ToolError> {
+        read_file(root, path, 1, None)
+    }
+
     #[test]
     fn resolve_path_resolves_within_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -560,35 +688,181 @@ mod tests {
         let root = dir.path();
 
         write_file(root, "hello.txt", "hi there").unwrap();
-        assert_eq!(read_file(root, "hello.txt").unwrap(), "hi there");
+        assert_eq!(read_all(root, "hello.txt").unwrap(), "hi there");
 
         std::fs::create_dir_all(root.join("sub")).unwrap();
         write_file(root, "sub/nested.txt", "deep").unwrap();
-        assert_eq!(read_file(root, "sub/nested.txt").unwrap(), "deep");
+        assert_eq!(read_all(root, "sub/nested.txt").unwrap(), "deep");
 
         // Writing into subdirectories that do not exist yet creates them.
         write_file(root, "nested/new/file.txt", "fresh").unwrap();
-        assert_eq!(read_file(root, "nested/new/file.txt").unwrap(), "fresh");
+        assert_eq!(read_all(root, "nested/new/file.txt").unwrap(), "fresh");
     }
 
     #[test]
     fn read_file_reports_missing_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file(dir.path(), "missing.txt").unwrap_err();
+        let err = read_all(dir.path(), "missing.txt").unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }));
     }
 
     #[test]
-    fn read_and_edit_reject_files_larger_than_1_mib() {
+    fn edit_rejects_files_larger_than_1_mib() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_file(root, "big.txt", &"x".repeat(MAX_FILE_BYTES + 1)).unwrap();
 
-        let err = read_file(root, "big.txt").unwrap_err();
-        assert!(matches!(err, ToolError::FileTooLarge { .. }));
-
         let err = edit(root, "big.txt", "a", "b").unwrap_err();
         assert!(matches!(err, ToolError::FileTooLarge { .. }));
+    }
+
+    #[test]
+    fn read_file_returns_the_requested_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(root, "lines.txt", "one\ntwo\nthree\nfour\nfive\n").unwrap();
+
+        // A window starts at `offset` and returns up to `limit` lines as raw
+        // text, newline endings intact.
+        assert_eq!(
+            read_file(root, "lines.txt", 2, Some(3)).unwrap(),
+            "two\nthree\nfour\n"
+        );
+        assert_eq!(read_file(root, "lines.txt", 4, Some(1)).unwrap(), "four\n");
+
+        // The first window of a file with no limit reads to the end of the
+        // file when it fits inline.
+        assert_eq!(
+            read_all(root, "lines.txt").unwrap(),
+            "one\ntwo\nthree\nfour\nfive\n"
+        );
+        assert_eq!(
+            read_file(root, "lines.txt", 1, Some(2)).unwrap(),
+            "one\ntwo\n"
+        );
+
+        // An offset past the last line reads nothing, so the model can probe
+        // for the end of the file.
+        assert_eq!(read_file(root, "lines.txt", 6, None).unwrap(), "");
+        assert_eq!(read_file(root, "lines.txt", 6, Some(10)).unwrap(), "");
+    }
+
+    #[test]
+    fn read_file_treats_an_unterminated_final_line_as_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(root, "f.txt", "one\ntwo\nthree").unwrap();
+
+        assert_eq!(read_all(root, "f.txt").unwrap(), "one\ntwo\nthree");
+        assert_eq!(read_file(root, "f.txt", 2, None).unwrap(), "two\nthree");
+        assert_eq!(read_file(root, "f.txt", 3, Some(1)).unwrap(), "three");
+        assert_eq!(read_file(root, "f.txt", 4, None).unwrap(), "");
+    }
+
+    #[test]
+    fn read_file_handles_empty_files_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        write_file(root, "empty.txt", "").unwrap();
+        assert_eq!(read_all(root, "empty.txt").unwrap(), "");
+        assert_eq!(read_file(root, "empty.txt", 1, Some(5)).unwrap(), "");
+
+        // A blank line is one line: offset and limit count it like any other.
+        write_file(root, "blank.txt", "one\n\nthree\n").unwrap();
+        assert_eq!(read_all(root, "blank.txt").unwrap(), "one\n\nthree\n");
+        assert_eq!(read_file(root, "blank.txt", 2, Some(1)).unwrap(), "\n");
+        assert_eq!(
+            read_file(root, "blank.txt", 2, Some(2)).unwrap(),
+            "\nthree\n"
+        );
+    }
+
+    #[test]
+    fn read_file_refuses_a_window_larger_than_the_inline_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // More lines than fit inline.
+        let lines = "x\n".repeat(SPILL_LINE_LIMIT + 1);
+        write_file(root, "many.txt", &lines).unwrap();
+        let err = read_all(root, "many.txt").unwrap_err();
+        assert!(matches!(err, ToolError::ReadTooLarge { .. }));
+        let err = read_file(root, "many.txt", 1, Some(SPILL_LINE_LIMIT + 1)).unwrap_err();
+        assert!(matches!(err, ToolError::ReadTooLarge { .. }));
+
+        // One line larger than the byte budget.
+        write_file(root, "long.txt", &"x".repeat(SPILL_BYTE_LIMIT + 1)).unwrap();
+        let err = read_all(root, "long.txt").unwrap_err();
+        assert!(matches!(err, ToolError::ReadTooLarge { .. }));
+        let err = read_file(root, "long.txt", 1, Some(1)).unwrap_err();
+        assert!(matches!(err, ToolError::ReadTooLarge { .. }));
+
+        // Enough lines that their total bytes exceed the budget while each
+        // line alone fits.
+        let wide = "x".repeat(SPILL_BYTE_LIMIT / 2);
+        write_file(root, "wide.txt", &format!("{wide}\n{wide}\n")).unwrap();
+        let err = read_all(root, "wide.txt").unwrap_err();
+        assert!(matches!(err, ToolError::ReadTooLarge { .. }));
+
+        // One of the two wide lines fits inline on its own.
+        assert_eq!(
+            read_file(root, "wide.txt", 1, Some(1)).unwrap(),
+            format!("{wide}\n")
+        );
+    }
+
+    #[test]
+    fn read_file_pages_a_file_larger_than_the_inline_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut body = String::new();
+        for i in 1..=SPILL_LINE_LIMIT * 2 {
+            body.push_str(&format!("line {i} {}\n", "y".repeat(8)));
+        }
+        write_file(root, "big.txt", &body).unwrap();
+
+        // The whole file does not fit inline.
+        let err = read_all(root, "big.txt").unwrap_err();
+        assert!(matches!(err, ToolError::ReadTooLarge { .. }));
+
+        // Page through it in two inline-sized windows that cover the file.
+        let first = read_file(root, "big.txt", 1, Some(SPILL_LINE_LIMIT)).unwrap();
+        assert_eq!(
+            first,
+            format!(
+                "{}\n",
+                body.lines()
+                    .take(SPILL_LINE_LIMIT)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        );
+        let second = read_file(
+            root,
+            "big.txt",
+            SPILL_LINE_LIMIT + 1,
+            Some(SPILL_LINE_LIMIT),
+        )
+        .unwrap();
+        let tail: Vec<&str> = body.lines().skip(SPILL_LINE_LIMIT).collect();
+        assert_eq!(second, format!("{}\n", tail.join("\n")));
+        assert_eq!(
+            first.len() + second.len(),
+            body.len(),
+            "the two windows cover the whole file"
+        );
+        // Past the last line there is nothing more to read.
+        assert_eq!(
+            read_file(
+                root,
+                "big.txt",
+                SPILL_LINE_LIMIT * 2 + 1,
+                Some(SPILL_LINE_LIMIT)
+            )
+            .unwrap(),
+            ""
+        );
     }
 
     #[test]
@@ -600,7 +874,7 @@ mod tests {
         std::fs::write(parent.path().join("outside/secret.txt"), "x").unwrap();
         std::os::unix::fs::symlink(parent.path().join("outside"), session.join("link")).unwrap();
 
-        let err = read_file(&session, "link/secret.txt").unwrap_err();
+        let err = read_all(&session, "link/secret.txt").unwrap_err();
         assert!(matches!(err, ToolError::PathOutsideRoot { .. }));
     }
 
@@ -649,7 +923,7 @@ mod tests {
 
         write_file(root, "f.txt", "a a a").unwrap();
         edit(root, "f.txt", "a", "b").unwrap();
-        assert_eq!(read_file(root, "f.txt").unwrap(), "b a a");
+        assert_eq!(read_all(root, "f.txt").unwrap(), "b a a");
     }
 
     #[test]
@@ -660,7 +934,7 @@ mod tests {
         write_file(root, "f.txt", "hello").unwrap();
         let err = edit(root, "f.txt", "xyz", "abc").unwrap_err();
         assert!(matches!(err, ToolError::OldTextNotFound));
-        assert_eq!(read_file(root, "f.txt").unwrap(), "hello");
+        assert_eq!(read_all(root, "f.txt").unwrap(), "hello");
     }
 
     #[test]

@@ -818,8 +818,7 @@ mod tests {
                     assert_eq!(exit_code, Some(0));
                     assert!(file.starts_with("tool-output/"), "{file}");
                     assert!(
-                        preview.len() <= bosun_common::tool::SPILLED_PREVIEW_BYTES
-                            + 64, /* the ellipsis suffix */
+                        preview.len() <= bosun_common::tool::SPILLED_PREVIEW_BYTES + 64, /* the ellipsis suffix */
                         "preview stays short"
                     );
                     terminal = Some((file, preview));
@@ -836,7 +835,10 @@ mod tests {
             .await
             .expect("the spilled file exists under the session's working copy");
         assert!(full.contains("line-1"));
-        assert!(full.contains("line-2001"), "the file holds the whole output");
+        assert!(
+            full.contains("line-2001"),
+            "the file holds the whole output"
+        );
         // The live frames stop at the spill byte budget: only the head
         // reaches the control plane, so the model's context stays bounded
         // while the run streams. The spilled file holds what the live stream
@@ -854,15 +856,18 @@ mod tests {
         relay.abort();
     }
 
-    /// A non-streaming result whose text exceeds the spill limits is replaced
-    /// by a Spilled frame naming a file that holds the full content.
+    /// An oversized `file_read` is refused rather than spilled: the executor
+    /// caps each read to the inline budget, and a read over it comes back as
+    /// an error instead of a copy of the file written into the working copy.
     #[tokio::test]
-    async fn a_large_result_spills_its_content_to_a_file() {
+    async fn a_large_file_read_is_refused_instead_of_spilled() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         tokio::fs::create_dir_all(root.join("s1")).await.unwrap();
         let big = "x".repeat(bosun_common::tool::SPILL_BYTE_LIMIT + 1);
-        tokio::fs::write(root.join("s1/big.txt"), &big).await.unwrap();
+        tokio::fs::write(root.join("s1/big.txt"), &big)
+            .await
+            .unwrap();
 
         let manager = manager_with(root, &["s1"]).await;
         let (cp_tunnel, node_tunnel, opens) = tunnel_pair();
@@ -876,24 +881,32 @@ mod tests {
             json!({ "path": "big.txt" }),
         )
         .await;
-        let ToolMsg::Spilled {
-            file,
-            preview,
-            exit_code,
-        } = message
-        else {
-            panic!("a large result must spill: {message:?}");
+        let ToolMsg::Error { message: _ } = message else {
+            panic!("a large file read must be refused: {message:?}");
         };
-        assert_eq!(exit_code, None, "a non-shell result carries no exit code");
-        assert!(file.starts_with("tool-output/"), "{file}");
-        let full = tokio::fs::read_to_string(root.join("s1").join(&file))
+
+        // Nothing was spilled: no file was written to the working copy.
+        assert!(
+            !root.join("s1/tool-output").exists(),
+            "a refused read must not write a spilled file"
+        );
+
+        // A ranged read still answers inline as a bounded result.
+        tokio::fs::write(root.join("s1/lines.txt"), "one\ntwo\nthree\n")
             .await
-            .expect("the spilled file exists under the session's working copy");
-        // The spilled file holds the result's serialized text, the form the
-        // model would otherwise have read in context.
-        assert!(full.contains(&big), "the file holds the full result text");
-        assert!(full.len() > bosun_common::tool::SPILL_BYTE_LIMIT);
-        assert!(preview.len() <= bosun_common::tool::SPILLED_PREVIEW_BYTES + 64);
+            .unwrap();
+        let message = typed_call(
+            &cp_tunnel,
+            "s1",
+            "run-window",
+            "file_read",
+            json!({ "path": "lines.txt", "offset": 2, "limit": 1 }),
+        )
+        .await;
+        let ToolMsg::Result { content } = message else {
+            panic!("a ranged read must return a result: {message:?}");
+        };
+        assert_eq!(content["content"], "two\n");
 
         relay.abort();
     }

@@ -96,8 +96,9 @@ pub fn should_spill(text: &str) -> bool {
 /// Largest serialized tool frame, in bytes. Both ends enforce it: the writer
 /// refuses a payload over the cap instead of emitting a frame the peer will
 /// reject, and the reader rejects a length header over it, so neither side can
-/// be driven into an unbounded allocation. File reads cap at 1 MiB and grep
-/// caps at 500 matches, so every legitimate response stays well under this.
+/// be driven into an unbounded allocation. `file_read` windows are capped to
+/// the spill budget and grep caps at 500 matches, so every legitimate response
+/// stays well under this.
 pub const MAX_TOOL_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
 /// Serialized payload is written in chunks of this size. A logical tunnel
@@ -190,8 +191,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "file_read".into(),
-            description: "Read a file from the session's working copy.".into(),
-            schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            description: "Read a file from the session's working copy. A file too large to return inline is refused; read it in ranges by passing `offset` (the first line, 1-based, default 1) and `limit` (the maximum number of lines, default to the end of the file). A read past the end of the file returns empty content.".into(),
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"]}),
         },
         ToolSpec {
             name: "file_write".into(),
@@ -397,6 +398,23 @@ mod tests {
         let tools = canonical_tools(Permission::ReadWrite);
         let shell = tools.iter().find(|tool| tool.name == "shell").unwrap();
         assert_eq!(shell.schema["required"], json!(["command"]));
+    }
+
+    #[test]
+    fn file_read_schema_has_optional_ranged_read_arguments() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let file_read = tools.iter().find(|tool| tool.name == "file_read").unwrap();
+        assert_eq!(file_read.schema["required"], json!(["path"]));
+        assert_eq!(
+            file_read.schema["properties"]["offset"],
+            json!({"type": "integer", "minimum": 1})
+        );
+        assert_eq!(
+            file_read.schema["properties"]["limit"],
+            json!({"type": "integer", "minimum": 1})
+        );
+        assert!(file_read.description.contains("offset"));
+        assert!(file_read.description.contains("limit"));
     }
 
     #[test]

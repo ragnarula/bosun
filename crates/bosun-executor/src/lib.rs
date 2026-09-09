@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use bosun_common::session::Permission;
+use bosun_common::tool::SPILL_BYTE_LIMIT;
 use futures_util::stream::BoxStream;
 use futures_util::stream::unfold;
 use serde_json::Value;
@@ -141,6 +142,22 @@ pub enum ExecutorError {
     Tool(#[from] ToolError),
 }
 
+/// A `file_read` range argument: a positive integer, or absent. Zero and
+/// non-integers are refused so a model cannot silently read an unintended
+/// window.
+fn parse_read_arg(args: &Value, key: &'static str) -> Result<Option<usize>, ExecutorError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let Some(parsed) = value.as_u64().and_then(|n| usize::try_from(n).ok()) else {
+        return Err(ExecutorError::BadArgument { key });
+    };
+    if parsed < 1 {
+        return Err(ExecutorError::BadArgument { key });
+    }
+    Ok(Some(parsed))
+}
+
 /// Runs one tool call against the session's working copy under its current
 /// permission. Blocking file, directory, and skill tools run on the blocking
 /// pool; `git`, `webfetch`, and `shell` are already async over child
@@ -172,9 +189,23 @@ pub async fn run_call(
                 return Err(ExecutorError::BadArgument { key: "path" });
             };
             let path = path.to_string();
-            run_blocking(&state.session_dir, move |dir| tools::read_file(dir, &path))
-                .await
-                .map(|content| json!({ "content": content }))
+            let offset = parse_read_arg(args, "offset")?.unwrap_or(1);
+            let limit = parse_read_arg(args, "limit")?;
+            let read_path = path.clone();
+            let content = run_blocking(&state.session_dir, move |dir| {
+                tools::read_file(dir, &read_path, offset, limit)
+            })
+            .await?;
+            let value = json!({ "content": content });
+            // The node judges a result against the spill budget on its
+            // serialized text, so a file_read window is capped on that same
+            // form: a window that serializes over the budget is refused here
+            // rather than ever spilling to a file in the working copy.
+            let serialized = serde_json::to_string(&value).expect("a content value serializes");
+            if serialized.len() > SPILL_BYTE_LIMIT {
+                return Err(ToolError::ReadTooLarge { path }.into());
+            }
+            Ok(value)
         }
         "file_write" => {
             if permission != Permission::ReadWrite {
@@ -1360,6 +1391,112 @@ mod tests {
 
         let error = call_error(&state, "run-2", "file_read", json!({})).await;
         assert!(matches!(error, ExecutorError::BadArgument { key: "path" }));
+    }
+
+    #[tokio::test]
+    async fn file_read_takes_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), Permission::ReadWrite);
+        let body = "one\ntwo\nthree\nfour\nfive\n";
+        call(
+            &state,
+            "run-write",
+            "file_write",
+            json!({ "path": "f.txt", "content": body }),
+        )
+        .await
+        .unwrap();
+
+        let read = |offset: Option<u64>, limit: Option<u64>| {
+            let state = state.clone();
+            let mut args = json!({ "path": "f.txt" });
+            if let Some(offset) = offset {
+                args["offset"] = json!(offset);
+            }
+            if let Some(limit) = limit {
+                args["limit"] = json!(limit);
+            }
+            async move { call(&state, "run-read", "file_read", args).await }
+        };
+
+        let full = read(None, None).await.unwrap();
+        let CallOutcome::Result { content } = full else {
+            panic!("file_read must not stream");
+        };
+        assert_eq!(content["content"], body);
+
+        let window = read(Some(3), Some(2)).await.unwrap();
+        let CallOutcome::Result { content } = window else {
+            panic!("file_read must not stream");
+        };
+        assert_eq!(content["content"], "three\nfour\n");
+
+        let past_eof = read(Some(10), None).await.unwrap();
+        let CallOutcome::Result { content } = past_eof else {
+            panic!("file_read must not stream");
+        };
+        assert_eq!(content["content"], "");
+
+        for (key, args) in [
+            ("offset", json!({ "path": "f.txt", "offset": 0 })),
+            ("offset", json!({ "path": "f.txt", "offset": "two" })),
+            ("limit", json!({ "path": "f.txt", "limit": 0 })),
+            ("limit", json!({ "path": "f.txt", "limit": 1.5 })),
+        ] {
+            let error = call_error(&state, "run-bad", "file_read", args).await;
+            assert!(
+                matches!(error, ExecutorError::BadArgument { key: k } if k == key),
+                "expected a bad {key} argument"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_read_refuses_a_window_whose_result_frame_exceeds_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), Permission::ReadWrite);
+
+        // A raw window exactly at the byte budget serializes to over it once
+        // wrapped in the result frame, so the executor refuses it rather than
+        // the node spilling the frame to a file.
+        call(
+            &state,
+            "run-write",
+            "file_write",
+            json!({ "path": "f.txt", "content": "a".repeat(SPILL_BYTE_LIMIT) }),
+        )
+        .await
+        .unwrap();
+        let error = call_error(&state, "run-read", "file_read", json!({ "path": "f.txt" })).await;
+        assert!(matches!(
+            error,
+            ExecutorError::Tool(ToolError::ReadTooLarge { .. })
+        ));
+
+        // A window comfortably inside the serialized budget still reads inline.
+        call(
+            &state,
+            "run-write",
+            "file_write",
+            json!({ "path": "small.txt", "content": "a".repeat(SPILL_BYTE_LIMIT - 1000) }),
+        )
+        .await
+        .unwrap();
+        let outcome = call(
+            &state,
+            "run-read",
+            "file_read",
+            json!({ "path": "small.txt" }),
+        )
+        .await
+        .unwrap();
+        let CallOutcome::Result { content } = outcome else {
+            panic!("file_read must not stream");
+        };
+        assert_eq!(
+            content["content"].as_str().unwrap().len(),
+            SPILL_BYTE_LIMIT - 1000
+        );
     }
 
     #[tokio::test]
