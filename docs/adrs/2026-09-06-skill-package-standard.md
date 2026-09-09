@@ -35,7 +35,7 @@ This ADR decides what a skill is at runtime. The companion `2026-09-06-remote-sk
 
 **A skill is a Bosun Skill Package: metadata, instructions, and reference chunks, identified by an immutable package address.**
 
-**Identity.** A package is addressed `github.com/<owner>/<repo>/<path...>/skills/<name>` — the repo-relative path to its `skills/` directory plus the skill's directory name. The address never carries a SHA; one stored version of a package exists at runtime, and the `@sha` only appears as provenance in the store and the web pane.
+**Identity.** A package is addressed `github.com/<owner>/<repo>/<path...>/skills/<name>` — the repo-relative path to the package's `skills/` ancestor plus the skill's directory name. The address never carries a SHA; one stored version of a package exists at runtime, and the `@sha` only appears as provenance in the store and the web pane.
 
 **Contents.** A package carries exactly this:
 

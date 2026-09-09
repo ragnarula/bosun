@@ -33,7 +33,7 @@ As a developer, I want the store to hold repos, packages, and references as rows
 As a user, I want to give bosun a GitHub repo and have its skills become packages, so I never edit files by hand.
 
 - The GitHub client resolves a ref to a SHA (`GET /repos/{o}/{r}/commits/{ref}`, default branch when `ref` is NULL), lists the tree (`GET /repos/{o}/{r}/git/trees/{sha}?recursive=1`, failing on truncation), and fetches only the files it keeps via the shared reqwest client — the raw endpoint without a token, the contents endpoint with the `Authorization` header when `github_token` is set. No archive is downloaded and no gzip dependency exists.
-- The indexer finds package roots — directories named `skills` whose children hold `SKILL.md`, anywhere in the tree, so Claude Code, opencode, `.agents`, plugin-pack, and collection layouts all convert to the standard.
+- The indexer finds package roots — a directory named `skills` anywhere in the tree with package directories below it, so `**/skills/**/<name>/SKILL.md` files all convert. Claude Code, opencode, `.agents`, plugin-pack, and category-collection layouts (`skills/engineering/code-review/SKILL.md`) all map to the standard.
 - Each root maps to one package: frontmatter to metadata, body to `instructions`, sibling text files to `skill_references` rows (binary and over-cap files skipped), shipped to the store in one transaction with the resolved SHA.
 - A repo with no package roots indexes zero packages without error; a failed fetch records `last_error` and changes nothing.
 

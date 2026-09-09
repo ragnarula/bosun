@@ -464,8 +464,11 @@ async fn build_package(
 }
 
 /// The package root directory a blob path belongs to, when the path is a
-/// `<...>/skills/<dir>/SKILL.md` whose package directory is not hidden.
-/// Hidden ancestors do not matter: `.claude/skills/foo` is a package root.
+/// `**/skills/**/<dir>/SKILL.md` — a directory named `skills` anywhere in
+/// the path, then the package directory, with anything in between — whose
+/// package directory is not hidden. Hidden ancestors do not matter:
+/// `.claude/skills/foo` and `skills/engineering/code-review` are package
+/// roots.
 fn package_root_of(path: &str) -> Option<String> {
     let package_path = path.strip_suffix("/SKILL.md")?;
     let segments: Vec<&str> = package_path.split('/').collect();
@@ -473,10 +476,16 @@ fn package_root_of(path: &str) -> Option<String> {
         return None;
     }
     let package_dir = segments[segments.len() - 1];
-    if segments[segments.len() - 2] != "skills" || package_dir.starts_with('.') {
+    if package_dir.starts_with('.') {
         return None;
     }
-    Some(package_path.to_string())
+    // A `skills` segment must sit somewhere above the package directory; the
+    // segments between the two may be empty (`skills/<dir>`) or category
+    // directories (`skills/<category>/<dir>`).
+    segments[..segments.len() - 1]
+        .iter()
+        .any(|segment| *segment == "skills")
+        .then(|| package_path.to_string())
 }
 
 /// The package's short name when its frontmatter carries no `name`: its
@@ -812,6 +821,9 @@ mod tests {
                         tree_dir("skills"),
                         tree_dir("skills/alpha"),
                         tree_dir("skills/alpha/sub"),
+                        tree_dir("skills/categories"),
+                        tree_dir("skills/categories/engineering"),
+                        tree_dir("skills/categories/engineering/epsilon"),
                         tree_dir(".claude"),
                         tree_dir(".claude/skills"),
                         tree_dir(".opencode"),
@@ -826,6 +838,7 @@ mod tests {
                         tree_blob("skills/alpha/sub/SKILL.md", 19),
                         tree_blob("skills/alpha/sub/NOTES.md", 20),
                         tree_blob("skills/alpha/sub/README.md", 9),
+                        tree_blob("skills/categories/engineering/epsilon/SKILL.md", 45),
                         tree_blob(".claude/skills/beta/SKILL.md", 40),
                         tree_blob(".opencode/skills/gamma/SKILL.md", 50),
                         tree_blob("plugins/x/skills/delta/SKILL.md", 44),
@@ -860,6 +873,10 @@ mod tests {
             (
                 "/owner/acme/sha1234/skills/alpha/sub/README.md",
                 ok("sub readme text"),
+            ),
+            (
+                "/owner/acme/sha1234/skills/categories/engineering/epsilon/SKILL.md",
+                ok("---\ndescription: Does epsilon\n---\n\nEpsilon instructions.\n"),
             ),
             (
                 "/owner/acme/sha1234/.claude/skills/beta/SKILL.md",
@@ -899,7 +916,7 @@ mod tests {
             .unwrap();
         assert_eq!(sha, "sha1234");
 
-        // All four layouts produce packages, sorted by address, with the
+        // All the layouts produce packages, sorted by address, with the
         // frontmatter description (or the first body line) advertised.
         assert_eq!(
             store.advertised_skill_packages().await.unwrap(),
@@ -925,15 +942,25 @@ mod tests {
                     description: "Does alpha".into(),
                 },
                 SkillAd {
+                    address: "github.com/owner/acme/skills/alpha/sub".into(),
+                    name: "sub".into(),
+                    description: "nested skill body".into(),
+                },
+                SkillAd {
                     address: "github.com/owner/acme/skills/bin".into(),
                     name: "bin".into(),
                     description: "Does bin".into(),
+                },
+                SkillAd {
+                    address: "github.com/owner/acme/skills/categories/engineering/epsilon".into(),
+                    name: "epsilon".into(),
+                    description: "Does epsilon".into(),
                 },
             ]
         );
 
         // The body is the instructions, and the package's other blobs —
-        // including nested ones — are references sorted by path.
+        // including the nested package dirs — are references sorted by path.
         let (instructions, paths) = store
             .load_skill_package("github.com/owner/acme/skills/alpha")
             .await
@@ -979,27 +1006,22 @@ mod tests {
             );
         }
 
-        // The exact-`skills`-segment rule: a SKILL.md directly under
-        // `skills/`, one under a non-`skills` segment, and a SKILL.md nested
-        // below a package are not package roots.
+        // The glob rule: a `SKILL.md` directly under `skills/`, or under a
+        // non-`skills` segment, is not a package; a `skills/<category>/<dir>`
+        // one is.
         let ads = store.advertised_skill_packages().await.unwrap();
         for address in [
             "github.com/owner/acme/skills",
             "github.com/owner/acme/fooskill/x",
-            "github.com/owner/acme/skills/sub",
         ] {
             assert!(
                 !ads.iter().any(|ad| ad.address == address),
                 "{address} should not be a package"
             );
         }
-        assert!(
-            !ads.iter().any(|ad| ad.name == "sub"),
-            "skills/alpha/sub/SKILL.md must not produce a package named sub"
-        );
 
         let repos = store.list_skill_repos().await.unwrap();
-        assert_eq!(repos[0].package_count, 5);
+        assert_eq!(repos[0].package_count, 7);
 
         // The over-cap and hidden SKILL.mds were never fetched.
         let requested: Vec<String> = log.lock().unwrap().iter().map(|r| r.path.clone()).collect();
@@ -1186,8 +1208,15 @@ mod tests {
                     false,
                     vec![
                         tree_dir("docs"),
+                        tree_dir("skills"),
+                        tree_dir("skills/.hidden"),
                         tree_blob("README.md", 42),
                         tree_blob("docs/GUIDE.md", 64),
+                        // No valid root: `skills/SKILL.md` has no package dir
+                        // between `skills` and the file, and a `SKILL.md`
+                        // with no `skills` ancestor anywhere is not a package.
+                        tree_blob("skills/SKILL.md", 40),
+                        tree_blob("docs/guides/alpha/SKILL.md", 40),
                     ],
                 )),
             ),
