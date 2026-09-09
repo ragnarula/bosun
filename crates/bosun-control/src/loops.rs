@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use bosun_agent::agent_loop::COMPACT_AT_INPUT_TOKENS;
 use bosun_agent::agent_loop::ChildSpawner;
 use bosun_agent::agent_loop::DeltaSink;
 use bosun_agent::agent_loop::LoopDeps;
@@ -28,10 +29,6 @@ use crate::tunnel::TunnelRegistry;
 /// Subscribers fall this far behind a live delta stream before broadcast
 /// drops the oldest deltas instead of blocking the loop.
 const LIVE_CHANNEL_CAPACITY: usize = 512;
-
-/// Non-archived messages allowed in the provider window before the loop
-/// compacts the retired tail into a summary.
-const MAX_WINDOW_MESSAGES: usize = 80;
 
 /// The running loop handle and live-delta broadcast channel per session.
 pub struct AgentRegistry {
@@ -112,7 +109,7 @@ impl AgentRegistry {
                 store: tool_store,
             }),
             delta_sink: Arc::new(LiveSink { tx: sender }),
-            max_window_messages: MAX_WINDOW_MESSAGES,
+            compact_at_input_tokens: COMPACT_AT_INPUT_TOKENS,
             personas: self.personas.clone(),
             providers: self.providers.clone(),
             prices: self.prices.clone(),

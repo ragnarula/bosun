@@ -8,7 +8,8 @@ use serde_json::json;
 
 use crate::provider::AskRecipient;
 
-/// Anthropic keeps the system prompt out of the message list.
+/// Anthropic keeps the system prompt out of the message list. An empty system
+/// prompt is omitted: some hosted APIs reject an empty system field.
 pub fn anthropic_messages(
     system: &str,
     messages: &[Message],
@@ -18,7 +19,11 @@ pub fn anthropic_messages(
         .iter()
         .map(|message| anthropic_message(message, ask_recipient))
         .collect();
-    json!({ "system": system, "messages": messages })
+    if system.is_empty() {
+        json!({ "messages": messages })
+    } else {
+        json!({ "system": system, "messages": messages })
+    }
 }
 
 /// Anthropic names the parameters object `input_schema`.
@@ -36,9 +41,13 @@ pub fn anthropic_tools(tools: &[ToolSpec]) -> Value {
     Value::Array(tools)
 }
 
-/// OpenAI puts the system prompt in the first message.
+/// OpenAI puts the system prompt in the first message. An empty system prompt
+/// is omitted: hosted APIs reject a system message without content.
 pub fn openai_messages(system: &str, messages: &[Message], ask_recipient: AskRecipient) -> Value {
-    let mut out = vec![json!({ "role": "system", "content": system })];
+    let mut out: Vec<Value> = Vec::new();
+    if !system.is_empty() {
+        out.push(json!({ "role": "system", "content": system }));
+    }
     out.extend(
         messages
             .iter()
@@ -479,19 +488,19 @@ mod tests {
         };
         assert_eq!(
             anthropic(&message(ChildEventKind::Report, "done")),
-            json!({ "system": "", "messages": [
+            json!({ "messages": [
                 { "type": "text", "text": "[report from child child-1]\ndone" }
             ] })
         );
         assert_eq!(
             anthropic(&message(ChildEventKind::Ask, "may I push?")),
-            json!({ "system": "", "messages": [
+            json!({ "messages": [
                 { "type": "text", "text": "[ask from child child-1]\nmay I push?" }
             ] })
         );
         assert_eq!(
             anthropic(&message(ChildEventKind::Failure, "")),
-            json!({ "system": "", "messages": [
+            json!({ "messages": [
                 { "type": "text", "text": "[failure from child child-1]" }
             ] })
         );
@@ -501,10 +510,32 @@ mod tests {
         };
         assert_eq!(
             openai(&message(ChildEventKind::Report, "done")),
-            json!([{ "role": "system", "content": "" }, {
+            json!([{
                 "role": "user",
                 "content": "[report from child child-1]\ndone"
             }])
+        );
+    }
+
+    #[test]
+    fn an_empty_system_prompt_is_omitted() {
+        // A summarizer call sends no system prompt; hosted APIs reject a
+        // system message without content, so the empty prompt must not appear
+        // in the serialized request.
+        let message = Message {
+            role: Role::User,
+            block: Block::Text {
+                text: "hello".into(),
+            },
+        };
+        let messages = std::slice::from_ref(&message);
+        assert_eq!(
+            anthropic_messages("", messages, AskRecipient::User),
+            json!({ "messages": [{ "type": "text", "text": "hello" }] })
+        );
+        assert_eq!(
+            openai_messages("", messages, AskRecipient::User),
+            json!([{ "role": "user", "content": "hello" }])
         );
     }
 
@@ -525,13 +556,13 @@ mod tests {
         };
         assert_eq!(
             anthropic(&ask(Some("child-1"))),
-            json!({ "system": "", "messages": [
+            json!({ "messages": [
                 { "type": "text", "text": "[question to user, from child child-1] may I push?" }
             ] })
         );
         assert_eq!(
             anthropic(&ask(None)),
-            json!({ "system": "", "messages": [
+            json!({ "messages": [
                 { "type": "text", "text": "[question to user] may I push?" }
             ] })
         );
@@ -541,7 +572,7 @@ mod tests {
         };
         assert_eq!(
             openai(&ask(Some("child-1"))),
-            json!([{ "role": "system", "content": "" }, {
+            json!([{
                 "role": "assistant",
                 "content": "[question to user, from child child-1] may I push?"
             }])
@@ -566,7 +597,7 @@ mod tests {
         let anthropic = anthropic_messages("", std::slice::from_ref(&message), AskRecipient::User);
         assert_eq!(
             anthropic,
-            json!({ "system": "", "messages": [{
+            json!({ "messages": [{
                 "type": "text",
                 "text": "[question to user, from child child-1] may I push?\n[user answered: yes, push to main]"
             }] })
@@ -574,7 +605,7 @@ mod tests {
         let openai = openai_messages("", std::slice::from_ref(&message), AskRecipient::User);
         assert_eq!(
             openai,
-            json!([{ "role": "system", "content": "" }, {
+            json!([{
                 "role": "assistant",
                 "content": "[question to user, from child child-1] may I push?\n[user answered: yes, push to main]"
             }])
@@ -598,14 +629,14 @@ mod tests {
         let anthropic = anthropic_messages("", std::slice::from_ref(&ask), AskRecipient::Parent);
         assert_eq!(
             anthropic,
-            json!({ "system": "", "messages": [
+            json!({ "messages": [
                 { "type": "text", "text": "[question to parent] may I push?" }
             ] })
         );
         let openai = openai_messages("", std::slice::from_ref(&ask), AskRecipient::Parent);
         assert_eq!(
             openai,
-            json!([{ "role": "system", "content": "" }, {
+            json!([{
                 "role": "assistant",
                 "content": "[question to parent] may I push?"
             }])

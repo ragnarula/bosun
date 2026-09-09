@@ -76,6 +76,20 @@ const SUMMARIZATION_PROMPT: &str = "Summarize the conversation so far. Preserve:
      decisions, file paths, commands run, tool results that still matter, and any \
      open questions. Be concise.";
 
+/// The assumed model context window in tokens. The loop receives each
+/// completion's actual input-token count from the provider, but no context
+/// window size, so compaction keys off a fixed assumption of one million.
+pub const CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
+
+/// Compaction fires when the last completion's input tokens reach this
+/// fraction of the assumed context window, leaving headroom for the next
+/// turn's new messages and its output.
+const COMPACT_AT_FRACTION: f64 = 0.95;
+
+/// The input-token count of the last completion that triggers compaction.
+pub const COMPACT_AT_INPUT_TOKENS: u64 =
+    (CONTEXT_WINDOW_TOKENS as f64 * COMPACT_AT_FRACTION) as u64;
+
 pub enum LoopEvent {
     /// A turn should run: a user message or a child's authored event was
     /// appended to this session's thread.
@@ -178,8 +192,9 @@ pub struct LoopDeps {
     pub provider: Arc<dyn crate::provider::Provider>,
     pub tools: Arc<dyn ToolExecutor>,
     pub delta_sink: Arc<dyn DeltaSink>,
-    /// Non-archived messages allowed before compaction triggers.
-    pub max_window_messages: usize,
+    /// The input-token count of the last completion that triggers a
+    /// compaction at the next turn.
+    pub compact_at_input_tokens: u64,
     /// Configured personas, keyed by persona name. The `spawn` tool resolves
     /// its target persona from here, and a session's persona prompt is read
     /// from it at every turn.
@@ -204,9 +219,10 @@ pub struct LoopDeps {
 }
 
 /// State a session's loop keeps across wakes: the todo list, the cached
-/// skill and repo-standard lists, and `handled_through` — the newest message
-/// row id a completed turn has reacted to. It advances per completed turn:
-/// authored child events at or below it are handled and leave the manifest.
+/// skill and repo-standard lists, the last completion's input-token count,
+/// and `handled_through` — the newest message row id a completed turn has
+/// reacted to. It advances per completed turn: authored child events at or
+/// below it are handled and leave the manifest.
 #[derive(Default)]
 struct LoopState {
     todos: Vec<Value>,
@@ -215,6 +231,10 @@ struct LoopState {
     /// per session like the skills list. None until the first turn has
     /// fetched; a fetch that fails caches an empty list.
     repo_standards_cache: Option<Vec<String>>,
+    /// The input-token count of the last completed completion, driving
+    /// next-turn compaction. Zero until the first completion reports usage,
+    /// and after a compaction consumed the headroom.
+    last_input_tokens: u64,
     handled_through: i64,
 }
 
@@ -1064,6 +1084,7 @@ async fn run_turn_inner(
         window,
         wake_boundary,
         ask_recipient,
+        state,
     )
     .await?;
     // A successful ask's tool call has no tool result in the transcript — its
@@ -1093,16 +1114,24 @@ async fn run_turn_inner(
     if state.skills_cache.is_none() {
         state.skills_cache = Some(fetch_session_skills(deps, session_id).await);
     }
-    let cached = state.skills_cache.as_ref().expect("populated above");
-    let working_skills: &[Skill] = &cached.working;
-    let remote_skills: &[Skill] = &cached.remote;
+    let working_skills: Vec<Skill> = state
+        .skills_cache
+        .as_ref()
+        .expect("populated above")
+        .working
+        .clone();
+    let remote_skills: Vec<Skill> = state
+        .skills_cache
+        .as_ref()
+        .expect("populated above")
+        .remote
+        .clone();
     // The system prompt advertises the union of both skill sources, never
     // deduplicated by short name: a remote package whose name collides with a
     // working-copy skill must stay discoverable under its full address.
-    let skills: Vec<Skill> = cached
-        .working
+    let skills: Vec<Skill> = working_skills
         .iter()
-        .chain(cached.remote.iter())
+        .chain(remote_skills.iter())
         .cloned()
         .collect();
     // The repo-standard presence list is fetched once per session and cached,
@@ -1167,7 +1196,7 @@ async fn run_turn_inner(
     })?;
 
     let (text, tool_calls, stopped, stop_reason) =
-        match collect_stream(&mut stream, deps, session_id, signal, &turn).await? {
+        match collect_stream(&mut stream, deps, session_id, signal, &turn, state).await? {
             StreamEnd::Collected {
                 text,
                 tool_calls,
@@ -1485,7 +1514,7 @@ async fn run_turn_inner(
                 // copy first, then the remote short names.
                 let outcome = async {
                     if skill_name.starts_with("github.com/") {
-                        match resolve_remote(remote_skills, skill_name) {
+                        match resolve_remote(&remote_skills, skill_name) {
                             RemoteResolution::Exact { address } => {
                                 return load_remote_skill(
                                     deps,
@@ -1525,7 +1554,7 @@ async fn run_turn_inner(
                             }
                         }
                     }
-                    match resolve_remote(remote_skills, skill_name) {
+                    match resolve_remote(&remote_skills, skill_name) {
                         RemoteResolution::Short { address } => {
                             return load_remote_skill(deps, session_id, &address, reference_path)
                                 .await;
@@ -1715,13 +1744,16 @@ async fn run_turn_inner(
 
 /// Runs the provider stream to its end, accumulating text and tool-call
 /// deltas and forwarding text to the delta sink. The caller decides what the
-/// end state means and logs it.
+/// end state means and logs it. Records the completion's input-token count on
+/// the loop state, so the next turn's compaction check sees how full context
+/// was.
 async fn collect_stream(
     stream: &mut BoxStream<'static, Result<StreamEvent, ProviderError>>,
     deps: &Arc<LoopDeps>,
     session_id: &str,
     signal: &Arc<InterruptSignal>,
     turn: &TurnModel,
+    state: &mut LoopState,
 ) -> Result<StreamEnd, anyhow::Error> {
     let mut text = String::new();
     let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
@@ -1753,6 +1785,7 @@ async fn collect_stream(
                     output_tokens,
                     stop_reason: reason,
                 })) => {
+                    state.last_input_tokens = input_tokens;
                     deps.store
                         .append_model_call(
                             session_id,
@@ -1946,13 +1979,16 @@ fn resolve_ask_leaf(window: &[(i64, Message)], named: &str) -> anyhow::Result<St
     anyhow::bail!("child session {named} has no pending question to surface")
 }
 
-/// Compacts the wake's working window when it exceeds `max_window_messages`:
-/// the oldest messages are summarized by the provider, archived in the
-/// store, and replaced by a Summary message in the window. Only messages at
-/// or below the wake's fixed boundary are retired: archiving is an id range
-/// in the store, and a mid-wake message from another writer can sit between
-/// ids the wake never saw. On a summarizer failure or interrupt the store is
-/// left untouched and the full window is returned.
+/// Compacts the wake's working window when the last completion's input-token
+/// count reached `compact_at_input_tokens`: the oldest messages are
+/// summarized by the provider, archived in the store, and replaced by a
+/// Summary message in the window. Only messages at or below the wake's fixed
+/// boundary are retired: archiving is an id range in the store, and a
+/// mid-wake message from another writer can sit between ids the wake never
+/// saw. On a summarizer failure or interrupt the store is left untouched and
+/// the full window is returned; the next turn reports the same high token
+/// count and retries.
+#[allow(clippy::too_many_arguments)] // a turn needs the wake's whole context
 async fn maybe_compact(
     deps: &Arc<LoopDeps>,
     turn: &TurnModel,
@@ -1961,14 +1997,16 @@ async fn maybe_compact(
     window: &mut Vec<(i64, Message)>,
     wake_boundary: i64,
     ask_recipient: AskRecipient,
+    state: &mut LoopState,
 ) -> anyhow::Result<Vec<Message>> {
-    if window.len() > deps.max_window_messages {
-        let keep = deps.max_window_messages / 2;
+    if state.last_input_tokens >= deps.compact_at_input_tokens {
         let retireable = window
             .iter()
             .take_while(|(id, _)| *id <= wake_boundary)
             .count();
-        let retire = (window.len() - keep).min(retireable);
+        // Retire the oldest half of the window, capped at the wake boundary,
+        // so the summarized window has roughly half the previous token load.
+        let retire = (window.len() / 2).min(retireable);
         if retire > 0 {
             let tail: Vec<(i64, Message)> = window.drain(..retire).collect();
             let tail_last_id = tail.last().expect("retire is at least one").0;
@@ -2001,6 +2039,9 @@ async fn maybe_compact(
                     )
                     .await?;
                 window.push((summary_id, summary));
+                // The summarized window is smaller; do not re-trigger on the
+                // pre-compaction count until another completion fills context.
+                state.last_input_tokens = 0;
                 info!(
                     session_id = %session_id,
                     retired = retire,
@@ -2691,18 +2732,26 @@ mod tests {
         tools: Arc<MockTools>,
         sink: Arc<CollectSink>,
     ) -> LoopDeps {
-        // Existing tests never fill a window, so compaction stays off.
-        test_deps_with_max_window(store, provider, tools, sink, usize::MAX)
+        // Existing tests never report a full context, so compaction stays off.
+        test_deps_with_compact_at(store, provider, tools, sink, u64::MAX)
     }
 
-    fn test_deps_with_max_window(
+    fn test_deps_with_compact_at(
         store: &Store,
         provider: Arc<dyn Provider>,
         tools: Arc<MockTools>,
         sink: Arc<CollectSink>,
-        max_window_messages: usize,
+        compact_at_input_tokens: u64,
     ) -> LoopDeps {
-        test_deps_with_prices(store, provider, tools, sink, max_window_messages, 0.0, 0.0)
+        test_deps_with_prices(
+            store,
+            provider,
+            tools,
+            sink,
+            compact_at_input_tokens,
+            0.0,
+            0.0,
+        )
     }
 
     fn test_deps_with_prices(
@@ -2710,7 +2759,7 @@ mod tests {
         provider: Arc<dyn Provider>,
         tools: Arc<MockTools>,
         sink: Arc<CollectSink>,
-        max_window_messages: usize,
+        compact_at_input_tokens: u64,
         price_input_per_mtok: f64,
         price_output_per_mtok: f64,
     ) -> LoopDeps {
@@ -2719,7 +2768,7 @@ mod tests {
             provider,
             tools,
             delta_sink: sink,
-            max_window_messages,
+            compact_at_input_tokens,
             personas: HashMap::new(),
             providers: HashMap::new(),
             prices: HashMap::new(),
@@ -2731,7 +2780,7 @@ mod tests {
     }
 
     /// A deps with configured personas and their providers; existing tests
-    /// never fill the window, so compaction stays off.
+    /// never report a full context, so compaction stays off.
     fn test_deps_with_personas(
         store: &Store,
         provider: Arc<dyn Provider>,
@@ -2745,7 +2794,7 @@ mod tests {
             provider,
             tools,
             delta_sink: sink,
-            max_window_messages: usize::MAX,
+            compact_at_input_tokens: u64::MAX,
             personas,
             providers,
             prices: HashMap::new(),
@@ -3003,7 +3052,7 @@ mod tests {
             provider,
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
-            usize::MAX,
+            u64::MAX,
             3.0,
             15.0,
         ));
@@ -5877,8 +5926,18 @@ mod tests {
         store.create_session(&session("s-compact")).await.unwrap();
         fill_transcript(&store, "s-compact").await;
 
-        // The first call summarizes the retired tail, the second runs the turn.
+        // Call 1 fills the wake's first turn past the compaction threshold;
+        // call 2 summarizes the retired tail; call 3 runs the compacted turn.
         let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"work"}"#.into(),
+                },
+                stop(1000, 20),
+            ],
             vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
             vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
         ]));
@@ -5887,7 +5946,7 @@ mod tests {
             provider.clone(),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
-            20,
+            500,
             3.0,
             15.0,
         ));
@@ -5907,8 +5966,8 @@ mod tests {
         let all = store.messages("s-compact", true).await.unwrap();
         assert_eq!(
             all.len(),
-            202,
-            "200 transcript messages plus the summary and the turn's reply"
+            204,
+            "200 transcript messages plus the turn's tool call and result, the summary, and the reply"
         );
         assert!(
             all.iter().any(|(_, message)| matches!(
@@ -5918,10 +5977,11 @@ mod tests {
             "the summarizer's text is recorded as a Summary message"
         );
 
-        // The retired tail (190 of 200) is archived: the active window holds
-        // only the kept messages, the summary, and the turn's reply.
+        // The retired tail (101 of 200) is archived: the active window holds
+        // only the kept messages, the turn's own traffic, the summary, and
+        // the turn's reply.
         let active = store.messages("s-compact", false).await.unwrap();
-        assert_eq!(active.len(), 12);
+        assert_eq!(active.len(), 103);
         assert!(active.len() < all.len(), "messages were archived");
         assert!(
             active
@@ -5937,35 +5997,41 @@ mod tests {
             "the turn's reply is recorded"
         );
 
-        // The summarizer call runs before the turn: no tools, tail as messages.
+        // The summarizer call runs before the second turn: no tools, tail as
+        // messages.
         let calls = provider.captured_calls();
-        assert_eq!(calls.len(), 2, "the summarizer call and the turn call");
+        assert_eq!(
+            calls.len(),
+            3,
+            "the first turn, the summarizer, and the compacted turn"
+        );
         assert!(
-            calls[0].tools.is_empty() && !calls[0].messages.is_empty(),
+            calls[1].tools.is_empty() && !calls[1].messages.is_empty(),
             "the summarizer call offers no tools and carries the tail"
         );
         assert!(
-            !calls[1].tools.is_empty(),
-            "the turn call still offers tools"
+            !calls[2].tools.is_empty(),
+            "the compacted turn call still offers tools"
         );
         assert!(
-            calls[1]
+            calls[2]
                 .messages
                 .iter()
                 .any(|message| matches!(&message.block, Block::Summary { .. })),
-            "the turn sees the summary in its window"
+            "the compacted turn sees the summary in its window"
         );
 
         let model_calls = store.model_calls("s-compact").await.unwrap();
-        assert_eq!(model_calls.len(), 2);
-        assert_eq!(model_calls[0].kind, "compaction");
-        assert_eq!(model_calls[0].input_tokens, Some(200));
-        assert_eq!(model_calls[0].output_tokens, Some(20));
+        assert_eq!(model_calls.len(), 3);
+        assert_eq!(model_calls[0].kind, "completion");
+        assert_eq!(model_calls[1].kind, "compaction");
+        assert_eq!(model_calls[1].input_tokens, Some(200));
+        assert_eq!(model_calls[1].output_tokens, Some(20));
         // 200k input tokens at $3/M and 20k output at $15/M: $0.0009.
-        assert_eq!(model_calls[0].cost, Some(0.0009));
-        assert_eq!(model_calls[1].kind, "completion");
+        assert_eq!(model_calls[1].cost, Some(0.0009));
+        assert_eq!(model_calls[2].kind, "completion");
         // 3k input at $3/M and 1k output at $15/M: $0.000024.
-        assert_eq!(model_calls[1].cost, Some(0.000024));
+        assert_eq!(model_calls[2].cost, Some(0.000024));
 
         handle.stop();
     }
@@ -5980,19 +6046,29 @@ mod tests {
             .unwrap();
         fill_transcript(&store, "s-compact-fail").await;
 
-        // The first call (the summarizer) fails; the second runs the turn.
+        // Call 1 fills the wake's first turn past the compaction threshold;
+        // call 2 (the summarizer) fails; call 3 runs the compacted turn.
         let provider = Arc::new(ScriptedProvider::with_results(vec![
+            vec![
+                Ok(StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"work"}"#.into(),
+                }),
+                Ok(stop(1000, 20)),
+            ],
             vec![Err(ProviderError::Parse {
                 detail: "boom".into(),
             })],
             vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(stop(1, 1))],
         ]));
-        let deps = Arc::new(test_deps_with_max_window(
+        let deps = Arc::new(test_deps_with_compact_at(
             &store,
             provider.clone(),
             Arc::new(MockTools::new(default_outcome())),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
-            20,
+            500,
         ));
         let handle = spawn_loop("s-compact-fail".into(), deps);
 
@@ -6015,8 +6091,8 @@ mod tests {
         );
         assert_eq!(
             all.len(),
-            201,
-            "the 200 transcript messages plus the turn's reply"
+            203,
+            "the 200 transcript messages plus the turn's tool call, result, and reply"
         );
         assert!(
             all.iter()
@@ -6025,10 +6101,10 @@ mod tests {
             "the turn still completes"
         );
 
-        // Only the turn's completion is metered; the failed summarizer is not.
+        // The two completions are metered; the failed summarizer is not.
         let model_calls = store.model_calls("s-compact-fail").await.unwrap();
-        assert_eq!(model_calls.len(), 1);
-        assert_eq!(model_calls[0].kind, "completion");
+        assert_eq!(model_calls.len(), 2);
+        assert!(model_calls.iter().all(|call| call.kind == "completion"));
 
         handle.stop();
     }
@@ -8463,8 +8539,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-cp")).await.unwrap();
-        // 20 messages: at the window limit, so compaction triggers only once
-        // this wake's own turns have appended past it.
+        // The first turn reports 1000 input tokens, past the compaction
+        // threshold, so compaction triggers on this wake's second turn.
         for index in 0..10 {
             store
                 .append_message(
@@ -8497,7 +8573,7 @@ mod tests {
                         name: Some("shell".into()),
                         args_delta: r#"{"command":"work"}"#.into(),
                     },
-                    stop(1, 1),
+                    stop(1000, 1),
                 ],
                 vec![
                     StreamEvent::TextDelta("compacted the tail".into()),
@@ -8507,12 +8583,12 @@ mod tests {
             ],
             Duration::from_millis(200),
         ));
-        let deps = Arc::new(test_deps_with_max_window(
+        let deps = Arc::new(test_deps_with_compact_at(
             &store,
             provider.clone(),
             instant_tools(),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
-            20,
+            500,
         ));
         let handle = spawn_loop("root-cp".into(), deps);
 
@@ -8539,10 +8615,11 @@ mod tests {
         .await;
         handle.send(LoopEvent::Wake);
 
-        // The running wake's second turn exceeds the window limit, compacts
-        // the snapshot tail, and reacts to the event it refreshed. The queued
-        // wake then finds nothing newer than a completed turn handled and
-        // drops. Call 1 is the summarizer.
+        // The running wake's second turn sees the first turn's token count
+        // past the compaction threshold, compacts the snapshot tail, and
+        // reacts to the event it refreshed. The queued wake then finds
+        // nothing newer than a completed turn handled and drops. Call 1 is
+        // the summarizer.
         wait_for(
             "the second turn, its compaction, and its reaction to run",
             {
