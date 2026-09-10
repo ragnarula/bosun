@@ -422,6 +422,7 @@ struct AccumulatedToolCall {
 enum StreamEnd {
     Collected {
         text: String,
+        reasoning: String,
         tool_calls: BTreeMap<usize, AccumulatedToolCall>,
         stopped: bool,
         stop_reason: StopReason,
@@ -1195,14 +1196,15 @@ async fn run_turn_inner(
         ask_recipient,
     })?;
 
-    let (text, tool_calls, stopped, stop_reason) =
+    let (text, reasoning, tool_calls, stopped, stop_reason) =
         match collect_stream(&mut stream, deps, session_id, signal, &turn, state).await? {
             StreamEnd::Collected {
                 text,
+                reasoning,
                 tool_calls,
                 stopped,
                 stop_reason,
-            } => (text, tool_calls, stopped, stop_reason),
+            } => (text, reasoning, tool_calls, stopped, stop_reason),
             StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
             StreamEnd::Failed(error) => {
                 error!(
@@ -1222,6 +1224,19 @@ async fn run_turn_inner(
             provider = %turn.provider.name()
         );
         return Ok(TurnOutcome::Failed);
+    }
+
+    // Recorded before the reply and the tool calls, so serialization can
+    // replay it onto every assistant message this completion produced.
+    if !reasoning.is_empty() {
+        record_in_wake(
+            deps,
+            session_id,
+            window,
+            Role::Assistant,
+            &Block::Reasoning { text: reasoning },
+        )
+        .await?;
     }
 
     if !text.is_empty() {
@@ -1756,6 +1771,7 @@ async fn collect_stream(
     state: &mut LoopState,
 ) -> Result<StreamEnd, anyhow::Error> {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
     let mut stopped = false;
     let mut stop_reason = StopReason::Other;
@@ -1769,6 +1785,11 @@ async fn collect_stream(
                 Some(Ok(StreamEvent::TextDelta(delta))) => {
                     text.push_str(&delta);
                     deps.delta_sink.send(delta);
+                }
+                // Thinking is not sent to the delta sink: the sink feeds the
+                // live assistant paragraph, and thinking is not the reply.
+                Some(Ok(StreamEvent::ReasoningDelta(delta))) => {
+                    reasoning.push_str(&delta);
                 }
                 Some(Ok(StreamEvent::ToolCallDelta { index, id, name, args_delta })) => {
                     let call = tool_calls.entry(index).or_default();
@@ -1818,6 +1839,7 @@ async fn collect_stream(
 
     Ok(StreamEnd::Collected {
         text,
+        reasoning,
         tool_calls,
         stopped,
         stop_reason,
@@ -2070,6 +2092,11 @@ async fn summarize_tail(
 ) -> Option<(String, Option<u64>, Option<u64>)> {
     let mut prompt = String::from(SUMMARIZATION_PROMPT);
     for (_, message) in tail {
+        // Thinking is working-out, not conversation: summarizing it would
+        // spend the compaction budget on text the next turn never sees.
+        if matches!(message.block, Block::Reasoning { .. }) {
+            continue;
+        }
         prompt.push_str(&format!(
             "\n\n{}: {}",
             message.role.as_str(),
@@ -2116,8 +2143,10 @@ async fn summarize_tail(
         tokio::select! {
             event = stream.next() => match event {
                 Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
-                // A summarizer that calls tools contributes no text.
+                // A summarizer that calls tools contributes no text, and its
+                // thinking is not part of the summary it returns.
                 Some(Ok(StreamEvent::ToolCallDelta { .. })) => {}
+                Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
                 Some(Ok(StreamEvent::Stop { input_tokens: input, output_tokens: output, .. })) => {
                     input_tokens = Some(input);
                     output_tokens = Some(output);
@@ -2162,6 +2191,7 @@ async fn summarize_tail(
 /// misattribute a child's ask to the user.
 fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
     match block {
+        Block::Reasoning { .. } => unreachable!("a filtered reasoning block"),
         Block::Text { text } => text.clone(),
         Block::ToolCall { id, name, args } => format!("tool call {name} (id {id}): {args}"),
         Block::ToolResult {

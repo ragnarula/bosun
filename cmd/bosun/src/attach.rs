@@ -90,6 +90,9 @@ pub enum LineKind {
     /// The durable note a rejected question leaves: a user action, not a
     /// typed message.
     Rejected,
+    /// The model's thinking. Dim, because it is working-out rather than
+    /// something the session said.
+    Reasoning,
     Summary,
     ChildEvent,
     ModelCall,
@@ -274,6 +277,10 @@ fn event_lines(event: &Event) -> Vec<Line> {
                         text: format!("{origin}{message} [{}]", options.join(", ")),
                     }]
                 }
+                Block::Reasoning { text } => vec![Line {
+                    kind: LineKind::Reasoning,
+                    text: text.clone(),
+                }],
                 Block::Summary { text } => vec![Line {
                     kind: LineKind::Summary,
                     text: text.clone(),
@@ -497,6 +504,7 @@ fn prefix_for(line: &Line) -> Cow<'static, str> {
         LineKind::ToolResult => Cow::Borrowed("    ↳ "),
         LineKind::Ask => Cow::Borrowed("  ? "),
         LineKind::Rejected => Cow::Borrowed("  ~ "),
+        LineKind::Reasoning => Cow::Borrowed("  ⋮ "),
         LineKind::Summary => Cow::Borrowed("── "),
         LineKind::ChildEvent => Cow::Borrowed("  ⤷ "),
         LineKind::ModelCall => Cow::Borrowed("  ◆ "),
@@ -540,6 +548,7 @@ fn kind_color(kind: LineKind) -> Color {
         LineKind::ToolResult => Color::Blue,
         LineKind::Ask => Color::Yellow,
         LineKind::Rejected => Color::DarkGray,
+        LineKind::Reasoning => Color::DarkGray,
         LineKind::Summary | LineKind::ChildEvent | LineKind::ModelCall => Color::DarkGray,
         LineKind::Status => Color::Cyan,
     }

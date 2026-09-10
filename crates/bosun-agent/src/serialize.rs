@@ -15,8 +15,12 @@ pub fn anthropic_messages(
     messages: &[Message],
     ask_recipient: AskRecipient,
 ) -> Value {
+    // Anthropic accepts thinking back only as a signed `thinking` block, and
+    // the signature is not carried on the transcript, so a Reasoning block is
+    // dropped here rather than sent in a form the API rejects.
     let messages: Vec<Value> = messages
         .iter()
+        .filter(|message| !matches!(message.block, Block::Reasoning { .. }))
         .map(|message| anthropic_message(message, ask_recipient))
         .collect();
     if system.is_empty() {
@@ -43,17 +47,61 @@ pub fn anthropic_tools(tools: &[ToolSpec]) -> Value {
 
 /// OpenAI puts the system prompt in the first message. An empty system prompt
 /// is omitted: hosted APIs reject a system message without content.
+/// A thinking model may require its own reasoning back. DeepSeek rejects a
+/// request whose in-flight turn carries an assistant message without
+/// `reasoning_content`, and rejects a reasoning-only assistant message, so a
+/// [`Block::Reasoning`] is not serialized on its own: it rides on each
+/// assistant message the same completion produced. A completed turn needs
+/// none, which is why a user message clears it. Tool results sit inside a
+/// turn and serialize as role `tool`, so they leave it standing.
 pub fn openai_messages(system: &str, messages: &[Message], ask_recipient: AskRecipient) -> Value {
     let mut out: Vec<Value> = Vec::new();
     if !system.is_empty() {
         out.push(json!({ "role": "system", "content": system }));
     }
-    out.extend(
-        messages
-            .iter()
-            .map(|message| openai_message(message, ask_recipient)),
-    );
+    let mut thinking: Option<&str> = None;
+    for message in messages {
+        if let Block::Reasoning { text } = &message.block {
+            thinking = Some(text);
+            continue;
+        }
+        let mut value = openai_message(message, ask_recipient);
+        match value["role"].as_str() {
+            Some("assistant") => {
+                if let Some(text) = thinking {
+                    value["reasoning_content"] = json!(text);
+                }
+            }
+            Some("user") => thinking = None,
+            _ => {}
+        }
+        out.push(value);
+    }
+    fill_missing_thinking(&mut out);
     Value::Array(out)
+}
+
+/// The thinking a model owes back is not always thinking it produced:
+/// deepseek-v4.1-flash returns completions with no `reasoning` at all, then
+/// rejects the next completion of the same turn for not carrying any. The
+/// field is validated for presence, not content, so a tool call left without
+/// one is given a single space rather than losing the turn.
+///
+/// Every assistant message in the turn in flight is filled, not just the tool
+/// calls: the provider rejects the request when any of them lacks the field,
+/// and one completion becomes several assistant messages here — its reply and
+/// one per tool call. The turn in flight is the run after the last message
+/// addressed to the model as `user`; a slice with no such message has no turn
+/// boundary to work from and is left alone.
+fn fill_missing_thinking(out: &mut [Value]) {
+    let Some(last_user) = out.iter().rposition(|value| value["role"] == "user") else {
+        return;
+    };
+    for value in &mut out[last_user + 1..] {
+        if value["role"] == "assistant" && value["reasoning_content"].is_null() {
+            value["reasoning_content"] = json!(" ");
+        }
+    }
 }
 
 /// OpenAI wraps each function in a `function` object.
@@ -76,6 +124,7 @@ pub fn openai_tools(tools: &[ToolSpec]) -> Value {
 
 fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
     match (&message.role, &message.block) {
+        (_, Block::Reasoning { .. }) => unreachable!("a filtered reasoning block"),
         (Role::User, Block::Text { text }) => json!({ "type": "text", "text": text }),
         (
             Role::User,
@@ -135,6 +184,7 @@ fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
 
 fn openai_message(message: &Message, ask_recipient: AskRecipient) -> Value {
     match (&message.role, &message.block) {
+        (_, Block::Reasoning { .. }) => unreachable!("a filtered reasoning block"),
         (Role::User, Block::Text { text }) => json!({ "role": "user", "content": text }),
         (
             Role::User,
@@ -640,6 +690,162 @@ mod tests {
                 "role": "assistant",
                 "content": "[question to parent] may I push?"
             }])
+        );
+    }
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            block: Block::Text { text: text.into() },
+        }
+    }
+
+    fn thinking(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            block: Block::Reasoning { text: text.into() },
+        }
+    }
+
+    fn tool_call(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            block: Block::ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                args: json!({ "command": "ls" }),
+            },
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            block: Block::ToolResult {
+                id: id.into(),
+                name: "shell".into(),
+                is_error: false,
+                content: json!("out"),
+            },
+        }
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            block: Block::Text { text: text.into() },
+        }
+    }
+
+    #[test]
+    fn thinking_rides_on_the_assistant_messages_of_its_turn() {
+        // DeepSeek rejects an in-flight turn whose assistant messages do not
+        // carry the reasoning back, and rejects a reasoning-only assistant
+        // message, so the block must not serialize as a message of its own.
+        // A tool result is not an assistant message and carries none.
+        let messages = vec![
+            user("go"),
+            thinking("plan it"),
+            tool_call("c1"),
+            tool_result("c1"),
+            assistant("done"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["reasoning_content"], Value::Null);
+        assert_eq!(out[1]["reasoning_content"], json!("plan it"));
+        assert_eq!(out[2]["role"], json!("tool"));
+        assert_eq!(out[2]["reasoning_content"], Value::Null);
+        // Still the same turn: the reply after the tool result needs it too.
+        assert_eq!(out[3]["reasoning_content"], json!("plan it"));
+    }
+
+    #[test]
+    fn an_assistant_message_in_flight_without_thinking_is_filled() {
+        // deepseek-v4.1-flash returns some completions with no reasoning and
+        // then rejects the next one for not carrying any, so the turn in
+        // flight must always present the field.
+        // One completion becomes an assistant reply and an assistant tool
+        // call, and the provider rejects the turn if either lacks the field.
+        let messages = vec![
+            user("go"),
+            assistant("reading it"),
+            tool_call("c1"),
+            tool_result("c1"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out[1]["reasoning_content"], json!(" "));
+        assert_eq!(out[2]["reasoning_content"], json!(" "));
+        assert_eq!(
+            out[3]["reasoning_content"],
+            Value::Null,
+            "a tool result carries none"
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_is_not_filled() {
+        let messages = vec![user("go"), assistant("done"), user("again")];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out[1]["reasoning_content"], Value::Null);
+        assert_eq!(out[2]["role"], json!("user"));
+    }
+
+    #[test]
+    fn a_completed_turn_carries_no_thinking() {
+        // The requirement covers the turn in flight. Once the user speaks
+        // again the model has discarded its thinking, and an earlier turn
+        // that never had a Reasoning block must not borrow a later one.
+        let messages = vec![
+            user("go"),
+            thinking("plan it"),
+            assistant("done"),
+            user("again"),
+            assistant("sure"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["reasoning_content"], json!("plan it"));
+        // out[3] closes the new turn, so it is filled rather than left bare.
+        assert_eq!(out[3]["reasoning_content"], json!(" "));
+    }
+
+    #[test]
+    fn a_later_completions_thinking_replaces_an_earlier_one() {
+        let messages = vec![
+            user("go"),
+            thinking("first"),
+            tool_call("c1"),
+            tool_result("c1"),
+            thinking("second"),
+            assistant("done"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out[1]["reasoning_content"], json!("first"));
+        assert_eq!(out[3]["reasoning_content"], json!("second"));
+    }
+
+    #[test]
+    fn anthropic_drops_a_reasoning_block() {
+        // Anthropic accepts thinking back only as a signed `thinking` block,
+        // and the transcript does not carry the signature.
+        let messages = vec![user("go"), thinking("plan it"), assistant("done")];
+        assert_eq!(
+            anthropic_messages("", &messages, AskRecipient::User),
+            json!({ "messages": [
+                { "type": "text", "text": "go" },
+                { "type": "text", "text": "done" },
+            ] })
         );
     }
 }

@@ -706,6 +706,18 @@
   #transcript .tool .glyph { color: var(--muted); margin-right: 6px; }
   #transcript .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
   #transcript .tool.open .toggle { color: var(--accent); }
+  /* Thinking reuses the tool strip's tap-to-open row, restyled as prose:
+     muted and italic so it does not read as something the session said. */
+  #transcript .reasoning { color: var(--muted); font-style: italic; }
+  #transcript .reasoning .body {
+    display: block;
+    margin-top: 6px;
+    padding-left: 10px;
+    border-left: 2px solid var(--border);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-style: normal;
+  }
   #transcript .tool-result {
     margin: 0 0 6px 20px;
     border-left: 2px solid var(--border);
@@ -2812,6 +2824,45 @@ function appendToolStrip(name, args) {
 // the full text is one click away here, where the TUI row is final.
 const TOOL_RESULT_PREVIEW = 400;
 
+// One completion's thinking, collapsed. The label carries its size so the
+// reader can judge whether to open it without it being shown twice.
+function appendReasoningPanel(text) {
+  const body = text == null ? '' : String(text);
+  if (body === '') return;
+  const line = document.createElement('div');
+  line.className = 'line tool reasoning';
+  const toggle = document.createElement('span');
+  toggle.className = 'toggle';
+  toggle.textContent = '\u25b8';
+  const glyph = document.createElement('span');
+  glyph.className = 'glyph';
+  glyph.textContent = '\u22ee';
+  const label = document.createElement('span');
+  label.textContent = 'thinking \u00b7 ' + body.length + ' chars';
+  const full = document.createElement('span');
+  full.className = 'body';
+  full.hidden = true;
+  full.textContent = body;
+  line.appendChild(toggle);
+  line.appendChild(glyph);
+  line.appendChild(label);
+  line.appendChild(full);
+  line.addEventListener('click', () => {
+    if (!full.hidden) {
+      full.hidden = true;
+      line.classList.remove('open');
+      toggle.textContent = '\u25b8';
+      return;
+    }
+    full.hidden = false;
+    line.classList.add('open');
+    toggle.textContent = '\u25be';
+    scrollToBottom();
+  });
+  transcript.appendChild(line);
+  scrollToBottom();
+}
+
 function appendToolResult(name, payload, error) {
   const text = payload == null ? '' : String(payload);
   if (!error && text === '') return;
@@ -3214,6 +3265,9 @@ function renderMessage(message) {
     }
     case 'ask':
       renderAskBox(block);
+      break;
+    case 'reasoning':
+      appendReasoningPanel(block.text);
       break;
     case 'summary':
       appendLine('summary', block.text);

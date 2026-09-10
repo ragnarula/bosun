@@ -63,6 +63,8 @@ pub enum StopReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),
+    /// A fragment of the model's thinking, streamed apart from the reply.
+    ReasoningDelta(String),
     ToolCallDelta {
         index: usize,
         id: Option<String>,

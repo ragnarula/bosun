@@ -133,6 +133,16 @@ fn parse_event(
     for choice in choices {
         let delta = &choice["delta"];
         let mut events = Vec::new();
+        // The field name differs by host: DeepSeek's own API streams
+        // `reasoning_content`, the Vercel AI Gateway streams `reasoning`.
+        // Requests carry it back as `reasoning_content` either way.
+        if let Some(thinking) = delta["reasoning_content"]
+            .as_str()
+            .or_else(|| delta["reasoning"].as_str())
+            && !thinking.is_empty()
+        {
+            events.push(StreamEvent::ReasoningDelta(thinking.to_string()));
+        }
         if let Some(text) = delta["content"].as_str()
             && !text.is_empty()
         {
@@ -567,5 +577,60 @@ mod tests {
             ]
         );
         assert!(matches!(events.last(), Some(StreamEvent::Stop { .. })));
+    }
+
+    #[test]
+    fn thinking_parses_under_either_field_name() {
+        // DeepSeek's own API streams `reasoning_content`; the Vercel AI
+        // Gateway streams `reasoning` for the same model.
+        let mut parser = OpenAiParser::default();
+        assert_eq!(
+            parse_event(
+                &sse(json!({ "choices": [{ "delta": { "reasoning": "we" } }] })),
+                &mut parser,
+            )
+            .expect("a reasoning delta parses"),
+            vec![StreamEvent::ReasoningDelta("we".into())],
+        );
+        assert_eq!(
+            parse_event(
+                &sse(json!({ "choices": [{ "delta": { "reasoning_content": "think" } }] })),
+                &mut parser,
+            )
+            .expect("a reasoning delta parses"),
+            vec![StreamEvent::ReasoningDelta("think".into())],
+        );
+    }
+
+    #[test]
+    fn a_chunk_carrying_thinking_and_text_yields_both_in_order() {
+        let mut parser = OpenAiParser::default();
+        assert_eq!(
+            parse_event(
+                &sse(json!({ "choices": [{ "delta": {
+                    "reasoning": "why",
+                    "content": "because",
+                } }] })),
+                &mut parser,
+            )
+            .expect("both deltas parse"),
+            vec![
+                StreamEvent::ReasoningDelta("why".into()),
+                StreamEvent::TextDelta("because".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_thinking_delta_yields_nothing() {
+        let mut parser = OpenAiParser::default();
+        assert!(
+            parse_event(
+                &sse(json!({ "choices": [{ "delta": { "reasoning": "" } }] })),
+                &mut parser,
+            )
+            .expect("an empty delta parses")
+            .is_empty(),
+        );
     }
 }

@@ -130,6 +130,13 @@ pub enum Block {
     Summary {
         text: String,
     },
+    /// The model's thinking for one completion, when the provider streams it
+    /// apart from the reply. It is kept because a thinking model may require
+    /// it back: DeepSeek rejects a request whose in-flight turn does not
+    /// replay the reasoning that produced its assistant messages.
+    Reasoning {
+        text: String,
+    },
     /// One authored event a child session wrote into its parent's thread: a
     /// completion report, a question, or a failure notice, attributed by
     /// session id. The child's own transcript stays on the child session.
