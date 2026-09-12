@@ -42,8 +42,9 @@ pub struct Session {
     pub dir: String,
     pub model: String,
     /// The persona this session runs under, resolved by name at creation.
-    /// None for sessions created before personas existed; they keep the
-    /// default system prompt.
+    /// None for sessions created before personas existed; they run on the
+    /// harness contract alone, and a persona without a prompt contributes no
+    /// role layer.
     #[serde(default)]
     pub persona: Option<String>,
     /// The session that spawned this one. None for a root session; a child

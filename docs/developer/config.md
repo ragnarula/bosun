@@ -48,11 +48,13 @@ A persona pairs a model entry with the session's effective surface:
 | `allowed_tools` | `"*"` | `"*"` for every canonical tool, or a comma/space-separated list of canonical tool names |
 | `description` | `""` | What the persona is for |
 
-A persona's role/behaviour prompt lives outside the TOML: when
-`<data dir>/personas/<name>.md` exists, its text is read at boot and becomes
-the persona's system prompt for sessions under it. Without a file the session
-runs on the built-in default system text. The personas directory is created at
-boot; the prompt files themselves are optional.
+A persona's role/behaviour prompt lives outside the TOML. When
+`<data dir>/personas/<name>.md` exists, Bosun reads its text at boot and appends
+it to the session's system prompt as the persona's role layer. The harness
+contract always comes first, and the role layer cannot override it. Without a
+file the session has no role layer; it still gets the contract and the session's
+live context, such as the repo-standards notice and the skill list. The personas
+directory is created at boot; the prompt files themselves are optional.
 
 `bosun clone` and `bosun dev` take `--persona <name>`; the persona's model,
 permission, and allowed-tool set are resolved onto the session at creation

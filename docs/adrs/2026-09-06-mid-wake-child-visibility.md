@@ -3,6 +3,8 @@
 **Date:** 2026-09-06
 **Author:** Raghav
 
+> Superseded in part by `2026-09-12-turn-model-in-the-contract.md`: the fourth Decision paragraph below, beginning "Waiting for a child is ending the turn" — its children-specific waiting rule is removed. The turn model is stated in the fixed harness contract, with the live-children manifest as data only. The re-read, boundary-split, redundant-wake, waiting-display, and no-`wait`-tool decisions stand.
+
 ## Context
 
 `2026-09-03-agent-tree.md` made communication between parent and child authored messages, and made each wake's turns read the thread as it stood when the wake began plus the wake's own tool traffic, so an event landing mid-wake was invisible to the running wake and surfaced only in its own queued wake. It also gave a parent no way to wait for a child other than the tools it already had. Over a delegated sprint of real work this made parents react to children's reports one wake too late — messaging children that had already answered — and supervising sessions spent hours in `sleep` waiting on children while consuming model calls. Sprint 008 changes both decisions.

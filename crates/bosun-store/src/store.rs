@@ -2371,7 +2371,7 @@ mod tests {
         );
         assert_eq!(
             session.persona, None,
-            "a pre-persona row has no persona and falls back to the default prompt"
+            "a pre-persona row has no persona, so the session runs on the harness contract alone"
         );
     }
 

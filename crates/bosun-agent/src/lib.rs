@@ -5,6 +5,7 @@ pub mod agent_loop;
 pub mod anthropic;
 pub mod config;
 pub mod openai;
+pub mod prompt;
 pub mod provider;
 pub mod serialize;
 pub mod skills;

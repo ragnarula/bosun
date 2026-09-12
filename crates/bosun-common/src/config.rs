@@ -81,8 +81,8 @@ impl ControlConfig {
     }
 
     /// Reads each persona's prompt body from `<data dir>/personas/<name>.md`
-    /// when the file exists. A persona without a prompt file keeps no system
-    /// prompt, so its sessions fall back to the loop's default system text.
+    /// when the file exists. A persona without a prompt file contributes no
+    /// role layer, so the session runs on the harness contract alone.
     pub fn load_persona_prompts(&mut self) -> Result<(), anyhow::Error> {
         let dir = self.data_dir.join("personas");
         let mut names: Vec<String> = self.personas.keys().cloned().collect();
@@ -168,9 +168,8 @@ pub struct PersonaConfig {
     /// What the persona is for, shown to the user when the persona is picked.
     #[serde(default)]
     pub description: String,
-    /// The persona's role/behaviour prompt, read from
-    /// `<data dir>/personas/<name>.md` at boot when the file exists; not a
-    /// TOML key. `None` leaves the session on the loop's default system text.
+    /// The persona's role/behaviour prompt, read by `load_persona_prompts` at
+    /// boot; not a TOML key. `None` means no role layer.
     #[serde(skip)]
     pub system_prompt: Option<String>,
 }
@@ -567,7 +566,7 @@ mod tests {
         );
         assert_eq!(
             config.personas["bare"].system_prompt, None,
-            "a persona without a prompt file keeps no system prompt"
+            "a persona without a prompt file keeps no role layer"
         );
     }
 

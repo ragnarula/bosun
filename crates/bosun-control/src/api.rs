@@ -4283,7 +4283,6 @@ mod tests {
         let recorded = systems.lock().unwrap();
         let system = recorded.first().expect("a system prompt was recorded");
         assert!(system.contains("You are the coder persona."), "{system}");
-        assert!(!system.contains("You are Bosun"), "{system}");
     }
 
     #[tokio::test]

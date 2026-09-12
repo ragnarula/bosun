@@ -37,6 +37,8 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::prompt::LiveChild;
+use crate::prompt::system_prompt;
 use crate::provider::AskRecipient;
 use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
@@ -236,16 +238,6 @@ struct LoopState {
     /// and after a compaction consumed the headroom.
     last_input_tokens: u64,
     handled_through: i64,
-}
-
-/// One child session in the per-wake manifest: id, persona, state, and its
-/// last authored message to this session, when it has authored one.
-#[derive(Debug, Clone)]
-struct LiveChild {
-    id: String,
-    persona: Option<String>,
-    state: SessionState,
-    last_authored: Option<String>,
 }
 
 /// The provider and prices one model call runs under: resolved from the
@@ -2232,14 +2224,14 @@ fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
 
 /// The session's persona prompt body, when the session names a configured
 /// persona that has one. A session without a persona (or whose persona is no
-/// longer configured) runs on the default system text below.
+/// longer configured) runs on the harness contract alone.
 fn persona_system_prompt<'a>(deps: &'a LoopDeps, session: &Session) -> Option<&'a str> {
     let name = session.persona.as_deref()?;
     match deps.personas.get(name) {
         Some(persona) => persona.system_prompt.as_deref(),
         None => {
             warn!(
-                msg = "session persona is not configured; using the default system prompt",
+                msg = "session persona is not configured; the session runs on the harness contract alone",
                 session_id = %session.id,
                 persona = %name
             );
@@ -2247,11 +2239,6 @@ fn persona_system_prompt<'a>(deps: &'a LoopDeps, session: &Session) -> Option<&'
         }
     }
 }
-
-const DEFAULT_SYSTEM_PROMPT: &str = "You are Bosun, an autonomous software engineering agent. \
-     You work in a session working copy. Use the provided tools to inspect \
-     and modify code. Prefer the simplest change that works. Keep replies \
-     concise and literal. Ask the user only when a decision requires them.";
 
 /// The configured personas as `(name, description)` pairs in name order, the
 /// catalog advertised to spawn-capable sessions. The description is context
@@ -2264,102 +2251,6 @@ fn persona_catalog(deps: &LoopDeps) -> Vec<(String, String)> {
         .collect();
     catalog.sort_by(|a, b| a.0.cmp(&b.0));
     catalog
-}
-
-/// How many characters of a skill's description the advertisement shows; the
-/// full text loads on demand through the `skill` tool.
-const SKILL_DESCRIPTION_CAP: usize = 500;
-
-/// One skill as the system prompt advertises it: the name with its
-/// provenance — the package address for a remote package, "working copy"
-/// otherwise — and the description truncated to the advertisement cap.
-fn skill_ad_line(skill: &Skill) -> String {
-    let provenance = skill.package.as_deref().unwrap_or("working copy");
-    let description: String = skill
-        .description
-        .chars()
-        .take(SKILL_DESCRIPTION_CAP)
-        .collect();
-    format!("- {} ({}): {}", skill.name, provenance, description)
-}
-/// The rule a supervising session reads beside the live-children manifest: a
-/// child's authored event wakes the parked session, so waiting for a child
-/// costs nothing and a message to a child is always for a reason.
-const WAITING_RULE: &str = "Each child's report or ask wakes this session; to wait for a child, end your turn. Message a child only to answer, redirect, or cancel it.";
-
-/// Builds the system prompt: the persona's role text when it has one (the
-/// built-in default otherwise), then the session's live context — the
-/// repo-standard files present in the working copy, the persona catalog for
-/// spawn-capable sessions, skill advertisements, the todo list, and the
-/// manifest of children whose state or latest authored event this wake is
-/// reacting to. The system prompt is never stored.
-fn system_prompt(
-    persona: Option<&str>,
-    repo_standards: &[String],
-    todos: &[Value],
-    skills: &[Skill],
-    live: &[LiveChild],
-    catalog: Option<Vec<(String, String)>>,
-) -> String {
-    let mut prompt = persona.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string();
-    if !repo_standards.is_empty() {
-        prompt.push_str(&format!(
-            "\n\nRepo standards present: {}. The contents are not in this context; \
-             read the files with the file tools when your task needs them.",
-            repo_standards.join(", ")
-        ));
-    }
-    if let Some(catalog) = catalog {
-        prompt.push_str("\n\nPersonas you may spawn:");
-        for (name, description) in catalog {
-            if description.is_empty() {
-                prompt.push_str(&format!("\n- {name}"));
-            } else {
-                prompt.push_str(&format!("\n- {name}: {description}"));
-            }
-        }
-    }
-    if !skills.is_empty() {
-        prompt.push_str("\n\nSkills available in this session:");
-        for skill in skills {
-            prompt.push_str(&format!("\n{}", skill_ad_line(skill)));
-        }
-    }
-    if !todos.is_empty() {
-        prompt.push_str("\n\nCurrent todo list:");
-        for (index, todo) in todos.iter().enumerate() {
-            let content = todo["content"].as_str().unwrap_or_default();
-            let status = todo["status"].as_str().unwrap_or_default();
-            prompt.push_str(&format!("\n{index}. [{status}] {content}"));
-        }
-    }
-    if !live.is_empty() {
-        prompt.push_str("\n\nLive children:");
-        for child in live {
-            let persona = child.persona.as_deref().unwrap_or("default");
-            let last = child.last_authored.as_deref().unwrap_or("none");
-            prompt.push_str(&format!(
-                "\n- {} (persona: {persona}, state: {}, last message: {last})",
-                child.id,
-                state_name(child.state)
-            ));
-        }
-        prompt.push_str("\n\n");
-        prompt.push_str(WAITING_RULE);
-    }
-    prompt
-}
-
-/// A session state as the manifest renders it: the wire-format names the
-/// store uses.
-fn state_name(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Creating => "creating",
-        SessionState::Running => "running",
-        SessionState::WaitingForInput => "waiting_for_input",
-        SessionState::Interrupted => "interrupted",
-        SessionState::Stopped => "stopped",
-    }
 }
 
 #[cfg(test)]
@@ -3898,56 +3789,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn skill_ad_line_renders_working_copy_provenance() {
-        let skill = Skill {
-            name: "my-skill".into(),
-            description: "Does things".into(),
-            package: None,
-        };
-        assert_eq!(
-            skill_ad_line(&skill),
-            "- my-skill (working copy): Does things"
-        );
-    }
-
-    #[test]
-    fn skill_ad_line_renders_the_package_address_for_a_remote_skill() {
-        let skill = Skill {
-            name: "checkout".into(),
-            description: "does checkout".into(),
-            package: Some("github.com/owner/acme/tools/skills/checkout".into()),
-        };
-        assert_eq!(
-            skill_ad_line(&skill),
-            "- checkout (github.com/owner/acme/tools/skills/checkout): does checkout"
-        );
-    }
-
-    #[test]
-    fn skill_ad_line_truncates_the_description_at_the_cap() {
-        let skill = Skill {
-            name: "wordy".into(),
-            description: "x".repeat(600),
-            package: None,
-        };
-        assert_eq!(
-            skill_ad_line(&skill),
-            format!("- wordy (working copy): {}", "x".repeat(500)),
-            "the advertisement keeps only the first 500 characters"
-        );
-        let unicode = Skill {
-            name: "accented".into(),
-            description: "é".repeat(600),
-            package: None,
-        };
-        assert_eq!(
-            skill_ad_line(&unicode),
-            format!("- accented (working copy): {}", "é".repeat(500)),
-            "the truncation cuts at a character boundary"
-        );
-    }
-
     #[tokio::test]
     async fn remote_skill_packages_from_the_store_are_advertised_and_cached_per_session() {
         let dir = tempdir().unwrap();
@@ -5298,24 +5139,23 @@ mod tests {
         .await;
 
         let calls = provider.captured_calls();
+        let system = &calls[0].system;
+        let contract_at = system
+            .find(crate::prompt::HARNESS_CONTRACT)
+            .expect("the harness contract is present");
+        let persona_at = system
+            .find("You are a meticulous reviewer. Never edit files.")
+            .expect("the persona's prompt is present");
         assert!(
-            calls[0]
-                .system
-                .contains("You are a meticulous reviewer. Never edit files."),
-            "the persona's prompt is the system prompt's role layer: {}",
-            calls[0].system
-        );
-        assert!(
-            !calls[0].system.contains("You are Bosun"),
-            "the persona's prompt replaces the built-in default role text: {}",
-            calls[0].system
+            contract_at < persona_at,
+            "the contract comes before the persona: {system}"
         );
 
         handle.stop();
     }
 
     #[tokio::test]
-    async fn a_persona_without_a_prompt_keeps_the_default_role_text() {
+    async fn a_persona_without_a_prompt_keeps_the_contract() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
@@ -5352,10 +5192,10 @@ mod tests {
         .await;
 
         let calls = provider.captured_calls();
-        assert!(
-            calls[0].system.contains("You are Bosun"),
-            "a persona without a prompt file leaves the default role text: {}",
-            calls[0].system
+        assert_eq!(
+            calls[0].system,
+            crate::prompt::HARNESS_CONTRACT,
+            "a persona without a prompt file adds no role text"
         );
 
         handle.stop();
@@ -7953,7 +7793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_waiting_rule_is_stated_while_live_children_exist() {
+    async fn the_manifest_lists_live_children_until_they_are_handled() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("root-tw3")).await.unwrap();
@@ -8021,15 +7861,10 @@ mod tests {
             "the surfacing wake lists the stopped child: {}",
             calls[0].system
         );
-        assert!(
-            calls[0].system.contains(WAITING_RULE),
-            "a wake with live children states the waiting rule: {}",
-            calls[0].system
-        );
 
         // The next wake — a user message — no longer lists the child: the
         // completion was handled and the parent did not resume it, so the
-        // rule must be gone with the manifest.
+        // manifest is gone.
         store
             .append_message(
                 "root-tw3",
@@ -8055,11 +7890,6 @@ mod tests {
         assert!(
             !calls[1].system.contains("Live children:"),
             "no live children remain: {}",
-            calls[1].system
-        );
-        assert!(
-            !calls[1].system.contains(WAITING_RULE),
-            "a wake without live children does not state the waiting rule: {}",
             calls[1].system
         );
 

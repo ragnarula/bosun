@@ -4,6 +4,8 @@
 **Author:** Raghav
 
 > Superseded in part by sprint 008 (`../sprints/008-sessions-stop-stalling.md`, recorded in `../adrs/2026-09-06-mid-wake-child-visibility.md`): an event that lands mid-wake is visible to the next turn of the running wake instead of surfacing only in the wake it queued, and a parent waits for a child by ending its turn rather than with the tools it already has. The persona, ask-gating, and transport decisions stand.
+>
+> Superseded in part by `2026-09-12-layered-system-prompt.md`: the sentence below that a persona's prompt file is the session's system prompt, and that a persona without a prompt file falls back to the loop's default system text, no longer holds. The harness contract is fixed and first, and the persona file is the role layer appended after it, which cannot override the contract. The remaining persona decisions, and the permission, persona-switch, tree, and transport decisions, stand.
 
 ## Context
 

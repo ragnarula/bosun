@@ -34,8 +34,7 @@ listen_addr = "127.0.0.1:8090"
 # description = "Makes changes directly"
 
 # A persona's role/behaviour prompt is optional: drop a file named
-# <data dir>/personas/<persona name>.md and its text becomes that persona's
-# system prompt. Without a file the session uses the built-in default.
+# <data dir>/personas/<persona name>.md. See docs/developer/config.md.
 
 # The persona sessions use when none is given.
 # default_persona = "coder"
