@@ -340,12 +340,19 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    width: 100%;
+    text-align: left;
     padding: 10px 14px 10px 26px;
+    border: none;
     border-bottom: 1px solid var(--border);
+    border-radius: 0;
     background: none;
+    font: inherit;
     font-size: 12px;
     color: var(--muted);
+    cursor: pointer;
   }
+  #session-list .child-row:active { background: var(--panel-2); }
   #session-list .child-row[hidden] { display: none; }
   #session-list .child-row .child-note {
     flex: 1;
@@ -744,6 +751,7 @@
     overflow-wrap: anywhere;
     font-style: normal;
   }
+  #transcript .reasoning .body[hidden] { display: none; }
   #transcript .tool-result {
     margin: 0 0 6px 20px;
     border-left: 2px solid var(--border);
@@ -1980,10 +1988,12 @@ function appendSessionRow(session) {
 }
 
 // One banner line per child, flattened under its parent row: rows never
-// indent deeper than the one level the children tag opens. Child sessions
-// are watch-only, so the line is information, not a tap target.
+// indent deeper than the one level the children tag opens. A child is
+// watch-only, so tapping the line opens its own monitor rather than acting
+// on it.
 function childLine(child) {
-  const line = document.createElement('div');
+  const line = document.createElement('button');
+  line.type = 'button';
   line.className = 'child-row';
   const dot = document.createElement('span');
   dot.className = 'dot ' + child.state;
@@ -1992,6 +2002,7 @@ function childLine(child) {
   note.className = 'child-note';
   note.textContent = shortId(child.id) + ' · ' + child.state + ' · watch-only';
   line.appendChild(note);
+  line.addEventListener('click', () => openSession(child.id));
   return line;
 }
 
@@ -3321,7 +3332,10 @@ function appendDelta(text) {
 }
 
 function closeLive() {
-  liveEl = null;
+  if (liveEl) {
+    liveEl.remove();
+    liveEl = null;
+  }
 }
 
 function askBoxKey(block) {
@@ -3395,18 +3409,10 @@ function renderMessage(message) {
     scheduleAskSync();
     return;
   }
-  // Tool-streamed output streams into a live assistant paragraph while the
-  // executor runs; it is tool output, not assistant prose, so the moment a
-  // durable tool frame lands the live paragraph is dropped rather than left
-  // in the transcript. The full output still lives inside the collapsed strip.
-  if (block.kind === 'tool_call' || block.kind === 'tool_result') {
-    if (liveEl) {
-      liveEl.remove();
-      liveEl = null;
-    }
-  } else {
-    closeLive();
-  }
+  // A durable block supersedes the streamed live paragraph. Text replaces it
+  // above; any other kind held tool output or reasoning, not assistant prose,
+  // so the paragraph is dropped rather than left in the transcript.
+  closeLive();
   switch (block.kind) {
     case 'text':
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
