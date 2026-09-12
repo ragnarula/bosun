@@ -573,6 +573,7 @@
     align-items: center;
     gap: 8px;
     font-size: 13px;
+    cursor: pointer;
   }
   .view-header .view-title .dot { flex: 0 0 auto; }
   .view-header .view-title .view-main { flex: 1; min-width: 0; }
@@ -588,6 +589,7 @@
     font-size: 12px;
     color: var(--warn);
   }
+  .view-header .view-title .view-waiting.running { color: var(--text); }
   .view-header .view-title .view-waiting[hidden] { display: none; }
   .view-header .btn-more {
     min-height: 40px;
@@ -669,6 +671,30 @@
     -webkit-tap-highlight-color: transparent;
   }
   #watch-banner button:active { background: var(--panel-2); border-color: var(--accent); }
+  /* The debug console: a monospace activity log between the header and the
+     transcript, closed by default and toggled from the status line. */
+  #activity-log {
+    flex: 0 1 auto;
+    max-height: 40%;
+    overflow-y: auto;
+    padding: 8px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  #activity-log[hidden] { display: none; }
+  #activity-log .activity-row { display: flex; gap: 8px; white-space: nowrap; }
+  #activity-log .activity-label { flex: 0 0 auto; }
+  #activity-log .activity-detail {
+    flex: 1;
+    min-width: 0;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #activity-log .activity-duration { flex: 0 0 auto; color: var(--muted); }
   #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
   #transcript .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* User and assistant messages carry a left accent gutter like opencode's
@@ -1083,6 +1109,7 @@
     </div>
     <button type="button" class="btn-more" id="btn-more" title="Session actions">⋯</button>
   </header>
+  <div id="activity-log" hidden></div>
   <div id="transcript"></div>
   <div id="watch-banner" hidden>
     <div class="watch-note">watching child session — it is read-only</div>
@@ -1192,7 +1219,9 @@ const viewStateDot = $('view-state-dot');
 
 const viewNode = $('view-node');
 const viewDir = $('view-dir');
+const viewTitle = $('view-title');
 const viewWaiting = $('view-waiting');
+const activityLog = $('activity-log');
 const btnBack = $('btn-back');
 const viewSheet = $('view-sheet');
 const btnMore = $('btn-more');
@@ -1239,6 +1268,8 @@ let nodeOptionsSignature = null;
 let personas = [];
 let sessions = [];
 let current = null;   // the open session id
+let viewState = null; // the open session's last known state
+let statusTick = null; // the 1s header-label interval for the open session
 let es = null;        // the open EventSource
 let liveEl = null;    // the assistant paragraph live deltas stream into
 let stick = true;     // auto-scroll the transcript when true
@@ -1248,6 +1279,11 @@ let dirPath = null;   // null = the node's browse roots
 let dirListing = null;
 let skillRepos = [];
 let skillReposFetching = false;
+// Loop-activity frames received for the open session, fed to the debug
+// console and the status indicator. Activity never enters the transcript.
+// The buffer is capped and drops the oldest; the store holds the full record.
+const MAX_ACTIVITIES = 5000;
+let activities = [];
 
 // The composer's chosen directory is a plain span, not an input: `value`
 // keeps the submit-facing property, textContent is what the user sees, and
@@ -1763,14 +1799,130 @@ function liveChildCount(session) {
   ).length;
 }
 
+// The visible label for a loop-activity phase. Activity detail fields flatten
+// beside `phase` on the wire. `wake_dropped` has no phase to show, so the
+// caller falls back to the state name. Mirrors the terminal client's labels.
+function phaseLabel(activity) {
+  switch (activity.phase) {
+    case 'wake_started': return 'working';
+    case 'request_sent': return 'awaiting model';
+    case 'first_token': return 'receiving reply';
+    case 'response_complete': return 'processing reply';
+    case 'tool_started': return 'running tool ' + activity.name;
+    case 'tool_finished': return 'ran tool ' + activity.name;
+    case 'empty_retry':
+      return 'retrying empty reply (' + activity.attempt + '/' + activity.limit + ')';
+    case 'compaction_started': return 'compacting';
+    case 'compaction_finished': return 'finishing compaction';
+    default: return null;
+  }
+}
+
+// The running status text: the newest phase label plus the elapsed seconds
+// counted from when the frame arrived locally. The wire `at_ms` orders the
+// history; clock skew must not distort the live counter.
+function runningStatus() {
+  const newest = activities[activities.length - 1];
+  if (!newest) return null;
+  const label = phaseLabel(newest);
+  if (!label) return null;
+  const elapsed = Math.max(0, Math.floor((Date.now() - newest.received) / 1000));
+  return label + ' · ' + elapsed + 's';
+}
+
+// The phase's detail, mirroring the terminal console's text.
+function phaseDetail(activity) {
+  switch (activity.phase) {
+    case 'wake_started': return '';
+    case 'wake_dropped': return activity.reason;
+    case 'request_sent': return activity.model + ' via ' + activity.provider;
+    case 'first_token': return activity.latency_ms + 'ms';
+    case 'response_complete': return activity.stop_reason;
+    case 'tool_started': return activity.name;
+    case 'tool_finished':
+      return activity.name + ' ' + (activity.ok ? 'ok' : 'failed') + ' ' + activity.elapsed_ms + 'ms';
+    case 'empty_retry':
+      return activity.attempt + '/' + activity.limit + ' ' + activity.reason;
+    case 'compaction_started': return activity.input_tokens + ' in';
+    case 'compaction_finished': return activity.retired_messages + ' retired';
+    default: return '';
+  }
+}
+
+// A duration for one console row: milliseconds under a second, whole seconds
+// above it, so the row stays short.
+function formatDuration(ms) {
+  return ms < 1000 ? ms + 'ms' : Math.floor(ms / 1000) + 's';
+}
+
+// The console's phase name. The status hides `wake_dropped`, but the console
+// lists every recorded phase, so a dropped wake still gets a name.
+function activityLabel(activity) {
+  return phaseLabel(activity) || 'wake dropped';
+}
+
+// One monospace row per activity: the phase label, its detail, and the time
+// since the previous row derived from `at_ms`. The first row has no previous
+// row, so it carries no duration.
+function appendActivityRow(activity, previous) {
+  const row = document.createElement('div');
+  row.className = 'activity-row';
+  const label = document.createElement('span');
+  label.className = 'activity-label';
+  label.textContent = activityLabel(activity);
+  row.appendChild(label);
+  const detail = phaseDetail(activity);
+  if (detail) {
+    const detailEl = document.createElement('span');
+    detailEl.className = 'activity-detail';
+    detailEl.textContent = detail;
+    row.appendChild(detailEl);
+  }
+  if (previous) {
+    const duration = document.createElement('span');
+    duration.className = 'activity-duration';
+    duration.textContent = '+' + formatDuration(Math.max(0, activity.at_ms - previous.at_ms));
+    row.appendChild(duration);
+  }
+  activityLog.appendChild(row);
+}
+
+function renderActivityConsole() {
+  activityLog.textContent = '';
+  activities.forEach((activity, index) => {
+    appendActivityRow(activity, index > 0 ? activities[index - 1] : null);
+  });
+  activityLog.scrollTop = activityLog.scrollHeight;
+}
+
 // A waiting session with live children announces that it is waiting for
-// them; any other state is named by its dot alone. The freshest list wins,
-// so a child's report is reflected here between polls.
-function liveChildrenLabel(session) {
+// them; a running session names its newest loop phase when one is known; any
+// other state is named by its dot alone. The freshest list wins, so a child's
+// report is reflected here between polls. A caller with no live phase (the
+// session-list row) passes none and gets the plain state.
+function liveChildrenLabel(session, running = null) {
+  if (session.state === 'running' && running) return running;
   const count = liveChildCount(session);
   return session.state === 'waiting_for_input' && count > 0
     ? 'waiting for children (' + count + ')'
     : session.state;
+}
+
+// Writes the header's state label. The state dot names the state; this span
+// carries the waiting-for-children or running-phase text, and hides when the
+// state alone says it.
+function updateStatusLabel(session) {
+  const running = runningStatus();
+  const label = liveChildrenLabel(session, running);
+  viewWaiting.hidden = label === session.state;
+  viewWaiting.textContent = label;
+  viewWaiting.classList.toggle('running', session.state === 'running' && !!running);
+}
+
+// The elapsed counter advances once a second while a session is open; the
+// state events and the session poll alone would leave it stale.
+function refreshStatusLabel() {
+  if (current && viewState) updateStatusLabel({ id: current, state: viewState });
 }
 
 // Active first, then past: newly creating, running and waiting sessions
@@ -2146,9 +2298,8 @@ async function refreshSessions() {
       closeSession();
     } else if (viewed && !view.hidden) {
       viewStateDot.className = 'dot ' + viewed.state;
-      const waiting = liveChildrenLabel(viewed);
-      viewWaiting.hidden = waiting === viewed.state;
-      viewWaiting.textContent = waiting;
+      viewState = viewed.state;
+      updateStatusLabel(viewed);
     }
   } catch (error) {
     showStatus('sessions: ' + error.message);
@@ -2347,6 +2498,7 @@ function openSession(id) {
   es.onerror = () => {
     showStatus('events: stream lost, reconnecting');
   };
+  statusTick = window.setInterval(refreshStatusLabel, 1000);
   // The chat draft survives closing the session; restore it here so the
   // resumed session starts where the user left off.
   input.value = loadDraft();
@@ -2359,9 +2511,15 @@ function closeSession() {
     es = null;
   }
   current = null;
+  viewState = null;
   liveEl = null;
   lastMsg = null;
+  activities = [];
+  activityLog.hidden = true;
+  activityLog.textContent = '';
   openAskBox = null;
+  if (statusTick) window.clearInterval(statusTick);
+  statusTick = null;
   if (askSyncTimer) window.clearTimeout(askSyncTimer);
   askSyncTimer = null;
   transcript.textContent = '';
@@ -2386,14 +2544,11 @@ async function fetchSession(id) {
 
 function updateHeader(session) {
   viewStateDot.className = 'dot ' + session.state;
+  viewState = session.state;
   viewNode.textContent = session.node;
   viewDir.textContent = session.dir;
   viewIdCopy.textContent = session.id;
-  // The state dot names the state; a waiting session adds who it waits for,
-  // and it is hidden the instant there is nothing left to wait on.
-  const waiting = liveChildrenLabel(session);
-  viewWaiting.hidden = waiting === session.state;
-  viewWaiting.textContent = waiting;
+  updateStatusLabel(session);
   updatePermissionBadge(session.permission);
   // Model and persona are session facts, shown once in the ⋯ sheet; the
   // transcript never repeats them as separator lines.
@@ -2476,6 +2631,13 @@ btnStop.addEventListener('click', async () => {
 // The thin header's back arrow returns to the session list; the sheet stays
 // closed until the user opens it with ⋯.
 btnBack.addEventListener('click', closeSession);
+
+// The status/phase line toggles the debug console. Opening it replays the
+// buffered activity rows, so a session watched after the fact shows history.
+viewTitle.addEventListener('click', () => {
+  activityLog.hidden = !activityLog.hidden;
+  if (!activityLog.hidden) renderActivityConsole();
+});
 
 btnMore.addEventListener('click', () => {
   viewSheet.hidden = false;
@@ -3300,6 +3462,22 @@ function renderMessage(message) {
   scheduleAskSync();
 }
 
+// The transcript line for a model call. Mirrors the terminal's `event_lines`
+// in `cmd/bosun/src/attach.rs`: the model, the call kind, and only the counts
+// that are present, with the cost at four decimals. The wire field for the
+// Rust `kind` is `call_kind`, renamed to avoid the event's own `kind` tag.
+function modelCallLine(event) {
+  const parts = [];
+  if (event.input_tokens != null) parts.push(event.input_tokens + ' in');
+  if (event.output_tokens != null) parts.push(event.output_tokens + ' out');
+  // The terminal formats the cost with Rust's `{:.4}` (half to even), this
+  // uses `toFixed(4)` (half away from zero). The two differ only on an exact
+  // half at the fourth decimal; the difference is accepted for display.
+  if (event.cost != null) parts.push('$' + event.cost.toFixed(4));
+  const detail = parts.length ? ' (' + parts.join(', ') + ')' : '';
+  return event.model + ' ' + event.call_kind + detail;
+}
+
 function handleEvent(event) {
   switch (event.kind) {
     case 'message':
@@ -3309,11 +3487,8 @@ function handleEvent(event) {
       // The current state lives once, in the header dot; a transcript line
       // would repeat what is already on screen.
       viewStateDot.className = 'dot ' + event.state;
-      if (current) {
-        const waiting = liveChildrenLabel({ id: current, state: event.state });
-        viewWaiting.hidden = waiting === event.state;
-        viewWaiting.textContent = waiting;
-      }
+      viewState = event.state;
+      if (current) updateStatusLabel({ id: current, state: event.state });
       break;
     case 'permission':
       updatePermissionBadge(event.permission);
@@ -3323,9 +3498,29 @@ function handleEvent(event) {
       // added to the transcript.
       break;
     case 'model_call':
-      // Model calls are metering history, not conversation: the model is a
-      // session fact shown in the ⋯ sheet. No separator line is appended.
+      // Model calls are metering history, not conversation: the line is
+      // transcript bookkeeping, never a message or an activity-console row.
+      appendLine('mono', modelCallLine(event));
       break;
+    case 'activity': {
+      // Loop activity is machinery, not conversation: it feeds the debug
+      // console and the phase indicator, and never the transcript. The local
+      // receipt time is stamped for the elapsed counter.
+      event.received = Date.now();
+      const previous = activities[activities.length - 1];
+      activities.push(event);
+      if (activities.length > MAX_ACTIVITIES) {
+        activities.shift();
+        // The console mirrors the capped buffer, so drop the oldest row too.
+        if (activityLog.firstChild) activityLog.removeChild(activityLog.firstChild);
+      }
+      if (!activityLog.hidden) {
+        appendActivityRow(event, previous);
+        activityLog.scrollTop = activityLog.scrollHeight;
+      }
+      if (current && viewState) updateStatusLabel({ id: current, state: viewState });
+      break;
+    }
   }
 }
 

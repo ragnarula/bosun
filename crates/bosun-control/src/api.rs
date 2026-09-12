@@ -4854,6 +4854,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_stream_replays_and_polls_activity_events() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_event(
+                "s1",
+                &Event::Activity {
+                    at_ms: 1_700_000_000_000,
+                    phase: bosun_common::session::ActivityPhase::WakeStarted,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The second activity is appended only once the client has received
+        // the replayed first one, so it cannot be part of the connect's
+        // replay: it can only arrive on the poll that follows.
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let writer = store.clone();
+        tokio::spawn(async move {
+            if received_rx.recv().await.is_some() {
+                writer
+                    .append_event(
+                        "s1",
+                        &Event::Activity {
+                            at_ms: 1_700_000_000_001,
+                            phase: bosun_common::session::ActivityPhase::WakeDropped {
+                                reason: "redundant".into(),
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut received = Some(received_tx);
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/s1/events"))
+                .send()
+                .await
+                .unwrap(),
+            move |frames| {
+                if frames
+                    .iter()
+                    .any(|frame| frame.data["event"]["phase"] == "wake_started")
+                    && let Some(tx) = received.take()
+                {
+                    let _ = tx.send(());
+                }
+                frames
+                    .iter()
+                    .any(|frame| frame.data["event"]["phase"] == "wake_dropped")
+            },
+        )
+        .await;
+
+        // Replay: an activity appended before the connect arrives from the
+        // store, carrying its phase and its payload timestamp.
+        let replayed = frames
+            .iter()
+            .find(|frame| frame.data["event"]["phase"] == "wake_started")
+            .expect("the activity event is replayed from the store");
+        assert_eq!(replayed.data["event"]["kind"], "activity");
+        assert_eq!(replayed.data["event"]["at_ms"], 1_700_000_000_000_i64);
+        let seq = replayed.data["seq"].as_i64().expect("a seq");
+        assert_eq!(replayed.id.as_deref(), Some(seq.to_string().as_str()));
+
+        // Poll: an activity appended while attached arrives on the open
+        // connection, past the replay.
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.data["event"]["phase"] == "wake_dropped"),
+            "the poll delivers an activity appended while attached"
+        );
+    }
+
+    #[tokio::test]
     async fn events_stream_delivers_the_terminal_state_live() {
         let provider_addr = fake_provider_with_delay(Duration::from_millis(800)).await;
         let dir = tempdir().unwrap();

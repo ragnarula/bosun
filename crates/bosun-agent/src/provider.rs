@@ -60,6 +60,17 @@ pub enum StopReason {
     Other,
 }
 
+impl StopReason {
+    /// The reason's wire-format name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopReason::StopResponse => "stop_response",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),

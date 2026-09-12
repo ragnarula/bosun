@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use bosun_agent::sse::SseError;
 use bosun_agent::sse::SseEvent;
 use bosun_agent::sse::sse_stream;
+use bosun_common::session::ActivityPhase;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
 use bosun_common::session::Event;
@@ -66,6 +68,10 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// line. A second or two of staleness is fine: the label is read, not acted
 /// on, and the state events already redraw it on change.
 const LIVE_CHILDREN_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the status line redraws so the running phase's elapsed counter
+/// advances without a stream or input event. Only a running session with
+/// activity redraws.
+const ACTIVITY_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a tool call's inline args or result may render before it is cut.
 /// The TUI row is final — there is no click to expand — so the cap is generous.
 /// The web pane clips its result preview at `TOOL_RESULT_PREVIEW` (400) instead,
@@ -73,6 +79,9 @@ const LIVE_CHILDREN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_INLINE_CHARS: usize = 1000;
 /// Transcript rows kept in memory; the oldest rows scroll away.
 const MAX_LINES: usize = 5000;
+/// Activity rows kept in client state; the oldest drop when the cap is hit.
+/// The durable store holds the full record.
+const MAX_ACTIVITIES: usize = 5000;
 /// How long one client POST may take before the terminal gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum characters the input line may hold.
@@ -106,6 +115,16 @@ pub struct Line {
     pub text: String,
 }
 
+/// One loop-activity phase received over the stream, with the local time it
+/// arrived. The elapsed counter counts from `received`, not `at_ms`, so a
+/// clock-skewed timestamp cannot distort it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityRecord {
+    pub at_ms: u64,
+    pub phase: ActivityPhase,
+    pub received: Instant,
+}
+
 /// A question the attached session is live-asking: the last durable message
 /// is an unanswered ask, so the session is waiting for an answer. While it is
 /// set, the input box title names the ask, Enter answers it, and an empty
@@ -130,6 +149,10 @@ pub struct ClientState {
     /// The question the session is live-asking, when its last message is an
     /// unanswered ask. Cleared the moment any other message resolves it.
     pub live_ask: Option<LiveAsk>,
+    /// The loop-activity phases received, each with its `at_ms`. It feeds the
+    /// waiting indicator and the debug console; activity never enters the
+    /// transcript.
+    pub activities: Vec<ActivityRecord>,
 }
 
 impl ClientState {
@@ -142,6 +165,7 @@ impl ClientState {
             permission,
             session_state,
             live_ask: None,
+            activities: Vec::new(),
         }
     }
 
@@ -158,6 +182,13 @@ impl ClientState {
         }
         if let Event::State { state } = event {
             self.session_state = *state;
+        }
+        if let Event::Activity { at_ms, phase } = event {
+            self.push_activity(ActivityRecord {
+                at_ms: *at_ms,
+                phase: phase.clone(),
+                received: Instant::now(),
+            });
         }
         if matches!(
             event,
@@ -212,6 +243,21 @@ impl ClientState {
             self.lines.remove(0);
         }
         self.lines.push(line);
+    }
+
+    fn push_activity(&mut self, activity: ActivityRecord) {
+        if self.activities.len() >= MAX_ACTIVITIES {
+            self.activities.remove(0);
+        }
+        self.activities.push(activity);
+    }
+
+    /// The newest activity's phase with the seconds since it arrived locally.
+    /// `at_ms` is never used, so clock skew cannot distort the counter.
+    fn newest_activity(&self, now: Instant) -> Option<(&ActivityPhase, u64)> {
+        let newest = self.activities.last()?;
+        let elapsed_secs = now.saturating_duration_since(newest.received).as_secs();
+        Some((&newest.phase, elapsed_secs))
     }
 }
 
@@ -336,6 +382,9 @@ fn event_lines(event: &Event) -> Vec<Line> {
                 text: format!("{model} {kind}{detail}"),
             }]
         }
+        // Activity is loop machinery, not conversation: the console and the
+        // status indicator read it, and it never becomes a transcript line.
+        Event::Activity { .. } => Vec::new(),
     }
 }
 
@@ -596,6 +645,8 @@ pub struct App {
     pick_persona: bool,
     /// The highlighted option in the open picker.
     pick_index: usize,
+    /// The debug activity console is open and renders over the transcript.
+    show_console: bool,
     /// The count of the attached session's direct children that can still
     /// act, for the status line's waiting-for-children label. Refreshed
     /// while attached from the session list.
@@ -623,6 +674,7 @@ impl App {
             persona_error: None,
             pick_persona: false,
             pick_index: 0,
+            show_console: false,
             live_children: 0,
         }
     }
@@ -724,7 +776,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         let title = if app.state.live_ask.is_some() {
             "question — Enter answers · ^R rejects · esc/^C interrupt".to_string()
         } else {
-            "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll".to_string()
+            "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^D console  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll".to_string()
         };
         Paragraph::new(text)
             .block(
@@ -735,7 +787,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             .wrap(Wrap { trim: false })
     } else {
         Paragraph::new(TuiLine::from(Span::styled(
-            "watch-only: this session is a child; it renders here but accepts no input. esc/^C/^Q quit · pgup/pgdn scroll",
+            "watch-only: this session is a child; it renders here but accepts no input. esc/^C/^Q quit · ^D console · pgup/pgdn scroll",
             Style::default().fg(Color::DarkGray),
         )))
         .block(
@@ -755,6 +807,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
     if app.pick_persona {
         render_persona_picker(frame, output, app);
+    }
+    if app.show_console {
+        render_activity_console(frame, output, app);
     }
 }
 
@@ -822,20 +877,183 @@ fn render_persona_picker(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     }
 }
 
-/// The status-line state text: a session parked while its children can still
-/// act names them, every other state renders as its wire name.
-fn state_label(session_state: SessionState, live_children: usize) -> String {
-    match (session_state, live_children) {
-        (SessionState::WaitingForInput, count) if count > 0 => {
-            format!("waiting for children ({count})")
+/// The phase's detail for a console row.
+fn phase_detail(phase: &ActivityPhase) -> String {
+    match phase {
+        ActivityPhase::WakeStarted => String::new(),
+        ActivityPhase::WakeDropped { reason } => reason.clone(),
+        ActivityPhase::RequestSent { model, provider } => format!("{model} via {provider}"),
+        ActivityPhase::FirstToken { latency_ms } => format!("{latency_ms}ms"),
+        ActivityPhase::ResponseComplete { stop_reason } => stop_reason.clone(),
+        ActivityPhase::ToolStarted { name } => name.clone(),
+        ActivityPhase::ToolFinished {
+            name,
+            ok,
+            elapsed_ms,
+        } => {
+            let outcome = if *ok { "ok" } else { "failed" };
+            format!("{name} {outcome} {elapsed_ms}ms")
         }
-        (state, _) => state_name(state).to_string(),
+        ActivityPhase::EmptyRetry {
+            attempt,
+            limit,
+            reason,
+        } => format!("{attempt}/{limit} {reason}"),
+        ActivityPhase::CompactionStarted { input_tokens } => format!("{input_tokens} in"),
+        ActivityPhase::CompactionFinished { retired_messages } => {
+            format!("{retired_messages} retired")
+        }
+    }
+}
+
+/// A duration for a console row: milliseconds under a second, whole seconds
+/// above it, so the row stays short.
+fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{}s", ms / 1000)
+    }
+}
+
+/// The console's phase name. The status hides `wake_dropped`, but the console
+/// lists every recorded phase, so a dropped wake still gets a name.
+fn console_label(phase: &ActivityPhase) -> String {
+    phase_label(phase).unwrap_or_else(|| "wake dropped".to_string())
+}
+
+/// One console row per activity: the phase label, its detail, and the time
+/// since the previous activity derived from `at_ms`. The detail is clipped to
+/// the space left in `width`, so a long detail never pushes the duration off
+/// the row. The first row has no previous row, so it carries no duration.
+fn console_rows(activities: &[ActivityRecord], width: usize) -> Vec<String> {
+    activities
+        .iter()
+        .enumerate()
+        .map(|(index, activity)| {
+            let label = console_label(&activity.phase);
+            let duration = index
+                .checked_sub(1)
+                .map(|previous| {
+                    format!(
+                        "  +{}",
+                        format_duration(activity.at_ms.saturating_sub(activities[previous].at_ms))
+                    )
+                })
+                .unwrap_or_default();
+            let detail = phase_detail(&activity.phase);
+            let detail_budget = width
+                .saturating_sub(label.chars().count())
+                .saturating_sub(duration.chars().count())
+                .saturating_sub(2);
+            let mut row = label;
+            if !detail.is_empty() && detail_budget > 0 {
+                row.push_str("  ");
+                if detail.chars().count() <= detail_budget {
+                    row.push_str(&detail);
+                } else {
+                    row.push_str(&clip(&detail, detail_budget - 1));
+                }
+            }
+            row.push_str(&duration);
+            row
+        })
+        .collect()
+}
+
+/// The debug activity console: a bordered list of the loop's recorded phases
+/// drawn over the transcript. `render_persona_picker` draws the same kind of
+/// popup; the list scrolls to keep the newest row visible.
+fn render_activity_console(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let height = area.height.saturating_sub(2).max(3).min(area.height);
+    let width = area.width.saturating_sub(4).clamp(20, 120).min(area.width);
+    let popup = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let rows: Vec<TuiLine> = console_rows(
+        &app.state.activities,
+        popup.width.saturating_sub(2) as usize,
+    )
+    .into_iter()
+    .map(TuiLine::from)
+    .collect();
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(Some(rows.len() - 1));
+    }
+    frame.render_stateful_widget(
+        List::new(rows).block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title("activity (^D close)"),
+        ),
+        popup,
+        &mut state,
+    );
+}
+
+/// The visible label for a loop phase. `WakeDropped` has no phase to show, so
+/// the caller falls back to the state name.
+fn phase_label(phase: &ActivityPhase) -> Option<String> {
+    Some(match phase {
+        ActivityPhase::WakeStarted => "working".to_string(),
+        ActivityPhase::RequestSent { .. } => "awaiting model".to_string(),
+        ActivityPhase::FirstToken { .. } => "receiving reply".to_string(),
+        ActivityPhase::ResponseComplete { .. } => "processing reply".to_string(),
+        ActivityPhase::ToolStarted { name } => format!("running tool {name}"),
+        ActivityPhase::ToolFinished { name, .. } => format!("ran tool {name}"),
+        ActivityPhase::EmptyRetry { attempt, limit, .. } => {
+            format!("retrying empty reply ({attempt}/{limit})")
+        }
+        ActivityPhase::CompactionStarted { .. } => "compacting".to_string(),
+        ActivityPhase::CompactionFinished { .. } => "finishing compaction".to_string(),
+        ActivityPhase::WakeDropped { .. } => return None,
+    })
+}
+
+/// The running status text: the newest phase label plus the elapsed whole
+/// seconds, or None when there is no phase to show. It takes no clock, so the
+/// formatted label is testable directly.
+fn activity_status(phase: Option<&ActivityPhase>, elapsed_secs: u64) -> Option<String> {
+    let label = phase_label(phase?)?;
+    Some(format!("{label} · {elapsed_secs}s"))
+}
+
+/// The status-line state text: a running session names its newest loop phase
+/// with the elapsed time, a session parked while its children can still act
+/// names them, and every other state renders as its wire name.
+fn state_label(
+    session_state: SessionState,
+    live_children: usize,
+    phase: Option<&ActivityPhase>,
+    elapsed_secs: u64,
+) -> String {
+    match session_state {
+        SessionState::Running => activity_status(phase, elapsed_secs)
+            .unwrap_or_else(|| state_name(session_state).to_string()),
+        SessionState::WaitingForInput if live_children > 0 => {
+            format!("waiting for children ({live_children})")
+        }
+        state => state_name(state).to_string(),
     }
 }
 
 fn status_line(app: &App) -> TuiLine<'static> {
     let id = clip(&app.session.id, 12);
-    let state = state_label(app.state.session_state, app.live_children);
+    let (phase, elapsed_secs) = match app.state.newest_activity(Instant::now()) {
+        Some((phase, elapsed_secs)) => (Some(phase), elapsed_secs),
+        None => (None, 0),
+    };
+    let state = state_label(
+        app.state.session_state,
+        app.live_children,
+        phase,
+        elapsed_secs,
+    );
     let connection = if app.connected {
         "connected"
     } else {
@@ -1119,6 +1337,8 @@ async fn stream_events(
     // The first tick completes immediately; the count was just fetched at
     // attach, so skip it and tick on the real cadence from here.
     children_interval.tick().await;
+    let mut activity_interval = tokio::time::interval(ACTIVITY_TICK_INTERVAL);
+    activity_interval.tick().await;
     loop {
         tokio::select! {
             event = input_rx.recv() => {
@@ -1143,6 +1363,13 @@ async fn stream_events(
                     && count != app.live_children
                 {
                     app.live_children = count;
+                    redraw(terminal, app)?;
+                }
+            }
+            _ = activity_interval.tick() => {
+                if app.state.session_state == SessionState::Running
+                    && !app.state.activities.is_empty()
+                {
                     redraw(terminal, app)?;
                 }
             }
@@ -1191,6 +1418,10 @@ async fn handle_key(
             KeyCode::Esc => Ok(Action::Exit),
             KeyCode::Char('c' | 'q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Ok(Action::Exit)
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.show_console = !app.show_console;
+                Ok(Action::Continue)
             }
             KeyCode::PageUp => {
                 app.follow = false;
@@ -1249,6 +1480,10 @@ async fn handle_key(
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             interrupt(app, client, cp_url, session_id).await;
+            Ok(Action::Continue)
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.show_console = !app.show_console;
             Ok(Action::Continue)
         }
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1634,15 +1869,119 @@ mod tests {
     #[test]
     fn state_label_renders_waiting_for_children_only_when_parked_with_live_children() {
         assert_eq!(
-            state_label(SessionState::WaitingForInput, 0),
+            state_label(SessionState::WaitingForInput, 0, None, 0),
             "waiting_for_input"
         );
         assert_eq!(
-            state_label(SessionState::WaitingForInput, 2),
+            state_label(SessionState::WaitingForInput, 2, None, 0),
             "waiting for children (2)"
         );
-        assert_eq!(state_label(SessionState::Running, 2), "running");
-        assert_eq!(state_label(SessionState::Stopped, 1), "stopped");
+        assert_eq!(state_label(SessionState::Stopped, 1, None, 0), "stopped");
+    }
+
+    #[test]
+    fn state_label_names_the_running_phase_with_the_elapsed() {
+        let request = ActivityPhase::RequestSent {
+            model: "alpha".into(),
+            provider: "x".into(),
+        };
+        assert_eq!(
+            state_label(SessionState::Running, 0, Some(&request), 4),
+            "awaiting model · 4s"
+        );
+
+        let tool = ActivityPhase::ToolStarted {
+            name: "file_read".into(),
+        };
+        assert_eq!(
+            state_label(SessionState::Running, 0, Some(&tool), 7),
+            "running tool file_read · 7s"
+        );
+
+        let retry = ActivityPhase::EmptyRetry {
+            attempt: 2,
+            limit: 3,
+            reason: "stop_response".into(),
+        };
+        assert_eq!(
+            state_label(SessionState::Running, 0, Some(&retry), 1),
+            "retrying empty reply (2/3) · 1s"
+        );
+    }
+
+    #[test]
+    fn state_label_maps_every_phased_activity() {
+        let cases = [
+            (ActivityPhase::WakeStarted, "working"),
+            (
+                ActivityPhase::FirstToken { latency_ms: 5 },
+                "receiving reply",
+            ),
+            (
+                ActivityPhase::ResponseComplete {
+                    stop_reason: "stop_response".into(),
+                },
+                "processing reply",
+            ),
+            (
+                ActivityPhase::ToolFinished {
+                    name: "shell".into(),
+                    ok: true,
+                    elapsed_ms: 1,
+                },
+                "ran tool shell",
+            ),
+            (
+                ActivityPhase::CompactionStarted { input_tokens: 1 },
+                "compacting",
+            ),
+            (
+                ActivityPhase::CompactionFinished {
+                    retired_messages: 2,
+                },
+                "finishing compaction",
+            ),
+        ];
+        for (phase, expected) in cases {
+            assert_eq!(
+                state_label(SessionState::Running, 0, Some(&phase), 9),
+                format!("{expected} · 9s")
+            );
+        }
+    }
+
+    #[test]
+    fn state_label_falls_back_to_running_without_a_phase() {
+        assert_eq!(state_label(SessionState::Running, 0, None, 0), "running");
+        let dropped = ActivityPhase::WakeDropped {
+            reason: "redundant".into(),
+        };
+        assert_eq!(
+            state_label(SessionState::Running, 0, Some(&dropped), 3),
+            "running"
+        );
+    }
+
+    #[test]
+    fn elapsed_counts_from_local_receipt_not_the_wire_timestamp() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::Running);
+        state.push_activity(ActivityRecord {
+            at_ms: 1_700_000_000_000,
+            phase: ActivityPhase::RequestSent {
+                model: "alpha".into(),
+                provider: "x".into(),
+            },
+            received: Instant::now() - Duration::from_secs(4),
+        });
+        let (phase, elapsed) = state.newest_activity(Instant::now()).expect("an activity");
+        assert_eq!(
+            *phase,
+            ActivityPhase::RequestSent {
+                model: "alpha".into(),
+                provider: "x".into(),
+            }
+        );
+        assert_eq!(elapsed, 4, "the elapsed counts from local receipt");
     }
 
     #[test]
@@ -1875,6 +2214,29 @@ mod tests {
     }
 
     #[test]
+    fn apply_sse_accepts_an_activity_frame_without_a_transcript_line() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::Running);
+        apply_sse(
+            &mut state,
+            &SseEvent {
+                event: None,
+                data: r#"{"seq":1,"event":{"kind":"activity","at_ms":1700000000000,"phase":"request_sent","model":"alpha","provider":"x"}}"#
+                    .into(),
+            },
+        );
+        assert_eq!(state.activities.len(), 1);
+        assert_eq!(state.activities[0].at_ms, 1_700_000_000_000);
+        assert_eq!(
+            state.activities[0].phase,
+            ActivityPhase::RequestSent {
+                model: "alpha".into(),
+                provider: "x".into(),
+            }
+        );
+        assert!(state.lines.is_empty(), "activity adds no transcript line");
+    }
+
+    #[test]
     fn event_lines_maps_each_durable_event_kind() {
         let text = Event::Message {
             message: Message {
@@ -2056,6 +2418,220 @@ mod tests {
                 text: "alpha completion (10 in, 2 out, $0.0100)".into(),
             }]
         );
+
+        let activity = Event::Activity {
+            at_ms: 1_700_000_000_000,
+            phase: ActivityPhase::WakeStarted,
+        };
+        assert_eq!(
+            event_lines(&activity),
+            Vec::new(),
+            "activity never becomes a transcript line"
+        );
+    }
+
+    #[test]
+    fn apply_event_records_an_activity_and_adds_no_transcript_line() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::Running);
+        let activity = Event::Activity {
+            at_ms: 1_700_000_000_000,
+            phase: ActivityPhase::RequestSent {
+                model: "alpha".into(),
+                provider: "x".into(),
+            },
+        };
+        assert!(state.apply_event(1, &activity));
+        assert_eq!(state.activities.len(), 1);
+        assert_eq!(state.activities[0].at_ms, 1_700_000_000_000);
+        assert_eq!(
+            state.activities[0].phase,
+            ActivityPhase::RequestSent {
+                model: "alpha".into(),
+                provider: "x".into(),
+            }
+        );
+        assert!(state.lines.is_empty(), "activity adds no transcript line");
+    }
+
+    #[test]
+    fn activity_buffer_drops_the_oldest_when_full() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::Running);
+        for index in 0..MAX_ACTIVITIES + 1 {
+            let event = Event::Activity {
+                at_ms: index as u64,
+                phase: ActivityPhase::WakeStarted,
+            };
+            assert!(state.apply_event(index as i64 + 1, &event));
+        }
+        assert_eq!(state.activities.len(), MAX_ACTIVITIES);
+        assert_eq!(
+            state.activities[0].at_ms, 1,
+            "the oldest activity is dropped"
+        );
+        assert_eq!(
+            state.activities[MAX_ACTIVITIES - 1].at_ms,
+            MAX_ACTIVITIES as u64,
+            "the newest activity is kept"
+        );
+    }
+
+    fn activity(at_ms: u64, phase: ActivityPhase) -> ActivityRecord {
+        ActivityRecord {
+            at_ms,
+            phase,
+            received: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn phase_detail_names_each_phase() {
+        let cases = [
+            (ActivityPhase::WakeStarted, ""),
+            (
+                ActivityPhase::WakeDropped {
+                    reason: "redundant".into(),
+                },
+                "redundant",
+            ),
+            (
+                ActivityPhase::RequestSent {
+                    model: "alpha".into(),
+                    provider: "x".into(),
+                },
+                "alpha via x",
+            ),
+            (ActivityPhase::FirstToken { latency_ms: 120 }, "120ms"),
+            (
+                ActivityPhase::ResponseComplete {
+                    stop_reason: "stop_response".into(),
+                },
+                "stop_response",
+            ),
+            (
+                ActivityPhase::ToolStarted {
+                    name: "shell".into(),
+                },
+                "shell",
+            ),
+            (
+                ActivityPhase::ToolFinished {
+                    name: "shell".into(),
+                    ok: false,
+                    elapsed_ms: 12,
+                },
+                "shell failed 12ms",
+            ),
+            (
+                ActivityPhase::EmptyRetry {
+                    attempt: 2,
+                    limit: 3,
+                    reason: "empty".into(),
+                },
+                "2/3 empty",
+            ),
+            (
+                ActivityPhase::CompactionStarted { input_tokens: 900 },
+                "900 in",
+            ),
+            (
+                ActivityPhase::CompactionFinished {
+                    retired_messages: 4,
+                },
+                "4 retired",
+            ),
+        ];
+        for (phase, expected) in cases {
+            assert_eq!(phase_detail(&phase), expected);
+        }
+    }
+
+    #[test]
+    fn console_rows_render_detail_and_a_duration_after_the_first() {
+        let rows = console_rows(
+            &[
+                activity(
+                    1_000,
+                    ActivityPhase::RequestSent {
+                        model: "alpha".into(),
+                        provider: "x".into(),
+                    },
+                ),
+                activity(
+                    3_500,
+                    ActivityPhase::ToolFinished {
+                        name: "file_read".into(),
+                        ok: true,
+                        elapsed_ms: 250,
+                    },
+                ),
+                activity(
+                    9_000,
+                    ActivityPhase::CompactionFinished {
+                        retired_messages: 4,
+                    },
+                ),
+            ],
+            80,
+        );
+        assert_eq!(rows.len(), 3, "one row per activity");
+        assert_eq!(rows[0], "awaiting model  alpha via x");
+        assert_eq!(rows[1], "ran tool file_read  file_read ok 250ms  +2s");
+        assert_eq!(rows[2], "finishing compaction  4 retired  +5s");
+    }
+
+    #[test]
+    fn console_rows_name_a_dropped_wake() {
+        let rows = console_rows(
+            &[activity(
+                1_000,
+                ActivityPhase::WakeDropped {
+                    reason: "redundant".into(),
+                },
+            )],
+            80,
+        );
+        assert_eq!(rows, vec!["wake dropped  redundant"]);
+    }
+
+    #[test]
+    fn console_rows_keep_the_duration_when_the_detail_is_long() {
+        let width = 40;
+        let rows = console_rows(
+            &[
+                activity(0, ActivityPhase::WakeStarted),
+                activity(
+                    1_000,
+                    ActivityPhase::RequestSent {
+                        model: "a-very-long-model-name-that-will-not-fit".into(),
+                        provider: "a-very-long-provider-name".into(),
+                    },
+                ),
+            ],
+            width,
+        );
+        assert!(
+            rows[1].chars().count() <= width,
+            "the row fits the console width: {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[1].starts_with("awaiting model"),
+            "the phase label stays: {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[1].ends_with("+1s"),
+            "the duration survives a long detail: {:?}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn format_duration_switches_from_milliseconds_to_seconds() {
+        assert_eq!(format_duration(0), "0ms");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1_000), "1s");
+        assert_eq!(format_duration(12_400), "12s");
     }
 
     #[test]
@@ -2370,6 +2946,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_d_toggles_the_activity_console() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(test_session());
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        let action = handle_key(&mut app, &client, "http://x", "s1", key)
+            .await
+            .unwrap();
+        assert_eq!(action, Action::Continue);
+        assert!(app.show_console, "^D opens the console");
+
+        handle_key(&mut app, &client, "http://x", "s1", key)
+            .await
+            .unwrap();
+        assert!(!app.show_console, "^D closes the console");
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_opens_the_activity_console_in_watch_only() {
+        let client = reqwest::Client::new();
+        let mut app = App::new(child_test_session());
+
+        let action = handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "child-1",
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(action, Action::Continue);
+        assert!(app.show_console, "a watcher can open the console");
+    }
+
+    #[tokio::test]
     async fn ctrl_o_and_bare_persona_do_not_reach_the_session() {
         let client = reqwest::Client::new();
         let mut app = App::new(test_session());
@@ -2500,6 +3113,37 @@ mod tests {
         assert!(
             bottom.contains("line 59"),
             "the view must follow to the newest row: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn draw_renders_the_activity_console_when_open() {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut app = App::new(test_session());
+        app.state.activities.push(activity(
+            1_000,
+            ActivityPhase::RequestSent {
+                model: "alpha".into(),
+                provider: "x".into(),
+            },
+        ));
+        app.show_console = true;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..12)
+            .map(|y| buffer_row_text(buffer, y, 80))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("activity (^D close)"),
+            "the console title must render: {text}"
+        );
+        assert!(
+            text.contains("awaiting model"),
+            "the activity row must render: {text}"
         );
     }
 

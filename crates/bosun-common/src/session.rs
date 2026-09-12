@@ -225,6 +225,56 @@ pub enum Event {
         output_tokens: Option<u64>,
         cost: Option<f64>,
     },
+    /// A phase transition of the agent loop, stamped with `at_ms` so a client
+    /// can order the session's history. The loop emits one per change; no
+    /// phase carries token or cost counts, which stay on `ModelCall`.
+    Activity {
+        // The phase's fields flatten in beside `at_ms`, so no phase field may
+        // be named `at_ms`: it would collide with the timestamp.
+        at_ms: u64,
+        #[serde(flatten)]
+        phase: ActivityPhase,
+    },
+}
+
+/// The phase of the agent loop an `Event::Activity` records. Each variant
+/// carries the phase's detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ActivityPhase {
+    WakeStarted,
+    WakeDropped {
+        reason: String,
+    },
+    RequestSent {
+        model: String,
+        provider: String,
+    },
+    FirstToken {
+        latency_ms: u64,
+    },
+    ResponseComplete {
+        stop_reason: String,
+    },
+    ToolStarted {
+        name: String,
+    },
+    ToolFinished {
+        name: String,
+        ok: bool,
+        elapsed_ms: u64,
+    },
+    EmptyRetry {
+        attempt: u32,
+        limit: u32,
+        reason: String,
+    },
+    CompactionStarted {
+        input_tokens: u64,
+    },
+    CompactionFinished {
+        retired_messages: usize,
+    },
 }
 
 #[cfg(test)]
@@ -450,7 +500,7 @@ mod tests {
 
     #[test]
     fn event_round_trips_every_variant() {
-        for event in [
+        let mut events = vec![
             Event::Message {
                 message: message(Block::Text {
                     text: "hello".into(),
@@ -473,7 +523,46 @@ mod tests {
                 output_tokens: Some(50),
                 cost: Some(0.001),
             },
+        ];
+        for phase in [
+            ActivityPhase::WakeStarted,
+            ActivityPhase::WakeDropped {
+                reason: "blocked".into(),
+            },
+            ActivityPhase::RequestSent {
+                model: "claude".into(),
+                provider: "anthropic".into(),
+            },
+            ActivityPhase::FirstToken { latency_ms: 120 },
+            ActivityPhase::ResponseComplete {
+                stop_reason: "stop_response".into(),
+            },
+            ActivityPhase::ToolStarted {
+                name: "shell".into(),
+            },
+            ActivityPhase::ToolFinished {
+                name: "shell".into(),
+                ok: true,
+                elapsed_ms: 42,
+            },
+            ActivityPhase::EmptyRetry {
+                attempt: 1,
+                limit: 3,
+                reason: "stop_response".into(),
+            },
+            ActivityPhase::CompactionStarted {
+                input_tokens: 950_000,
+            },
+            ActivityPhase::CompactionFinished {
+                retired_messages: 12,
+            },
         ] {
+            events.push(Event::Activity {
+                at_ms: 1_700_000_000_000,
+                phase,
+            });
+        }
+        for event in events {
             assert_round_trips(&event);
         }
     }
@@ -513,6 +602,22 @@ mod tests {
         assert_eq!(json["kind"], "model_call");
         assert_eq!(json["call_kind"], "completion");
         assert_eq!(json["input_tokens"], serde_json::Value::Null);
+
+        let json = serde_json::to_value(Event::Activity {
+            at_ms: 1_700_000_000_000,
+            phase: ActivityPhase::ToolFinished {
+                name: "shell".into(),
+                ok: false,
+                elapsed_ms: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "activity");
+        assert_eq!(json["at_ms"], 1_700_000_000_000_i64);
+        assert_eq!(json["phase"], "tool_finished");
+        assert_eq!(json["name"], "shell");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["elapsed_ms"], 7);
     }
 
     #[test]

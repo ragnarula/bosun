@@ -2,7 +2,7 @@
 
 A session's status says `running` for every busy phase of a wake, so a watcher cannot tell waiting for the model from a run that has stalled. The loop records its activity as durable events, the status shows the live phase with an elapsed counter, a debug console lists what the loop has done, and the web pane shows each model call's input and output context again.
 
-Status: **proposed**.
+Status: **complete**. All five stories are implemented and tested.
 
 > The durable-event placement and the phase vocabulary are recorded in `../adrs/2026-09-12-loop-activity.md`. The terminal client already renders `model_call` context lines; this sprint restores the web pane's equivalent and adds the indicator and console to both clients.
 
@@ -22,7 +22,7 @@ Unchanged. No command or flag changes. The terminal client gains a `^D` keybindi
 
 ## User stories in implementation order
 
-- [ ] **S1 — The loop records its activity**
+- [x] **S1 — The loop records its activity**
 
 As a developer, I want the loop to append an `Activity` event at each phase transition, so a watcher can reconstruct what it is doing.
 
@@ -32,7 +32,7 @@ As a developer, I want the loop to append an `Activity` event at each phase tran
 - An interrupted stream emits no `response_complete`, so the record never claims a finished turn that did not finish.
 - Tests: a clean text turn emits `request_sent`, `first_token`, `response_complete` in order with `at_ms`; a tool turn emits `tool_started` then `tool_finished` with the elapsed; three empty replies emit `empty_retry` for attempts 1, 2, 3; compaction emits `compaction_started` then `compaction_finished`; a redundant wake emits `wake_dropped`; an interrupted stream emits no `response_complete`.
 
-- [ ] **S2 — Activity is delivered over the existing stream**
+- [x] **S2 — Activity is delivered over the existing stream**
 
 As a developer, I want activity events to reach both clients through the existing durable replay and poll, so a reconnected screen replays the loop's history.
 
@@ -40,7 +40,7 @@ As a developer, I want activity events to reach both clients through the existin
 - Both clients deserialize `Event::Activity` and route it to the debug console, never to the transcript; an unknown event must not render as transcript noise.
 - Tests: an SSE reconnect replays activity events from the store; the poll delivers an activity event appended while attached; the web pane and the terminal accept an `"activity"` frame without adding a transcript line.
 
-- [ ] **S3 — The waiting indicator shows the live phase**
+- [x] **S3 — The waiting indicator shows the live phase**
 
 As a user, I want the status to say what the loop is doing and for how long, so I can tell waiting from stuck.
 
@@ -48,7 +48,7 @@ As a user, I want the status to say what the loop is doing and for how long, so 
 - The terminal status line carries the phase; a small redraw tick keeps the elapsed counter moving while no input or stream event arrives. The web pane's header label carries the phase, refreshed on a short interval while a session is open.
 - Tests: latest activity `request_sent` labels the status `awaiting model` with a counting elapsed; `tool_started` labels it `running tool X`; `empty_retry` labels it `retrying empty reply (2/3)`; `waiting_for_input` is unchanged; `running` with no activity shows `running`.
 
-- [ ] **S4 — A debug console lists the loop's activity**
+- [x] **S4 — A debug console lists the loop's activity**
 
 As a user, I want a console that lists what the loop has done, so I can see the whole sequence and its durations.
 
@@ -56,13 +56,14 @@ As a user, I want a console that lists what the loop has done, so I can see the 
 - Terminal: a `^D`-toggled overlay pane listing the activity rows; the status line still carries the current phase.
 - Tests: toggling works in each client; each activity event renders one row; consecutive rows show a duration; the log replays history after a reconnect.
 
-- [ ] **S5 — The web pane shows per-call context lines**
+- [x] **S5 — The web pane shows per-call context lines**
 
 As a user, I want each model call's input and output tokens in the transcript, so I can see the context used so far.
 
-- The web pane renders each `model_call` event as one dim monospace line, matching the terminal's format: `claude-3-7-sonnet completion (12,340 in · 421 out · $0.04)`.
+- The web pane renders each `model_call` event as one dim monospace line, matching the terminal's format: `claude-3-7-sonnet completion (12340 in, 421 out, $0.0400)`.
+  - Deviation: the sprint first drafted this example with `·` separators and two cost decimals. The terminal's `event_lines` uses comma separators, no token grouping, and four cost decimals, and it is the source of truth, so the pane matches it.
 - The terminal already renders these lines; nothing there changes.
-- Tests: the web pane appends the line in the terminal's format; a compaction call renders with `compaction` as its kind.
+- Tests: the pane has no browser harness, so its test is a source presence check that a `model_call` handler appends the monospace line and passes `call_kind` through; the terminal test covers the line's format and the `compaction` kind.
 
 ## Acceptance measures
 

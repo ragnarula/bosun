@@ -366,7 +366,9 @@ mod tests {
                             "spill" => Some(ToolMsg::Spilled {
                                 file: "tool-output/run-big-file-read.txt".into(),
                                 preview: "head".into(),
-                                exit_code: args["exit_code"].as_i64().and_then(|code| i32::try_from(code).ok()),
+                                exit_code: args["exit_code"]
+                                    .as_i64()
+                                    .and_then(|code| i32::try_from(code).ok()),
                             }),
                             other => Some(ToolMsg::Error {
                                 message: format!("unknown tool {other}"),

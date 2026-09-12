@@ -10,12 +10,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
+use bosun_common::session::ActivityPhase;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
+use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
 use bosun_common::session::Message;
 use bosun_common::session::Role;
@@ -285,6 +289,42 @@ fn model_call_cost(
     (cost * 1e6).round() / 1e6
 }
 
+async fn append_activity(
+    deps: &LoopDeps,
+    session_id: &str,
+    phase: ActivityPhase,
+) -> anyhow::Result<()> {
+    deps.store
+        .append_event(
+            session_id,
+            &Event::Activity {
+                at_ms: bosun_common::time::unix_ms(SystemTime::now()),
+                phase,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn append_tool_finished(
+    deps: &LoopDeps,
+    session_id: &str,
+    name: &str,
+    started: Instant,
+    ok: bool,
+) -> anyhow::Result<()> {
+    append_activity(
+        deps,
+        session_id,
+        ActivityPhase::ToolFinished {
+            name: name.to_string(),
+            ok,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    )
+    .await
+}
+
 pub struct LoopHandle {
     pub sender: mpsc::UnboundedSender<LoopEvent>,
     pub task: tokio::task::JoinHandle<()>,
@@ -452,6 +492,14 @@ async fn handle_wake(
         WakeKind::UserMessage | WakeKind::ParentMessage => false,
     });
     if blocked {
+        append_activity(
+            deps,
+            session_id,
+            ActivityPhase::WakeDropped {
+                reason: "blocked".into(),
+            },
+        )
+        .await?;
         return Ok(());
     }
     // A turn-shaped wake whose thread holds nothing newer than the last
@@ -465,12 +513,21 @@ async fn handle_wake(
         let thread = deps.store.messages(session_id, false).await?;
         let newest = thread.last().map(|(id, _)| *id).unwrap_or(0);
         if newest > 0 && newest <= state.handled_through {
+            append_activity(
+                deps,
+                session_id,
+                ActivityPhase::WakeDropped {
+                    reason: "redundant".into(),
+                },
+            )
+            .await?;
             return Ok(());
         }
     }
     deps.store
         .set_state(session_id, SessionState::Running)
         .await?;
+    append_activity(deps, session_id, ActivityPhase::WakeStarted).await?;
 
     // Whether this session is a child decides what a completed wake does: a
     // child ends by reporting to its parent and stopping, a root waits for
@@ -597,6 +654,16 @@ async fn handle_wake(
         let outcome = match outcome {
             TurnOutcome::Empty { reason } if !interrupted => {
                 consecutive_empty += 1;
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::EmptyRetry {
+                        attempt: consecutive_empty,
+                        limit: EMPTY_TURN_LIMIT,
+                        reason: reason.as_str().to_string(),
+                    },
+                )
+                .await?;
                 if consecutive_empty < EMPTY_TURN_LIMIT {
                     tokio::select! {
                         biased;
@@ -1179,6 +1246,16 @@ async fn run_turn_inner(
             .any(|tool| tool.name == "spawn")
             .then(|| persona_catalog(deps)),
     );
+    append_activity(
+        deps,
+        session_id,
+        ActivityPhase::RequestSent {
+            model: turn.provider.model().to_string(),
+            provider: turn.provider.name().to_string(),
+        },
+    )
+    .await?;
+    let request_started = Instant::now();
     let mut stream = turn.provider.chat_stream(ProviderCall {
         model: turn.provider.model(),
         max_tokens: turn.provider.max_output_tokens(),
@@ -1188,26 +1265,35 @@ async fn run_turn_inner(
         ask_recipient,
     })?;
 
-    let (text, reasoning, tool_calls, stopped, stop_reason) =
-        match collect_stream(&mut stream, deps, session_id, signal, &turn, state).await? {
-            StreamEnd::Collected {
-                text,
-                reasoning,
-                tool_calls,
-                stopped,
-                stop_reason,
-            } => (text, reasoning, tool_calls, stopped, stop_reason),
-            StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
-            StreamEnd::Failed(error) => {
-                error!(
-                    msg = "provider stream failed",
-                    session_id = %session_id,
-                    provider = %turn.provider.name(),
-                    error = %error.display_chain()
-                );
-                return Ok(TurnOutcome::Failed);
-            }
-        };
+    let (text, reasoning, tool_calls, stopped, stop_reason) = match collect_stream(
+        &mut stream,
+        deps,
+        session_id,
+        signal,
+        &turn,
+        state,
+        request_started,
+    )
+    .await?
+    {
+        StreamEnd::Collected {
+            text,
+            reasoning,
+            tool_calls,
+            stopped,
+            stop_reason,
+        } => (text, reasoning, tool_calls, stopped, stop_reason),
+        StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
+        StreamEnd::Failed(error) => {
+            error!(
+                msg = "provider stream failed",
+                session_id = %session_id,
+                provider = %turn.provider.name(),
+                error = %error.display_chain()
+            );
+            return Ok(TurnOutcome::Failed);
+        }
+    };
 
     if !stopped {
         error!(
@@ -1311,6 +1397,9 @@ async fn run_turn_inner(
             continue;
         }
 
+        // The activity name is kept aside because each arm moves `name` into
+        // the durable tool result before the finish event is appended.
+        let tool_name = name.clone();
         match name.as_str() {
             "" => {
                 warn!(
@@ -1336,6 +1425,15 @@ async fn run_turn_inner(
                 .await?;
             }
             "ask" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
                 let message = args["message"].as_str().unwrap_or_default().to_string();
                 let options = args["options"]
                     .as_array()
@@ -1423,6 +1521,7 @@ async fn run_turn_inner(
                         },
                     )
                     .await?;
+                    append_tool_finished(deps, session_id, &tool_name, started, false).await?;
                     continue;
                 }
                 let bound_leaf = outcome.expect("a successful ask names its bound leaf");
@@ -1460,12 +1559,22 @@ async fn run_turn_inner(
                         .set_pending_ask(&session.id, raised_child, leaf, &message, ask_id)
                         .await?;
                 }
+                append_tool_finished(deps, session_id, &tool_name, started, true).await?;
                 return Ok(TurnOutcome::AskedUser {
                     question: message,
                     origin: bound_leaf,
                 });
             }
             "todowrite" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
                 // Children never see the todo tool, so a call here is a
                 // refused fallback, not a path a model should reach.
                 if session.parent_id.is_some() {
@@ -1487,6 +1596,7 @@ async fn run_turn_inner(
                         },
                     )
                     .await?;
+                    append_tool_finished(deps, session_id, &tool_name, started, false).await?;
                     continue;
                 }
                 match args["items"].as_array() {
@@ -1512,8 +1622,18 @@ async fn run_turn_inner(
                     },
                 )
                 .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, true).await?;
             }
             "skill" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
                 let skill_name = args["name"].as_str().unwrap_or_default();
                 let reference_path = args["reference"].as_str();
                 // Resolution order: a full address matches a remote package
@@ -1597,6 +1717,7 @@ async fn run_turn_inner(
                     },
                 )
                 .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
             }
             // Creates a real child session: the child runs its own loop and
             // executor on this working copy under the target persona. The
@@ -1604,6 +1725,15 @@ async fn run_turn_inner(
             // completion report arrives later as an authored event in this
             // session's thread.
             "spawn" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
                 let persona_name = args["persona"].as_str().unwrap_or_default().to_string();
                 let instructions = args["instructions"]
                     .as_str()
@@ -1654,12 +1784,22 @@ async fn run_turn_inner(
                     },
                 )
                 .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
             }
             // Resumes or redirects one of this session's children: the
             // message is appended to the child's thread as its next user
             // message and the child's loop is woken, so a stopped child
             // resumes from its archived thread and reports again.
             "message_child" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
                 let child_id = args["id"].as_str().unwrap_or_default().to_string();
                 let text = args["text"].as_str().unwrap_or_default().to_string();
                 let outcome = async {
@@ -1712,8 +1852,18 @@ async fn run_turn_inner(
                     },
                 )
                 .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
             }
             _ => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
                 let run_id = Uuid::new_v4().to_string();
                 debug!(
                     msg = "dispatching tool call",
@@ -1742,6 +1892,8 @@ async fn run_turn_inner(
                     },
                 )
                 .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, !outcome.is_error)
+                    .await?;
             }
         }
     }
@@ -1761,12 +1913,14 @@ async fn collect_stream(
     signal: &Arc<InterruptSignal>,
     turn: &TurnModel,
     state: &mut LoopState,
+    request_started: Instant,
 ) -> Result<StreamEnd, anyhow::Error> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = BTreeMap::<usize, AccumulatedToolCall>::new();
     let mut stopped = false;
     let mut stop_reason = StopReason::Other;
+    let mut first_event_seen = false;
 
     loop {
         if signal.flag.load(Ordering::Acquire) {
@@ -1774,49 +1928,72 @@ async fn collect_stream(
         }
         tokio::select! {
             event = stream.next() => match event {
-                Some(Ok(StreamEvent::TextDelta(delta))) => {
-                    text.push_str(&delta);
-                    deps.delta_sink.send(delta);
-                }
-                // Thinking is not sent to the delta sink: the sink feeds the
-                // live assistant paragraph, and thinking is not the reply.
-                Some(Ok(StreamEvent::ReasoningDelta(delta))) => {
-                    reasoning.push_str(&delta);
-                }
-                Some(Ok(StreamEvent::ToolCallDelta { index, id, name, args_delta })) => {
-                    let call = tool_calls.entry(index).or_default();
-                    if call.id.is_none() {
-                        call.id = id;
-                    }
-                    if call.name.is_none() {
-                        call.name = name;
-                    }
-                    call.args_delta.push_str(&args_delta);
-                }
-                Some(Ok(StreamEvent::Stop {
-                    input_tokens,
-                    output_tokens,
-                    stop_reason: reason,
-                })) => {
-                    state.last_input_tokens = input_tokens;
-                    deps.store
-                        .append_model_call(
+                Some(Ok(event)) => {
+                    if !first_event_seen {
+                        first_event_seen = true;
+                        append_activity(
+                            deps,
                             session_id,
-                            turn.provider.model(),
-                            turn.provider.name(),
-                            "completion",
-                            Some(input_tokens),
-                            Some(output_tokens),
-                            Some(model_call_cost(
-                                Some(input_tokens),
-                                Some(output_tokens),
-                                turn.price_input_per_mtok,
-                                turn.price_output_per_mtok,
-                            )),
+                            ActivityPhase::FirstToken {
+                                latency_ms: request_started.elapsed().as_millis() as u64,
+                            },
                         )
                         .await?;
-                    stopped = true;
-                    stop_reason = reason;
+                    }
+                    match event {
+                        StreamEvent::TextDelta(delta) => {
+                            text.push_str(&delta);
+                            deps.delta_sink.send(delta);
+                        }
+                        // Thinking is not sent to the delta sink: the sink feeds the
+                        // live assistant paragraph, and thinking is not the reply.
+                        StreamEvent::ReasoningDelta(delta) => {
+                            reasoning.push_str(&delta);
+                        }
+                        StreamEvent::ToolCallDelta { index, id, name, args_delta } => {
+                            let call = tool_calls.entry(index).or_default();
+                            if call.id.is_none() {
+                                call.id = id;
+                            }
+                            if call.name.is_none() {
+                                call.name = name;
+                            }
+                            call.args_delta.push_str(&args_delta);
+                        }
+                        StreamEvent::Stop {
+                            input_tokens,
+                            output_tokens,
+                            stop_reason: reason,
+                        } => {
+                            state.last_input_tokens = input_tokens;
+                            deps.store
+                                .append_model_call(
+                                    session_id,
+                                    turn.provider.model(),
+                                    turn.provider.name(),
+                                    "completion",
+                                    Some(input_tokens),
+                                    Some(output_tokens),
+                                    Some(model_call_cost(
+                                        Some(input_tokens),
+                                        Some(output_tokens),
+                                        turn.price_input_per_mtok,
+                                        turn.price_output_per_mtok,
+                                    )),
+                                )
+                                .await?;
+                            stopped = true;
+                            stop_reason = reason;
+                            append_activity(
+                                deps,
+                                session_id,
+                                ActivityPhase::ResponseComplete {
+                                    stop_reason: reason.as_str().to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 Some(Err(error)) => return Ok(StreamEnd::Failed(anyhow::Error::new(error))),
                 None => break,
@@ -2022,6 +2199,14 @@ async fn maybe_compact(
         // so the summarized window has roughly half the previous token load.
         let retire = (window.len() / 2).min(retireable);
         if retire > 0 {
+            append_activity(
+                deps,
+                session_id,
+                ActivityPhase::CompactionStarted {
+                    input_tokens: state.last_input_tokens,
+                },
+            )
+            .await?;
             let tail: Vec<(i64, Message)> = window.drain(..retire).collect();
             let tail_last_id = tail.last().expect("retire is at least one").0;
             if let Some((text, input_tokens, output_tokens)) =
@@ -2036,6 +2221,14 @@ async fn maybe_compact(
                     .append_message(session_id, summary.role, &summary.block)
                     .await?;
                 deps.store.mark_archived(session_id, tail_last_id).await?;
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::CompactionFinished {
+                        retired_messages: retire,
+                    },
+                )
+                .await?;
                 deps.store
                     .append_model_call(
                         session_id,
@@ -2953,6 +3146,407 @@ mod tests {
         let captured = provider.captured_calls();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].model, "mock-model");
+
+        handle.stop();
+    }
+
+    /// The session's loop-activity events in append order, each with its
+    /// payload `at_ms`.
+    async fn activities(store: &Store, session_id: &str) -> Vec<(u64, ActivityPhase)> {
+        store
+            .events_after(session_id, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::Activity { at_ms, phase } => Some((at_ms, phase)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_clean_text_turn_emits_request_first_token_and_response_complete() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-act-text")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("hello".into()),
+            stop(5, 2),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-act-text".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-act-text")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let recorded = activities(&store, "s-act-text").await;
+        assert_eq!(
+            recorded.len(),
+            4,
+            "one activity per turn phase: {recorded:?}"
+        );
+        assert_eq!(recorded[0].1, ActivityPhase::WakeStarted);
+        assert_eq!(
+            recorded[1].1,
+            ActivityPhase::RequestSent {
+                model: "mock-model".into(),
+                provider: "mock".into(),
+            }
+        );
+        assert!(
+            matches!(recorded[2].1, ActivityPhase::FirstToken { .. }),
+            "the first stream event records the token latency"
+        );
+        assert_eq!(
+            recorded[3].1,
+            ActivityPhase::ResponseComplete {
+                stop_reason: "stop_response".into(),
+            }
+        );
+        assert!(
+            recorded.iter().all(|(at_ms, _)| *at_ms > 1_600_000_000_000),
+            "each activity carries a unix-millisecond timestamp: {recorded:?}"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_tool_turn_emits_tool_started_then_tool_finished_with_elapsed() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-act-tool")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"ls"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-act-tool".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-act-tool")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let phases: Vec<ActivityPhase> = activities(&store, "s-act-tool")
+            .await
+            .into_iter()
+            .map(|(_, phase)| phase)
+            .collect();
+        let started = phases
+            .iter()
+            .position(
+                |phase| matches!(phase, ActivityPhase::ToolStarted { name } if name == "shell"),
+            )
+            .expect("a tool_started for the shell call");
+        let ActivityPhase::ToolFinished {
+            name,
+            ok,
+            elapsed_ms,
+        } = &phases[started + 1]
+        else {
+            panic!("tool_finished follows tool_started: {phases:?}");
+        };
+        assert_eq!(name, "shell");
+        assert!(ok);
+        assert!(
+            *elapsed_ms < 60_000,
+            "the finish carries a sane elapsed: {elapsed_ms}"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn three_empty_replies_emit_empty_retry_for_each_attempt() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-act-empty")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![stop(1, 0)],
+            vec![stop(1, 0)],
+            vec![stop(1, 0)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-act-empty".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to give up as interrupted", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-act-empty")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::Interrupted
+            }
+        })
+        .await;
+
+        let retries: Vec<(u32, u32, String)> = activities(&store, "s-act-empty")
+            .await
+            .into_iter()
+            .filter_map(|(_, phase)| match phase {
+                ActivityPhase::EmptyRetry {
+                    attempt,
+                    limit,
+                    reason,
+                } => Some((attempt, limit, reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            retries,
+            vec![
+                (1, 3, "stop_response".into()),
+                (2, 3, "stop_response".into()),
+                (3, 3, "stop_response".into()),
+            ]
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn compaction_emits_started_then_finished() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-act-compact"))
+            .await
+            .unwrap();
+        fill_transcript(&store, "s-act-compact").await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"work"}"#.into(),
+                },
+                stop(1000, 20),
+            ],
+            vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
+            vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_compact_at(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            500,
+        ));
+        let handle = spawn_loop("s-act-compact".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-act-compact")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let phases: Vec<ActivityPhase> = activities(&store, "s-act-compact")
+            .await
+            .into_iter()
+            .map(|(_, phase)| phase)
+            .collect();
+        let started = phases
+            .iter()
+            .position(|phase| matches!(phase, ActivityPhase::CompactionStarted { .. }))
+            .expect("a compaction_started");
+        let finished = phases
+            .iter()
+            .position(|phase| matches!(phase, ActivityPhase::CompactionFinished { .. }))
+            .expect("a compaction_finished");
+        assert!(started < finished, "started precedes finished: {phases:?}");
+        assert!(
+            matches!(
+                phases[finished],
+                ActivityPhase::CompactionFinished { retired_messages } if retired_messages > 0
+            ),
+            "the finish reports the retired messages"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_redundant_wake_emits_wake_dropped() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-act-drop")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::with_delay(
+            vec![vec![StreamEvent::TextDelta("first".into()), stop(1, 1)]],
+            Duration::from_millis(200),
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-act-drop".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn to start", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 1 }
+            }
+        })
+        .await;
+
+        // The second wake finds nothing newer than the completed turn handled,
+        // so the loop drops it and records the drop.
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the redundant wake to be recorded as dropped", || {
+            let store = store.clone();
+            async move {
+                store
+                    .events_after("s-act-drop", 0)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|(_, event)| {
+                        matches!(
+                            event,
+                            Event::Activity {
+                                phase: ActivityPhase::WakeDropped { reason },
+                                ..
+                            } if reason == "redundant"
+                        )
+                    })
+            }
+        })
+        .await;
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_stream_emits_no_response_complete() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-act-interrupt"))
+            .await
+            .unwrap();
+
+        let deps = Arc::new(test_deps(
+            &store,
+            Arc::new(BlockingProvider),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-act-interrupt".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to start running", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-act-interrupt")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::Running
+            }
+        })
+        .await;
+
+        handle.send(LoopEvent::Interrupt);
+
+        wait_for("the session to be interrupted", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-act-interrupt")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::Interrupted
+            }
+        })
+        .await;
+
+        let recorded = activities(&store, "s-act-interrupt").await;
+        assert!(
+            recorded
+                .iter()
+                .any(|(_, phase)| matches!(phase, ActivityPhase::RequestSent { .. })),
+            "the request is recorded before the interrupt: {recorded:?}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|(_, phase)| matches!(phase, ActivityPhase::ResponseComplete { .. })),
+            "an interrupted stream records no response_complete: {recorded:?}"
+        );
 
         handle.stop();
     }
