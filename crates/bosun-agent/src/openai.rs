@@ -105,6 +105,12 @@ impl OpenAiParser {
 /// Turn one SSE chunk into [`StreamEvent`]s. The `[DONE]` marker and the
 /// final usage chunk both stop the completion; empty deltas are skipped.
 /// A chunk may carry text, tool call fragments, one per index, or both.
+///
+/// A usage chunk is parsed like any other before its stop is emitted. The
+/// Vercel AI Gateway carries `usage`, `finish_reason` and the turn's last
+/// delta on one chunk, so returning at the counts drops the finish reason for
+/// every completion it serves: `length` then reads as an ordinary stop and a
+/// truncated turn is indistinguishable from a complete one.
 fn parse_event(
     event: &SseEvent,
     parser: &mut OpenAiParser,
@@ -115,64 +121,72 @@ fn parse_event(
     let chunk: Value = serde_json::from_str(&event.data).map_err(|error| ProviderError::Parse {
         detail: format!("openai event data is not JSON: {error}"),
     })?;
+    // Recorded here, but the chunk still falls through: its `choices` carry
+    // the finish reason and may carry the turn's last delta. The stop is
+    // appended after those events so their order on the stream is preserved.
+    let mut usage_chunk = false;
     if let Some(usage) = chunk.get("usage")
         && !usage.is_null()
     {
         parser.input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
         parser.output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
-        return Ok(parser.stop().into_iter().collect());
+        usage_chunk = true;
     }
-    let Some(choices) = chunk["choices"].as_array() else {
-        return Ok(Vec::new());
-    };
-    if let Some(first) = choices.first()
-        && let Some(reason) = first["finish_reason"].as_str()
-    {
-        parser.finish_reason = Some(reason.to_string());
-    }
-    for choice in choices {
-        let delta = &choice["delta"];
-        let mut events = Vec::new();
-        // The field name differs by host: DeepSeek's own API streams
-        // `reasoning_content`, the Vercel AI Gateway streams `reasoning`.
-        // Requests carry it back as `reasoning_content` either way.
-        if let Some(thinking) = delta["reasoning_content"]
-            .as_str()
-            .or_else(|| delta["reasoning"].as_str())
-            && !thinking.is_empty()
+    let mut out = Vec::new();
+    if let Some(choices) = chunk["choices"].as_array() {
+        if let Some(first) = choices.first()
+            && let Some(reason) = first["finish_reason"].as_str()
         {
-            events.push(StreamEvent::ReasoningDelta(thinking.to_string()));
+            parser.finish_reason = Some(reason.to_string());
         }
-        if let Some(text) = delta["content"].as_str()
-            && !text.is_empty()
-        {
-            events.push(StreamEvent::TextDelta(text.to_string()));
-        }
-        if let Some(calls) = delta["tool_calls"].as_array() {
-            for call in calls {
-                let index = call["index"].as_u64().unwrap_or(0) as usize;
-                let id = call["id"].as_str().map(str::to_string);
-                let name = call["function"]["name"].as_str().map(str::to_string);
-                let args_delta = call["function"]["arguments"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                if id.is_none() && name.is_none() && args_delta.is_empty() {
-                    continue;
+        for choice in choices {
+            let delta = &choice["delta"];
+            let mut events = Vec::new();
+            // The field name differs by host: DeepSeek's own API streams
+            // `reasoning_content`, the Vercel AI Gateway streams `reasoning`.
+            // Requests carry it back as `reasoning_content` either way.
+            if let Some(thinking) = delta["reasoning_content"]
+                .as_str()
+                .or_else(|| delta["reasoning"].as_str())
+                && !thinking.is_empty()
+            {
+                events.push(StreamEvent::ReasoningDelta(thinking.to_string()));
+            }
+            if let Some(text) = delta["content"].as_str()
+                && !text.is_empty()
+            {
+                events.push(StreamEvent::TextDelta(text.to_string()));
+            }
+            if let Some(calls) = delta["tool_calls"].as_array() {
+                for call in calls {
+                    let index = call["index"].as_u64().unwrap_or(0) as usize;
+                    let id = call["id"].as_str().map(str::to_string);
+                    let name = call["function"]["name"].as_str().map(str::to_string);
+                    let args_delta = call["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    if id.is_none() && name.is_none() && args_delta.is_empty() {
+                        continue;
+                    }
+                    events.push(StreamEvent::ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        args_delta,
+                    });
                 }
-                events.push(StreamEvent::ToolCallDelta {
-                    index,
-                    id,
-                    name,
-                    args_delta,
-                });
+            }
+            if !events.is_empty() {
+                out = events;
+                break;
             }
         }
-        if !events.is_empty() {
-            return Ok(events);
-        }
     }
-    Ok(Vec::new())
+    if usage_chunk {
+        out.extend(parser.stop());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -389,6 +403,105 @@ mod tests {
                     input_tokens: 4,
                     output_tokens: 2,
                     stop_reason: StopReason::MaxTokens,
+                },
+            ]
+        );
+    }
+
+    /// The Vercel AI Gateway puts `usage`, `finish_reason` and the turn's last
+    /// delta on one chunk. Reading the counts and returning there loses the
+    /// finish reason, so every completion it serves stops as `Other` and a
+    /// truncated turn cannot be told from a complete one.
+    #[tokio::test]
+    async fn a_usage_chunk_carrying_the_finish_reason_still_sets_the_stop_reason() {
+        let server_events = vec![
+            sse(json!({
+                "choices": [{ "index": 0, "delta": { "content": "Bye" } }],
+            })),
+            sse(json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }],
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 },
+            })),
+            sse(json!("[DONE]")),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+
+        let events = collect_stream(&provider, provider_call("gpt-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("Bye".into()),
+                StreamEvent::Stop {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                    stop_reason: StopReason::MaxTokens,
+                },
+            ]
+        );
+    }
+
+    /// The same chunk may also carry a delta. It is emitted before the stop,
+    /// so a tool call that closes on the usage chunk is not dropped.
+    #[tokio::test]
+    async fn a_delta_on_the_usage_chunk_is_emitted_before_the_stop() {
+        let server_events = vec![
+            sse(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "shell", "arguments": "{\"cmd\":" },
+                    }] },
+                }],
+            })),
+            sse(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "function": { "arguments": "\"ls\"}" },
+                    }] },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": { "prompt_tokens": 7, "completion_tokens": 3 },
+            })),
+            sse(json!("[DONE]")),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+
+        let events = collect_stream(&provider, provider_call("gpt-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("shell".into()),
+                    args_delta: "{\"cmd\":".into(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    args_delta: "\"ls\"}".into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    stop_reason: StopReason::Other,
                 },
             ]
         );
