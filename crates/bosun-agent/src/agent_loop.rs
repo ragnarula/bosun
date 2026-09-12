@@ -1167,6 +1167,7 @@ async fn run_turn_inner(
                 if name == "ask" && !ask_result_ids.contains(id))
         })
         .collect();
+    let messages = order_tool_exchange(messages);
 
     // The two skill sources are fetched once per session and cached, so a
     // turn does not round-trip for them. The on-demand `skill` read still
@@ -2138,6 +2139,43 @@ fn tool_allowed(allowed_tools: &Option<Vec<String>>, name: &str) -> bool {
     }
 }
 
+/// Moves each tool result directly after its tool call in a request window.
+/// A foreign message can land in the store between a call and its result when
+/// a parent, child, or user appends concurrently; providers reject a result
+/// that no longer immediately follows its call, so the window is normalised
+/// while the store keeps the true order. Foreign messages keep their relative
+/// order and follow the result. A result already beside its call is not
+/// emitted twice; a call or result with no counterpart is left in place.
+fn order_tool_exchange(messages: Vec<Message>) -> Vec<Message> {
+    let mut remaining: Vec<Option<Message>> = messages.into_iter().map(Some).collect();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for index in 0..remaining.len() {
+        let Some(message) = remaining[index].take() else {
+            continue;
+        };
+        let result_index = match &message.block {
+            Block::ToolCall { id, .. } => (index + 1..remaining.len()).find(|&later| {
+                matches!(
+                    &remaining[later],
+                    Some(Message {
+                        block: Block::ToolResult { id: result_id, .. },
+                        ..
+                    }) if result_id == id
+                )
+            }),
+            _ => None,
+        };
+        ordered.push(message);
+        if let Some(result_index) = result_index {
+            let result = remaining[result_index]
+                .take()
+                .expect("a matched tool result is still present");
+            ordered.push(result);
+        }
+    }
+    ordered
+}
+
 /// The origin leaf of the question `named` last raised into this session's
 /// window: the origin leaf its Ask event carries. A child that is waiting on
 /// a question has authored nothing since the event, so the child's last
@@ -2631,6 +2669,30 @@ mod tests {
                     .iter()
                     .any(|earlier| matches!(&earlier.block, Block::ToolCall { id: use_id, .. } if use_id == id)),
                 "provider request has a tool result for {name} ({id}) with no preceding tool use: {:#?}",
+                call.messages
+            );
+        }
+    }
+
+    /// Asserts one provider request's tool exchanges are adjacent: when a tool
+    /// call has a result in the same request, the result immediately follows
+    /// it, as Anthropic and OpenAI require. A foreign message landing between
+    /// them makes the provider reject the request; the scripted provider never
+    /// validates requests, so the fault would surface only as a real 400.
+    fn assert_tool_exchange_is_adjacent(call: &CapturedCall) {
+        for (index, message) in call.messages.iter().enumerate() {
+            let Block::ToolCall { id, name, .. } = &message.block else {
+                continue;
+            };
+            let has_result = call.messages[index + 1..].iter().any(|later| {
+                matches!(&later.block, Block::ToolResult { id: result_id, .. } if result_id == id)
+            });
+            if !has_result {
+                continue;
+            }
+            assert!(
+                matches!(&call.messages[index + 1].block, Block::ToolResult { id: result_id, .. } if result_id == id),
+                "provider request puts a message between the tool call for {name} ({id}) and its result: {:#?}",
                 call.messages
             );
         }
@@ -3146,6 +3208,89 @@ mod tests {
         let captured = provider.captured_calls();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].model, "mock-model");
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_interleaved_message_is_moved_after_the_tool_result() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-adjacent")).await.unwrap();
+        // A foreign message lands between a tool call and its result — a
+        // parent's message, a child event, or a user message appended
+        // concurrently. The request window must present the result directly
+        // after its call while the store keeps the true order.
+        store
+            .append_message(
+                "s-adjacent",
+                Role::Assistant,
+                &Block::ToolCall {
+                    id: "call-1".into(),
+                    name: "file_read".into(),
+                    args: json!({ "path": "README.md" }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "s-adjacent",
+                Role::User,
+                &Block::Text {
+                    text: "parent says hi".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "s-adjacent",
+                Role::User,
+                &Block::ToolResult {
+                    id: "call-1".into(),
+                    name: "file_read".into(),
+                    is_error: false,
+                    content: json!({ "content": "readme" }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("done".into()),
+            stop(1, 1),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-adjacent".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the loop to send its request", || {
+            let provider = provider.clone();
+            async move { !provider.captured_calls().is_empty() }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_tool_exchange_is_adjacent(&calls[0]);
+
+        let stored: Vec<Message> = store
+            .messages("s-adjacent", false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect();
+        assert_eq!(
+            exchange_shape(&stored[..3]),
+            ["call call-1", "text parent says hi", "result call-1"],
+            "the request window is normalised without touching the store"
+        );
 
         handle.stop();
     }
@@ -3749,6 +3894,120 @@ mod tests {
             render_block(&ask, AskRecipient::User),
             "question to user, from child child-1: may I push? (options: yes, no)"
         );
+    }
+
+    fn tool_call(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            block: Block::ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                args: json!({ "command": "ls" }),
+            },
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            block: Block::ToolResult {
+                id: id.into(),
+                name: "shell".into(),
+                is_error: false,
+                content: json!("out"),
+            },
+        }
+    }
+
+    fn foreign_text(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            block: Block::Text { text: text.into() },
+        }
+    }
+
+    fn exchange_shape(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|message| match &message.block {
+                Block::ToolCall { id, .. } => format!("call {id}"),
+                Block::ToolResult { id, .. } => format!("result {id}"),
+                Block::Text { text } => format!("text {text}"),
+                _ => "other".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn order_tool_exchange_moves_a_foreign_message_after_the_result() {
+        let ordered = order_tool_exchange(vec![
+            tool_call("call-1"),
+            foreign_text("parent says hi"),
+            tool_result("call-1"),
+        ]);
+        assert_eq!(
+            exchange_shape(&ordered),
+            ["call call-1", "result call-1", "text parent says hi"]
+        );
+    }
+
+    #[test]
+    fn order_tool_exchange_leaves_a_well_formed_pair_in_place() {
+        let ordered = order_tool_exchange(vec![tool_call("call-1"), tool_result("call-1")]);
+        assert_eq!(exchange_shape(&ordered), ["call call-1", "result call-1"]);
+    }
+
+    #[test]
+    fn order_tool_exchange_orders_two_sequential_pairs() {
+        let ordered = order_tool_exchange(vec![
+            tool_call("call-1"),
+            foreign_text("between the pairs"),
+            tool_result("call-1"),
+            tool_call("call-2"),
+            tool_result("call-2"),
+        ]);
+        assert_eq!(
+            exchange_shape(&ordered),
+            [
+                "call call-1",
+                "result call-1",
+                "text between the pairs",
+                "call call-2",
+                "result call-2",
+            ]
+        );
+    }
+
+    #[test]
+    fn order_tool_exchange_orders_a_parallel_batch_into_adjacent_pairs() {
+        let ordered = order_tool_exchange(vec![
+            tool_call("call-1"),
+            tool_call("call-2"),
+            tool_result("call-1"),
+            tool_result("call-2"),
+        ]);
+        assert_eq!(
+            exchange_shape(&ordered),
+            [
+                "call call-1",
+                "result call-1",
+                "call call-2",
+                "result call-2",
+            ]
+        );
+    }
+
+    #[test]
+    fn order_tool_exchange_leaves_a_dangling_result_in_place() {
+        let ordered = order_tool_exchange(vec![foreign_text("before"), tool_result("call-1")]);
+        assert_eq!(exchange_shape(&ordered), ["text before", "result call-1"]);
+    }
+
+    #[test]
+    fn order_tool_exchange_leaves_a_dangling_call_in_place() {
+        let ordered = order_tool_exchange(vec![tool_call("call-1")]);
+        assert_eq!(ordered.len(), 1, "a dangling call is not lost");
+        assert_eq!(exchange_shape(&ordered), ["call call-1"]);
     }
 
     #[tokio::test]
@@ -10761,6 +11020,7 @@ mod tests {
         );
         for call in &calls {
             assert_tool_results_have_matching_tool_uses(call);
+            assert_tool_exchange_is_adjacent(call);
         }
         for id in ["call-1", "call-2", "call-3"] {
             assert!(
