@@ -828,6 +828,20 @@
   }
   #activity-log .activity-duration { flex: 0 0 auto; color: var(--muted); }
   #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  /* A stamped entry is one flex row: the time holds the leading gutter and the
+     entry takes the rest of the width, so a block entry's first line shares
+     the row with its time and still wraps on a narrow screen. */
+  #transcript .stamp-row { display: flex; align-items: baseline; }
+  /* The time a durable entry landed, in the row's leading gutter. Tabular
+     figures keep the times aligned down the transcript. */
+  #transcript .stamp-row .ts {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    margin-right: 6px;
+  }
+  #transcript .stamp-row > :last-child { flex: 1; min-width: 0; }
   #transcript .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* User and assistant messages carry a left accent gutter like opencode's
      message boxes: the user's is tinted with the user color, the assistant's
@@ -934,6 +948,7 @@
     border-left: 4px solid var(--accent);
     border-radius: 8px;
     background: rgba(91, 140, 255, 0.08);
+    overflow-wrap: anywhere;
   }
   #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
   #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
@@ -3416,11 +3431,34 @@ transcript.addEventListener('scroll', () => {
   stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;
 });
 
-function appendLine(kind, text) {
+// A durable event's stamp as the reader's local clock time. The wire carries
+// UTC; the browser converts it, and an empty locale list keeps the reader's
+// own separators. The hour cycle is explicit because the locale picks it, and
+// the h24 cycle renders the day's first hour as 24 rather than 00; h23 pins
+// the 00-23 clock.
+function clockTime(atMs) {
+  return new Date(atMs).toLocaleTimeString([], { hourCycle: 'h23' });
+}
+
+// An entry whose event carries no stamp (stored before the field existed)
+// appends as itself, with no row and no time.
+function stampRow(el, atMs) {
+  if (atMs == null) return el;
+  const row = document.createElement('div');
+  row.className = 'stamp-row';
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = clockTime(atMs);
+  row.appendChild(ts);
+  row.appendChild(el);
+  return row;
+}
+
+function appendLine(kind, text, atMs) {
   const line = document.createElement('div');
   line.className = 'line ' + kind;
   line.textContent = text;
-  transcript.appendChild(line);
+  transcript.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3507,7 +3545,7 @@ const TOOL_SUMMARY_LIMIT = 120;
 
 // One-line tool strip: the glyph, the tool name, and a compact label of what
 // it acted on. The full args stay hidden until the line is clicked.
-function appendToolStrip(name, args) {
+function appendToolStrip(name, args, atMs) {
   const line = document.createElement('div');
   line.className = 'line tool';
   const glyph = document.createElement('span');
@@ -3538,7 +3576,7 @@ function appendToolStrip(name, args) {
     toggle.textContent = '▾';
     scrollToBottom();
   });
-  transcript.appendChild(line);
+  transcript.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3552,7 +3590,7 @@ const TOOL_RESULT_PREVIEW = 400;
 
 // One completion's thinking, collapsed. The label carries its size so the
 // reader can judge whether to open it without it being shown twice.
-function appendReasoningPanel(text) {
+function appendReasoningPanel(text, atMs) {
   const body = text == null ? '' : String(text);
   if (body === '') return;
   const line = document.createElement('div');
@@ -3585,11 +3623,11 @@ function appendReasoningPanel(text) {
     toggle.textContent = '\u25be';
     scrollToBottom();
   });
-  transcript.appendChild(line);
+  transcript.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
-function appendToolResult(name, payload, error) {
+function appendToolResult(name, payload, error, atMs) {
   const text = payload == null ? '' : String(payload);
   if (!error && text === '') return;
   const line = document.createElement('div');
@@ -3625,7 +3663,7 @@ function appendToolResult(name, payload, error) {
       scrollToBottom();
     });
   }
-  transcript.appendChild(line);
+  transcript.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3645,25 +3683,25 @@ function readableValue(value) {
   return String(value);
 }
 
-function appendMsg(role, text) {
+function appendMsg(role, text, atMs) {
   const paragraph = document.createElement('p');
   paragraph.className = 'msg ' + role;
   // A rejection is a durable user action, not a typed message; it renders
   // as a muted note so it never reads as words the user composed.
   if (role === 'user' && text === USER_REJECTED_TEXT) paragraph.classList.add('rejected');
   paragraph.textContent = text;
-  transcript.appendChild(paragraph);
+  transcript.appendChild(stampRow(paragraph, atMs));
   scrollToBottom();
 }
 
 // Assistant turns render markdown like the terminal client; user text stays
 // plain. Renders the same subset the TUI parses: headings, emphasis, inline
 // code, code fences, links, lists, blockquotes, and rules.
-function appendAssistant(text) {
+function appendAssistant(text, atMs) {
   const container = document.createElement('div');
   container.className = 'msg assistant';
   renderMarkdown(container, text);
-  transcript.appendChild(container);
+  transcript.appendChild(stampRow(container, atMs));
   scrollToBottom();
 }
 
@@ -3898,7 +3936,7 @@ function askBoxKey(block) {
 // The durable ask record in the transcript. When an ask is answered, the
 // control plane appends a matching answered-ask event after the surface it
 // resolves; the box updates in place so the same question never renders twice.
-function renderAskBox(block) {
+function renderAskBox(block, atMs) {
   const key = askBoxKey(block);
   if (openAskBox && openAskBox.key === key && !openAskBox.answered) {
     if (block.answer) {
@@ -3936,12 +3974,12 @@ function renderAskBox(block) {
     note.textContent = 'answered: ' + block.answer;
     box.appendChild(note);
   }
-  transcript.appendChild(box);
+  transcript.appendChild(stampRow(box, atMs));
   scrollToBottom();
   openAskBox = { key, el: box, answered: !!block.answer };
 }
 
-function renderMessage(message) {
+function renderMessage(message, atMs) {
   const block = message.block;
   lastMsg = block;
   // Any message that is not itself the pending ask closes the previous ask's
@@ -3952,13 +3990,13 @@ function renderMessage(message) {
       const container = document.createElement('div');
       container.className = 'msg assistant';
       renderMarkdown(container, block.text);
-      liveEl.replaceWith(container);
+      liveEl.replaceWith(stampRow(container, atMs));
       liveEl = null;
       scrollToBottom();
       scheduleAskSync();
       return;
     }
-    appendAssistant(block.text);
+    appendAssistant(block.text, atMs);
     scheduleAskSync();
     return;
   }
@@ -3968,11 +4006,11 @@ function renderMessage(message) {
   closeLive();
   switch (block.kind) {
     case 'text':
-      appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text);
+      appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs);
       break;
     case 'tool_call': {
       const args = block.args == null ? {} : block.args;
-      appendToolStrip(block.name, args);
+      appendToolStrip(block.name, args, atMs);
       break;
     }
     case 'tool_result': {
@@ -3981,17 +4019,17 @@ function renderMessage(message) {
         typeof content === 'string' || content === null
           ? String(content)
           : readableValue(content);
-      appendToolResult(block.name, payload, block.is_error);
+      appendToolResult(block.name, payload, block.is_error, atMs);
       break;
     }
     case 'ask':
-      renderAskBox(block);
+      renderAskBox(block, atMs);
       break;
     case 'reasoning':
-      appendReasoningPanel(block.text);
+      appendReasoningPanel(block.text, atMs);
       break;
     case 'summary':
-      appendLine('summary', block.text);
+      appendLine('summary', block.text, atMs);
       break;
     case 'child_event': {
       // Child activity renders as one line whose child id expands into that
@@ -4010,12 +4048,12 @@ function renderMessage(message) {
       const tail = document.createElement('span');
       tail.textContent = ' ' + (block.event_kind || 'report') + '] ' + block.text;
       line.appendChild(tail);
-      transcript.appendChild(line);
+      transcript.appendChild(stampRow(line, atMs));
       scrollToBottom();
       break;
     }
     default:
-      appendLine('unknown', JSON.stringify(block));
+      appendLine('unknown', JSON.stringify(block), atMs);
       break;
   }
   scheduleAskSync();
@@ -4040,7 +4078,7 @@ function modelCallLine(event) {
 function handleEvent(event) {
   switch (event.kind) {
     case 'message':
-      renderMessage(event.message);
+      renderMessage(event.message, event.at_ms);
       break;
     case 'state':
       // The current state lives once, in the header dot; a transcript line
@@ -4059,7 +4097,7 @@ function handleEvent(event) {
     case 'model_call':
       // Model calls are metering history, not conversation: the line is
       // transcript bookkeeping, never a message or an activity-console row.
-      appendLine('mono', modelCallLine(event));
+      appendLine('mono', modelCallLine(event), event.at_ms);
       break;
     case 'activity': {
       // Loop activity is machinery, not conversation: it feeds the debug

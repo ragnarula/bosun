@@ -17,6 +17,7 @@ bosun-common.workspace = true
 bosun-control.workspace = true
 bosun-node.workspace = true
 bosun-store.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 dialoguer.workspace = true

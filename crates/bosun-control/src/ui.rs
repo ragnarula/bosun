@@ -17,6 +17,25 @@ mod tests {
 
     // The pane ships as one embedded HTML file with no browser test harness,
     // so these are presence checks, not behaviour tests.
+
+    /// The pane's source from `start` to the next `end`, so a check reads one
+    /// function or one case instead of the indentation around a single line.
+    fn segment<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("the pane must contain {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("the pane must contain {end} after {start}"))
+            .0
+    }
+
+    /// The same source with every run of whitespace removed, so a check reads
+    /// the tokens of a call and not the line breaks a formatter chose.
+    fn squeezed(source: &str) -> String {
+        source.split_whitespace().collect()
+    }
+
     #[test]
     fn the_pane_routes_activity_frames_to_the_console() {
         assert!(
@@ -29,7 +48,7 @@ mod tests {
     fn the_pane_has_a_model_call_line_handler() {
         assert!(
             PANE.contains("case 'model_call':")
-                && PANE.contains("appendLine('mono', modelCallLine(event))")
+                && PANE.contains("appendLine('mono', modelCallLine(event), event.at_ms)")
                 && PANE.contains("event.call_kind")
                 && PANE.contains("event.cost.toFixed(4)"),
             "the pane must render a model_call as one monospace transcript line"
@@ -56,6 +75,103 @@ mod tests {
                 && PANE.contains("newest.received")
                 && PANE.contains("window.setInterval(refreshStatusLabel, 1000)"),
             "the pane must label the running status from the newest activity"
+        );
+    }
+
+    #[test]
+    fn the_pane_renders_a_stamp_in_the_readers_local_time() {
+        let clock = segment(PANE, "function clockTime(", "\n}");
+        assert!(
+            clock.contains("new Date(atMs)")
+                && clock.contains("toLocaleTimeString")
+                && clock.contains("hourCycle")
+                && clock.contains("h23"),
+            "the pane must convert the stamp to the reader's local 00-23 time"
+        );
+    }
+
+    #[test]
+    fn the_pane_stamps_a_durable_entry_and_skips_one_without_a_stamp() {
+        let stamp = segment(PANE, "function stampRow(", "\n}");
+        assert!(
+            stamp.contains("== null") && stamp.contains("clockTime(") && stamp.contains("'ts'"),
+            "the stamp helper must time the entry, and add nothing when the stamp is missing"
+        );
+    }
+
+    #[test]
+    fn the_pane_threads_the_event_stamp_into_every_durable_entry() {
+        let source = squeezed(PANE);
+        for call in [
+            "renderMessage(event.message, event.at_ms)",
+            "appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs)",
+            "appendAssistant(block.text, atMs)",
+            "appendToolStrip(block.name, args, atMs)",
+            "appendToolResult(block.name, payload, block.is_error, atMs)",
+            "appendReasoningPanel(block.text, atMs)",
+            "appendLine('summary', block.text, atMs)",
+            "appendLine('unknown', JSON.stringify(block), atMs)",
+            "renderAskBox(block, atMs);",
+        ] {
+            assert!(
+                source.contains(&squeezed(call)),
+                "the pane must pass the stamp to {call}"
+            );
+        }
+        // The child report and the durable block that replaces the live
+        // paragraph build their element inline, so each of those two stamps is
+        // read from the case or the function it belongs to.
+        let child_report = segment(PANE, "case 'child_event':", "default:");
+        assert!(
+            squeezed(child_report).contains(&squeezed("stampRow(line, atMs)")),
+            "a child report line must carry the stamp"
+        );
+        let message = segment(PANE, "function renderMessage(", "\n}");
+        assert!(
+            squeezed(message).contains(&squeezed("liveEl.replaceWith(stampRow(container, atMs))")),
+            "the durable block that replaces the live paragraph must carry the stamp"
+        );
+    }
+
+    #[test]
+    fn the_pane_stamps_the_entry_that_every_durable_append_helper_writes() {
+        for helper in [
+            "appendLine",
+            "appendToolStrip",
+            "appendReasoningPanel",
+            "appendToolResult",
+            "appendMsg",
+            "appendAssistant",
+            "renderAskBox",
+        ] {
+            let body = squeezed(segment(PANE, &format!("function {helper}("), "\n}"));
+            assert!(
+                body.contains(&squeezed("stampRow(")),
+                "{helper} must put the event's stamp on the entry it appends"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_lays_the_stamp_out_as_a_gutter_column() {
+        let row = segment(PANE, "#transcript .stamp-row {", "}");
+        assert!(
+            row.contains("display: flex") && row.contains("align-items: baseline"),
+            "the stamp row must set the time beside the entry, on the entry's first line of text"
+        );
+        let entry = segment(PANE, "#transcript .stamp-row > :last-child {", "}");
+        assert!(
+            entry.contains("flex: 1") && entry.contains("min-width: 0"),
+            "the entry must take the row's remaining width and still shrink on a phone"
+        );
+    }
+
+    #[test]
+    fn the_pane_leaves_the_live_delta_unstamped() {
+        let delta = segment(PANE, "function appendDelta(", "\n}");
+        assert!(
+            !delta.contains("stampRow"),
+            "a live delta is not durable and must carry no time"
         );
     }
 }

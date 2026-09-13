@@ -27,6 +27,7 @@ bosun-executor = { path = "crates/bosun-executor" }
 bosun-node = { path = "crates/bosun-node" }
 bosun-store = { path = "crates/bosun-store" }
 bosun-test-support = { path = "crates/bosun-test-support" }
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 bytes = "1"

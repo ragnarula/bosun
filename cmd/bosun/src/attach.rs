@@ -24,6 +24,11 @@ use bosun_common::session::Session;
 use bosun_common::session::SessionState;
 use bosun_control::api::PersonaSummary;
 use bosun_control::api::USER_REJECTED_TEXT;
+use chrono::FixedOffset;
+use chrono::Local;
+use chrono::Offset;
+use chrono::TimeZone;
+use chrono::Utc;
 use crossterm::event;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::EnableBracketedPaste;
@@ -77,6 +82,15 @@ const ACTIVITY_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// The web pane clips its result preview at `TOOL_RESULT_PREVIEW` (400) instead,
 /// because the full text is one click away there.
 const MAX_INLINE_CHARS: usize = 1000;
+/// The width of a transcript row's time gutter: `HH:MM:SS` and the space
+/// that separates it from the row's own prefix.
+const TIME_GUTTER_WIDTH: usize = 9;
+/// The clock a gutter renders: 24-hour, zero-padded.
+const CLOCK_FORMAT: &str = "%H:%M:%S";
+/// The gutter a row leads with when it has no time to show: blanks as wide as
+/// a time, so the rows wrapped under an entry keep one text column. It is
+/// written out because a const cannot repeat `TIME_GUTTER_WIDTH` spaces.
+const BLANK_GUTTER: &str = "         ";
 /// Transcript rows kept in memory; the oldest rows scroll away.
 const MAX_LINES: usize = 5000;
 /// Activity rows kept in client state; the oldest drop when the cap is hit.
@@ -113,6 +127,10 @@ pub enum LineKind {
 pub struct Line {
     pub kind: LineKind,
     pub text: String,
+    /// The append time of the durable event this line came from, in unix
+    /// milliseconds UTC. None for a line no event carries — a local note, or
+    /// an event the store wrote before it stamped events.
+    pub at_ms: Option<u64>,
 }
 
 /// One loop-activity phase received over the stream, with the local time it
@@ -177,10 +195,10 @@ impl ClientState {
             return false;
         }
         self.last_seq = seq;
-        if let Event::Permission { permission } = event {
+        if let Event::Permission { permission, .. } = event {
             self.permission = *permission;
         }
-        if let Event::State { state } = event {
+        if let Event::State { state, .. } = event {
             self.session_state = *state;
         }
         if let Event::Activity { at_ms, phase } = event {
@@ -192,7 +210,7 @@ impl ClientState {
         }
         if matches!(
             event,
-            Event::Message { message } if matches!(message.block, Block::Text { .. })
+            Event::Message { message, .. } if matches!(message.block, Block::Text { .. })
         ) {
             // The durable text is the turn's final text; it supersedes the
             // streaming delta that led up to it.
@@ -203,7 +221,7 @@ impl ClientState {
             // next, so any streaming text from the prior turn is stale.
             self.pending_delta = None;
         }
-        if let Event::Message { message } = event {
+        if let Event::Message { message, .. } = event {
             self.live_ask = match &message.block {
                 Block::Ask {
                     message,
@@ -233,10 +251,16 @@ impl ClientState {
     }
 
     fn push_line(&mut self, line: Line) {
-        // A routed answer replays the resolved ask right after the surface it
-        // supersedes; the surface is already on screen, so an identical ask
-        // line is skipped rather than duplicated.
-        if line.kind == LineKind::Ask && self.lines.last() == Some(&line) {
+        // A routed answer replays the resolved ask right after the ask line
+        // the user was shown; that line is already on screen, so an ask line
+        // that repeats the last one is skipped rather than duplicated. The
+        // replay is a later append, so the repeat is matched on its kind and
+        // text, not on its time.
+        if line.kind == LineKind::Ask
+            && let Some(last) = self.lines.last()
+            && last.kind == LineKind::Ask
+            && last.text == line.text
+        {
             return;
         }
         if self.lines.len() >= MAX_LINES {
@@ -270,19 +294,22 @@ fn child_event_verb(kind: ChildEventKind) -> &'static str {
     }
 }
 
-/// Maps a durable event to the transcript lines it contributes.
+/// Maps a durable event to the transcript lines it contributes. Every line
+/// carries the event's own append time, so one event's rows show one time.
 fn event_lines(event: &Event) -> Vec<Line> {
+    let at_ms = event.at_ms();
     match event {
-        Event::Message { message }
+        Event::Message { message, .. }
             if message.role == Role::User
                 && matches!(&message.block, Block::Text { text } if text == USER_REJECTED_TEXT) =>
         {
             vec![Line {
                 kind: LineKind::Rejected,
                 text: USER_REJECTED_TEXT.to_string(),
+                at_ms,
             }]
         }
-        Event::Message { message } => {
+        Event::Message { message, .. } => {
             let kind = match message.role {
                 Role::User => LineKind::User,
                 Role::Assistant => LineKind::Assistant,
@@ -291,10 +318,12 @@ fn event_lines(event: &Event) -> Vec<Line> {
                 Block::Text { text } => vec![Line {
                     kind,
                     text: text.clone(),
+                    at_ms,
                 }],
                 Block::ToolCall { name, args, .. } => vec![Line {
                     kind: LineKind::ToolCall,
                     text: format!("{name} {}", inline_value(args)),
+                    at_ms,
                 }],
                 Block::ToolResult {
                     name,
@@ -306,6 +335,7 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     vec![Line {
                         kind: LineKind::ToolResult,
                         text: format!("{prefix}{name} {}", output_text(content)),
+                        at_ms,
                     }]
                 }
                 Block::Ask {
@@ -321,15 +351,18 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     vec![Line {
                         kind: LineKind::Ask,
                         text: format!("{origin}{message} [{}]", options.join(", ")),
+                        at_ms,
                     }]
                 }
                 Block::Reasoning { text } => vec![Line {
                     kind: LineKind::Reasoning,
                     text: text.clone(),
+                    at_ms,
                 }],
                 Block::Summary { text } => vec![Line {
                     kind: LineKind::Summary,
                     text: text.clone(),
+                    at_ms,
                 }],
                 Block::ChildEvent {
                     child_id,
@@ -339,24 +372,29 @@ fn event_lines(event: &Event) -> Vec<Line> {
                 } => vec![Line {
                     kind: LineKind::ChildEvent,
                     text: format!("child {child_id} {}: {text}", child_event_verb(*kind)),
+                    at_ms,
                 }],
             }
         }
-        Event::State { state } => vec![Line {
+        Event::State { state, .. } => vec![Line {
             kind: LineKind::Status,
             text: format!("state: {}", state_name(*state)),
+            at_ms,
         }],
-        Event::Permission { permission } => vec![Line {
+        Event::Permission { permission, .. } => vec![Line {
             kind: LineKind::Status,
             text: format!("permission: {}", permission_name(*permission)),
+            at_ms,
         }],
-        Event::Persona { persona } => vec![Line {
+        Event::Persona { persona, .. } => vec![Line {
             kind: LineKind::Status,
             text: format!("persona: {persona}"),
+            at_ms,
         }],
         Event::Warning { text } => vec![Line {
             kind: LineKind::Status,
             text: format!("warning: {text}"),
+            at_ms,
         }],
         Event::ModelCall {
             model,
@@ -384,6 +422,7 @@ fn event_lines(event: &Event) -> Vec<Line> {
             vec![Line {
                 kind: LineKind::ModelCall,
                 text: format!("{model} {kind}{detail}"),
+                at_ms,
             }]
         }
         // Activity is loop machinery, not conversation: the console and the
@@ -490,46 +529,102 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// The `HH:MM:SS` time a stamp renders as at `offset`, followed by the space
+/// that separates it from the rest of the row. Blanks when the stamp names a
+/// time no clock can show.
+fn time_gutter(at_ms: u64, offset: FixedOffset) -> String {
+    match offset.timestamp_millis_opt(at_ms as i64).single() {
+        Some(time) => format!("{} ", time.format(CLOCK_FORMAT)),
+        None => BLANK_GUTTER.to_string(),
+    }
+}
+
+/// The offset from UTC the reader's clock had at `at_ms`, so an entry either
+/// side of a daylight-saving change renders the wall clock the reader saw. UTC
+/// when the stamp names an instant `Local` cannot resolve.
+fn local_offset(at_ms: u64) -> FixedOffset {
+    Local
+        .timestamp_millis_opt(at_ms as i64)
+        .earliest()
+        .map_or(Utc.fix(), |local| {
+            Local.offset_from_utc_datetime(&local.naive_utc())
+        })
+}
+
+/// The dim span that leads a row: the gutter the caller computed on the
+/// entry's first row, blanks under the rows that wrap below it.
+fn gutter_span(gutter: &str, first: bool) -> Span<'static> {
+    let style = Style::default().fg(Color::DarkGray);
+    if first {
+        Span::styled(gutter.to_string(), style)
+    } else {
+        Span::styled(BLANK_GUTTER, style)
+    }
+}
+
+/// The wrapped rows one line contributes at `width`, with `gutter` leading the
+/// first row. Assistant text is rendered as markdown; everything else keeps
+/// the per-kind prefix and color. The rows that wrap under the first lead with
+/// blanks, so the text stays in one column.
+fn line_rows(
+    kind: LineKind,
+    text: &str,
+    gutter: &str,
+    width: usize,
+) -> Vec<(LineKind, Vec<Span<'static>>)> {
+    let inner = width.saturating_sub(TIME_GUTTER_WIDTH).max(1);
+    let mut rows = Vec::new();
+    if kind == LineKind::Assistant {
+        for (i, spans) in markdown_rows(text, inner).into_iter().enumerate() {
+            let mut row = Vec::with_capacity(spans.len() + 1);
+            row.push(gutter_span(gutter, i == 0));
+            row.extend(spans);
+            rows.push((LineKind::Assistant, row));
+        }
+        return rows;
+    }
+    let mut style = Style::default().fg(row_color(kind, text));
+    if kind == LineKind::Status {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let prefix = prefix_for(kind, text);
+    let prefix_width = prefix.chars().count();
+    let inner = inner.saturating_sub(prefix_width).max(1);
+    let wrapped = wrap_text(text, inner);
+    for (i, row) in wrapped.iter().enumerate() {
+        let indent = if i == 0 {
+            prefix.to_string()
+        } else {
+            " ".repeat(prefix_width)
+        };
+        rows.push((
+            kind,
+            vec![
+                gutter_span(gutter, i == 0),
+                Span::styled(indent, style),
+                Span::styled(row.clone(), style),
+            ],
+        ));
+    }
+    rows
+}
+
 /// The wrapped, prefixed transcript rows as styled spans: the durable lines
-/// plus the live delta, cut to `width` columns. Assistant text is rendered as
-/// markdown; everything else keeps the per-kind prefix and color.
+/// plus the live delta, wrapped to the width left after the time gutter.
 fn transcript_rows(state: &ClientState, width: usize) -> Vec<(LineKind, Vec<Span<'static>>)> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for line in &state.lines {
-        if line.kind == LineKind::Assistant {
-            for row in markdown_rows(&line.text, width) {
-                rows.push((LineKind::Assistant, row));
-            }
-            continue;
-        }
-        let mut style = Style::default().fg(row_color(line.kind, &line.text));
-        if line.kind == LineKind::Status {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        let prefix = prefix_for(line);
-        let prefix_width = prefix.chars().count();
-        let inner = width.saturating_sub(prefix_width).max(1);
-        let wrapped = wrap_text(&line.text, inner);
-        for (i, row) in wrapped.iter().enumerate() {
-            let indent = if i == 0 {
-                prefix.to_string()
-            } else {
-                " ".repeat(prefix_width)
-            };
-            rows.push((
-                line.kind,
-                vec![
-                    Span::styled(indent, style),
-                    Span::styled(row.clone(), style),
-                ],
-            ));
-        }
+        let gutter = match line.at_ms {
+            Some(at_ms) => Cow::Owned(time_gutter(at_ms, local_offset(at_ms))),
+            None => Cow::Borrowed(BLANK_GUTTER),
+        };
+        rows.extend(line_rows(line.kind, &line.text, &gutter, width));
     }
     if let Some(pending) = &state.pending_delta {
-        for row in markdown_rows(pending, width) {
-            rows.push((LineKind::Assistant, row));
-        }
+        // A live delta is not durable yet, so it carries no time; the blank
+        // gutter keeps it aligned with the durable assistant rows around it.
+        rows.extend(line_rows(LineKind::Assistant, pending, BLANK_GUTTER, width));
     }
     rows
 }
@@ -543,17 +638,17 @@ fn row_color(kind: LineKind, text: &str) -> Color {
     }
 }
 
-/// The per-kind prefix that aligns the transcript: messages start at the
-/// margin, tool activity and meta rows are indented, section rows are
-/// separated. Tool calls carry the tool's own glyph; the result nests under
-/// it, so a call and its outcome read as one unit like opencode's inline tool
-/// rows. Summary and Status both use the divider so a compaction reads as a
-/// section boundary rather than a message.
-fn prefix_for(line: &Line) -> Cow<'static, str> {
-    match line.kind {
+/// The per-kind prefix that aligns the transcript, after the time gutter:
+/// messages are least indented, tool activity and meta rows are indented,
+/// section rows are separated. Tool calls carry the tool's own glyph; the
+/// result nests under it, so a call and its outcome read as one unit like
+/// opencode's inline tool rows. Summary and Status both use the divider so a
+/// compaction reads as a section boundary rather than a message.
+fn prefix_for(kind: LineKind, text: &str) -> Cow<'static, str> {
+    match kind {
         LineKind::User => Cow::Borrowed("you: "),
         LineKind::Assistant => Cow::Borrowed(""),
-        LineKind::ToolCall => Cow::Owned(format!("  {} ", tool_glyph(&line.text))),
+        LineKind::ToolCall => Cow::Owned(format!("  {} ", tool_glyph(text))),
         LineKind::ToolResult => Cow::Borrowed("    ↳ "),
         LineKind::Ask => Cow::Borrowed("  ? "),
         LineKind::Rejected => Cow::Borrowed("  ~ "),
@@ -565,15 +660,15 @@ fn prefix_for(line: &Line) -> Cow<'static, str> {
     }
 }
 
-/// The single-glyph marker that identifies the tool kind in the gutter, so a
-/// reader sees what ran before reading its name and args. Unknown tools fall
-/// back to a generic gear.
+/// The single-glyph marker that identifies the tool kind in the row's prefix,
+/// so a reader sees what ran before reading its name and args. Unknown tools
+/// fall back to a generic gear.
 ///
 /// Mirrors the web pane's `toolGlyph` in `crates/bosun-control/src/ui/index.html`;
 /// keep both in step with the canonical tool list in `bosun_common::tool::canonical_tools`.
 /// Every glyph measures one column in `unicode-width` (which ratatui uses to
-/// lay out rows), because the gutter prefix width is counted in chars; a glyph
-/// that rendered two columns would misalign wrapped rows.
+/// lay out rows), because the prefix width is counted in chars; a glyph that
+/// rendered two columns would misalign wrapped rows.
 fn tool_glyph(text: &str) -> &'static str {
     match text.split_whitespace().next().unwrap_or_default() {
         "shell" => "$",
@@ -1237,6 +1332,7 @@ fn push_input(state: &mut ClientState, text: &str) {
         state.push_line(Line {
             kind: LineKind::Status,
             text: "input limit reached".into(),
+            at_ms: None,
         });
     }
 }
@@ -1284,6 +1380,7 @@ async fn run_attach(
                 app.state.push_line(Line {
                     kind: LineKind::Status,
                     text: "connection lost; reconnecting".to_string(),
+                    at_ms: None,
                 });
                 redraw(terminal, app)?;
             }
@@ -1292,6 +1389,7 @@ async fn run_attach(
             app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "connection lost; reconnecting".to_string(),
+                at_ms: None,
             });
             redraw(terminal, app)?;
         }
@@ -1642,6 +1740,7 @@ async fn send_message(
             app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
+                at_ms: None,
             });
             return;
         }
@@ -1650,6 +1749,7 @@ async fn send_message(
         app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("send failed: {error}"),
+            at_ms: None,
         });
     }
 }
@@ -1670,6 +1770,7 @@ async fn reject_question(app: &mut App, client: &reqwest::Client, cp_url: &str, 
             app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
+                at_ms: None,
             });
             return;
         }
@@ -1678,6 +1779,7 @@ async fn reject_question(app: &mut App, client: &reqwest::Client, cp_url: &str, 
         app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("reject failed: {error}"),
+            at_ms: None,
         });
     }
 }
@@ -1696,6 +1798,7 @@ async fn interrupt(app: &mut App, client: &reqwest::Client, cp_url: &str, sessio
             app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
+                at_ms: None,
             });
             return;
         }
@@ -1704,6 +1807,7 @@ async fn interrupt(app: &mut App, client: &reqwest::Client, cp_url: &str, sessio
         app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("interrupt failed: {error}"),
+            at_ms: None,
         });
     }
 }
@@ -1732,6 +1836,7 @@ async fn toggle_permission(
             app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
+                at_ms: None,
             });
             return;
         }
@@ -1741,6 +1846,7 @@ async fn toggle_permission(
         Err(error) => app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("permission change failed: {error}"),
+            at_ms: None,
         }),
     }
 }
@@ -1766,6 +1872,7 @@ async fn switch_persona(
             app.state.push_line(Line {
                 kind: LineKind::Status,
                 text: "request timed out".into(),
+                at_ms: None,
             });
             return;
         }
@@ -1774,6 +1881,7 @@ async fn switch_persona(
         app.state.push_line(Line {
             kind: LineKind::Status,
             text: format!("persona switch failed: {error}"),
+            at_ms: None,
         });
     }
 }
@@ -2020,20 +2128,41 @@ mod tests {
             .collect()
     }
 
+    /// Whether the row leads with an `HH:MM:SS ` gutter: two digits, a colon,
+    /// two digits, a colon, two digits and a space. The shape alone, because
+    /// the clock a machine renders is its own.
+    fn leads_with_a_clock(row: &str) -> bool {
+        let digit = |c: char| c.is_ascii_digit();
+        let shape: Vec<char> = row.chars().take(TIME_GUTTER_WIDTH).collect();
+        shape.len() == TIME_GUTTER_WIDTH
+            && digit(shape[0])
+            && digit(shape[1])
+            && shape[2] == ':'
+            && digit(shape[3])
+            && digit(shape[4])
+            && shape[5] == ':'
+            && digit(shape[6])
+            && digit(shape[7])
+            && shape[8] == ' '
+    }
+
     #[test]
     fn transcript_rows_align_each_kind_and_include_the_delta() {
         let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         state.push_line(Line {
             kind: LineKind::User,
             text: "hello".into(),
+            at_ms: None,
         });
         state.push_line(Line {
             kind: LineKind::ToolCall,
             text: "shell {\"cmd\":\"ls\"}".into(),
+            at_ms: None,
         });
         state.push_line(Line {
             kind: LineKind::Status,
             text: "state: waiting_for_input".into(),
+            at_ms: None,
         });
         state.pending_delta = Some("streaming".into());
 
@@ -2041,10 +2170,10 @@ mod tests {
         assert_eq!(
             row_texts(&rows),
             vec![
-                "you: hello",
-                "  $ shell {\"cmd\":\"ls\"}",
-                "── state: waiting_for_input",
-                "streaming"
+                "         you: hello",
+                "           $ shell {\"cmd\":\"ls\"}",
+                "         ── state: waiting_for_input",
+                "         streaming",
             ]
         );
         let kinds: Vec<LineKind> = rows.iter().map(|(k, _)| *k).collect();
@@ -2065,9 +2194,15 @@ mod tests {
         state.push_line(Line {
             kind: LineKind::Assistant,
             text: "one two three four".into(),
+            at_ms: None,
         });
-        let rows = transcript_rows(&state, 10);
-        assert_eq!(row_texts(&rows), vec!["one two", "three four"]);
+        // The gutter takes nine of the nineteen columns, so the text wraps at
+        // ten.
+        let rows = transcript_rows(&state, 19);
+        assert_eq!(
+            row_texts(&rows),
+            vec!["         one two", "         three four"]
+        );
     }
 
     #[test]
@@ -2076,13 +2211,99 @@ mod tests {
         state.push_line(Line {
             kind: LineKind::Assistant,
             text: "## Done\n\nIt **works** now.".into(),
+            at_ms: None,
         });
         let rows = transcript_rows(&state, 40);
-        assert_eq!(row_texts(&rows), vec!["Done", "", "It works now."]);
+        assert_eq!(
+            row_texts(&rows),
+            vec!["         Done", "         ", "         It works now."]
+        );
         let (kind, spans) = &rows[0];
         assert_eq!(*kind, LineKind::Assistant);
-        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
-        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        // The dim gutter leads; the heading keeps its own style.
+        assert_eq!(spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(spans[1].style.fg, Some(Color::Cyan));
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // The tests below pin fixed offsets: the local conversion itself is not
+    // covered, because it follows the machine's timezone and an assertion on
+    // the wall clock would pass or fail with the runner's zone. `time_gutter`
+    // is covered through injected offsets instead.
+
+    #[test]
+    fn time_gutter_renders_the_stamp_at_the_given_offset() {
+        // The wire stamp is UTC; the gutter renders the reader's offset.
+        let west = FixedOffset::east_opt(-5 * 3600).unwrap();
+        assert_eq!(time_gutter(1_700_000_000_000, west), "17:13:20 ");
+        let east = FixedOffset::east_opt(2 * 3600).unwrap();
+        assert_eq!(time_gutter(1_700_000_000_000, east), "00:13:20 ");
+    }
+
+    #[test]
+    fn a_rendered_time_and_the_blank_gutter_are_both_time_gutter_width() {
+        let zero = FixedOffset::east_opt(0).unwrap();
+        assert_eq!(BLANK_GUTTER.chars().count(), TIME_GUTTER_WIDTH);
+        assert_eq!(
+            time_gutter(1_700_000_000_000, zero).chars().count(),
+            TIME_GUTTER_WIDTH
+        );
+    }
+
+    #[test]
+    fn a_wrapped_entry_times_only_its_first_row() {
+        // Nineteen columns leave five after the gutter and the "you: " prefix,
+        // so the second row starts where the first one's text does.
+        let rows = line_rows(LineKind::User, "hello world", "22:13:20 ", 19);
+        assert_eq!(
+            row_texts(&rows),
+            vec!["22:13:20 you: hello", "              world"]
+        );
+        assert_eq!(rows[0].1[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(rows[1].1[0].content, BLANK_GUTTER);
+    }
+
+    #[test]
+    fn assistant_markdown_wraps_to_the_width_left_after_the_gutter() {
+        // The text fits nineteen columns but not the ten left after the gutter.
+        let rows = row_texts(&line_rows(
+            LineKind::Assistant,
+            "alpha beta gamma",
+            "22:13:20 ",
+            19,
+        ));
+        assert_eq!(rows, vec!["22:13:20 alpha beta", "         gamma"]);
+    }
+
+    #[test]
+    fn a_stamped_line_renders_a_clock_gutter_through_the_public_path() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::User,
+            text: "hello world".into(),
+            at_ms: Some(1_700_000_000_000),
+        });
+        state.pending_delta = Some("streaming".into());
+
+        let rows = row_texts(&transcript_rows(&state, 19));
+        assert_eq!(rows.len(), 3);
+        assert!(leads_with_a_clock(&rows[0]), "first row: {:?}", rows[0]);
+        assert!(!leads_with_a_clock(&rows[1]), "wrapped row: {:?}", rows[1]);
+        assert!(!leads_with_a_clock(&rows[2]), "delta row: {:?}", rows[2]);
+    }
+
+    #[test]
+    fn an_unstamped_line_renders_nine_blanks_in_the_gutter() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::User,
+            text: "hello".into(),
+            at_ms: None,
+        });
+        assert_eq!(
+            row_texts(&transcript_rows(&state, 40)),
+            vec!["         you: hello"]
+        );
     }
 
     #[test]
@@ -2108,6 +2329,7 @@ mod tests {
             Some(&Line {
                 kind: LineKind::Status,
                 text: "input limit reached".into(),
+                at_ms: None,
             })
         );
     }
@@ -2123,6 +2345,7 @@ mod tests {
             Some(&Line {
                 kind: LineKind::Status,
                 text: "input limit reached".into(),
+                at_ms: None,
             })
         );
     }
@@ -2135,6 +2358,7 @@ mod tests {
         assert_eq!(state.pending_delta.as_deref(), Some("building the crate"));
 
         let event = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::Assistant,
                 block: Block::Text {
@@ -2149,6 +2373,7 @@ mod tests {
             vec![Line {
                 kind: LineKind::Assistant,
                 text: "building the crate".into(),
+                at_ms: None,
             }]
         );
     }
@@ -2161,6 +2386,7 @@ mod tests {
         // linger on screen.
         state.apply_delta("phantom text");
         let interrupted = Event::State {
+            at_ms: None,
             state: SessionState::Interrupted,
         };
         assert!(state.apply_event(1, &interrupted));
@@ -2170,6 +2396,7 @@ mod tests {
         // deltas append.
         state.apply_delta("stale text");
         let running = Event::State {
+            at_ms: None,
             state: SessionState::Running,
         };
         assert!(state.apply_event(2, &running));
@@ -2213,6 +2440,7 @@ mod tests {
             vec![Line {
                 kind: LineKind::Assistant,
                 text: "hello".into(),
+                at_ms: None,
             }]
         );
     }
@@ -2243,6 +2471,7 @@ mod tests {
     #[test]
     fn event_lines_maps_each_durable_event_kind() {
         let text = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::User,
                 block: Block::Text { text: "go".into() },
@@ -2253,10 +2482,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::User,
                 text: "go".into(),
+                at_ms: None,
             }]
         );
 
         let call = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::Assistant,
                 block: Block::ToolCall {
@@ -2271,10 +2502,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::ToolCall,
                 text: "shell {\"cmd\":\"ls\"}".into(),
+                at_ms: None,
             }]
         );
 
         let result = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::User,
                 block: Block::ToolResult {
@@ -2290,10 +2523,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::ToolResult,
                 text: "shell ok".into(),
+                at_ms: None,
             }]
         );
 
         let error = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::User,
                 block: Block::ToolResult {
@@ -2309,10 +2544,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::ToolResult,
                 text: "error: shell boom".into(),
+                at_ms: None,
             }]
         );
 
         let ask = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::Assistant,
                 block: Block::Ask {
@@ -2328,10 +2565,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::Ask,
                 text: "pick [a, b]".into(),
+                at_ms: None,
             }]
         );
 
         let bound_ask = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::Assistant,
                 block: Block::Ask {
@@ -2347,10 +2586,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::Ask,
                 text: "child explorer-1: may I push? [yes, no]".into(),
+                at_ms: None,
             }]
         );
 
         let summary = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::Assistant,
                 block: Block::Summary {
@@ -2363,10 +2604,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::Summary,
                 text: "compacted".into(),
+                at_ms: None,
             }]
         );
 
         let child_report = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::Assistant,
                 block: Block::ChildEvent {
@@ -2382,10 +2625,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::ChildEvent,
                 text: "child explorer-1 reported: found it".into(),
+                at_ms: None,
             }]
         );
 
         let state = Event::State {
+            at_ms: None,
             state: SessionState::WaitingForInput,
         };
         assert_eq!(
@@ -2393,10 +2638,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::Status,
                 text: "state: waiting_for_input".into(),
+                at_ms: None,
             }]
         );
 
         let permission = Event::Permission {
+            at_ms: None,
             permission: Permission::ReadOnly,
         };
         assert_eq!(
@@ -2404,10 +2651,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::Status,
                 text: "permission: read_only".into(),
+                at_ms: None,
             }]
         );
 
         let model = Event::ModelCall {
+            at_ms: None,
             model: "alpha".into(),
             provider: "x".into(),
             kind: "completion".into(),
@@ -2420,6 +2669,7 @@ mod tests {
             vec![Line {
                 kind: LineKind::ModelCall,
                 text: "alpha completion (10 in, 2 out, $0.0100)".into(),
+                at_ms: None,
             }]
         );
 
@@ -2432,6 +2682,125 @@ mod tests {
             Vec::new(),
             "activity never becomes a transcript line"
         );
+    }
+
+    #[test]
+    fn event_lines_carry_the_events_time() {
+        let stamped = Event::Message {
+            at_ms: Some(1_700_000_000_000),
+            message: Message {
+                role: Role::User,
+                block: Block::Text { text: "go".into() },
+            },
+        };
+        assert_eq!(
+            event_lines(&stamped),
+            vec![Line {
+                kind: LineKind::User,
+                text: "go".into(),
+                at_ms: Some(1_700_000_000_000),
+            }]
+        );
+
+        // An event the store wrote before it stamped events has no time.
+        let unstamped = Event::State {
+            at_ms: None,
+            state: SessionState::Running,
+        };
+        assert_eq!(event_lines(&unstamped)[0].at_ms, None);
+    }
+
+    #[test]
+    fn event_lines_carry_the_events_time_on_every_kind_that_renders() {
+        let at_ms = Some(1_700_000_000_000);
+        let assistant_message = |block: Block| Event::Message {
+            at_ms,
+            message: Message {
+                role: Role::Assistant,
+                block,
+            },
+        };
+        let events = [
+            // Every Message block that reaches the transcript, plus the
+            // rejection marker, which is user text with a reserved body.
+            Event::Message {
+                at_ms,
+                message: Message {
+                    role: Role::User,
+                    block: Block::Text { text: "go".into() },
+                },
+            },
+            Event::Message {
+                at_ms,
+                message: Message {
+                    role: Role::User,
+                    block: Block::Text {
+                        text: USER_REJECTED_TEXT.into(),
+                    },
+                },
+            },
+            assistant_message(Block::ToolCall {
+                id: "1".into(),
+                name: "shell".into(),
+                args: json!({ "cmd": "ls" }),
+            }),
+            assistant_message(Block::ToolResult {
+                id: "1".into(),
+                name: "shell".into(),
+                is_error: true,
+                content: json!("boom"),
+            }),
+            assistant_message(Block::Ask {
+                message: "pick".into(),
+                options: vec!["a".into(), "b".into()],
+                child_id: Some("explorer-1".into()),
+                answer: None,
+            }),
+            assistant_message(Block::Reasoning {
+                text: "thinking".into(),
+            }),
+            assistant_message(Block::Summary {
+                text: "compacted".into(),
+            }),
+            assistant_message(Block::ChildEvent {
+                child_id: "explorer-1".into(),
+                kind: ChildEventKind::Report,
+                text: "found it".into(),
+                origin: None,
+            }),
+            Event::State {
+                at_ms,
+                state: SessionState::Running,
+            },
+            Event::Permission {
+                at_ms,
+                permission: Permission::ReadOnly,
+            },
+            Event::Persona {
+                at_ms,
+                persona: "reviewer".into(),
+            },
+            Event::ModelCall {
+                at_ms,
+                model: "alpha".into(),
+                provider: "x".into(),
+                kind: "completion".into(),
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                cost: Some(0.01),
+            },
+        ];
+        for event in &events {
+            let lines = event_lines(event);
+            assert!(!lines.is_empty(), "{event:?} contributes a line");
+            for line in lines {
+                assert_eq!(
+                    line.at_ms, at_ms,
+                    "{event:?} carries its time onto the {:?} line",
+                    line.kind
+                );
+            }
+        }
     }
 
     #[test]
@@ -2642,6 +3011,7 @@ mod tests {
     fn apply_event_skips_replayed_seq() {
         let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         let event = Event::State {
+            at_ms: None,
             state: SessionState::Running,
         };
         assert!(state.apply_event(5, &event));
@@ -2657,8 +3027,9 @@ mod tests {
         assert_eq!(state.lines.len(), 2);
     }
 
-    fn ask_event(ask: Block) -> Event {
+    fn ask_event(ask: Block, at_ms: Option<u64>) -> Event {
         Event::Message {
+            at_ms,
             message: Message {
                 role: Role::Assistant,
                 block: ask,
@@ -2677,7 +3048,7 @@ mod tests {
             child_id: Some("child-1".into()),
             answer: None,
         };
-        assert!(state.apply_event(1, &ask_event(ask.clone())));
+        assert!(state.apply_event(1, &ask_event(ask.clone(), Some(1_700_000_000_000))));
         assert_eq!(
             state.live_ask,
             Some(LiveAsk {
@@ -2688,18 +3059,21 @@ mod tests {
         );
 
         // Its answered form (appended durably by a routed answer) clears the
-        // live question and, because the replay is identical to the surface,
-        // is not duplicated as a second transcript line.
+        // live question and, because the replay repeats the surface, is not
+        // duplicated as a second transcript line — even though the replay is
+        // a later append and carries its own time.
         let answered = Block::Ask {
             message: "may I push?".into(),
             options: vec!["yes".into(), "no".into()],
             child_id: Some("child-1".into()),
             answer: Some("yes".into()),
         };
-        assert!(state.apply_event(2, &ask_event(answered)));
+        assert!(state.apply_event(2, &ask_event(answered, Some(1_700_000_005_000))));
         assert_eq!(state.live_ask, None, "a resolved ask is not live");
         assert_eq!(state.lines.len(), 1, "the resolved ask does not duplicate");
         assert_eq!(state.lines[0].kind, LineKind::Ask);
+        // The surface keeps its own time; the replay's time is dropped with it.
+        assert_eq!(state.lines[0].at_ms, Some(1_700_000_000_000));
     }
 
     #[test]
@@ -2711,12 +3085,13 @@ mod tests {
             child_id: None,
             answer: None,
         };
-        assert!(state.apply_event(1, &ask_event(ask)));
+        assert!(state.apply_event(1, &ask_event(ask, None)));
         assert!(state.live_ask.is_some());
 
         // The user's answer to an own question is an ordinary text message;
         // the durable note of a rejection is one too. Both clear the live ask.
         let user_text = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::User,
                 block: Block::Text {
@@ -2731,6 +3106,7 @@ mod tests {
             Some(&Line {
                 kind: LineKind::Rejected,
                 text: USER_REJECTED_TEXT.to_string(),
+                at_ms: None,
             }),
             "the rejection renders as a user action note, not a typed message"
         );
@@ -2739,6 +3115,7 @@ mod tests {
     #[test]
     fn event_lines_renders_the_rejection_marker_as_a_rejection_line() {
         let marker = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::User,
                 block: Block::Text {
@@ -2751,10 +3128,12 @@ mod tests {
             vec![Line {
                 kind: LineKind::Rejected,
                 text: USER_REJECTED_TEXT.to_string(),
+                at_ms: None,
             }]
         );
         // Ordinary user text stays a user line.
         let plain = Event::Message {
+            at_ms: None,
             message: Message {
                 role: Role::User,
                 block: Block::Text { text: "go".into() },
@@ -2765,6 +3144,7 @@ mod tests {
             vec![Line {
                 kind: LineKind::User,
                 text: "go".into(),
+                at_ms: None,
             }]
         );
     }
@@ -2773,6 +3153,7 @@ mod tests {
     fn permission_events_update_the_state() {
         let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
         let event = Event::Permission {
+            at_ms: None,
             permission: Permission::ReadOnly,
         };
         assert!(state.apply_event(1, &event));
@@ -2782,6 +3163,7 @@ mod tests {
     #[test]
     fn persona_events_render_as_a_status_line() {
         let persona = Event::Persona {
+            at_ms: None,
             persona: "reviewer".into(),
         };
         assert_eq!(
@@ -2789,6 +3171,7 @@ mod tests {
             vec![Line {
                 kind: LineKind::Status,
                 text: "persona: reviewer".into(),
+                at_ms: None,
             }]
         );
     }
@@ -2803,6 +3186,7 @@ mod tests {
             vec![Line {
                 kind: LineKind::Status,
                 text: "warning: MCP server srv-a is unavailable".into(),
+                at_ms: None,
             }]
         );
     }
@@ -3111,6 +3495,7 @@ mod tests {
             app.state.push_line(Line {
                 kind: LineKind::Assistant,
                 text: format!("line {i}"),
+                at_ms: None,
             });
         }
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -3125,6 +3510,7 @@ mod tests {
             app.state.push_line(Line {
                 kind: LineKind::Assistant,
                 text: format!("line {i}"),
+                at_ms: None,
             });
         }
         terminal.draw(|f| draw(f, &mut app)).unwrap();

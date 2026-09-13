@@ -203,22 +203,32 @@ pub struct Message {
 
 /// Durable events replayed over SSE. `Delta` is not part of this enum; text
 /// streaming is delivered live only and is not stored.
+///
+/// Every variant carries `at_ms` in unix milliseconds UTC: the moment the
+/// store appended the event, or, for `Activity`, the phase transition the
+/// loop recorded. It is optional because events stored before the stamp
+/// existed carry no such field; serde reads a missing stamp as `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     Message {
+        at_ms: Option<u64>,
         message: Message,
     },
     State {
+        at_ms: Option<u64>,
         state: SessionState,
     },
     Permission {
+        at_ms: Option<u64>,
         permission: Permission,
     },
     Persona {
+        at_ms: Option<u64>,
         persona: String,
     },
     ModelCall {
+        at_ms: Option<u64>,
         model: String,
         provider: String,
         // "completion" or "compaction"; renamed away from the enum's own
@@ -244,6 +254,24 @@ pub enum Event {
     Warning {
         text: String,
     },
+}
+
+impl Event {
+    /// The event's stamp: the moment the store appended it, in unix
+    /// milliseconds UTC. `None` when the payload carries no stamp: every
+    /// event written before the store stamped them, and `Warning`, which
+    /// carries no stamp field.
+    pub fn at_ms(&self) -> Option<u64> {
+        match self {
+            Event::Message { at_ms, .. }
+            | Event::State { at_ms, .. }
+            | Event::Permission { at_ms, .. }
+            | Event::Persona { at_ms, .. }
+            | Event::ModelCall { at_ms, .. } => *at_ms,
+            Event::Activity { at_ms, .. } => Some(*at_ms),
+            Event::Warning { .. } => None,
+        }
+    }
 }
 
 /// The phase of the agent loop an `Event::Activity` records. Each variant
@@ -511,20 +539,25 @@ mod tests {
     fn event_round_trips_every_variant() {
         let mut events = vec![
             Event::Message {
+                at_ms: Some(1_700_000_000_000),
                 message: message(Block::Text {
                     text: "hello".into(),
                 }),
             },
             Event::State {
+                at_ms: Some(1_700_000_000_000),
                 state: SessionState::WaitingForInput,
             },
             Event::Permission {
+                at_ms: Some(1_700_000_000_000),
                 permission: Permission::ReadWrite,
             },
             Event::Persona {
+                at_ms: Some(1_700_000_000_000),
                 persona: "reviewer".into(),
             },
             Event::ModelCall {
+                at_ms: Some(1_700_000_000_000),
                 model: "claude".into(),
                 provider: "anthropic".into(),
                 kind: "completion".into(),
@@ -582,13 +615,16 @@ mod tests {
     #[test]
     fn event_uses_snake_case_kind_tags() {
         let json = serde_json::to_value(Event::State {
+            at_ms: Some(1_700_000_000_000),
             state: SessionState::Running,
         })
         .unwrap();
         assert_eq!(json["kind"], "state");
         assert_eq!(json["state"], "running");
+        assert_eq!(json["at_ms"], 1_700_000_000_000_i64);
 
         let json = serde_json::to_value(Event::Permission {
+            at_ms: Some(1_700_000_000_000),
             permission: Permission::ReadWrite,
         })
         .unwrap();
@@ -596,6 +632,7 @@ mod tests {
         assert_eq!(json["permission"], "read_write");
 
         let json = serde_json::to_value(Event::Persona {
+            at_ms: Some(1_700_000_000_000),
             persona: "reviewer".into(),
         })
         .unwrap();
@@ -603,6 +640,7 @@ mod tests {
         assert_eq!(json["persona"], "reviewer");
 
         let json = serde_json::to_value(Event::ModelCall {
+            at_ms: Some(1_700_000_000_000),
             model: "claude".into(),
             provider: "anthropic".into(),
             kind: "completion".into(),
@@ -637,6 +675,64 @@ mod tests {
         .unwrap();
         assert_eq!(json["kind"], "warning");
         assert_eq!(json["text"], "MCP server srv-a is unavailable");
+    }
+
+    #[test]
+    fn at_ms_reports_the_stamp_of_every_variant() {
+        let events = [
+            Event::Message {
+                at_ms: Some(1_700_000_000_001),
+                message: message(Block::Text { text: "hi".into() }),
+            },
+            Event::State {
+                at_ms: Some(1_700_000_000_002),
+                state: SessionState::Running,
+            },
+            Event::Permission {
+                at_ms: Some(1_700_000_000_003),
+                permission: Permission::ReadOnly,
+            },
+            Event::Persona {
+                at_ms: Some(1_700_000_000_004),
+                persona: "reviewer".into(),
+            },
+            Event::ModelCall {
+                at_ms: Some(1_700_000_000_005),
+                model: "claude".into(),
+                provider: "anthropic".into(),
+                kind: "completion".into(),
+                input_tokens: None,
+                output_tokens: None,
+                cost: None,
+            },
+            Event::Activity {
+                at_ms: 1_700_000_000_006,
+                phase: ActivityPhase::WakeStarted,
+            },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            assert_eq!(
+                event.at_ms(),
+                Some(1_700_000_000_001 + index as u64),
+                "for {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_without_a_stamp_field_parses_as_unstamped() {
+        // Events appended before the store stamped them carry no at_ms, so a
+        // stored payload must keep parsing after the field is added.
+        for payload in [
+            r#"{"kind":"state","state":"running"}"#,
+            r#"{"kind":"permission","permission":"read_write"}"#,
+            r#"{"kind":"persona","persona":"reviewer"}"#,
+            r#"{"kind":"model_call","call_kind":"completion","model":"claude","provider":"anthropic","input_tokens":null,"output_tokens":null,"cost":null}"#,
+            r#"{"kind":"message","message":{"role":"assistant","block":{"kind":"text","text":"hi"}}}"#,
+        ] {
+            let event: Event = serde_json::from_str(payload).unwrap();
+            assert_eq!(event.at_ms(), None, "for {payload}");
+        }
     }
 
     #[test]

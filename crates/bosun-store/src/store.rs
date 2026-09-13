@@ -462,7 +462,15 @@ impl Store {
                 params![state_json, session_id],
             )
             .context("failed to update session state")?;
-            append_event(&tx, session_id, "state", &Event::State { state })?;
+            append_event(
+                &tx,
+                session_id,
+                "state",
+                &Event::State {
+                    at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
+                    state,
+                },
+            )?;
             tx.commit().context("failed to commit state change")?;
             Ok(())
         })
@@ -496,6 +504,7 @@ impl Store {
                 session_id,
                 "state",
                 &Event::State {
+                    at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
                     state: SessionState::Interrupted,
                 },
             )?;
@@ -521,7 +530,10 @@ impl Store {
                 &tx,
                 session_id,
                 "permission",
-                &Event::Permission { permission },
+                &Event::Permission {
+                    at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
+                    permission,
+                },
             )?;
             tx.commit().context("failed to commit permission change")?;
             Ok(())
@@ -562,13 +574,24 @@ impl Store {
                 params![persona, model, permission_json, allowed_tools, session_id],
             )
             .context("failed to update the session persona")?;
-            append_event(&tx, session_id, "persona", &Event::Persona { persona })?;
+            append_event(
+                &tx,
+                session_id,
+                "persona",
+                &Event::Persona {
+                    at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
+                    persona,
+                },
+            )?;
             if previous != permission_json {
                 append_event(
                     &tx,
                     session_id,
                     "permission",
-                    &Event::Permission { permission },
+                    &Event::Permission {
+                        at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
+                        permission,
+                    },
                 )?;
             }
             tx.commit().context("failed to commit persona change")?;
@@ -786,7 +809,10 @@ impl Store {
         let provider = provider.to_string();
         let kind = kind.to_string();
         self.with_session(session_id, move |conn, session_id| {
-            let started_at_secs = bosun_common::time::unix_secs(SystemTime::now());
+            // The row's own column and the event's stamp describe the same
+            // moment, so one clock reading fills both.
+            let at_ms = bosun_common::time::unix_ms(SystemTime::now());
+            let started_at_secs = (at_ms / 1000) as i64;
             let tx = transaction(conn)?;
             tx.execute(
                 "INSERT INTO model_calls (session_id, model, provider, kind, input_tokens, output_tokens, cost, started_at_secs)
@@ -805,6 +831,7 @@ impl Store {
             .context("failed to insert model call")?;
             let model_call_id = tx.last_insert_rowid();
             append_event(&tx, session_id, "model call", &Event::ModelCall {
+                at_ms: Some(at_ms),
                 model,
                 provider,
                 kind,
@@ -994,6 +1021,7 @@ impl Store {
                     session_id,
                     "answered ask",
                     &Event::Message {
+                        at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
                         message: Message {
                             role: Role::Assistant,
                             block: answered,
@@ -1796,6 +1824,7 @@ fn insert_message(
         session_id,
         "message",
         &Event::Message {
+            at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
             message: message.clone(),
         },
     )?;
@@ -2233,11 +2262,14 @@ mod tests {
         let events = store.events_after("a", 0).await.unwrap();
         assert_eq!(events.len(), 2);
         assert!(
-            matches!(&events[0].1, Event::State { state } if *state == SessionState::WaitingForInput)
+            matches!(&events[0].1, Event::State { state, .. } if *state == SessionState::WaitingForInput)
         );
         assert!(
-            matches!(&events[1].1, Event::Permission { permission } if *permission == Permission::ReadOnly)
+            matches!(&events[1].1, Event::Permission { permission, .. } if *permission == Permission::ReadOnly)
         );
+        for (_, event) in &events {
+            assert!(event.at_ms().is_some(), "{event:?} is unstamped");
+        }
     }
 
     #[tokio::test]
@@ -2284,11 +2316,11 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0].1,
-            Event::Persona { persona } if persona == "reviewer"
+            Event::Persona { persona, .. } if persona == "reviewer"
         ));
         assert!(matches!(
             &events[1].1,
-            Event::Permission { permission } if *permission == Permission::ReadOnly
+            Event::Permission { permission, .. } if *permission == Permission::ReadOnly
         ));
     }
 
@@ -2311,7 +2343,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0].1,
-            Event::Persona { persona } if persona == "architect"
+            Event::Persona { persona, .. } if persona == "architect"
         ));
     }
 
@@ -2360,9 +2392,11 @@ mod tests {
         let events = store.events_after("a", 0).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!((events[0].0, events[1].0), (1, 2));
-        assert!(matches!(&events[0].1, Event::Message { message } if message.role == Role::User));
         assert!(
-            matches!(&events[1].1, Event::Message { message } if message.role == Role::Assistant)
+            matches!(&events[0].1, Event::Message { message, .. } if message.role == Role::User)
+        );
+        assert!(
+            matches!(&events[1].1, Event::Message { message, .. } if message.role == Role::Assistant)
         );
 
         let messages = store.messages("a", true).await.unwrap();
@@ -2390,6 +2424,108 @@ mod tests {
         let seqs: Vec<i64> = events.iter().map(|(seq, _)| *seq).collect();
         assert_eq!(seqs, [2, 3]);
         assert!(store.events_after("a", 3).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn appended_events_replay_with_a_stamp_near_now() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        let before = bosun_common::time::unix_ms(SystemTime::now());
+        store
+            .set_state("a", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "a",
+                Role::User,
+                &Block::Text {
+                    text: "hello".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_model_call(
+                "a",
+                "claude",
+                "anthropic",
+                "completion",
+                Some(100),
+                Some(50),
+                None,
+            )
+            .await
+            .unwrap();
+        let after = bosun_common::time::unix_ms(SystemTime::now());
+
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 3);
+        for (_, event) in &events {
+            let at_ms = event
+                .at_ms()
+                .expect("the store stamps the events it appends");
+            assert!(
+                (before..=after).contains(&at_ms),
+                "{event:?} carries {at_ms}, which is outside the append window {before}..={after}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_stored_without_a_stamp_replays_unstamped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let store = Store::open(&path).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        // A payload the store wrote before it stamped events: the current
+        // build must still replay it, with no time to show.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
+            params!["a", r#"{"kind":"state","state":"running"}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1.at_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn one_write_stamps_its_events_close_together() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        let before = bosun_common::time::unix_ms(SystemTime::now());
+        store
+            .switch_persona("a", "reviewer", "cheap", Permission::ReadOnly, "file_read")
+            .await
+            .unwrap();
+        let after = bosun_common::time::unix_ms(SystemTime::now());
+
+        // One write appends the persona event and the permission event in one
+        // transaction, stamping each as it is appended, so the two stamps sit
+        // in the write's own window, in the order they were appended.
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let persona = events[0].1.at_ms().unwrap();
+        let permission = events[1].1.at_ms().unwrap();
+        for stamp in [persona, permission] {
+            assert!(
+                (before..=after).contains(&stamp),
+                "one write stamped an event {stamp}, which is outside {before}..={after}"
+            );
+        }
+        assert!(
+            persona <= permission,
+            "one write stamped its events {persona} and {permission} out of order"
+        );
     }
 
     #[tokio::test]
@@ -2497,6 +2633,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cost,
+                ..
             } if model == "claude"
                 && provider == "anthropic"
                 && kind == "completion"
@@ -2621,6 +2758,7 @@ mod tests {
             .append_event(
                 "missing",
                 &Event::State {
+                    at_ms: None,
                     state: SessionState::Running,
                 },
             )
@@ -2723,8 +2861,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0].1,
-            Event::State { state } if *state == SessionState::Interrupted
+            Event::State { state, .. } if *state == SessionState::Interrupted
         ));
+        assert!(
+            events[0].1.at_ms().is_some(),
+            "the interrupt's state event is unstamped"
+        );
 
         // A later interruption replaces the cause; leaving the state keeps it.
         store
@@ -3006,10 +3148,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!((events[0].0, events[1].0), (1, 3));
         assert!(
-            matches!(&events[0].1, Event::Message { message } if matches!(&message.block, Block::Text { text } if text == "a1"))
+            matches!(&events[0].1, Event::Message { message, .. } if matches!(&message.block, Block::Text { text } if text == "a1"))
         );
         assert!(
-            matches!(&events[1].1, Event::Message { message } if matches!(&message.block, Block::Text { text } if text == "a2"))
+            matches!(&events[1].1, Event::Message { message, .. } if matches!(&message.block, Block::Text { text } if text == "a2"))
         );
 
         let events = store.events_after("b", 0).await.unwrap();
@@ -3194,7 +3336,7 @@ mod tests {
         let ask_events: Vec<&Block> = events
             .iter()
             .filter_map(|(_, event)| match event {
-                Event::Message { message } => match &message.block {
+                Event::Message { message, .. } => match &message.block {
                     block @ Block::Ask { .. } => Some(block),
                     _ => None,
                 },
@@ -3210,6 +3352,15 @@ mod tests {
             unreachable!("a filtered ask block");
         };
         assert_eq!(second.as_deref(), Some("yes, push to main"));
+        let answered = events
+            .iter()
+            .filter(|(_, event)| matches!(event, Event::Message { .. }))
+            .map(|(_, event)| event.at_ms())
+            .collect::<Vec<_>>();
+        assert!(
+            answered.iter().all(Option::is_some),
+            "the routed answer's message events replay unstamped: {answered:?}"
+        );
     }
 
     #[tokio::test]
