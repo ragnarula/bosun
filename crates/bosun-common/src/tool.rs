@@ -186,8 +186,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
     let all = vec![
         ToolSpec {
             name: "shell".into(),
-            description: "Run a command in the session's shell. Output streams until the command exits.".into(),
-            schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            description: "Run a command in the session's shell. Output streams until the command exits. Every run has a time limit and is killed when it passes: the default is 600 seconds, and `timeout_secs` raises or lowers it up to 3600. A killed run answers with exit code 124 and says it timed out. Raise the limit for a command you expect to be slow, such as a full build or test suite; do not disable a network call's own timeout and rely on this one.".into(),
+            schema: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1,"maximum":3600}},"required":["command"]}),
         },
         ToolSpec {
             name: "file_read".into(),

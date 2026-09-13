@@ -34,6 +34,17 @@ use tools::ToolError;
 /// Cap on the total bytes streamed as `Out` events for one shell run. Output
 /// past the cap is still drained from the pipes but not forwarded.
 const MAX_SHELL_OUTPUT_BYTES: usize = 1 << 20;
+
+/// How long a shell run may take before the executor kills it. A run that
+/// blocks forever otherwise parks its session indefinitely with no signal:
+/// the turn cannot end while a tool call is outstanding, so the session sits
+/// in `running` and looks identical to healthy work. The cap is generous
+/// because real builds and test suites are slow, and `timeout_secs` raises it
+/// per call up to MAX_SHELL_TIMEOUT_SECS.
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
+const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
+/// The exit code a timed-out run reports, matching GNU `timeout`.
+const SHELL_TIMEOUT_EXIT_CODE: i32 = 124;
 /// After the shell exits, keep forwarding buffered output for this long even
 /// if a backgrounded grandchild still holds the pipes open.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
@@ -179,7 +190,20 @@ pub async fn run_call(
         if command.is_empty() {
             return Err(ExecutorError::BadArgument { key: "command" });
         }
-        let stream = start_shell(state.clone(), run_id, command).await?;
+        // Absent, out of range, or the wrong type all fall back to the
+        // default: a malformed limit must not mean no limit.
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .filter(|secs| (1..=MAX_SHELL_TIMEOUT_SECS).contains(secs))
+            .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS);
+        let stream = start_shell(
+            state.clone(),
+            run_id,
+            command,
+            Duration::from_secs(timeout_secs),
+        )
+        .await?;
         return Ok(CallOutcome::Shell(stream));
     }
 
@@ -457,6 +481,7 @@ async fn start_shell(
     state: Arc<ExecutorState>,
     run_id: &str,
     command: &str,
+    timeout: Duration,
 ) -> Result<ShellStream, ExecutorError> {
     let mut shell = tokio::process::Command::new("sh");
     shell
@@ -515,11 +540,16 @@ async fn start_shell(
     // answers kill requests. Killing happens here, while the child is alive
     // and its pid is still allocated, so the process group it signals is this
     // shell's own and cannot have been reused by another process.
+    let (tx, rx) = mpsc::channel::<ShellMsg>(64);
     let (exit_tx, exit_rx) = oneshot::channel();
     tokio::spawn({
         let kill_signal = kill_signal.clone();
         let state = state.clone();
         let run_id = run_id.to_string();
+        // A clone so the timeout can say why the run ended. The stream ends on
+        // the exit code and the readers' own done frames, not on this channel
+        // closing, so holding a sender here cannot stall it.
+        let notice = tx.clone();
         async move {
             // A pid visible in the running map always belongs to a child this
             // task is about to reap. The entry can already be gone when a kill
@@ -536,13 +566,30 @@ async fn start_shell(
                     child.kill().await.ok();
                     child.wait().await.ok().and_then(|status| status.code()).unwrap_or(-1)
                 }
+                // The run outlived its limit. Report before killing, so the
+                // output the model reads ends with the reason it stopped
+                // rather than going silent at an arbitrary point.
+                _ = tokio::time::sleep(timeout) => {
+                    let secs = timeout.as_secs();
+                    let _ = notice
+                        .send(ShellMsg::Out(format!(
+                            "shell: timed out after {secs}s and was killed; \
+                             pass a larger timeout_secs if the command needs longer"
+                        )))
+                        .await;
+                    if child.try_wait().ok().flatten().is_none() {
+                        kill_group(pid).await;
+                    }
+                    child.kill().await.ok();
+                    child.wait().await.ok();
+                    SHELL_TIMEOUT_EXIT_CODE
+                }
                 status = child.wait() => status.ok().and_then(|status| status.code()).unwrap_or(-1),
             };
             let _ = exit_tx.send(code);
         }
     });
 
-    let (tx, rx) = mpsc::channel::<ShellMsg>(64);
     let total = Arc::new(AtomicUsize::new(0));
     tokio::spawn(pump(stdout, tx.clone(), total.clone()));
     tokio::spawn(pump(stderr, tx, total));
@@ -919,6 +966,110 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+
+    /// A command that would block forever is killed at its limit. Without
+    /// this the run never answers, and a session cannot end a turn while a
+    /// tool call is outstanding, so it parks indefinitely looking healthy.
+    #[tokio::test]
+    async fn a_shell_run_past_its_timeout_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), Permission::ReadWrite);
+
+        let outcome = call(
+            &state,
+            "run-hang",
+            "shell",
+            json!({ "command": "sleep 30", "timeout_secs": 1 }),
+        )
+        .await
+        .expect("shell should start");
+        let CallOutcome::Shell(stream) = outcome else {
+            panic!("shell must stream");
+        };
+
+        let events = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+            .await
+            .expect("the stream must end at the timeout");
+        assert_eq!(
+            done_code(&events),
+            SHELL_TIMEOUT_EXIT_CODE,
+            "a timed-out shell reports 124"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ShellEvent::Out(line) => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("timed out after 1s"),
+            "the output should say why the run ended, got {text:?}"
+        );
+    }
+
+    /// The limit is not opt-in. A call that names no `timeout_secs`, or names
+    /// a malformed one, still gets the default rather than running unbounded.
+    #[test]
+    fn a_missing_or_malformed_timeout_falls_back_to_the_default() {
+        let parse = |args: &Value| {
+            args.get("timeout_secs")
+                .and_then(Value::as_u64)
+                .filter(|secs| (1..=MAX_SHELL_TIMEOUT_SECS).contains(secs))
+                .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
+        };
+        assert_eq!(parse(&json!({})), DEFAULT_SHELL_TIMEOUT_SECS, "absent");
+        assert_eq!(
+            parse(&json!({"timeout_secs": 0})),
+            DEFAULT_SHELL_TIMEOUT_SECS,
+            "zero"
+        );
+        assert_eq!(
+            parse(&json!({"timeout_secs": 99_999})),
+            DEFAULT_SHELL_TIMEOUT_SECS,
+            "over the maximum"
+        );
+        assert_eq!(
+            parse(&json!({"timeout_secs": "600"})),
+            DEFAULT_SHELL_TIMEOUT_SECS,
+            "wrong type"
+        );
+        assert_eq!(
+            parse(&json!({"timeout_secs": 45})),
+            45,
+            "a valid override is kept"
+        );
+        assert_eq!(
+            parse(&json!({"timeout_secs": MAX_SHELL_TIMEOUT_SECS})),
+            MAX_SHELL_TIMEOUT_SECS,
+            "the maximum is allowed"
+        );
+    }
+
+    /// A run inside its limit is untouched, so the cap costs a normal command
+    /// nothing.
+    #[tokio::test]
+    async fn a_shell_run_inside_its_timeout_is_not_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), Permission::ReadWrite);
+
+        let outcome = call(
+            &state,
+            "run-quick",
+            "shell",
+            json!({ "command": "echo done", "timeout_secs": 30 }),
+        )
+        .await
+        .expect("shell should start");
+        let CallOutcome::Shell(stream) = outcome else {
+            panic!("shell must stream");
+        };
+
+        let events = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+            .await
+            .expect("the stream must end when the command exits");
+        assert_eq!(done_code(&events), 0, "a command inside its limit exits 0");
     }
 
     #[tokio::test]
