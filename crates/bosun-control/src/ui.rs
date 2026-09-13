@@ -45,6 +45,18 @@ mod tests {
     }
 
     #[test]
+    fn the_pane_leads_a_session_row_with_its_summary() {
+        let row = squeezed(segment(PANE, "function appendSessionRow(", "\n}"));
+        assert!(
+            row.contains(&squeezed("summary.textContent = session.summary"))
+                && row.contains(&squeezed(
+                    "nodeDir.className = session.summary ? 'row-meta' : 'row-node'"
+                )),
+            "a summarized session must lead its row with that line and drop node/dir to the meta line"
+        );
+    }
+
+    #[test]
     fn the_pane_has_a_model_call_line_handler() {
         assert!(
             PANE.contains("case 'model_call':")

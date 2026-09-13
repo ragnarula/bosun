@@ -315,6 +315,7 @@ mod tests {
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
+                summary: None,
             })
             .await
             .unwrap();
@@ -621,6 +622,7 @@ mod tests {
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
+                summary: None,
             })
             .await
             .unwrap();

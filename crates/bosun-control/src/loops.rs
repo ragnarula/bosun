@@ -14,6 +14,7 @@ use bosun_agent::agent_loop::LoopEvent;
 use bosun_agent::agent_loop::LoopHandle;
 use bosun_agent::agent_loop::LoopMailbox;
 use bosun_agent::agent_loop::McpConnections;
+use bosun_agent::agent_loop::SUMMARY_IDLE_BEFORE;
 use bosun_agent::agent_loop::spawn_loop;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
@@ -115,6 +116,7 @@ impl AgentRegistry {
             }),
             delta_sink: Arc::new(LiveSink { tx: sender }),
             compact_at_input_tokens: COMPACT_AT_INPUT_TOKENS,
+            summary_idle_before: SUMMARY_IDLE_BEFORE,
             personas: self.personas.clone(),
             providers: self.providers.clone(),
             prices: self.prices.clone(),
@@ -261,6 +263,7 @@ mod tests {
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
+                summary: None,
             })
             .await
             .unwrap();
@@ -333,6 +336,7 @@ mod tests {
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
+                summary: None,
             })
             .await
             .unwrap();

@@ -411,9 +411,10 @@
     color: var(--muted);
     border-bottom: 1px solid var(--border);
   }
-  /* One session per row: a whole-row tap target with the session's short id,
-     node/dir pair, persona tag and age. Children nest one level deep under a
-     `N children` toggle on the parent row. */
+  /* One session per row: a whole-row tap target led by the model's summary of
+     the session when it has one, then the node/dir pair, the persona tag and
+     the age. Children nest one level deep under a `N children` toggle on the
+     parent row. */
   #session-list { padding: 0 0 8px; }
   #session-list[hidden] { display: none; }
   #session-list .empty {
@@ -439,7 +440,11 @@
   }
   .session-row:active { background: var(--panel-2); }
   .session-row .row-main { flex: 1; min-width: 0; }
-  .session-row .row-node {
+  .session-row .row-node,
+  .session-row .row-summary {
+    /* A block box, so a line wider than the row ends in an ellipsis instead
+       of running past it; the meta and time lines are blocks too. */
+    display: block;
     font-weight: 600;
     white-space: nowrap;
     overflow: hidden;
@@ -2512,9 +2517,10 @@ function byActiveThenNewest(a, b) {
   return (b.created_at_secs || 0) - (a.created_at_secs || 0);
 }
 
-// One row per root session: a whole-row tap target with the state dot, the
-// node/dir pair, the persona tag, and the short id plus age. The full id
-// lives on the session screen, so no id is touch-invisible on home.
+// One row per root session: a whole-row tap target led by the model's summary
+// of the session when it has one, then the state dot, the node/dir pair, the
+// persona tag, and the short id plus age. The full id lives on the session
+// screen, so no id is touch-invisible on home.
 function appendSessionRow(session) {
   const button = document.createElement('button');
   button.type = 'button';
@@ -2524,8 +2530,16 @@ function appendSessionRow(session) {
   button.appendChild(dot);
   const main = document.createElement('span');
   main.className = 'row-main';
+  // A summarized session is named by that line: the node and directory it
+  // works in drop to the meta line under it.
+  if (session.summary) {
+    const summary = document.createElement('span');
+    summary.className = 'row-summary';
+    summary.textContent = session.summary;
+    main.appendChild(summary);
+  }
   const nodeDir = document.createElement('span');
-  nodeDir.className = 'row-node';
+  nodeDir.className = session.summary ? 'row-meta' : 'row-node';
   nodeDir.textContent = session.node + ' / ' + session.dir;
   main.appendChild(nodeDir);
   if (session.persona) {

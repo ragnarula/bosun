@@ -75,6 +75,11 @@ pub struct Session {
     pub interrupt_cause: Option<InterruptCause>,
     pub created_at_secs: i64,
     pub prompt: Option<String>,
+    /// The model's short description of the session: what it is for and what
+    /// it is doing now. The loop writes it when the session goes idle. It is
+    /// a field of the session, never a transcript message.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 fn default_allowed_tools() -> String {
@@ -761,6 +766,7 @@ mod tests {
             interrupt_cause: Some(InterruptCause::User),
             created_at_secs: 1_700_000_000,
             prompt: None,
+            summary: Some("port the harness contract".into()),
         };
         assert_round_trips(&session);
     }
@@ -787,6 +793,7 @@ mod tests {
         assert_eq!(session.parent_id, None);
         assert_eq!(session.owner_id, "");
         assert_eq!(session.interrupt_cause, None);
+        assert_eq!(session.summary, None);
     }
 
     #[test]
@@ -808,6 +815,7 @@ mod tests {
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: Some("review the change".into()),
+            summary: None,
         };
         assert_round_trips(&session);
     }

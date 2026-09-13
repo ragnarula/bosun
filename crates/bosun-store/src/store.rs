@@ -138,7 +138,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   prompt TEXT,
   parent_id TEXT,
   owner_id TEXT NOT NULL,
-  interrupt_cause TEXT
+  interrupt_cause TEXT,
+  summary TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -290,6 +291,10 @@ impl Store {
             conn.execute("ALTER TABLE sessions ADD COLUMN interrupt_cause TEXT", [])
                 .context("failed to add the interrupt_cause column")?;
         }
+        if !column_exists(&conn, "sessions", "summary")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT", [])
+                .context("failed to add the summary column")?;
+        }
         if !column_exists(&conn, "pending_asks", "origin_leaf")? {
             // Rows written before the origin column held the origin leaf in
             // child_id, so the leaf is copied over. The direct child such a
@@ -364,8 +369,8 @@ impl Store {
                 .map(|cause| serde_json::to_string(&cause))
                 .transpose()?;
             conn.execute(
-                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     session.id,
                     session.node,
@@ -383,6 +388,7 @@ impl Store {
                     session.parent_id,
                     session.owner_id,
                     interrupt_cause,
+                    session.summary,
                 ],
             )
             .context("failed to insert session")?;
@@ -396,7 +402,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
                      FROM sessions WHERE id = ?1",
                 )
                 .context("failed to prepare session query")?;
@@ -413,7 +419,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
                      FROM sessions ORDER BY id",
                 )
                 .context("failed to prepare session list query")?;
@@ -434,7 +440,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
                      FROM sessions WHERE parent_id = ?1 ORDER BY id",
                 )
                 .context("failed to prepare child session query")?;
@@ -595,6 +601,24 @@ impl Store {
                 )?;
             }
             tx.commit().context("failed to commit persona change")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records the model's description of the session: what it is for and
+    /// what it is doing now. It is a field of the session row, not a
+    /// transcript message, so the thread and the model's context are
+    /// untouched. No event is written: a client reads the summary from the
+    /// session list it already fetches.
+    pub async fn set_summary(&self, id: &str, summary: &str) -> Result<(), StoreError> {
+        let summary = summary.to_string();
+        self.with_session(id, move |conn, session_id| {
+            conn.execute(
+                "UPDATE sessions SET summary = ?1 WHERE id = ?2",
+                params![summary, session_id],
+            )
+            .context("failed to update the session summary")?;
             Ok(())
         })
         .await
@@ -2035,6 +2059,7 @@ fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
             .transpose()?,
         created_at_secs: row.get("created_at_secs")?,
         prompt: row.get("prompt")?,
+        summary: row.get("summary")?,
     })
 }
 
@@ -2130,6 +2155,7 @@ mod tests {
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: Some("finish the feature".to_string()),
+            summary: None,
         }
     }
 
@@ -2170,6 +2196,31 @@ mod tests {
         assert_eq!(actual.interrupt_cause, expected.interrupt_cause);
         assert_eq!(actual.created_at_secs, expected.created_at_secs);
         assert_eq!(actual.prompt, expected.prompt);
+        assert_eq!(actual.summary, expected.summary);
+    }
+
+    #[tokio::test]
+    async fn a_summary_written_at_creation_reads_back() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let created = Session {
+            summary: Some("port the harness contract".to_string()),
+            ..session("a")
+        };
+        let child = Session {
+            parent_id: Some("a".to_string()),
+            summary: Some("review the change".to_string()),
+            ..session("b")
+        };
+
+        store.create_session(&created).await.unwrap();
+        store.create_session(&child).await.unwrap();
+
+        assert_session_eq(&store.get_session("a").await.unwrap().unwrap(), &created);
+        // The list, and the child query the loop reads for its manifest, both
+        // carry the summary too.
+        assert_session_eq(&store.list_sessions().await.unwrap()[0], &created);
+        assert_session_eq(&store.child_sessions("a").await.unwrap()[0], &child);
     }
 
     #[tokio::test]
@@ -2270,6 +2321,32 @@ mod tests {
         for (_, event) in &events {
             assert!(event.at_ms().is_some(), "{event:?} is unstamped");
         }
+    }
+
+    #[tokio::test]
+    async fn set_summary_persists_without_touching_the_transcript() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        store
+            .set_summary("a", "port the loop to the control plane")
+            .await
+            .unwrap();
+
+        let stored = store.get_session("a").await.unwrap().unwrap();
+        assert_eq!(
+            stored.summary.as_deref(),
+            Some("port the loop to the control plane")
+        );
+        assert!(
+            store.messages("a", true).await.unwrap().is_empty(),
+            "the summary is a session field, never a transcript message"
+        );
+        assert!(
+            store.events_after("a", 0).await.unwrap().is_empty(),
+            "a client reads the summary from the session list, so no event is written"
+        );
     }
 
     #[tokio::test]
@@ -2975,6 +3052,53 @@ mod tests {
         assert_eq!(
             session.mcp_servers, "",
             "a pre-S6 row selects no MCP servers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_summary_column_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // The pre-summary shape: every other session column exists, the
+            // summary does not yet.
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   node TEXT NOT NULL,
+                   repo_url TEXT,
+                   git_ref TEXT,
+                   dir TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   persona TEXT,
+                   permission TEXT NOT NULL,
+                   allowed_tools TEXT NOT NULL DEFAULT '*',
+                   mcp_servers TEXT NOT NULL DEFAULT '',
+                   state TEXT NOT NULL,
+                   created_at_secs INTEGER NOT NULL,
+                   prompt TEXT,
+                   parent_id TEXT,
+                   owner_id TEXT NOT NULL,
+                   interrupt_cause TEXT
+                 );
+                 INSERT INTO sessions (id, node, dir, model, permission, state, created_at_secs, owner_id)
+                 VALUES ('old', 'node-1', '/work', 'claude', '\"read_write\"', '\"waiting_for_input\"', 1700000000, 'old');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("old").await.unwrap().unwrap();
+        assert_eq!(
+            session.summary, None,
+            "a row written before summaries has none"
+        );
+        store.set_summary("old", "review the change").await.unwrap();
+        assert_eq!(
+            store.get_session("old").await.unwrap().unwrap().summary,
+            Some("review the change".to_string()),
+            "the migrated column takes a write"
         );
     }
 

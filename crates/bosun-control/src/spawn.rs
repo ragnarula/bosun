@@ -132,6 +132,7 @@ async fn spawn_child(
         interrupt_cause: None,
         created_at_secs: bosun_common::time::unix_secs(SystemTime::now()),
         prompt: Some(instructions.clone()),
+        summary: None,
     };
     store.create_session(&child).await.map_err(store_error)?;
 

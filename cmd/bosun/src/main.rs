@@ -1170,6 +1170,7 @@ mod tests {
             interrupt_cause: None,
             created_at_secs: 0,
             prompt: None,
+            summary: None,
         }
     }
 

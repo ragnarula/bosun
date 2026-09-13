@@ -20,8 +20,11 @@ from GitHub repositories the operator manages in the web pane and reach
 sessions through the `skill` tool. MCP support shipped: the control plane
 connects to external MCP servers over HTTP, the operator manages the server
 list and each session's selection in the web pane, and the chosen servers'
-tools reach the model beside the canonical tools. The current sprint and the
-planned roadmap are tracked in [docs/sprints](docs/sprints/).
+tools reach the model beside the canonical tools. Session summaries shipped:
+each session's own model writes a one-line description of what the session is
+for and what it is doing now, the session's loop refreshes it once the session
+goes idle, and the web pane leads the session row with it. The current sprint
+and the planned roadmap are tracked in [docs/sprints](docs/sprints/).
 
 ## ⚙️ How it works
 

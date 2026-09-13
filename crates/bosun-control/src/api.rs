@@ -675,6 +675,7 @@ async fn create_session(
         interrupt_cause: None,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
+        summary: None,
     };
     start_session(&state, &session, provider).await?;
 
@@ -749,6 +750,7 @@ async fn clone(
         interrupt_cause: None,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
+        summary: None,
     };
     start_session(&state, &session, provider).await?;
 
@@ -823,6 +825,7 @@ async fn dev(
         interrupt_cause: None,
         created_at_secs: now_secs(),
         prompt: req.prompt.clone(),
+        summary: None,
     };
     start_session(&state, &session, provider).await?;
 
@@ -2075,6 +2078,7 @@ mod tests {
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
             prompt: None,
+            summary: None,
         }
     }
 
@@ -2605,6 +2609,7 @@ mod tests {
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
                 prompt: None,
+                summary: None,
             })
             .await
             .unwrap();
