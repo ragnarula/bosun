@@ -127,6 +127,7 @@ async fn spawn_child(
         owner_id: parent.owner_id,
         permission: persona.permission,
         allowed_tools: persona.allowed_tools.clone(),
+        mcp_servers: "".into(),
         state: SessionState::Creating,
         interrupt_cause: None,
         created_at_secs: bosun_common::time::unix_secs(SystemTime::now()),

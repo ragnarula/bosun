@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -16,19 +17,27 @@ use std::time::SystemTime;
 use anyhow::Context;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
+use bosun_common::mcp::McpCallOutcome;
+use bosun_common::mcp::McpTool;
+use bosun_common::mcp::expose_mcp_tools;
+use bosun_common::mcp::parse_mcp_servers;
 use bosun_common::session::ActivityPhase;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
 use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
 use bosun_common::session::Message;
+use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
+use bosun_common::tool::SPILL_BYTE_LIMIT;
+use bosun_common::tool::SPILL_LINE_LIMIT;
 use bosun_common::tool::ToolDelta;
 use bosun_common::tool::ToolSpec;
 use bosun_common::tool::canonical_tools;
 use bosun_common::tool::parse_allowed_tools;
+use bosun_common::tool::should_spill;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use serde_json::Value;
@@ -149,6 +158,48 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), ToolError>> + Send>>;
 }
 
+/// The control plane's MCP connections as the loop sees them: the servers a
+/// session chose, the tools they advertise, and the way to call one.
+pub trait McpConnections: Send + Sync {
+    /// What the named servers offer right now: each healthy server's
+    /// discovered tools under the raw name the server reports, and the names
+    /// of the servers that are down or unknown. The loop maps the tools onto
+    /// the model-facing names.
+    fn servers(&self, names: &[String]) -> McpAvailability;
+
+    /// Calls one tool on one server. The server's progress notifications
+    /// reach the live session view through `delta`, the same channel a
+    /// canonical tool's streamed output uses.
+    fn call(
+        &self,
+        server: String,
+        tool: String,
+        args: Value,
+        delta: mpsc::UnboundedSender<ToolDelta>,
+    ) -> Pin<Box<dyn Future<Output = Result<McpCallOutcome, McpCallError>> + Send>>;
+}
+
+/// What a session's chosen MCP servers offer right now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpAvailability {
+    /// One entry per healthy server, in the order the names were given.
+    pub servers: Vec<(String, Vec<McpTool>)>,
+    /// The names of the servers that cannot serve a call: down, or unknown
+    /// to the control plane.
+    pub unavailable: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpCallError {
+    /// The server cannot serve this call. The reason reaches the model as a
+    /// tool error.
+    #[error("MCP server {server} cannot serve the call: {reason}")]
+    Unavailable { server: String, reason: String },
+
+    #[error("internal error")]
+    Internal(#[from] anyhow::Error),
+}
+
 #[derive(Clone)]
 pub struct ToolOutcome {
     pub content: Value,
@@ -222,13 +273,17 @@ pub struct LoopDeps {
     /// None disables `message_child` and leaves authored events unwoken, for
     /// a lone loop in tests.
     pub mailbox: Option<Arc<dyn LoopMailbox>>,
+    /// The control plane's shared MCP connections, for the servers the
+    /// session chose. None leaves a session with the canonical tools only.
+    pub mcp: Option<Arc<dyn McpConnections>>,
 }
 
 /// State a session's loop keeps across wakes: the todo list, the cached
 /// skill and repo-standard lists, the last completion's input-token count,
-/// and `handled_through` — the newest message row id a completed turn has
-/// reacted to. It advances per completed turn: authored child events at or
-/// below it are handled and leave the manifest.
+/// the MCP servers already warned about, and `handled_through` — the newest
+/// message row id a completed turn has reacted to. It advances per completed
+/// turn: authored child events at or below it are handled and leave the
+/// manifest.
 #[derive(Default)]
 struct LoopState {
     todos: Vec<Value>,
@@ -242,6 +297,11 @@ struct LoopState {
     /// and after a compaction consumed the headroom.
     last_input_tokens: u64,
     handled_through: i64,
+    /// The selected MCP servers this session has warned about being down, so
+    /// a server that stays down warns once. A server that answers again
+    /// leaves this set, so a later outage warns again. The memory is per
+    /// process, so a control-plane restart warns about the same outage again.
+    unavailable_mcp_servers: HashSet<String>,
 }
 
 /// The provider and prices one model call runs under: resolved from the
@@ -1213,11 +1273,7 @@ async fn run_turn_inner(
             });
         state.repo_standards_cache = Some(present);
     }
-    let repo_standards = state
-        .repo_standards_cache
-        .as_ref()
-        .expect("populated above");
-    let tools: Vec<ToolSpec> = canonical_tools(permission)
+    let mut tools: Vec<ToolSpec> = canonical_tools(permission)
         .into_iter()
         .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
         .filter(|tool| {
@@ -1234,10 +1290,44 @@ async fn run_turn_inner(
             }
         })
         .collect();
+    // The selected MCP servers' tools join the same list, so the provider
+    // adapters receive one finished surface. `mcp_routes` sends a call back
+    // to the server that exposed its name.
+    let mut mcp_routes: HashMap<String, (String, String)> = HashMap::new();
+    if let Some(mcp) = deps.mcp.as_deref() {
+        let names = parse_mcp_servers(&session.mcp_servers);
+        if !names.is_empty() {
+            let availability = mcp.servers(&names);
+            warn_unavailable_servers(deps, session_id, state, &availability).await?;
+            // Every canonical name is reserved, not only the names this
+            // session may call: the dispatch runs a canonical tool under its
+            // bare name, so an MCP tool that took one would never reach its
+            // server.
+            let reserved: Vec<String> = canonical_tools(Permission::ReadWrite)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            let exposure = expose_mcp_tools(availability.servers, &reserved);
+            for advertised in exposure.advertised {
+                mcp_routes.insert(
+                    advertised.tool.name.clone(),
+                    (advertised.server, advertised.server_name),
+                );
+                tools.push(ToolSpec {
+                    name: advertised.tool.name,
+                    description: advertised.tool.description,
+                    schema: advertised.tool.schema,
+                });
+            }
+        }
+    }
 
     let system = system_prompt(
         persona_system_prompt(deps, &session),
-        repo_standards,
+        state
+            .repo_standards_cache
+            .as_ref()
+            .expect("populated above"),
         &state.todos,
         &skills,
         live,
@@ -1368,11 +1458,16 @@ async fn run_turn_inner(
             .append_tool_call(session_id, &id, &name, &args)
             .await?;
 
-        // The session's allowed-tool set is the second half of its effective
-        // surface (the executor enforces the permission); a call outside it is
-        // refused without reaching the executor. A nameless call falls through
-        // to the unknown-tool branch below.
-        if !name.is_empty() && !tool_allowed(&allowed_tools, &name) {
+        // The session's allowed-tool set is the second half of its canonical
+        // surface (the executor enforces the permission); a canonical call
+        // outside it is refused without reaching the executor. An advertised
+        // MCP tool is granted by the session's server selection instead, so it
+        // is not gated here. A nameless call falls through to the unknown-tool
+        // branch below.
+        if !name.is_empty()
+            && !mcp_routes.contains_key(&name)
+            && !tool_allowed(&allowed_tools, &name)
+        {
             warn!(
                 msg = "tool call refused: not allowed for this session",
                 session_id = %session_id,
@@ -1856,6 +1951,38 @@ async fn run_turn_inner(
                 .await?;
                 append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
             }
+            // A call naming an advertised MCP tool routes back to the server
+            // that exposed the name, carrying the tool name the server itself
+            // reports. Progress notifications reach the session view through
+            // the same delta channel a canonical tool's output uses.
+            call if mcp_routes.contains_key(call) => {
+                let (server, tool) = mcp_routes.get(call).expect("guarded above").clone();
+                let mcp = deps
+                    .mcp
+                    .as_deref()
+                    .expect("an advertised MCP route implies attached connections");
+                let Some(outcome) =
+                    run_mcp_call(deps, mcp, session_id, &server, &tool, args, signal).await
+                else {
+                    return Ok(TurnOutcome::Interrupted);
+                };
+                deps.store
+                    .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
+                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error: outcome.is_error,
+                        content: outcome.content,
+                    },
+                )
+                .await?;
+            }
             _ => {
                 let started = Instant::now();
                 append_activity(
@@ -2017,6 +2144,41 @@ async fn collect_stream(
     })
 }
 
+/// Records a visible warning for each selected MCP server that cannot serve a
+/// call, once per outage, and logs it. A server that answers again leaves the
+/// set here, so a later outage warns again.
+async fn warn_unavailable_servers(
+    deps: &LoopDeps,
+    session_id: &str,
+    state: &mut LoopState,
+    availability: &McpAvailability,
+) -> anyhow::Result<()> {
+    for (server, _) in &availability.servers {
+        state.unavailable_mcp_servers.remove(server);
+    }
+    for server in &availability.unavailable {
+        if !state.unavailable_mcp_servers.insert(server.clone()) {
+            continue;
+        }
+        warn!(
+            msg = "MCP server unavailable",
+            session_id = %session_id,
+            server = %server
+        );
+        deps.store
+            .append_event(
+                session_id,
+                &Event::Warning {
+                    text: format!(
+                        "MCP server {server} is unavailable; its tools are not advertised to this session"
+                    ),
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// Runs one tool call to its end, streaming deltas to the delta sink. An
 /// interrupt cancels the in-flight call and returns `Ok(None)`; the caller
 /// translates that into its own interrupted outcome.
@@ -2104,6 +2266,110 @@ async fn run_tool_call(
         deps.delta_sink.send(delta.text);
     }
     Ok(Some(outcome))
+}
+
+/// Runs one advertised MCP tool call to its end, forwarding the server's
+/// progress notifications to the delta sink as a canonical tool's output
+/// streams. An interrupt drops the call and returns None: an MCP call cannot
+/// be cancelled, so the caller's interrupted outcome is the whole story.
+async fn run_mcp_call(
+    deps: &Arc<LoopDeps>,
+    mcp: &dyn McpConnections,
+    session_id: &str,
+    server: &str,
+    tool: &str,
+    args: Value,
+    signal: &Arc<InterruptSignal>,
+) -> Option<ToolOutcome> {
+    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
+    let mut call = mcp.call(server.to_string(), tool.to_string(), args, delta_tx);
+    let outcome = loop {
+        if signal.flag.load(Ordering::Acquire) {
+            return None;
+        }
+        tokio::select! {
+            result = &mut call => break result,
+            delta = delta_rx.recv() => {
+                if let Some(delta) = delta {
+                    deps.delta_sink.send(delta.text);
+                }
+            }
+            _ = signal.notify.notified() => {
+                if signal.flag.load(Ordering::Acquire) {
+                    return None;
+                }
+            }
+        }
+    };
+    drop(call);
+    // The outcome can overtake the server's final progress lines, so drain
+    // whatever the select left in the channel before recording.
+    while let Ok(delta) = delta_rx.try_recv() {
+        deps.delta_sink.send(delta.text);
+    }
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let text = error.to_string();
+            error!(
+                msg = "MCP tool call failed",
+                session_id = %session_id,
+                server = %server,
+                tool = %tool,
+                error = %error.display_chain()
+            );
+            McpCallOutcome {
+                text,
+                is_error: true,
+            }
+        }
+    };
+    Some(mcp_tool_result(outcome))
+}
+
+/// One MCP call's transcript result: the text in the canonical `text` field,
+/// as a tool error when the server reported one. MCP results are never
+/// spilled to a file — a spill belongs in the session's working copy, which
+/// the server never touched — so an oversized text is cut at the tool limits
+/// instead.
+fn mcp_tool_result(outcome: McpCallOutcome) -> ToolOutcome {
+    let text = truncate_mcp_text(&outcome.text);
+    let content = if outcome.is_error {
+        json!({ "error": text })
+    } else {
+        json!({ "text": text })
+    };
+    ToolOutcome {
+        content,
+        is_error: outcome.is_error,
+    }
+}
+
+/// The marker an MCP result cut at the tool limits ends with. No file holds
+/// the rest, so the marker is how the model learns the result was cut.
+const MCP_TRUNCATION_MARKER: &str =
+    "\n\n[truncated: this MCP result exceeded the tool limits; the rest was dropped]";
+
+/// Truncates an MCP result over either tool limit: the leading lines and the
+/// leading bytes that fit, then the marker. The byte cut walks back to a
+/// character boundary, so the text stays valid.
+fn truncate_mcp_text(text: &str) -> String {
+    if !should_spill(text) {
+        return text.to_string();
+    }
+    let mut kept = text
+        .lines()
+        .take(SPILL_LINE_LIMIT)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if kept.len() > SPILL_BYTE_LIMIT {
+        let mut end = SPILL_BYTE_LIMIT;
+        while !kept.is_char_boundary(end) {
+            end -= 1;
+        }
+        kept.truncate(end);
+    }
+    format!("{kept}{MCP_TRUNCATION_MARKER}")
 }
 
 /// Maps the accumulated tool-call deltas into `(id, name, args)` triples;
@@ -2582,6 +2848,7 @@ mod tests {
             owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: ALL_TOOLS.to_string(),
+            mcp_servers: "".to_string(),
             state: SessionState::Creating,
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
@@ -2746,6 +3013,23 @@ mod tests {
             assert!(
                 matches!(&call.messages[index + 1].block, Block::ToolResult { id: result_id, .. } if result_id == id),
                 "provider request puts a message between the tool call for {name} ({id}) and its result: {:#?}",
+                call.messages
+            );
+        }
+    }
+
+    /// Asserts one provider request's tool traffic is a shape a real provider
+    /// accepts: every tool use is answered by a tool result later in the same
+    /// request. A dangling tool use — one whose call an interrupt cut short
+    /// before it recorded a result — surfaces as a real provider's 400.
+    fn assert_tool_uses_have_matching_tool_results(call: &CapturedCall) {
+        for (index, message) in call.messages.iter().enumerate() {
+            let Block::ToolCall { id, name, .. } = &message.block else {
+                continue;
+            };
+            assert!(
+                call.messages[index + 1..].iter().any(|later| matches!(&later.block, Block::ToolResult { id: result_id, .. } if result_id == id)),
+                "provider request has a tool use for {name} ({id}) with no tool result after it: {:#?}",
                 call.messages
             );
         }
@@ -2920,6 +3204,176 @@ mod tests {
         }
     }
 
+    /// One `call` the loop made to an MCP server, captured for assertions.
+    #[derive(Debug, Clone)]
+    struct CapturedMcpCall {
+        server: String,
+        tool: String,
+        args: Value,
+    }
+
+    /// A fake MCP surface: the servers it serves with their discovered tools,
+    /// what each call answers, and the calls it received. A selected name it
+    /// does not serve is reported unavailable, the way the control plane's
+    /// manager reports a server that is down or unknown.
+    struct MockMcp {
+        servers: Mutex<Vec<(String, Vec<McpTool>)>>,
+        outcome: McpCallOutcome,
+        outcomes: HashMap<String, McpCallOutcome>,
+        /// Tools the server cannot serve, by the reason the manager reports.
+        failures: HashMap<String, String>,
+        delta_text: Option<String>,
+        block: bool,
+        /// Signalled when a blocking call is first polled, so a test can tell
+        /// the loop is parked on it before it interrupts.
+        polled: Arc<Notify>,
+        calls: Mutex<Vec<CapturedMcpCall>>,
+    }
+
+    impl MockMcp {
+        fn new(outcome: McpCallOutcome) -> Self {
+            Self {
+                servers: Mutex::new(Vec::new()),
+                outcome,
+                outcomes: HashMap::new(),
+                failures: HashMap::new(),
+                delta_text: None,
+                block: false,
+                polled: Arc::new(Notify::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Serves one server's tool list.
+        fn serving(self, server: &str, tools: Vec<McpTool>) -> Self {
+            self.publish(server, tools);
+            self
+        }
+
+        /// Answers one tool with its own outcome; other tools get the default.
+        fn answering(mut self, tool: &str, outcome: McpCallOutcome) -> Self {
+            self.outcomes.insert(tool.to_string(), outcome);
+            self
+        }
+
+        /// Refuses one tool with the reason a server that went down reports.
+        fn failing(mut self, tool: &str, reason: &str) -> Self {
+            self.failures.insert(tool.to_string(), reason.to_string());
+            self
+        }
+
+        /// Streams one progress line before the call completes.
+        fn streaming(mut self, text: &str) -> Self {
+            self.delta_text = Some(text.to_string());
+            self
+        }
+
+        /// Never completes, so an interrupt reaches the in-flight call. Tools
+        /// with their own outcome still complete.
+        fn blocking(mut self) -> Self {
+            self.block = true;
+            self
+        }
+
+        fn calls(&self) -> Vec<CapturedMcpCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Makes a server answerable, so a test can bring one back after an
+        /// outage.
+        fn publish(&self, server: &str, tools: Vec<McpTool>) {
+            let mut servers = self.servers.lock().unwrap();
+            servers.retain(|(name, _)| name != server);
+            servers.push((server.to_string(), tools));
+        }
+
+        /// Takes a server down, so a test can simulate an outage.
+        fn withdraw(&self, server: &str) {
+            self.servers
+                .lock()
+                .unwrap()
+                .retain(|(name, _)| name != server);
+        }
+    }
+
+    impl McpConnections for MockMcp {
+        fn servers(&self, names: &[String]) -> McpAvailability {
+            let servers = self.servers.lock().unwrap();
+            let mut available = Vec::new();
+            let mut unavailable = Vec::new();
+            for name in names {
+                match servers.iter().find(|(server, _)| server == name) {
+                    Some((server, tools)) => available.push((server.clone(), tools.clone())),
+                    None => unavailable.push(name.clone()),
+                }
+            }
+            McpAvailability {
+                servers: available,
+                unavailable,
+            }
+        }
+
+        fn call(
+            &self,
+            server: String,
+            tool: String,
+            args: Value,
+            delta: mpsc::UnboundedSender<ToolDelta>,
+        ) -> Pin<Box<dyn Future<Output = Result<McpCallOutcome, McpCallError>> + Send>> {
+            self.calls.lock().unwrap().push(CapturedMcpCall {
+                server: server.clone(),
+                tool: tool.clone(),
+                args,
+            });
+            if let Some(reason) = self.failures.get(&tool).cloned() {
+                return Box::pin(async move {
+                    drop(delta);
+                    Err(McpCallError::Unavailable { server, reason })
+                });
+            }
+            let outcome = self
+                .outcomes
+                .get(&tool)
+                .cloned()
+                .unwrap_or_else(|| self.outcome.clone());
+            let delta_text = self.delta_text.clone();
+            let block = self.block && !self.outcomes.contains_key(&tool);
+            let polled = self.polled.clone();
+            Box::pin(async move {
+                if let Some(text) = delta_text {
+                    let _ = delta.send(ToolDelta { text });
+                }
+                if block {
+                    // Hold the sender so the loop parks on the delta channel
+                    // and the interrupt wakes its select deterministically.
+                    polled.notify_one();
+                    let _hold = delta;
+                    std::future::pending::<Result<McpCallOutcome, McpCallError>>().await
+                } else {
+                    drop(delta);
+                    Ok(outcome)
+                }
+            })
+        }
+    }
+
+    /// One discovered MCP tool with a fixed schema.
+    fn mcp_tool(name: &str, description: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: description.to_string(),
+            schema: json!({ "type": "object", "properties": { "query": { "type": "string" } } }),
+        }
+    }
+
+    /// A text outcome, the shape a successful MCP call returns.
+    fn mcp_text(text: &str) -> McpCallOutcome {
+        McpCallOutcome {
+            text: text.to_string(),
+            is_error: false,
+        }
+    }
+
     fn default_outcome() -> ToolOutcome {
         ToolOutcome {
             content: json!({ "ok": true }),
@@ -3005,6 +3459,7 @@ mod tests {
             price_output_per_mtok,
             spawner: None,
             mailbox: None,
+            mcp: None,
         }
     }
 
@@ -3031,6 +3486,7 @@ mod tests {
             price_output_per_mtok: 0.0,
             spawner: None,
             mailbox: None,
+            mcp: None,
         }
     }
 
@@ -3061,6 +3517,21 @@ mod tests {
     ) -> LoopDeps {
         LoopDeps {
             mailbox: Some(mailbox),
+            ..test_deps(store, provider, tools, sink)
+        }
+    }
+
+    /// A deps with MCP connections attached, for advertising and routing
+    /// tests.
+    fn test_deps_with_mcp(
+        store: &Store,
+        provider: Arc<dyn Provider>,
+        tools: Arc<MockTools>,
+        sink: Arc<CollectSink>,
+        mcp: Arc<dyn McpConnections>,
+    ) -> LoopDeps {
+        LoopDeps {
+            mcp: Some(mcp),
             ..test_deps(store, provider, tools, sink)
         }
     }
@@ -13754,5 +14225,766 @@ mod tests {
 
         root_handle.stop();
         resumed_handle.stop();
+    }
+
+    /// The warning texts the session has recorded, in order.
+    async fn warnings(store: &Store, session_id: &str) -> Vec<String> {
+        store
+            .events_after(session_id, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::Warning { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Appends a user message, wakes the loop, and returns once the turn that
+    /// answered it has ended, so a test can drive several turns in order.
+    async fn send_message_and_wait_for_turn(
+        store: &Store,
+        handle: &LoopHandle,
+        provider: &Arc<ScriptedProvider>,
+        session_id: &str,
+        text: &str,
+        turns: usize,
+    ) {
+        store
+            .append_message(
+                session_id,
+                Role::User,
+                &Block::Text {
+                    text: text.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::Wake);
+        let provider = provider.clone();
+        let store = store.clone();
+        let session_id = session_id.to_string();
+        wait_for("the next turn to end", move || {
+            let provider = provider.clone();
+            let store = store.clone();
+            let session_id = session_id.clone();
+            async move {
+                let stored = store
+                    .get_session(&session_id)
+                    .await
+                    .unwrap()
+                    .expect("the session is stored");
+                provider.captured_calls().len() == turns
+                    && stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_advertises_the_selected_servers_tools_beside_the_canonical_tools() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-advertise")
+            })
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("done".into()),
+            stop(1, 1),
+        ]]));
+        let mcp = Arc::new(MockMcp::new(mcp_text("unused")).serving(
+            "srv-a",
+            vec![
+                mcp_tool("lookup", "looks a name up"),
+                mcp_tool("look.up", "looks a name up"),
+                mcp_tool("shell", "runs a command"),
+            ],
+        ));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp,
+        ));
+        let handle = spawn_loop("s-advertise".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("s-advertise")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let tools = provider.captured_calls()[0].tools.clone();
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| tool.description.clone())
+        };
+        // A valid, unambiguous name is exposed bare, and the server it came
+        // from stays visible in the description.
+        assert_eq!(
+            description("lookup").as_deref(),
+            Some("[srv-a] looks a name up")
+        );
+        // A name the provider pattern rejects is namespaced, and its schema
+        // reaches the provider as the server reported it.
+        assert_eq!(
+            description("srv-a-look_up").as_deref(),
+            Some("looks a name up")
+        );
+        let namespaced = tools
+            .iter()
+            .find(|tool| tool.name == "srv-a-look_up")
+            .expect("the namespaced tool is advertised");
+        assert_eq!(
+            namespaced.schema,
+            json!({ "type": "object", "properties": { "query": { "type": "string" } } })
+        );
+        // A canonical name is reserved: the canonical tool is untouched and
+        // the MCP tool takes a namespaced name instead.
+        assert_eq!(
+            tools.iter().filter(|tool| tool.name == "shell").count(),
+            1,
+            "an MCP tool never shadows a canonical one"
+        );
+        assert!(description("srv-a-shell").is_some());
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_mcp_call_routes_to_its_server_under_the_servers_own_tool_name() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-route")
+            })
+            .await
+            .unwrap();
+
+        let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+        // The tool's own name is one the provider pattern rejects, so the
+        // model calls the exposed name while the server hears its own.
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("the answer"))
+                .serving("srv-a", vec![mcp_tool("look.up", "looks a name up")])
+                .streaming("working"),
+        );
+        let tools = instant_tools();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("srv-a-look_up".into()),
+                    args_delta: r#"{"query":"ada"}"#.into(),
+                },
+                stop(1, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            sink.clone(),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-route".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-route").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let calls = mcp.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server, "srv-a");
+        assert_eq!(
+            calls[0].tool, "look.up",
+            "the server hears its own tool name, never the exposed one"
+        );
+        assert_eq!(calls[0].args, json!({ "query": "ada" }));
+        assert!(
+            !tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.name == "srv-a-look_up"),
+            "an advertised MCP tool never reaches the executor"
+        );
+        assert!(
+            sink.0.lock().unwrap().iter().any(|text| text == "working"),
+            "the server's progress reaches the session view"
+        );
+
+        let tool_calls = store.tool_calls("s-route").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].name, "srv-a-look_up",
+            "the transcript records the exposed name the model called"
+        );
+        assert_eq!(tool_calls[0].result, Some(json!({ "text": "the answer" })));
+        assert!(!tool_calls[0].is_error);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn the_allowed_tool_list_does_not_gate_an_mcp_call() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        // The canonical allow-list names one tool. The session's server
+        // selection is the whole MCP grant, so the advertised tool is callable
+        // even though the allow-list never names it.
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session_allowing("s-grant", "file_read")
+            })
+            .await
+            .unwrap();
+
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("the answer"))
+                .serving("srv-a", vec![mcp_tool("lookup", "looks a name up")]),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("lookup".into()),
+                    args_delta: "{}".into(),
+                },
+                stop(1, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-grant".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-grant").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(mcp.calls().len(), 1, "the MCP call is dispatched");
+        let tool_calls = store.tool_calls("s-grant").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].result, Some(json!({ "text": "the answer" })));
+        assert!(
+            !tool_calls[0].is_error,
+            "the canonical allow-list does not refuse an MCP tool"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tool_never_takes_a_canonical_name_the_session_cannot_call() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        // The allow-list drops `ask` from this session's canonical surface,
+        // and the server offers a tool of that name.
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session_allowing("s-shadow", "file_read")
+            })
+            .await
+            .unwrap();
+
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("the answer"))
+                .serving("srv-a", vec![mcp_tool("ask", "asks the server")]),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("srv-a-ask".into()),
+                    args_delta: r#"{"message":"hi"}"#.into(),
+                },
+                stop(1, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-shadow".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-shadow").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        // Every canonical name is reserved, so the server's tool is namespaced
+        // and the call reaches the server rather than the canonical arm.
+        let tools = provider.captured_calls()[0].tools.clone();
+        assert!(tools.iter().any(|tool| tool.name == "srv-a-ask"));
+        assert!(
+            !tools.iter().any(|tool| tool.name == "ask"),
+            "an MCP tool never takes a canonical name"
+        );
+        let calls = mcp.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server, "srv-a");
+        assert_eq!(calls[0].tool, "ask");
+        let messages = store.messages("s-shadow", false).await.unwrap();
+        assert!(
+            !messages
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::Ask { .. })),
+            "the canonical ask never runs under the server's tool name"
+        );
+        let tool_calls = store.tool_calls("s-shadow").await.unwrap();
+        assert_eq!(tool_calls[0].result, Some(json!({ "text": "the answer" })));
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_mcp_result_maps_to_text_and_a_refused_call_to_a_tool_error() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-map")
+            })
+            .await
+            .unwrap();
+
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("unused"))
+                .serving(
+                    "srv-a",
+                    vec![
+                        mcp_tool("ok", "works"),
+                        mcp_tool("bad", "fails"),
+                        mcp_tool("gone", "vanished"),
+                    ],
+                )
+                .answering("ok", mcp_text("the answer"))
+                .answering(
+                    "bad",
+                    McpCallOutcome {
+                        text: "the server refused".into(),
+                        is_error: true,
+                    },
+                )
+                .failing("gone", "the connection is closed"),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-ok".into()),
+                    name: Some("ok".into()),
+                    args_delta: "{}".into(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: Some("call-bad".into()),
+                    name: Some("bad".into()),
+                    args_delta: "{}".into(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 2,
+                    id: Some("call-gone".into()),
+                    name: Some("gone".into()),
+                    args_delta: "{}".into(),
+                },
+                stop(1, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp,
+        ));
+        let handle = spawn_loop("s-map".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-map").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let tool_calls = store.tool_calls("s-map").await.unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        assert_eq!(
+            tool_calls[0].result,
+            Some(json!({ "text": "the answer" })),
+            "the result text is recorded verbatim"
+        );
+        assert!(!tool_calls[0].is_error);
+        assert_eq!(
+            tool_calls[1].result,
+            Some(json!({ "error": "the server refused" }))
+        );
+        assert!(
+            tool_calls[1].is_error,
+            "the server's isError becomes a normal tool error"
+        );
+        assert!(
+            tool_calls[2].is_error,
+            "a call the server cannot serve is a tool error, not a failed turn"
+        );
+        assert!(
+            tool_calls[2]
+                .result
+                .as_ref()
+                .is_some_and(|content| content.get("error").is_some()),
+            "the reason reaches the model as the error"
+        );
+
+        let messages = store.messages("s-map", false).await.unwrap();
+        assert!(
+            messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::ToolResult { name, content, is_error, .. }
+                    if name == "bad"
+                        && *is_error
+                        && content == &json!({ "error": "the server refused" })
+            )),
+            "the transcript carries the mapped result"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_drops_an_mcp_call_that_cannot_be_cancelled() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-drop")
+            })
+            .await
+            .unwrap();
+
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("unused"))
+                .serving("srv-a", vec![mcp_tool("slow", "takes forever")])
+                .blocking(),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("slow".into()),
+                args_delta: "{}".into(),
+            },
+            stop(1, 1),
+        ]]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider,
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-drop".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        // The call is in flight once its first poll signalled, so the
+        // interrupt lands on a call the loop has parked on.
+        tokio::time::timeout(Duration::from_secs(15), mcp.polled.notified())
+            .await
+            .expect("the MCP call is polled");
+
+        handle.send(LoopEvent::Interrupt);
+        wait_for("the session to be interrupted", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-drop").await.unwrap().unwrap().state
+                    == SessionState::Interrupted
+            }
+        })
+        .await;
+
+        // The call cannot be cancelled, so it is dropped and the turn records
+        // no result for it.
+        let tool_calls = store.tool_calls("s-drop").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert!(
+            tool_calls[0].result.is_none(),
+            "an interrupted MCP call records no result"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_turn_answers_the_tool_call_an_interrupt_left_unanswered() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-dangle")
+            })
+            .await
+            .unwrap();
+
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("unused"))
+                .serving("srv-a", vec![mcp_tool("slow", "takes forever")])
+                .blocking(),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("slow".into()),
+                    args_delta: "{}".into(),
+                },
+                stop(1, 1),
+            ],
+            vec![StreamEvent::TextDelta("resumed".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-dangle".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        tokio::time::timeout(Duration::from_secs(15), mcp.polled.notified())
+            .await
+            .expect("the MCP call is polled");
+        handle.send(LoopEvent::Interrupt);
+        wait_for("the session to be interrupted", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-dangle").await.unwrap().unwrap().state
+                    == SessionState::Interrupted
+            }
+        })
+        .await;
+
+        // The interrupt cut the call short, so the thread holds its call with
+        // no result: exactly the pair the resumed turn's window must repair.
+        let tool_calls = store.tool_calls("s-dangle").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert!(
+            tool_calls[0].result.is_none(),
+            "the interrupted call records no result"
+        );
+
+        // The resumed turn rebuilds its window from the thread the interrupt
+        // left behind, so the recorded call with no result is in front of the
+        // provider again.
+        store
+            .append_message(
+                "s-dangle",
+                Role::User,
+                &Block::Text {
+                    text: "carry on".into(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::UserMessage);
+
+        wait_for("the resumed turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 2, "the interrupt ended the first turn only");
+        for call in &calls {
+            assert_tool_uses_have_matching_tool_results(call);
+        }
+        // The window answers the dangling call instead of dropping it, so the
+        // model learns the run was interrupted rather than assuming it ran.
+        assert!(
+            calls[1].messages.iter().any(
+                |message| matches!(&message.block, Block::ToolCall { name, .. } if name == "slow")
+            ),
+            "the interrupted call is sent again"
+        );
+        assert!(
+            calls[1].messages.iter().any(|message| matches!(
+                &message.block,
+                Block::ToolResult { id, is_error: true, .. } if id == "call-1"
+            )),
+            "the interrupted call is answered with an error result"
+        );
+
+        handle.stop();
+    }
+
+    #[test]
+    fn an_oversized_mcp_result_is_cut_at_the_tool_limits_on_a_character_boundary() {
+        // A result inside both limits passes through untouched.
+        assert_eq!(truncate_mcp_text("short"), "short");
+
+        // One line over the byte limit, where the cut lands inside a two-byte
+        // character and must walk back to a boundary.
+        let oversized = format!("a{}", "é".repeat(SPILL_BYTE_LIMIT));
+        let cut = truncate_mcp_text(&oversized);
+        let body = cut
+            .strip_suffix(MCP_TRUNCATION_MARKER)
+            .expect("the cut is marked");
+        assert!(body.len() <= SPILL_BYTE_LIMIT);
+        assert!(
+            body.len() > SPILL_BYTE_LIMIT - 2,
+            "the cut keeps as much as fits: {} bytes",
+            body.len()
+        );
+        assert!(body.starts_with('a'));
+
+        // Many short lines over the line limit, under the byte limit.
+        let lines: String = (0..=SPILL_LINE_LIMIT).map(|i| format!("{i}\n")).collect();
+        assert!(lines.len() < SPILL_BYTE_LIMIT);
+        let cut = truncate_mcp_text(&lines);
+        let body = cut
+            .strip_suffix(MCP_TRUNCATION_MARKER)
+            .expect("the cut is marked");
+        assert_eq!(body.lines().count(), SPILL_LINE_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn a_down_server_warns_once_and_again_after_it_recovers() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a,ghost".to_string(),
+                ..session("s-warn")
+            })
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta("one".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("two".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("three".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("four".into()), stop(1, 1)],
+        ]));
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("unused"))
+                .serving("srv-a", vec![mcp_tool("lookup", "looks a name up")]),
+        );
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-warn".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s-warn").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+        let recorded = warnings(&store, "s-warn").await;
+        assert_eq!(recorded.len(), 1, "the down server warns once");
+        assert!(recorded[0].contains("ghost"), "the warning names it");
+
+        // The server stays down: the next turn repeats nothing.
+        send_message_and_wait_for_turn(&store, &handle, &provider, "s-warn", "again", 2).await;
+        assert_eq!(
+            warnings(&store, "s-warn").await.len(),
+            1,
+            "a server that stays down is not warned about again"
+        );
+
+        // It answers again: its tools are advertised and the warning is
+        // forgotten, so a later outage is a new one.
+        mcp.publish("ghost", vec![mcp_tool("ghost_tool", "does ghost things")]);
+        send_message_and_wait_for_turn(&store, &handle, &provider, "s-warn", "recovered", 3).await;
+        assert_eq!(warnings(&store, "s-warn").await.len(), 1);
+        assert!(
+            provider.captured_calls()[2]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ghost_tool"),
+            "a server that answers again is advertised"
+        );
+
+        mcp.withdraw("ghost");
+        send_message_and_wait_for_turn(&store, &handle, &provider, "s-warn", "down again", 4).await;
+        assert_eq!(
+            warnings(&store, "s-warn").await.len(),
+            2,
+            "an outage after a recovery warns again"
+        );
+
+        handle.stop();
     }
 }

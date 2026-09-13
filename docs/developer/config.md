@@ -20,6 +20,7 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
 | `data_dir` | `data` | Directory for the SQLite store and persona prompt files |
 | `github_token` | none | Optional GitHub token, a literal or `env:VAR` read from the environment at boot. Sent as the `Authorization` header when the control plane fetches or updates skill repositories; private repos need it, public repos do not. Never stored or exposed; see skill repositories below |
+| `oauth_redirect_uri` | none | The control-plane URL the MCP OAuth callback is served at. No default. A path the control plane already serves fails boot with a clear error, and an unset value fails an OAuth flow with a clear error; see MCP servers below |
 | `models` | none | Named model entries (see `ModelConfig` below). Sessions never name one directly; a persona's `model` does |
 | `personas` | none | Named personas (see `PersonaConfig` below) |
 | `default_persona` | none | Persona sessions use when the request does not name one |
@@ -100,6 +101,45 @@ and loads a package's instructions or one of its reference chunks on demand.
 See `docs/adrs/2026-09-06-skill-package-standard.md` for the standard and
 `docs/adrs/2026-09-06-remote-skill-packages.md` for the acquisition and storage
 model.
+
+### MCP servers
+
+Bosun is an MCP client for HTTP servers. The operator manages the server list
+in the web pane's MCP section: add, edit, enable or disable, retry, and remove
+happen there, and the store's `mcp_servers` table holds the list. Each row
+carries the name, the URL, the auth kind (`none`, `bearer`, or `oauth`), the
+inline secrets, the OAuth tokens with their expiry and the scopes they were
+granted for, and the last error. List and read endpoints never return secret
+values.
+
+A server's secret is a literal or `env:VAR`, resolved at connect like a model
+`api_key`. Secrets are plaintext in the store, matching the single-user MVP's
+trust model; see `docs/adrs/2026-09-06-mcp-support.md`.
+
+An OAuth server needs `oauth_redirect_uri` set to the callback URL registered
+with its authorization server. The pane starts the flow; the authorization
+server redirects back to that URL. A server that needs no OAuth takes a static
+bearer token instead. A later 401 or an expired token refreshes from the stored
+refresh token. If a server refuses a call because the token's scopes are too
+small, the control plane asks for the union of the scopes already granted and
+the challenge's scope; the row's OAuth status becomes re-authorization
+required, and the Re-authorize control opens that authorization URL.
+
+A session gets the servers chosen when it was created: `bosun clone` and
+`bosun dev` take a repeatable `--mcp <name>`, `POST /sessions`, `/clone`, and
+`/dev` accept the list, and the web pane's new-session form has a multi-select
+over the enabled servers. The default is none, and an unknown or disabled name
+fails creation. The selection is the whole MCP grant: a persona's
+`allowed_tools` governs the canonical tools only, and MCP tools are not bound
+by the read-only/read-write permission today.
+
+The control plane connects each enabled server at boot and gives every session
+that selected it the same connection. A tool whose name is valid and
+unambiguous is exposed bare with its description prefixed `[server]`;
+otherwise it is exposed as `<server>-<tool>`. A failed connect retries with
+backoff, the row's retry control forces an immediate attempt, and `last_error`
+records the latest failure. A session whose chosen server is down starts
+without that server's tools and shows a warning.
 
 ## Node
 

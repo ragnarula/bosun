@@ -61,6 +61,10 @@ pub struct Session {
     /// creation: `"*"` for every canonical tool, or a list of tool names.
     #[serde(default = "default_allowed_tools")]
     pub allowed_tools: String,
+    /// The MCP servers the session may borrow, as a comma-separated list of
+    /// enabled server names. Empty means none.
+    #[serde(default)]
+    pub mcp_servers: String,
     pub state: SessionState,
     /// Why the session was last interrupted: by the user, or by a crash.
     /// Recorded when the session becomes interrupted and kept when it later
@@ -234,6 +238,11 @@ pub enum Event {
         at_ms: u64,
         #[serde(flatten)]
         phase: ActivityPhase,
+    },
+    /// A note the loop recorded for the user: something it handled that the
+    /// user should see, such as a selected MCP server being unavailable.
+    Warning {
+        text: String,
     },
 }
 
@@ -523,6 +532,9 @@ mod tests {
                 output_tokens: Some(50),
                 cost: Some(0.001),
             },
+            Event::Warning {
+                text: "MCP server srv-a is unavailable".into(),
+            },
         ];
         for phase in [
             ActivityPhase::WakeStarted,
@@ -618,6 +630,13 @@ mod tests {
         assert_eq!(json["name"], "shell");
         assert_eq!(json["ok"], false);
         assert_eq!(json["elapsed_ms"], 7);
+
+        let json = serde_json::to_value(Event::Warning {
+            text: "MCP server srv-a is unavailable".into(),
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "warning");
+        assert_eq!(json["text"], "MCP server srv-a is unavailable");
     }
 
     #[test]
@@ -641,6 +660,7 @@ mod tests {
             owner_id: "root-1".into(),
             permission: Permission::ReadOnly,
             allowed_tools: "file_read, git".into(),
+            mcp_servers: "srv-a,srv-b".into(),
             state: SessionState::Interrupted,
             interrupt_cause: Some(InterruptCause::User),
             created_at_secs: 1_700_000_000,
@@ -666,6 +686,7 @@ mod tests {
         .unwrap();
         assert_eq!(session.persona, None);
         assert_eq!(session.allowed_tools, "*");
+        assert_eq!(session.mcp_servers, "");
         // A session without tree fields predates children, so it is a root.
         assert_eq!(session.parent_id, None);
         assert_eq!(session.owner_id, "");
@@ -686,6 +707,7 @@ mod tests {
             owner_id: "root-1".into(),
             permission: Permission::ReadOnly,
             allowed_tools: "file_read, grep".into(),
+            mcp_servers: "".into(),
             state: SessionState::Running,
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,

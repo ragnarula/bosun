@@ -39,6 +39,7 @@ use bosun_common::version::compare;
 use bosun_control::api::AppState;
 use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
+use bosun_control::mcp_manager::McpManager;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::skills_repos::GitHubClient;
@@ -139,6 +140,9 @@ struct CloneArgs {
     /// First instruction for the session.
     #[arg(long)]
     message: Option<String>,
+    /// MCP server to make available to the session. Repeatable; defaults to none.
+    #[arg(long = "mcp", value_name = "NAME")]
+    mcp: Vec<String>,
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
@@ -155,6 +159,9 @@ struct DevArgs {
     /// First instruction for the session.
     #[arg(long)]
     message: Option<String>,
+    /// MCP server to make available to the session. Repeatable; defaults to none.
+    #[arg(long = "mcp", value_name = "NAME")]
+    mcp: Vec<String>,
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
@@ -292,6 +299,12 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         load_config(&args.config).context("failed to load control-plane config")?;
     // The error's Display lists every problem on its own line.
     config.validate_personas()?;
+    if let Some(redirect_uri) = config.oauth_redirect_uri.as_deref() {
+        // The callback route registers here; a path the router cannot serve
+        // or already serves would leave the callback unreachable, so the
+        // operator's flow could never complete.
+        bosun_control::api::oauth_callback_path(redirect_uri)?;
+    }
     info!(
         listen_addr = %config.listen_addr,
         node_timeout_secs = config.node_timeout_secs,
@@ -351,6 +364,21 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let github_token = resolve_github_token(&config.github_token)?;
+    let mcp_oauth = bosun_control::mcp_oauth::McpOAuthContext::new(
+        reqwest::Client::new(),
+        store.clone(),
+        config.oauth_redirect_uri.clone(),
+    );
+    // Every enabled server connects in its own task, so a server that is down
+    // delays nothing here and does not stop the control plane from starting.
+    let mcp = Arc::new(McpManager::new(
+        store.clone(),
+        mcp_oauth.clone(),
+        reqwest::Client::new(),
+    ));
+    mcp.start().await;
+    let mut loops = AgentRegistry::new(providers.clone(), config.personas.clone(), prices);
+    loops.mcp = Some(mcp.clone());
 
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(
@@ -366,14 +394,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             "https://raw.githubusercontent.com",
             github_token,
         ),
-        loops: Arc::new(AgentRegistry::new(
-            providers.clone(),
-            config.personas.clone(),
-            prices,
-        )),
+        loops: Arc::new(loops),
         providers,
         personas: config.personas,
         default_persona: config.default_persona,
+        oauth_redirect_uri: config.oauth_redirect_uri,
+        mcp_oauth,
+        mcp,
     });
     // The loops' `spawn` tool starts child sessions through the registry, so
     // the registry needs the node-facing handles before any loop runs.
@@ -579,6 +606,7 @@ async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
         git_ref: args.git_ref,
         persona: args.persona,
         prompt: args.message,
+        mcp_servers: args.mcp,
     };
     let response = client
         .post(format!("{cp_url}/clone"))
@@ -671,6 +699,7 @@ async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
                     &dir,
                     args.persona.clone(),
                     args.message.clone(),
+                    args.mcp.clone(),
                 )
                 .await?;
                 return Ok(());
@@ -722,12 +751,14 @@ async fn spawn_dev(
     dir: &Path,
     persona: Option<String>,
     prompt: Option<String>,
+    mcp_servers: Vec<String>,
 ) -> anyhow::Result<()> {
     let request = DevRequest {
         node: node.to_string(),
         dir: dir.to_path_buf(),
         persona,
         prompt,
+        mcp_servers,
     };
     let response = client
         .post(format!("{cp_url}/dev"))
@@ -1134,6 +1165,7 @@ mod tests {
             owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
+            mcp_servers: "".into(),
             state: SessionState::WaitingForInput,
             interrupt_cause: None,
             created_at_secs: 0,
@@ -1413,6 +1445,7 @@ mod tests {
         };
         assert_eq!(args.persona.as_deref(), Some("reviewer"));
         assert!(args.git_ref.is_none());
+        assert!(args.mcp.is_empty());
 
         let dev = Cli::try_parse_from(["bosun", "dev", "--node", "node-1", "--persona", "coder"])
             .expect("--persona should parse");
@@ -1420,6 +1453,36 @@ mod tests {
             panic!("expected the dev command");
         };
         assert_eq!(args.persona.as_deref(), Some("coder"));
+        assert!(args.mcp.is_empty());
+    }
+
+    #[test]
+    fn clone_and_dev_parse_a_repeatable_mcp_flag() {
+        let clone = Cli::try_parse_from([
+            "bosun",
+            "clone",
+            "--node",
+            "node-1",
+            "--mcp",
+            "srv-a",
+            "--mcp",
+            "srv-b",
+            "https://example.com/repo",
+        ])
+        .expect("--mcp should parse for clone");
+        let Command::Clone(args) = clone.command else {
+            panic!("expected the clone command");
+        };
+        assert_eq!(args.mcp, ["srv-a", "srv-b"]);
+
+        let dev = Cli::try_parse_from([
+            "bosun", "dev", "--node", "node-1", "--mcp", "srv-a", "--mcp", "srv-b",
+        ])
+        .expect("--mcp should parse for dev");
+        let Command::Dev(args) = dev.command else {
+            panic!("expected the dev command");
+        };
+        assert_eq!(args.mcp, ["srv-a", "srv-b"]);
     }
 
     #[test]

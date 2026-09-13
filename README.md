@@ -17,13 +17,17 @@ from a terminal client 💻 or the web pane 🌐.
 Single-user MVP. There is no security model and no scalability story yet:
 run it on a network you trust 🔒. Remote skill packages shipped: skills come
 from GitHub repositories the operator manages in the web pane and reach
-sessions through the `skill` tool. The current sprint and the planned
-roadmap are tracked in [docs/sprints](docs/sprints/).
+sessions through the `skill` tool. MCP support shipped: the control plane
+connects to external MCP servers over HTTP, the operator manages the server
+list and each session's selection in the web pane, and the chosen servers'
+tools reach the model beside the canonical tools. The current sprint and the
+planned roadmap are tracked in [docs/sprints](docs/sprints/).
 
 ## ⚙️ How it works
 
 - **🎛️ Control plane** (`bosun serve`) runs one agent loop per session,
-  keeps the session store, and manages skill repositories in the web pane.
+  keeps the session store, manages skill repositories and MCP servers in the
+  web pane, and holds one shared connection per enabled MCP server.
 - **🖥️ Nodes** (`bosun node`) dial out to the control plane. No open inbound
   ports are needed on a node. Each session runs its tools in-process on the
   node, scoped to the session's working copy and permission.
@@ -88,7 +92,7 @@ command with `--cp-url`, stored with `bosun config set`, or exported as
 
 The web pane is served at the control-plane root (`/` or `/ui`). Open it in a
 browser to see the node list, start a session, follow its live transcript,
-and manage skill repositories 🍿.
+and manage skill repositories and MCP servers 🍿.
 
 ## 📚 Documentation
 

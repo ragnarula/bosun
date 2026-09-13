@@ -28,6 +28,10 @@ pub struct ControlConfig {
     /// `"env:VAR"` read from the environment at boot like a model `api_key`.
     /// Never serialized back to TOML or exposed through the API.
     pub github_token: Option<String>,
+    /// The control-plane URL the MCP OAuth callback is served at. No default:
+    /// a server that needs OAuth cannot be authorised until this is set, and
+    /// a wrong value fails the flow with a clear error.
+    pub oauth_redirect_uri: Option<String>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -127,6 +131,7 @@ impl Default for ControlConfig {
             personas: HashMap::new(),
             default_persona: None,
             github_token: None,
+            oauth_redirect_uri: None,
         }
     }
 }
@@ -331,6 +336,19 @@ mod tests {
         assert_eq!(config.github_token, None);
         let config: ControlConfig = toml::from_str("github_token = \"env:GITHUB_TOKEN\"").unwrap();
         assert_eq!(config.github_token.as_deref(), Some("env:GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn oauth_redirect_uri_defaults_to_none_and_parses_a_value() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(config.oauth_redirect_uri, None);
+        let config: ControlConfig =
+            toml::from_str("oauth_redirect_uri = \"http://127.0.0.1:8090/mcp/oauth/callback\"")
+                .unwrap();
+        assert_eq!(
+            config.oauth_redirect_uri.as_deref(),
+            Some("http://127.0.0.1:8090/mcp/oauth/callback")
+        );
     }
 
     #[test]

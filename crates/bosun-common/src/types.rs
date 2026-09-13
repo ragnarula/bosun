@@ -199,6 +199,9 @@ pub struct CloneRequest {
     pub persona: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// The MCP servers the session may borrow, by name. Defaults to none.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -220,6 +223,9 @@ pub struct DevRequest {
     pub persona: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// The MCP servers the session may borrow, by name. Defaults to none.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -266,6 +272,7 @@ mod tests {
                 .unwrap();
         assert_eq!(request.persona, None);
         assert_eq!(request.prompt, None);
+        assert!(request.mcp_servers.is_empty());
     }
 
     #[test]
@@ -283,6 +290,7 @@ mod tests {
             serde_json::from_str(r#"{"node":"node-1","dir":"/work/repo"}"#).unwrap();
         assert_eq!(request.persona, None);
         assert_eq!(request.prompt, None);
+        assert!(request.mcp_servers.is_empty());
     }
 
     #[test]
@@ -292,6 +300,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.prompt.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn clone_and_dev_requests_parse_a_provided_mcp_server_list() {
+        let clone: CloneRequest = serde_json::from_str(
+            r#"{"node":"node-1","repo_url":"https://example.com/repo","mcp_servers":["srv-a","srv-b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(clone.mcp_servers, ["srv-a", "srv-b"]);
+
+        let dev: DevRequest =
+            serde_json::from_str(r#"{"node":"node-1","dir":"/work/repo","mcp_servers":["srv-a"]}"#)
+                .unwrap();
+        assert_eq!(dev.mcp_servers, ["srv-a"]);
     }
 
     #[test]

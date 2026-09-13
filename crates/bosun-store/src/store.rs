@@ -9,6 +9,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use anyhow::Context;
+use bosun_common::mcp::McpAuth;
+use bosun_common::mcp::McpServer;
+use bosun_common::mcp::McpServerSecret;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
@@ -36,6 +39,10 @@ pub enum StoreError {
     RepoAlreadyExists { repo: String },
     #[error("skill repo {repo} was not found")]
     RepoNotFound { repo: String },
+    #[error("MCP server {name} already exists")]
+    McpServerAlreadyExists { name: String },
+    #[error("MCP server {name} was not found")]
+    McpServerNotFound { name: String },
     #[error(
         "skill package {address} belongs to repo {package_repo}, not the repo being replaced ({repo})"
     )]
@@ -125,6 +132,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   persona TEXT,
   permission TEXT NOT NULL,
   allowed_tools TEXT NOT NULL DEFAULT '*',
+  mcp_servers TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
   created_at_secs INTEGER NOT NULL,
   prompt TEXT,
@@ -204,6 +212,22 @@ CREATE TABLE IF NOT EXISTS skill_references (
   content TEXT NOT NULL,
   PRIMARY KEY (package, path)
 );
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  name TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  auth TEXT NOT NULL,
+  bearer_token TEXT,
+  oauth_client_id TEXT,
+  oauth_client_secret TEXT,
+  oauth_access_token TEXT,
+  oauth_refresh_token TEXT,
+  oauth_expires_at_secs INTEGER,
+  oauth_scope TEXT,
+  added_at_secs INTEGER NOT NULL,
+  updated_at_secs INTEGER,
+  last_error TEXT
+);
 ";
 
 impl Store {
@@ -224,15 +248,22 @@ impl Store {
         // Additive migrations for databases created by an older schema. The
         // column list is checked first, so the migration does not depend on
         // the wording of SQLite's duplicate-column error. Old rows then mean
-        // what the defaults say: '*' for allowed_tools, no persona, and, for
-        // rows older than the session tree, no parent and the session as its
-        // own owner.
+        // what the defaults say: '*' for allowed_tools, no persona, no MCP
+        // servers, and, for rows older than the session tree, no parent and
+        // the session as its own owner.
         if !column_exists(&conn, "sessions", "allowed_tools")? {
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT '*'",
                 [],
             )
             .context("failed to add the allowed_tools column")?;
+        }
+        if !column_exists(&conn, "sessions", "mcp_servers")? {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN mcp_servers TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .context("failed to add the mcp_servers column")?;
         }
         if !column_exists(&conn, "sessions", "persona")? {
             conn.execute("ALTER TABLE sessions ADD COLUMN persona TEXT", [])
@@ -271,6 +302,13 @@ impl Store {
                 [],
             )
             .context("failed to backfill the origin_leaf column")?;
+        }
+        if !column_exists(&conn, "mcp_servers", "oauth_scope")? {
+            // A server authorized before the scope was stored has no record
+            // of what its token was granted for, so a step-up asks only for
+            // the challenge's scope.
+            conn.execute("ALTER TABLE mcp_servers ADD COLUMN oauth_scope TEXT", [])
+                .context("failed to add the oauth_scope column")?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -326,8 +364,8 @@ impl Store {
                 .map(|cause| serde_json::to_string(&cause))
                 .transpose()?;
             conn.execute(
-                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     session.id,
                     session.node,
@@ -338,6 +376,7 @@ impl Store {
                     session.persona,
                     permission,
                     session.allowed_tools,
+                    session.mcp_servers,
                     state,
                     session.created_at_secs,
                     session.prompt,
@@ -357,7 +396,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
                      FROM sessions WHERE id = ?1",
                 )
                 .context("failed to prepare session query")?;
@@ -374,7 +413,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
                      FROM sessions ORDER BY id",
                 )
                 .context("failed to prepare session list query")?;
@@ -395,7 +434,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
+                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause
                      FROM sessions WHERE parent_id = ?1 ORDER BY id",
                 )
                 .context("failed to prepare child session query")?;
@@ -1406,6 +1445,313 @@ impl Store {
         })
         .await
     }
+
+    /// Lists MCP servers by name, with the secret columns omitted. This is
+    /// the only shape the registry routes and web pane see.
+    pub async fn list_mcp_servers(&self) -> Result<Vec<McpServer>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, url, enabled, auth, oauth_access_token, oauth_expires_at_secs,
+                            added_at_secs, updated_at_secs, last_error
+                     FROM mcp_servers ORDER BY name",
+                )
+                .context("failed to prepare MCP server list query")?;
+            let mut rows = stmt.query([]).context("failed to query MCP servers")?;
+            let mut servers = Vec::new();
+            while let Some(row) = rows.next().context("failed to read MCP server row")? {
+                servers.push(mcp_server_from_row(row)?);
+            }
+            Ok(servers)
+        })
+        .await
+    }
+
+    /// One MCP server's public row, or None when the server is unknown.
+    pub async fn get_mcp_server(&self, name: &str) -> Result<Option<McpServer>, StoreError> {
+        let name = name.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, url, enabled, auth, oauth_access_token, oauth_expires_at_secs,
+                            added_at_secs, updated_at_secs, last_error
+                     FROM mcp_servers WHERE name = ?1",
+                )
+                .context("failed to prepare MCP server query")?;
+            let mut rows = stmt.query([name]).context("failed to query MCP server")?;
+            match rows.next().context("failed to read MCP server row")? {
+                Some(row) => Ok(Some(mcp_server_from_row(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// One MCP server's full row including secrets. The connection manager
+    /// and the OAuth flow read this; it is never returned by a route.
+    pub async fn load_mcp_server(&self, name: &str) -> Result<Option<McpServerSecret>, StoreError> {
+        let name = name.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, url, enabled, auth, bearer_token, oauth_client_id,
+                            oauth_client_secret, oauth_access_token, oauth_refresh_token,
+                            oauth_expires_at_secs, oauth_scope, added_at_secs, updated_at_secs,
+                            last_error
+                     FROM mcp_servers WHERE name = ?1",
+                )
+                .context("failed to prepare MCP server load query")?;
+            let mut rows = stmt.query([name]).context("failed to load MCP server")?;
+            match rows.next().context("failed to read MCP server row")? {
+                Some(row) => Ok(Some(mcp_server_secret_from_row(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Loads every enabled server with its secrets, for the connection
+    /// manager to connect at boot.
+    pub async fn enabled_mcp_servers(&self) -> Result<Vec<McpServerSecret>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, url, enabled, auth, bearer_token, oauth_client_id,
+                            oauth_client_secret, oauth_access_token, oauth_refresh_token,
+                            oauth_expires_at_secs, oauth_scope, added_at_secs, updated_at_secs,
+                            last_error
+                     FROM mcp_servers WHERE enabled = 1 ORDER BY name",
+                )
+                .context("failed to prepare enabled MCP server query")?;
+            let mut rows = stmt
+                .query([])
+                .context("failed to query enabled MCP servers")?;
+            let mut servers = Vec::new();
+            while let Some(row) = rows.next().context("failed to read MCP server row")? {
+                servers.push(mcp_server_secret_from_row(row)?);
+            }
+            Ok(servers)
+        })
+        .await
+    }
+
+    /// Inserts a new MCP server, refusing a duplicate name before writing.
+    pub async fn insert_mcp_server(&self, server: &McpServerSecret) -> Result<(), StoreError> {
+        let server = server.clone();
+        self.with_conn(move |conn| {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE name = ?1)",
+                    [&server.name],
+                    |row| row.get(0),
+                )
+                .context("failed to check MCP server existence")?;
+            if exists {
+                return Err(anyhow::Error::new(StoreError::McpServerAlreadyExists {
+                    name: server.name.clone(),
+                }));
+            }
+            conn.execute(
+                "INSERT INTO mcp_servers (name, url, enabled, auth, bearer_token,
+                        oauth_client_id, oauth_client_secret, oauth_access_token,
+                        oauth_refresh_token, oauth_expires_at_secs, oauth_scope,
+                        added_at_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    server.name,
+                    server.url,
+                    server.enabled,
+                    server.auth.as_str(),
+                    server.bearer_token,
+                    server.oauth_client_id,
+                    server.oauth_client_secret,
+                    server.oauth_access_token,
+                    server.oauth_refresh_token,
+                    server.oauth_expires_at_secs,
+                    server.oauth_scope,
+                    server.added_at_secs,
+                ],
+            )
+            .context("failed to insert MCP server")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Replaces one server's editable fields and secrets, leaving the name,
+    /// added time, and OAuth tokens untouched unless new values are supplied.
+    /// An unknown name fails with `McpServerNotFound`; a failed update leaves
+    /// the old row unchanged.
+    pub async fn update_mcp_server(
+        &self,
+        name: &str,
+        url: &str,
+        auth: McpAuth,
+        bearer_token: Option<&str>,
+        oauth_client_id: Option<&str>,
+        oauth_client_secret: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let name = name.to_string();
+        let url = url.to_string();
+        let bearer_token = bearer_token.map(str::to_string);
+        let oauth_client_id = oauth_client_id.map(str::to_string);
+        let oauth_client_secret = oauth_client_secret.map(str::to_string);
+        self.with_mcp_server(&name, move |conn, name| {
+            conn.execute(
+                "UPDATE mcp_servers SET url = ?1, auth = ?2, bearer_token = ?3,
+                        oauth_client_id = ?4, oauth_client_secret = ?5,
+                        updated_at_secs = ?6
+                 WHERE name = ?7",
+                params![
+                    url,
+                    auth.as_str(),
+                    bearer_token,
+                    oauth_client_id,
+                    oauth_client_secret,
+                    bosun_common::time::unix_secs(SystemTime::now()),
+                    name,
+                ],
+            )
+            .context("failed to update MCP server")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Flips a server's enabled flag.
+    pub async fn set_mcp_server_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let name = name.to_string();
+        self.with_mcp_server(&name, move |conn, name| {
+            conn.execute(
+                "UPDATE mcp_servers SET enabled = ?1 WHERE name = ?2",
+                params![enabled, name],
+            )
+            .context("failed to update the MCP server enabled flag")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Deletes a server row.
+    pub async fn remove_mcp_server(&self, name: &str) -> Result<(), StoreError> {
+        let name = name.to_string();
+        self.with_mcp_server(&name, move |conn, name| {
+            conn.execute("DELETE FROM mcp_servers WHERE name = ?1", [name])
+                .context("failed to delete MCP server")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Replaces a server's OAuth tokens in one write: the access token, the
+    /// refresh token when present, the expiry, and the scopes the token was
+    /// granted. `scope` is the granted set, or None when the server named
+    /// none.
+    pub async fn set_mcp_oauth_tokens(
+        &self,
+        name: &str,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at_secs: Option<i64>,
+        scope: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let name = name.to_string();
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.map(str::to_string);
+        let scope = scope.map(str::to_string);
+        self.with_mcp_server(&name, move |conn, name| {
+            conn.execute(
+                "UPDATE mcp_servers SET oauth_access_token = ?1, oauth_refresh_token = ?2,
+                        oauth_expires_at_secs = ?3, oauth_scope = ?4, updated_at_secs = ?5
+                 WHERE name = ?6",
+                params![
+                    access_token,
+                    refresh_token,
+                    expires_at_secs,
+                    scope,
+                    bosun_common::time::unix_secs(SystemTime::now()),
+                    name,
+                ],
+            )
+            .context("failed to store the MCP OAuth tokens")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records a connection failure on the server row.
+    pub async fn set_mcp_server_error(
+        &self,
+        name: &str,
+        last_error: &str,
+    ) -> Result<(), StoreError> {
+        let name = name.to_string();
+        let last_error = last_error.to_string();
+        self.with_mcp_server(&name, move |conn, name| {
+            conn.execute(
+                "UPDATE mcp_servers SET last_error = ?1 WHERE name = ?2",
+                params![last_error, name],
+            )
+            .context("failed to record the MCP server error")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Clears a server's recorded connection error.
+    pub async fn clear_mcp_server_error(&self, name: &str) -> Result<(), StoreError> {
+        let name = name.to_string();
+        self.with_mcp_server(&name, move |conn, name| {
+            conn.execute(
+                "UPDATE mcp_servers SET last_error = NULL WHERE name = ?1",
+                [name],
+            )
+            .context("failed to clear the MCP server error")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Clears the recorded error only when it still starts with `prefix`, so a
+    /// different failure recorded since the caller read the row survives. One
+    /// statement, so no write can slip between a read and a clear.
+    pub async fn clear_mcp_server_error_with_prefix(
+        &self,
+        name: &str,
+        prefix: &str,
+    ) -> Result<(), StoreError> {
+        let name = name.to_string();
+        let prefix = prefix.to_string();
+        blocking(self.conn.clone(), move |conn| {
+            conn.execute(
+                "UPDATE mcp_servers SET last_error = NULL WHERE name = ?1 AND instr(last_error, ?2) = 1",
+                params![name, prefix],
+            )
+            .context("failed to clear the MCP server error")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Runs `f` on the shared connection after checking the MCP server row
+    /// exists, so writes fail with `McpServerNotFound` instead of silently
+    /// succeeding.
+    async fn with_mcp_server<T, F>(&self, name: &str, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection, &str) -> Result<T, anyhow::Error> + Send + 'static,
+    {
+        let name = name.to_string();
+        blocking(self.conn.clone(), move |conn| {
+            ensure_mcp_server_exists(conn, &name)?;
+            f(conn, &name)
+        })
+        .await
+    }
 }
 
 fn transaction(
@@ -1599,6 +1945,25 @@ fn ensure_skill_repo_exists(conn: &rusqlite::Connection, repo: &str) -> Result<(
     }
 }
 
+/// Checks that the MCP server row exists, so server writes fail with
+/// `McpServerNotFound` instead of silently succeeding.
+fn ensure_mcp_server_exists(conn: &rusqlite::Connection, name: &str) -> Result<(), anyhow::Error> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .context("failed to check MCP server existence")?;
+    if exists {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(StoreError::McpServerNotFound {
+            name: name.to_string(),
+        }))
+    }
+}
+
 /// Whether `column` is one of `table`'s columns, for additive migrations.
 fn column_exists(
     conn: &rusqlite::Connection,
@@ -1634,6 +1999,7 @@ fn session_from_row(row: &rusqlite::Row) -> Result<Session, anyhow::Error> {
         owner_id: row.get("owner_id")?,
         permission: serde_json::from_str(&permission).context("failed to parse permission")?,
         allowed_tools: row.get("allowed_tools")?,
+        mcp_servers: row.get("mcp_servers")?,
         state: serde_json::from_str(&state).context("failed to parse state")?,
         interrupt_cause: interrupt_cause
             .map(|raw| serde_json::from_str(&raw).context("failed to parse interrupt cause"))
@@ -1654,6 +2020,57 @@ fn skill_repo_from_row(row: &rusqlite::Row) -> Result<SkillRepo, anyhow::Error> 
         updated_at_secs: row.get("updated_at_secs")?,
         last_error: row.get("last_error")?,
         package_count: row.get("package_count")?,
+    })
+}
+
+fn mcp_auth_from_row(value: &str) -> Result<McpAuth, anyhow::Error> {
+    match value {
+        "none" => Ok(McpAuth::None),
+        "bearer" => Ok(McpAuth::Bearer),
+        "oauth" => Ok(McpAuth::OAuth),
+        other => anyhow::bail!("unknown MCP auth kind {other}"),
+    }
+}
+
+/// Builds the public row. The query must select the secret columns only as
+/// `oauth_access_token` (used to derive `oauth_authorized`); no other secret
+/// column is read.
+fn mcp_server_from_row(row: &rusqlite::Row) -> Result<McpServer, anyhow::Error> {
+    let auth: String = row.get("auth")?;
+    let oauth_access_token: Option<String> = row.get("oauth_access_token")?;
+    Ok(McpServer {
+        name: row.get("name")?,
+        url: row.get("url")?,
+        enabled: row.get("enabled")?,
+        auth: mcp_auth_from_row(&auth)?,
+        oauth_authorized: oauth_access_token.is_some(),
+        oauth_expires_at_secs: row.get("oauth_expires_at_secs")?,
+        // Only the connection manager knows a pending step-up URL, so a row
+        // read straight from the store never carries one.
+        reauthorize_url: None,
+        added_at_secs: row.get("added_at_secs")?,
+        updated_at_secs: row.get("updated_at_secs")?,
+        last_error: row.get("last_error")?,
+    })
+}
+
+fn mcp_server_secret_from_row(row: &rusqlite::Row) -> Result<McpServerSecret, anyhow::Error> {
+    let auth: String = row.get("auth")?;
+    Ok(McpServerSecret {
+        name: row.get("name")?,
+        url: row.get("url")?,
+        enabled: row.get("enabled")?,
+        auth: mcp_auth_from_row(&auth)?,
+        bearer_token: row.get("bearer_token")?,
+        oauth_client_id: row.get("oauth_client_id")?,
+        oauth_client_secret: row.get("oauth_client_secret")?,
+        oauth_access_token: row.get("oauth_access_token")?,
+        oauth_refresh_token: row.get("oauth_refresh_token")?,
+        oauth_expires_at_secs: row.get("oauth_expires_at_secs")?,
+        oauth_scope: row.get("oauth_scope")?,
+        added_at_secs: row.get("added_at_secs")?,
+        updated_at_secs: row.get("updated_at_secs")?,
+        last_error: row.get("last_error")?,
     })
 }
 
@@ -1679,6 +2096,7 @@ mod tests {
             owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "shell, file_read".to_string(),
+            mcp_servers: "srv-a,srv-b".to_string(),
             state: SessionState::Running,
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
@@ -1699,6 +2117,7 @@ mod tests {
             owner_id: owner.to_string(),
             permission: Permission::ReadOnly,
             allowed_tools: "file_read, grep".to_string(),
+            mcp_servers: "".to_string(),
             state: SessionState::Creating,
             prompt: Some("review the change".to_string()),
             ..session(id)
@@ -1717,6 +2136,7 @@ mod tests {
         assert_eq!(actual.owner_id, expected.owner_id);
         assert_eq!(actual.permission, expected.permission);
         assert_eq!(actual.allowed_tools, expected.allowed_tools);
+        assert_eq!(actual.mcp_servers, expected.mcp_servers);
         assert_eq!(actual.state, expected.state);
         assert_eq!(actual.interrupt_cause, expected.interrupt_cause);
         assert_eq!(actual.created_at_secs, expected.created_at_secs);
@@ -1752,6 +2172,7 @@ mod tests {
             tables,
             [
                 "events",
+                "mcp_servers",
                 "messages",
                 "model_calls",
                 "pending_asks",
@@ -2372,6 +2793,46 @@ mod tests {
         assert_eq!(
             session.persona, None,
             "a pre-persona row has no persona, so the session runs on the harness contract alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_mcp_servers_column_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // The pre-S6 shape: allowed_tools, persona and the session tree
+            // exist, but the MCP selection column does not yet.
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   node TEXT NOT NULL,
+                   repo_url TEXT,
+                   git_ref TEXT,
+                   dir TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   persona TEXT,
+                   permission TEXT NOT NULL,
+                   allowed_tools TEXT NOT NULL DEFAULT '*',
+                   state TEXT NOT NULL,
+                   created_at_secs INTEGER NOT NULL,
+                   prompt TEXT,
+                   parent_id TEXT,
+                   owner_id TEXT,
+                   interrupt_cause TEXT
+                 );
+                 INSERT INTO sessions (id, node, dir, model, permission, state, created_at_secs, owner_id)
+                 VALUES ('old', 'node-1', '/work', 'claude', '\"read_write\"', '\"waiting_for_input\"', 1700000000, 'old');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("old").await.unwrap().unwrap();
+        assert_eq!(
+            session.mcp_servers, "",
+            "a pre-S6 row selects no MCP servers"
         );
     }
 
@@ -3722,6 +4183,324 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A full MCP server row with secret values set so tests can assert the
+    /// split between the public and secret shapes.
+    fn mcp_server(name: &str, enabled: bool) -> McpServerSecret {
+        McpServerSecret {
+            name: name.to_string(),
+            url: format!("https://{name}.example"),
+            enabled,
+            auth: McpAuth::Bearer,
+            bearer_token: Some(format!("bearer-{name}")),
+            oauth_client_id: Some(format!("client-{name}")),
+            oauth_client_secret: Some(format!("secret-{name}")),
+            oauth_access_token: Some(format!("access-{name}")),
+            oauth_refresh_token: Some(format!("refresh-{name}")),
+            oauth_expires_at_secs: Some(1_800_000_000),
+            oauth_scope: Some(format!("scope-{name}")),
+            added_at_secs: 1_700_000_000,
+            updated_at_secs: None,
+            last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inserting_and_listing_an_mcp_server_returns_the_public_shape_without_secrets() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        let listed = store.list_mcp_servers().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "srv");
+        assert_eq!(listed[0].auth, McpAuth::Bearer);
+
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert!(json.get("bearer_token").is_none());
+        assert!(json.get("oauth_client_id").is_none());
+        assert!(json.get("oauth_client_secret").is_none());
+        assert!(json.get("oauth_access_token").is_none());
+        assert!(json.get("oauth_refresh_token").is_none());
+        assert!(json.get("oauth_scope").is_none());
+    }
+
+    #[tokio::test]
+    async fn load_mcp_server_returns_the_full_secret_row() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        let loaded = store.load_mcp_server("srv").await.unwrap().unwrap();
+        assert_eq!(loaded.name, "srv");
+        assert_eq!(loaded.bearer_token.as_deref(), Some("bearer-srv"));
+        assert_eq!(loaded.oauth_scope.as_deref(), Some("scope-srv"));
+    }
+
+    #[tokio::test]
+    async fn inserting_a_duplicate_mcp_server_name_fails_with_already_exists() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        let error = store
+            .insert_mcp_server(&mcp_server("srv", false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::McpServerAlreadyExists { name } if name == "srv"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_an_unknown_mcp_server_fails_with_not_found_and_leaves_the_row_unchanged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        let error = store
+            .update_mcp_server(
+                "ghost",
+                "https://ghost.example",
+                McpAuth::None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::McpServerNotFound { name } if name == "ghost"),
+            "unexpected error: {error}"
+        );
+
+        let loaded = store.load_mcp_server("srv").await.unwrap().unwrap();
+        assert_eq!(loaded.url, "https://srv.example");
+        assert!(loaded.enabled);
+        assert_eq!(loaded.auth, McpAuth::Bearer);
+        assert_eq!(loaded.bearer_token.as_deref(), Some("bearer-srv"));
+    }
+
+    #[tokio::test]
+    async fn set_mcp_oauth_tokens_updates_expiry_and_authorizes_without_exposing_tokens() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+        store
+            .set_mcp_oauth_tokens(
+                "srv",
+                "new-access",
+                Some("new-refresh"),
+                Some(1_800_000_100),
+                Some("files.read files.write"),
+            )
+            .await
+            .unwrap();
+
+        let public = store.get_mcp_server("srv").await.unwrap().unwrap();
+        assert!(public.oauth_authorized);
+        assert_eq!(public.oauth_expires_at_secs, Some(1_800_000_100));
+
+        let json = serde_json::to_value(&public).unwrap();
+        assert!(json.get("oauth_access_token").is_none());
+        assert!(json.get("oauth_refresh_token").is_none());
+
+        let secret = store.load_mcp_server("srv").await.unwrap().unwrap();
+        assert_eq!(secret.oauth_access_token.as_deref(), Some("new-access"));
+        assert_eq!(secret.oauth_refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(
+            secret.oauth_scope.as_deref(),
+            Some("files.read files.write")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_oauth_scope_column_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // The pre-scope shape: every other MCP column exists, and the row
+            // was authorized before the granted scope was recorded.
+            conn.execute_batch(
+                "CREATE TABLE mcp_servers (
+                   name TEXT PRIMARY KEY,
+                   url TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 1,
+                   auth TEXT NOT NULL,
+                   bearer_token TEXT,
+                   oauth_client_id TEXT,
+                   oauth_client_secret TEXT,
+                   oauth_access_token TEXT,
+                   oauth_refresh_token TEXT,
+                   oauth_expires_at_secs INTEGER,
+                   added_at_secs INTEGER NOT NULL,
+                   updated_at_secs INTEGER,
+                   last_error TEXT
+                 );
+                 INSERT INTO mcp_servers (name, url, enabled, auth, oauth_access_token, added_at_secs)
+                 VALUES ('old', 'https://old.example', 1, 'oauth', 'access', 1700000000);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let loaded = store.load_mcp_server("old").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.oauth_scope, None,
+            "a row authorized before the scope was stored records no scope"
+        );
+        assert_eq!(loaded.oauth_access_token.as_deref(), Some("access"));
+
+        // The migrated column takes a write and reads back.
+        store
+            .set_mcp_oauth_tokens("old", "access", None, None, Some("files.read"))
+            .await
+            .unwrap();
+        let loaded = store.load_mcp_server("old").await.unwrap().unwrap();
+        assert_eq!(loaded.oauth_scope.as_deref(), Some("files.read"));
+    }
+
+    #[tokio::test]
+    async fn set_mcp_server_enabled_flips_the_flag_and_remove_mcp_server_deletes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        store.set_mcp_server_enabled("srv", false).await.unwrap();
+        assert!(!store.get_mcp_server("srv").await.unwrap().unwrap().enabled);
+
+        store.set_mcp_server_enabled("srv", true).await.unwrap();
+        assert!(store.get_mcp_server("srv").await.unwrap().unwrap().enabled);
+
+        store.remove_mcp_server("srv").await.unwrap();
+        assert!(store.get_mcp_server("srv").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_mcp_servers_returns_only_enabled_servers_with_secrets() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("on", true))
+            .await
+            .unwrap();
+        store
+            .insert_mcp_server(&mcp_server("off", false))
+            .await
+            .unwrap();
+
+        let enabled = store.enabled_mcp_servers().await.unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "on");
+        assert_eq!(enabled[0].bearer_token.as_deref(), Some("bearer-on"));
+    }
+
+    #[tokio::test]
+    async fn set_and_clear_mcp_server_error_round_trip_last_error() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        store.set_mcp_server_error("srv", "boom").await.unwrap();
+        assert_eq!(
+            store
+                .get_mcp_server("srv")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("boom")
+        );
+
+        store.clear_mcp_server_error("srv").await.unwrap();
+        assert_eq!(
+            store
+                .get_mcp_server("srv")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_error,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_clear_leaves_a_different_error_alone() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .insert_mcp_server(&mcp_server("srv", true))
+            .await
+            .unwrap();
+
+        // The step-up reason goes, and nothing else was recorded.
+        store
+            .set_mcp_server_error("srv", "the server requires more OAuth scopes; re-authorize")
+            .await
+            .unwrap();
+        store
+            .clear_mcp_server_error_with_prefix("srv", "the server requires more OAuth scopes")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_mcp_server("srv")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_error,
+            None
+        );
+
+        // A connection failure does not, even though the same clear ran.
+        store.set_mcp_server_error("srv", "boom").await.unwrap();
+        store
+            .clear_mcp_server_error_with_prefix("srv", "the server requires more OAuth scopes")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_mcp_server("srv")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("boom")
         );
     }
 }

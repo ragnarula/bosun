@@ -87,6 +87,21 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>, tempfile::T
         providers: HashMap::new(),
         personas: HashMap::new(),
         default_persona: None,
+        oauth_redirect_uri: None,
+        mcp: Arc::new(bosun_control::mcp_manager::McpManager::new(
+            store.clone(),
+            bosun_control::mcp_oauth::McpOAuthContext::new(
+                reqwest::Client::new(),
+                store.clone(),
+                None,
+            ),
+            reqwest::Client::new(),
+        )),
+        mcp_oauth: bosun_control::mcp_oauth::McpOAuthContext::new(
+            reqwest::Client::new(),
+            store.clone(),
+            None,
+        ),
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -113,6 +128,7 @@ async fn register_session(store: &Store, session_id: &str) {
             owner_id: session_id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
+            mcp_servers: "".into(),
             state: SessionState::WaitingForInput,
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,

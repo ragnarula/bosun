@@ -43,13 +43,16 @@ pub fn older_than(version: &str) -> String {
 }
 
 /// Polls `condition` every 10ms until it returns true, failing the test after
-/// 5 seconds.
+/// 15 seconds. The deadline is generous because the workspace runs many test
+/// binaries in parallel: a condition reached in milliseconds on an idle
+/// machine can wait seconds behind multi-session chains and stub HTTP servers
+/// on a loaded one.
 pub async fn wait_for<F, Fut>(what: &str, mut condition: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if condition().await {
             return;

@@ -354,6 +354,10 @@ fn event_lines(event: &Event) -> Vec<Line> {
             kind: LineKind::Status,
             text: format!("persona: {persona}"),
         }],
+        Event::Warning { text } => vec![Line {
+            kind: LineKind::Status,
+            text: format!("warning: {text}"),
+        }],
         Event::ModelCall {
             model,
             kind,
@@ -2790,6 +2794,20 @@ mod tests {
     }
 
     #[test]
+    fn warning_events_render_as_a_status_line() {
+        let warning = Event::Warning {
+            text: "MCP server srv-a is unavailable".into(),
+        };
+        assert_eq!(
+            event_lines(&warning),
+            vec![Line {
+                kind: LineKind::Status,
+                text: "warning: MCP server srv-a is unavailable".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn persona_switch_target_extracts_the_persona_name() {
         assert_eq!(
             persona_switch_target("/persona reviewer").as_deref(),
@@ -3067,6 +3085,7 @@ mod tests {
             owner_id: "s1".into(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
+            mcp_servers: "".into(),
             state: SessionState::WaitingForInput,
             interrupt_cause: None,
             created_at_secs: 0,

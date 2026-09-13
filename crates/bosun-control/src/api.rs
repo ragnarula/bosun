@@ -33,6 +33,9 @@ use bosun_agent::agent_loop::author_child_event;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
 use bosun_common::error::ErrorExt;
+use bosun_common::mcp::McpAuth;
+use bosun_common::mcp::McpServer;
+use bosun_common::mcp::McpServerSecret;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
 use bosun_common::session::Event;
@@ -72,6 +75,10 @@ use tracing::warn;
 
 use crate::commands::CommandQueue;
 use crate::loops::AgentRegistry;
+use crate::mcp_manager::McpManager;
+use crate::mcp_oauth::McpOAuthContext;
+use crate::mcp_oauth::McpOAuthError;
+use crate::mcp_oauth::OAuthCallbackQuery;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
 use crate::skills_repos::GitHubClient;
@@ -124,6 +131,20 @@ pub enum ApiError {
     RepoAlreadyExists { repo: String },
     #[error("skill repo {repo} was not found")]
     RepoNotFound { repo: String },
+    #[error("MCP server name is required")]
+    McpServerNameRequired,
+    #[error("MCP server {name} already exists")]
+    McpServerAlreadyExists { name: String },
+    #[error("MCP server {name} was not found")]
+    McpServerNotFound { name: String },
+    #[error("MCP server {name} is not configured or disabled")]
+    McpServerUnavailable { name: String },
+    #[error("MCP server {name} is not an OAuth server")]
+    McpServerNotOAuth { name: String },
+    #[error("OAuth authorization failed: {0}")]
+    McpOAuth(#[from] McpOAuthError),
+    #[error("MCP server URL is not a valid http or https URL")]
+    McpServerUrlInvalid,
     #[error(
         "skill package {address} belongs to repo {package_repo}, not the repo being replaced ({repo})"
     )]
@@ -144,6 +165,10 @@ impl From<StoreError> for ApiError {
             StoreError::SessionNotFound { id } => ApiError::SessionNotFound { id },
             StoreError::RepoAlreadyExists { repo } => ApiError::RepoAlreadyExists { repo },
             StoreError::RepoNotFound { repo } => ApiError::RepoNotFound { repo },
+            StoreError::McpServerAlreadyExists { name } => {
+                ApiError::McpServerAlreadyExists { name }
+            }
+            StoreError::McpServerNotFound { name } => ApiError::McpServerNotFound { name },
             StoreError::PackageRepoMismatch {
                 repo,
                 address,
@@ -174,10 +199,23 @@ impl IntoResponse for ApiError {
             }
             ApiError::ChildIsWatchOnly { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
-            ApiError::SessionNotFound { .. } | ApiError::RepoNotFound { .. } => {
-                (StatusCode::NOT_FOUND, Some(self.to_string()))
+            ApiError::SessionNotFound { .. }
+            | ApiError::RepoNotFound { .. }
+            | ApiError::McpServerNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
+            ApiError::McpServerUrlInvalid | ApiError::McpServerNameRequired => {
+                (StatusCode::BAD_REQUEST, Some(self.to_string()))
             }
-            ApiError::RepoAlreadyExists { .. } => (StatusCode::CONFLICT, Some(self.to_string())),
+            ApiError::McpServerUnavailable { .. } => {
+                (StatusCode::BAD_REQUEST, Some(self.to_string()))
+            }
+            ApiError::McpServerNotOAuth { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
+            ApiError::McpOAuth(error) => match &error {
+                McpOAuthError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+                _ => (StatusCode::BAD_REQUEST, Some(error.to_string())),
+            },
+            ApiError::RepoAlreadyExists { .. } | ApiError::McpServerAlreadyExists { .. } => {
+                (StatusCode::CONFLICT, Some(self.to_string()))
+            }
             // A failed repo fetch maps its skills-fetch error kind to the
             // status the fetch failed with: a repo or ref GitHub does not
             // have is 404, a malformed repo 400, an indexing problem 422, a
@@ -226,6 +264,13 @@ pub struct AppState {
     pub personas: HashMap<String, PersonaConfig>,
     /// The persona sessions use when a request names none.
     pub default_persona: Option<String>,
+    /// The configured MCP OAuth callback URL, served as the callback route.
+    pub oauth_redirect_uri: Option<String>,
+    /// The OAuth flow context the authorize and callback routes use.
+    pub mcp_oauth: McpOAuthContext,
+    /// The shared MCP connections: the loops borrow them and the retry route
+    /// asks them for an immediate attempt.
+    pub mcp: Arc<McpManager>,
 }
 
 impl AppState {
@@ -340,8 +385,77 @@ pub async fn recover(state: &AppState) {
     info!(count = sessions.len(), "recovered sessions");
 }
 
+/// The paths the router serves at a fixed location. The OAuth callback must
+/// not be registered on one of them: a path and method the router already
+/// serves panics when the router is built, and any other collision leaves the
+/// callback unreachable.
+const RESERVED_PATHS: &[&str] = &[
+    "/",
+    "/ui",
+    "/poll",
+    "/nodes",
+    "/personas",
+    "/sessions",
+    "/clone",
+    "/dev",
+    "/stop",
+    "/skills/repos",
+    "/mcp/servers",
+];
+
+/// The path prefixes the router serves dynamic routes below.
+const RESERVED_PATH_PREFIXES: &[&str] = &[
+    "/tunnel/node/",
+    "/sessions/",
+    "/nodes/",
+    "/skills/repos/",
+    "/mcp/servers/",
+];
+
+/// The `oauth_redirect_uri` names a path the control plane cannot serve as
+/// the OAuth callback.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct OauthRedirectUriError(String);
+
+/// The path the OAuth callback registers on: the `oauth_redirect_uri`'s path.
+/// A path the router cannot serve, or one it already serves, is an error:
+/// registering the callback there would panic or leave it unreachable.
+/// `Url::path` returns `"/"` rather than an empty string for a URL with no
+/// path, so a bare origin collides on the root route.
+pub fn oauth_callback_path(redirect_uri: &str) -> Result<String, OauthRedirectUriError> {
+    let url = reqwest::Url::parse(redirect_uri).map_err(|error| {
+        OauthRedirectUriError(format!("oauth_redirect_uri is not a valid URL: {error}"))
+    })?;
+    let path = url.path();
+    // A URL that cannot be a base, such as one written without its scheme,
+    // has a path with no leading slash; a segment starting with `:` or `*`
+    // is axum's parameter syntax. `Router::route` panics on both. Braces need
+    // no check: the URL parser percent-encodes `{` and `}`, so a raw brace
+    // never reaches the path.
+    if !path.starts_with('/')
+        || path
+            .split('/')
+            .any(|segment| segment.starts_with(':') || segment.starts_with('*'))
+    {
+        return Err(OauthRedirectUriError(format!(
+            "oauth_redirect_uri resolves to path {path}, which the router cannot serve"
+        )));
+    }
+    if RESERVED_PATHS.contains(&path)
+        || RESERVED_PATH_PREFIXES
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    {
+        return Err(OauthRedirectUriError(format!(
+            "oauth_redirect_uri resolves to path {path}, which the control plane already serves"
+        )));
+    }
+    Ok(path.to_string())
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/", get(crate::ui::pane))
         .route("/ui", get(crate::ui::pane))
         .route("/poll", post(poll))
@@ -366,9 +480,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/skills/repos/{repo}", delete(remove_skill_repo))
         .route("/skills/repos/{repo}/update", post(update_skill_repo))
         .route("/skills/repos/{repo}/enabled", post(set_skill_repo_enabled))
-        .fallback(not_found)
-        .layer(from_fn(add_version_header))
-        .with_state(state)
+        .route("/mcp/servers", get(mcp_servers).post(add_mcp_server))
+        .route(
+            "/mcp/servers/{name}",
+            post(update_mcp_server).delete(remove_mcp_server),
+        )
+        .route("/mcp/servers/{name}/enabled", post(set_mcp_server_enabled))
+        .route("/mcp/servers/{name}/authorize", post(authorize_mcp_server))
+        .route("/mcp/servers/{name}/retry", post(retry_mcp_server));
+
+    // The callback registers before the version-header layer, so its responses
+    // carry `X-Bosun-Version` like every other response.
+    if let Some(uri) = state.oauth_redirect_uri.as_deref() {
+        match oauth_callback_path(uri) {
+            Ok(path) => app = app.route(&path, get(mcp_oauth_callback)),
+            Err(error) => {
+                tracing::error!(error = %error, "the OAuth callback route was not registered");
+            }
+        }
+    }
+
+    app = app.fallback(not_found).layer(from_fn(add_version_header));
+    app.with_state(state)
 }
 
 /// Puts the control plane's version on every response, so a client learns it
@@ -513,6 +646,8 @@ struct CreateSessionRequest {
     git_ref: Option<String>,
     persona: Option<String>,
     prompt: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
 }
 
 #[instrument(skip(state))]
@@ -521,6 +656,7 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<Session>, ApiError> {
     let (persona, config, provider) = state.resolve_persona(&req.persona)?;
+    let mcp_servers = resolve_mcp_servers(&state, &req.mcp_servers).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
     let session = Session {
         id: session_id.clone(),
@@ -534,6 +670,7 @@ async fn create_session(
         owner_id: session_id,
         permission: config.permission,
         allowed_tools: config.allowed_tools.clone(),
+        mcp_servers,
         state: SessionState::Creating,
         interrupt_cause: None,
         created_at_secs: now_secs(),
@@ -561,8 +698,10 @@ async fn clone(
     }
     // Resolve the persona before the node does any work, so an unconfigured
     // persona rejects without leaving a cloned dir, executor, or tunnel
-    // behind.
+    // behind. The MCP selection resolves before the node sees a command too,
+    // so a bad server name also fails cleanly.
     let (persona, config, provider) = state.resolve_persona(&req.persona)?;
+    let mcp_servers = resolve_mcp_servers(&state, &req.mcp_servers).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let command = NodeCommand::Clone {
@@ -605,6 +744,7 @@ async fn clone(
         owner_id: session_id,
         permission: config.permission,
         allowed_tools: config.allowed_tools.clone(),
+        mcp_servers,
         state: SessionState::Creating,
         interrupt_cause: None,
         created_at_secs: now_secs(),
@@ -632,8 +772,11 @@ async fn dev(
         });
     }
     // Resolve the persona before the node does any work, so an unconfigured
-    // persona rejects without leaving an executor or tunnel behind.
+    // persona rejects without leaving an executor or tunnel behind. The MCP
+    // selection resolves before the node sees a command too, so a bad server
+    // name also fails cleanly.
     let (persona, config, provider) = state.resolve_persona(&req.persona)?;
+    let mcp_servers = resolve_mcp_servers(&state, &req.mcp_servers).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let command = NodeCommand::Dev {
@@ -675,6 +818,7 @@ async fn dev(
         owner_id: session_id,
         permission: config.permission,
         allowed_tools: config.allowed_tools.clone(),
+        mcp_servers,
         state: SessionState::Creating,
         interrupt_cause: None,
         created_at_secs: now_secs(),
@@ -953,6 +1097,253 @@ async fn skill_repo_row(state: &AppState, repo: &str) -> Result<SkillRepo, ApiEr
         })?;
     Ok(row)
 }
+// MCP server registry management: the store is the source of truth for the
+// server list, and the web pane is the only management surface. Routes mirror
+// the skill-repo ones. A row change also drives the connection manager: a
+// server that is added, edited, enabled, or authorized connects now, and a
+// server that is disabled or deleted is stopped. The manager owns
+// `last_error` and the connections themselves.
+// The name path param is a plain server name percent-encoded by the client,
+// decoded by the Path extractor exactly like the skill repo routes.
+#[instrument(skip(state))]
+
+async fn mcp_servers(State(state): State<Arc<AppState>>) -> Result<Json<Vec<McpServer>>, ApiError> {
+    let listed = state.store.list_mcp_servers().await?;
+    // A step-up URL lives in the manager, not the store. Asking for it can
+    // also drop a step-up whose flow is gone, which clears the error its row
+    // records, so the rows are read again once the manager has answered.
+    let mut reauthorize_urls = HashMap::new();
+    for server in &listed {
+        let url = state.mcp.reauthorize_url(&server.name).await;
+        reauthorize_urls.insert(server.name.clone(), url);
+    }
+    let mut servers = state.store.list_mcp_servers().await?;
+    for server in &mut servers {
+        server.reauthorize_url = reauthorize_urls.remove(&server.name).unwrap_or_default();
+    }
+    Ok(Json(servers))
+}
+#[derive(Debug, Deserialize)]
+
+struct AddMcpServerRequest {
+    name: String,
+    url: String,
+    auth: McpAuth,
+    #[serde(default)]
+    bearer_token: Option<String>,
+    #[serde(default)]
+    oauth_client_id: Option<String>,
+    #[serde(default)]
+    oauth_client_secret: Option<String>,
+}
+#[instrument(skip_all)]
+
+async fn add_mcp_server(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddMcpServerRequest>,
+) -> Result<Json<McpServer>, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::McpServerNameRequired);
+    }
+    if state.store.get_mcp_server(name).await?.is_some() {
+        return Err(ApiError::McpServerAlreadyExists {
+            name: name.to_string(),
+        });
+    }
+    validate_mcp_url(&req.url)?;
+    let now = bosun_common::time::unix_secs(SystemTime::now());
+    let server = McpServerSecret {
+        name: name.to_string(),
+        url: req.url.clone(),
+        enabled: true,
+        auth: req.auth,
+        bearer_token: req.bearer_token,
+        oauth_client_id: req.oauth_client_id,
+        oauth_client_secret: req.oauth_client_secret,
+        oauth_access_token: None,
+        oauth_refresh_token: None,
+        oauth_expires_at_secs: None,
+        oauth_scope: None,
+        added_at_secs: now,
+        updated_at_secs: None,
+        last_error: None,
+    };
+    state.store.insert_mcp_server(&server).await?;
+    // A server added later than boot is connected now, so a session that
+    // chose it is not told it is down until an operator clicks retry.
+    state.mcp.connect(name).await;
+    Ok(Json(mcp_server_row(&state, name).await?))
+}
+#[derive(Debug, Deserialize)]
+
+struct UpdateMcpServerRequest {
+    url: String,
+    auth: McpAuth,
+    #[serde(default)]
+    bearer_token: Option<String>,
+    #[serde(default)]
+    oauth_client_id: Option<String>,
+    #[serde(default)]
+    oauth_client_secret: Option<String>,
+}
+#[instrument(skip_all)]
+
+async fn update_mcp_server(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<UpdateMcpServerRequest>,
+) -> Result<Json<McpServer>, ApiError> {
+    mcp_server_row(&state, &name).await?;
+    validate_mcp_url(&req.url)?;
+    // The public row never returns secret columns, so the pane cannot prefill
+    // them; a field left absent on edit means "keep the stored value", not
+    // "clear it".
+    let existing = state
+        .store
+        .load_mcp_server(&name)
+        .await?
+        .ok_or_else(|| ApiError::McpServerNotFound { name: name.clone() })?;
+    let bearer_token = req.bearer_token.or(existing.bearer_token);
+    let oauth_client_id = req.oauth_client_id.or(existing.oauth_client_id);
+    let oauth_client_secret = req.oauth_client_secret.or(existing.oauth_client_secret);
+    state
+        .store
+        .update_mcp_server(
+            &name,
+            &req.url,
+            req.auth,
+            bearer_token.as_deref(),
+            oauth_client_id.as_deref(),
+            oauth_client_secret.as_deref(),
+        )
+        .await?;
+    // The URL or the credential changed, so the live connection no longer
+    // describes this server.
+    state.mcp.connect(&name).await;
+    Ok(Json(mcp_server_row(&state, &name).await?))
+}
+#[derive(Debug, Deserialize)]
+
+struct SetMcpServerEnabledRequest {
+    enabled: bool,
+}
+#[instrument(skip(state))]
+
+async fn set_mcp_server_enabled(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<SetMcpServerEnabledRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .store
+        .set_mcp_server_enabled(&name, req.enabled)
+        .await?;
+    if req.enabled {
+        state.mcp.connect(&name).await;
+    } else {
+        // A disabled server is served to no session, so its task ends and
+        // its connection goes with it.
+        state.mcp.stop(&name);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+#[instrument(skip(state))]
+
+async fn remove_mcp_server(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.store.remove_mcp_server(&name).await?;
+    // A deleted server must not keep a connection behind.
+    state.mcp.stop(&name);
+    Ok(StatusCode::NO_CONTENT)
+}
+#[instrument(skip(state))]
+
+async fn retry_mcp_server(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    // A disabled server is not connected by design, so there is nothing to
+    // retry; the operator enables it first.
+    let server = mcp_server_row(&state, &name).await?;
+    if !server.enabled {
+        return Err(ApiError::McpServerUnavailable { name });
+    }
+    state.mcp.connect(&name).await;
+    // The attempt runs in the server's task, so the row's state and error are
+    // where its outcome lands.
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Starts the OAuth auth-code flow for an OAuth server and returns the URL
+/// the browser must navigate to.
+#[instrument(skip(state))]
+async fn authorize_mcp_server(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let server = state
+        .store
+        .load_mcp_server(&name)
+        .await?
+        .ok_or_else(|| ApiError::McpServerNotFound { name: name.clone() })?;
+    if server.auth != McpAuth::OAuth {
+        return Err(ApiError::McpServerNotOAuth { name });
+    }
+    let authorize_url = state.mcp_oauth.start_authorization(&server).await?;
+    Ok(Json(json!({ "authorize_url": authorize_url })))
+}
+
+/// The OAuth callback: the authorization server redirects the operator's
+/// browser here with `code`, `state`, `error`, and `iss`.
+#[instrument(skip_all)]
+async fn mcp_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> Result<Response, ApiError> {
+    // A failed callback becomes an `ApiError`, whose response logs the full
+    // chain and maps the status like every other route.
+    let name = state.mcp_oauth.complete_authorization(&query).await?;
+    // The tokens are stored, so the server connects now rather than at its
+    // task's next backoff.
+    state.mcp.connect(&name).await;
+    Ok((
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "MCP server authorized — you may close this tab",
+    )
+        .into_response())
+}
+
+/// One stored MCP server row, or a 404 when the server is unknown. The row
+/// carries the manager's step-up URL when one is pending. The manager answers
+/// first, because dropping a step-up whose flow is gone clears the error the
+/// row records.
+async fn mcp_server_row(state: &AppState, name: &str) -> Result<McpServer, ApiError> {
+    let reauthorize_url = state.mcp.reauthorize_url(name).await;
+    let mut row =
+        state
+            .store
+            .get_mcp_server(name)
+            .await?
+            .ok_or_else(|| ApiError::McpServerNotFound {
+                name: name.to_string(),
+            })?;
+    row.reauthorize_url = reauthorize_url;
+    Ok(row)
+}
+
+/// Accepts only a URL reqwest can parse with an http or https scheme. A
+/// malformed URL is a 400 before the row is written.
+fn validate_mcp_url(url: &str) -> Result<(), ApiError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| ApiError::McpServerUrlInvalid)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::McpServerUrlInvalid);
+    }
+    Ok(())
+}
+
 /// The durable line a rejected question leaves in the transcript. Styled as a
 /// user action note by both clients (mirror the literal in
 /// `crates/bosun-control/src/ui/index.html`); it is read by the session's
@@ -1383,6 +1774,34 @@ fn now_secs() -> i64 {
     bosun_common::time::unix_secs(SystemTime::now())
 }
 
+/// Resolves the requested MCP server names to a deterministic comma-separated
+/// string for the session row. Each name is trimmed, duplicates keep their
+/// first occurrence, and empty entries are dropped. A name that is unknown or
+/// disabled fails before any node work or store write. Preserves the request
+/// order so the stored value reads exactly as the user picked it.
+async fn resolve_mcp_servers(state: &AppState, requested: &[String]) -> Result<String, ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut resolved = Vec::new();
+    for name in requested {
+        let name = name.trim();
+        if name.is_empty() || !seen.insert(name.to_string()) {
+            continue;
+        }
+        let server = state.store.get_mcp_server(name).await?.ok_or_else(|| {
+            ApiError::McpServerUnavailable {
+                name: name.to_string(),
+            }
+        })?;
+        if !server.enabled {
+            return Err(ApiError::McpServerUnavailable {
+                name: name.to_string(),
+            });
+        }
+        resolved.push(name.to_string());
+    }
+    Ok(resolved.join(","))
+}
+
 /// Creates the session in the store, starts its loop, and kicks off the first
 /// turn when a prompt is present.
 async fn start_session(
@@ -1434,6 +1853,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use bosun_agent::adapters::provider_for;
+    use bosun_agent::agent_loop::McpConnections;
     use bosun_agent::config::ResolvedModel;
     use bosun_agent::config::resolve_api_key;
     use bosun_agent::provider::ProviderCall;
@@ -1457,8 +1877,17 @@ mod tests {
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::mcp_test_support::discover_ok;
+    use crate::mcp_test_support::empty_log;
+    use crate::mcp_test_support::json_ok;
+    use crate::mcp_test_support::oauth_stub;
+    use crate::mcp_test_support::result_message;
+    use crate::mcp_test_support::sse_ok;
+    use crate::mcp_test_support::stub_endpoint;
+    use crate::mcp_test_support::text_status;
     use crate::tunnel::TunnelError;
 
     /// A provider that answers every turn with one text delta and a stop and
@@ -1509,11 +1938,28 @@ mod tests {
     /// configured and a GitHub client aimed at a dead port: tests that never
     /// fetch use this.
     fn test_state(dir: &tempfile::TempDir) -> Arc<AppState> {
+        test_state_with_redirect_uri(dir, None)
+    }
+
+    /// The same state as [`test_state`], with the OAuth callback configured at
+    /// `redirect_uri`. The manager and the routes share one OAuth context, as
+    /// the control plane does, so a step-up flow the manager starts is the one
+    /// the callback completes.
+    fn test_state_with_redirect_uri(
+        dir: &tempfile::TempDir,
+        redirect_uri: Option<&str>,
+    ) -> Arc<AppState> {
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let oauth = McpOAuthContext::new(
+            reqwest::Client::new(),
+            store.clone(),
+            redirect_uri.map(str::to_string),
+        );
         Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
-            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            store: store.clone(),
             github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
                 HashMap::new(),
@@ -1523,6 +1969,13 @@ mod tests {
             providers: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
+            oauth_redirect_uri: redirect_uri.map(str::to_string),
+            mcp: Arc::new(McpManager::new(
+                store.clone(),
+                oauth.clone(),
+                reqwest::Client::new(),
+            )),
+            mcp_oauth: oauth,
         })
     }
 
@@ -1617,6 +2070,7 @@ mod tests {
             owner_id: id.to_string(),
             permission: Permission::ReadWrite,
             allowed_tools: "*".into(),
+            mcp_servers: "".into(),
             state: SessionState::Creating,
             interrupt_cause: None,
             created_at_secs: 1_700_000_000,
@@ -1671,11 +2125,12 @@ mod tests {
         personas: &[(&str, &str)],
         default_persona: Option<&str>,
     ) -> Arc<AppState> {
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
-            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            store: store.clone(),
             github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
                 HashMap::new(),
@@ -1707,6 +2162,9 @@ mod tests {
                 })
                 .collect(),
             default_persona: default_persona.map(ToString::to_string),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
         })
     }
 
@@ -1741,11 +2199,12 @@ mod tests {
         personas: HashMap<String, PersonaConfig>,
         default_persona: Option<&str>,
     ) -> Arc<AppState> {
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
-            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            store: store.clone(),
             github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
                 providers.clone(),
@@ -1755,6 +2214,9 @@ mod tests {
             providers,
             personas,
             default_persona: default_persona.map(ToString::to_string),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
         })
     }
 
@@ -2138,6 +2600,7 @@ mod tests {
                 owner_id: session_id.clone(),
                 permission: Permission::ReadWrite,
                 allowed_tools: "*".into(),
+                mcp_servers: "".into(),
                 state: SessionState::WaitingForInput,
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
@@ -2690,6 +3153,9 @@ mod tests {
                 },
             )]),
             default_persona: Some("test".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -2873,6 +3339,9 @@ mod tests {
                 },
             )]),
             default_persona: Some("reviewer".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -3002,6 +3471,9 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -3290,6 +3762,9 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -3511,6 +3986,9 @@ mod tests {
             providers,
             personas: HashMap::new(),
             default_persona: None,
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         (state, store, root.id, child.id)
     }
@@ -3947,6 +4425,9 @@ mod tests {
             providers,
             personas: HashMap::new(),
             default_persona: None,
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         (state, store, root.id, mid.id, leaf.id)
     }
@@ -4245,6 +4726,9 @@ mod tests {
             providers: HashMap::from([("test".to_string(), provider)]),
             personas,
             default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -4684,11 +5168,12 @@ mod tests {
         });
 
         let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         let state = Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels,
-            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            store: store.clone(),
             github: dead_github(),
             loops: Arc::new(AgentRegistry::new(
                 HashMap::new(),
@@ -4714,6 +5199,9 @@ mod tests {
                 ),
             ]),
             default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         let store = state.store.clone();
         state.store.create_session(&session("s1")).await.unwrap();
@@ -4966,6 +5454,9 @@ mod tests {
                 },
             )]),
             default_persona: Some("test".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -5586,6 +6077,9 @@ mod tests {
             providers,
             personas: HashMap::new(),
             default_persona: None,
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         (
             state,
@@ -6118,13 +6612,24 @@ mod tests {
         GitHubClient::new("http://127.0.0.1:1", "http://127.0.0.1:1", None)
     }
 
+    /// The MCP manager a test state gets: no server is connected, so a test
+    /// that needs one starts it through the route it is checking.
+    fn idle_mcp(store: &Store) -> Arc<McpManager> {
+        Arc::new(McpManager::new(
+            store.clone(),
+            McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            reqwest::Client::new(),
+        ))
+    }
+
     /// A control-plane state whose GitHub client points at a stub.
     fn state_with_github(dir: &tempfile::TempDir, github: GitHubClient) -> Arc<AppState> {
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         Arc::new(AppState {
             registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
             commands: Arc::new(CommandQueue::new(Duration::from_secs(30))),
             tunnels: Arc::new(TunnelRegistry::new()),
-            store: Store::open(&dir.path().join("sessions.db")).unwrap(),
+            store: store.clone(),
             github,
             loops: Arc::new(AgentRegistry::new(
                 HashMap::new(),
@@ -6134,6 +6639,9 @@ mod tests {
             providers: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
         })
     }
 
@@ -6795,6 +7303,946 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_mcp_servers_endpoint_lists_an_empty_store() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let servers: Value = response.json().await.unwrap();
+        assert_eq!(servers.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn creating_and_listing_an_mcp_server_returns_the_public_shape_without_secret_keys() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "bearer",
+                "bearer_token": "tok",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: Value = response.json().await.unwrap();
+        assert_eq!(created["name"], "srv");
+        assert_eq!(created["url"], "https://srv.example");
+        assert_eq!(created["enabled"], true);
+        assert_eq!(created["auth"], "bearer");
+        assert_eq!(created["last_error"], serde_json::Value::Null);
+        assert!(created.get("bearer_token").is_none());
+        assert!(created.get("oauth_client_id").is_none());
+        assert!(created.get("oauth_client_secret").is_none());
+        assert!(created.get("oauth_access_token").is_none());
+        assert!(created.get("oauth_refresh_token").is_none());
+
+        let listed: Value = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["name"], "srv");
+        assert!(listed[0].get("bearer_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn creating_an_oauth_mcp_server_stores_its_client_credentials() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "oauth",
+                "oauth_client_id": "client",
+                "oauth_client_secret": "secret",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let stored = state.store.load_mcp_server("srv").await.unwrap().unwrap();
+        assert_eq!(stored.oauth_client_id.as_deref(), Some("client"));
+        assert_eq!(stored.oauth_client_secret.as_deref(), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn creating_a_duplicate_mcp_server_is_a_conflict() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/mcp/servers");
+        let body = json!({
+            "name": "srv",
+            "url": "https://srv.example",
+            "auth": "none",
+        });
+        let response = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let listed: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn creating_an_mcp_server_with_a_malformed_url_is_bad_request_before_writing() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "not a url",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // A non-http scheme parses but is still refused, also before writing.
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "ftp",
+                "url": "ftp://srv.example",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let listed: Value = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn updating_an_mcp_server_with_a_malformed_url_is_bad_request_and_leaves_the_row() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = client
+            .post(format!("http://{addr}/mcp/servers/srv"))
+            .json(&json!({
+                "url": "not a url",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let listed: Value = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["url"], "https://srv.example");
+    }
+
+    #[tokio::test]
+    async fn unknown_mcp_server_update_delete_and_enabled_are_not_found() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let update = client
+            .post(format!("http://{addr}/mcp/servers/ghost"))
+            .json(&json!({
+                "url": "https://ghost.example",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::NOT_FOUND);
+        // An unknown name is 404 even when the body would otherwise be a 400:
+        // the name check runs before the URL validation.
+        let update = client
+            .post(format!("http://{addr}/mcp/servers/ghost"))
+            .json(&json!({
+                "url": "not a url",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::NOT_FOUND);
+        let remove = client
+            .delete(format!("http://{addr}/mcp/servers/ghost"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(remove.status(), StatusCode::NOT_FOUND);
+        let toggle = client
+            .post(format!("http://{addr}/mcp/servers/ghost/enabled"))
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(toggle.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_mcp_server_enabled_toggle_round_trips() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let created: Value = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(created["enabled"], true);
+        let url = format!("http://{addr}/mcp/servers/srv/enabled");
+        let response = client
+            .post(&url)
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let listed: Value = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["enabled"], false);
+        let response = client
+            .post(&url)
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let listed: Value = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn updating_an_mcp_server_preserves_a_missing_bearer_token() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "bearer",
+                "bearer_token": "keep-me",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = client
+            .post(format!("http://{addr}/mcp/servers/srv"))
+            .json(&json!({
+                "url": "https://srv.example/v2",
+                "auth": "bearer",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let loaded = state.store.load_mcp_server("srv").await.unwrap().unwrap();
+        assert_eq!(loaded.url, "https://srv.example/v2");
+        assert_eq!(loaded.auth, McpAuth::Bearer);
+        assert_eq!(loaded.bearer_token.as_deref(), Some("keep-me"));
+    }
+
+    #[tokio::test]
+    async fn updating_an_mcp_server_replaces_editable_fields_and_returns_the_public_shape() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "bearer",
+                "bearer_token": "old",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: Value = client
+            .post(format!("http://{addr}/mcp/servers/srv"))
+            .json(&json!({
+                "url": "https://srv.example/v2",
+                "auth": "oauth",
+                "oauth_client_id": "client",
+                "oauth_client_secret": "secret",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(updated["url"], "https://srv.example/v2");
+        assert_eq!(updated["auth"], "oauth");
+        assert!(updated.get("oauth_client_id").is_none());
+        assert!(updated.get("oauth_client_secret").is_none());
+        assert!(updated.get("bearer_token").is_none());
+        assert_eq!(updated["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn retrying_an_unknown_mcp_server_is_not_found() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/mcp/servers/ghost/retry"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retrying_a_known_mcp_server_attempts_a_connection() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        // The row is written without the add route, so no task has run yet
+        // and only the retry route can start one. A port nothing listens on
+        // fails the attempt at once without touching the network.
+        state
+            .store
+            .insert_mcp_server(&McpServerSecret {
+                name: "srv".to_string(),
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                enabled: true,
+                auth: McpAuth::None,
+                bearer_token: None,
+                oauth_client_id: None,
+                oauth_client_secret: None,
+                oauth_access_token: None,
+                oauth_refresh_token: None,
+                oauth_expires_at_secs: None,
+                oauth_scope: None,
+                added_at_secs: 1,
+                updated_at_secs: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let retry = client
+            .post(format!("http://{addr}/mcp/servers/srv/retry"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        // The attempt runs in the server's own task, so the failure it hits
+        // is what proves the route asked for one.
+        wait_for("the retry to record its failure", || {
+            let store = state.store.clone();
+            async move {
+                store
+                    .get_mcp_server("srv")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_error
+                    .is_some()
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retrying_a_disabled_mcp_server_is_bad_request() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "http://127.0.0.1:1/mcp",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let disabled = client
+            .post(format!("http://{addr}/mcp/servers/srv/enabled"))
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::NO_CONTENT);
+
+        let retry = client
+            .post(format!("http://{addr}/mcp/servers/srv/retry"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A stub MCP server: the modern handshake, `tool` in its list with a
+    /// minute of cache, and an open change stream. Returns its URL.
+    async fn mcp_stub(tool: &str) -> String {
+        let tool = tool.to_string();
+        stub_endpoint(
+            move |request| match request.message().as_str() {
+                "server/discover" => discover_ok(request),
+                "tools/list" => json_ok(result_message(
+                    request.id(),
+                    json!({
+                        "tools": [{
+                            "name": tool,
+                            "inputSchema": { "type": "object", "properties": {} },
+                        }],
+                        "ttlMs": 60_000,
+                    }),
+                )),
+                "subscriptions/listen" => sse_ok(&[], true),
+                other => panic!("unexpected method {other}"),
+            },
+            empty_log(),
+        )
+        .await
+    }
+
+    /// The tool names the control plane's manager holds for one server, empty
+    /// while it is not connected.
+    fn connected_tools(state: &AppState, name: &str) -> Vec<String> {
+        state
+            .mcp
+            .servers(&[name.to_string()])
+            .servers
+            .first()
+            .map(|(_, tools)| tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Creates one server through the route and waits until it is connected.
+    async fn create_connected_mcp_server(addr: SocketAddr, state: &Arc<AppState>, url: &str) {
+        let created = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({ "name": "srv", "url": url, "auth": "none" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        wait_for("the created server to connect", || {
+            let state = state.clone();
+            async move { !connected_tools(&state, "srv").is_empty() }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn adding_an_mcp_server_connects_it() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let url = mcp_stub("added").await;
+
+        create_connected_mcp_server(addr, &state, &url).await;
+
+        assert_eq!(connected_tools(&state, "srv"), vec!["added".to_string()]);
+    }
+
+    /// The step-up URL the manager holds for a challenged server is what the
+    /// registry rows carry, which is what the pane navigates to.
+    #[tokio::test]
+    async fn the_mcp_server_rows_carry_the_step_up_url_the_manager_holds() {
+        let dir = tempdir().unwrap();
+        let state =
+            test_state_with_redirect_uri(&dir, Some("https://control.example/mcp/oauth/callback"));
+        let addr = serve(state.clone()).await;
+        let (url, _refreshes) = oauth_stub(
+            |request| match request.message().as_str() {
+                "server/discover" => discover_ok(request),
+                "tools/list" => text_status(403, "insufficient scope").with_www_authenticate(
+                    "Bearer error=\"insufficient_scope\", scope=\"files.write\"",
+                ),
+                other => panic!("unexpected method {other}"),
+            },
+            empty_log(),
+            Arc::new(Mutex::new("stale".to_string())),
+        )
+        .await;
+        state
+            .store
+            .insert_mcp_server(&McpServerSecret {
+                name: "srv".to_string(),
+                url: url.clone(),
+                enabled: true,
+                auth: McpAuth::OAuth,
+                bearer_token: None,
+                oauth_client_id: Some("client".to_string()),
+                oauth_client_secret: None,
+                oauth_access_token: Some("stale".to_string()),
+                oauth_refresh_token: Some("refresh".to_string()),
+                oauth_expires_at_secs: None,
+                oauth_scope: Some("files.read".to_string()),
+                added_at_secs: 1,
+                updated_at_secs: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+
+        state.mcp.connect("srv").await;
+        wait_for("the manager's step-up URL", || {
+            let state = state.clone();
+            async move { state.mcp.reauthorize_url("srv").await.is_some() }
+        })
+        .await;
+
+        let expected = json!(state.mcp.reauthorize_url("srv").await.unwrap());
+        let client = reqwest::Client::new();
+        let listed: Value = client
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["reauthorize_url"], expected);
+        // An update answers with the same row shape, so the edit path in the
+        // pane sees the step-up too.
+        let updated: Value = client
+            .post(format!("http://{addr}/mcp/servers/srv"))
+            .json(&json!({ "url": url, "auth": "oauth" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(updated["reauthorize_url"], expected);
+    }
+
+    /// The listing that drops a step-up carries no reason for it: the manager
+    /// clears the row's recorded error while it answers, and the rows are read
+    /// after that.
+    #[tokio::test]
+    async fn a_listing_that_drops_a_step_up_carries_no_step_up_reason() {
+        let dir = tempdir().unwrap();
+        let state =
+            test_state_with_redirect_uri(&dir, Some("https://control.example/mcp/oauth/callback"));
+        let addr = serve(state.clone()).await;
+        let (url, _refreshes) = oauth_stub(
+            |request| match request.message().as_str() {
+                "server/discover" => discover_ok(request),
+                "subscriptions/listen" => sse_ok(&[], true),
+                // Only the call needs the scope, so the server keeps serving
+                // its tool list and stays connected.
+                "tools/call" => text_status(403, "insufficient scope").with_www_authenticate(
+                    "Bearer error=\"insufficient_scope\", scope=\"files.write\"",
+                ),
+                "tools/list" => json_ok(result_message(
+                    request.id(),
+                    json!({
+                        "tools": [{
+                            "name": "echo",
+                            "inputSchema": { "type": "object", "properties": {} },
+                        }],
+                        "ttlMs": 60_000,
+                    }),
+                )),
+                other => panic!("unexpected method {other}"),
+            },
+            empty_log(),
+            Arc::new(Mutex::new("stale".to_string())),
+        )
+        .await;
+        state
+            .store
+            .insert_mcp_server(&McpServerSecret {
+                name: "srv".to_string(),
+                url: url.clone(),
+                enabled: true,
+                auth: McpAuth::OAuth,
+                bearer_token: None,
+                oauth_client_id: Some("client".to_string()),
+                oauth_client_secret: None,
+                oauth_access_token: Some("stale".to_string()),
+                oauth_refresh_token: Some("refresh".to_string()),
+                oauth_expires_at_secs: None,
+                oauth_scope: Some("files.read".to_string()),
+                added_at_secs: 1,
+                updated_at_secs: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+
+        state.mcp.connect("srv").await;
+        wait_for("the server to connect", || {
+            let state = state.clone();
+            async move { !connected_tools(&state, "srv").is_empty() }
+        })
+        .await;
+
+        // A call meets the challenge, which offers the operator a step-up.
+        let (delta, _deltas) = mpsc::unbounded_channel();
+        let _ = state
+            .mcp
+            .call("srv".to_string(), "echo".to_string(), json!({}), delta)
+            .await;
+        wait_for("the server to serve its tools again", || {
+            let state = state.clone();
+            async move { !connected_tools(&state, "srv").is_empty() }
+        })
+        .await;
+        let offered = state
+            .mcp
+            .reauthorize_url("srv")
+            .await
+            .expect("a step-up URL");
+
+        // The callback refuses the flow, so the offering has nothing left to
+        // complete.
+        let state_param = reqwest::Url::parse(&offered)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.to_string())
+            .unwrap();
+        let query = OAuthCallbackQuery {
+            code: Some("stub-code".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: Some("http://elsewhere.example".to_string()),
+        };
+        assert!(
+            state
+                .mcp_oauth
+                .complete_authorization(&query)
+                .await
+                .is_err()
+        );
+
+        // The URL goes and the reason goes with it, in the response itself.
+        let listed: Value = reqwest::Client::new()
+            .get(format!("http://{addr}/mcp/servers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["reauthorize_url"], json!(null));
+        assert_eq!(listed[0]["last_error"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn disabling_an_mcp_server_stops_it_and_enabling_it_connects_again() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let url = mcp_stub("served").await;
+        create_connected_mcp_server(addr, &state, &url).await;
+        let client = reqwest::Client::new();
+        let enabled_url = format!("http://{addr}/mcp/servers/srv/enabled");
+
+        let disabled = client
+            .post(&enabled_url)
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::NO_CONTENT);
+
+        // The route stops the server before it answers, so it is unavailable
+        // to every session from here.
+        let availability = state.mcp.servers(&["srv".to_string()]);
+        assert!(availability.servers.is_empty());
+        assert_eq!(availability.unavailable, vec!["srv".to_string()]);
+
+        let enabled = client
+            .post(&enabled_url)
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the re-enabled server to connect", || {
+            let state = state.clone();
+            async move { !connected_tools(&state, "srv").is_empty() }
+        })
+        .await;
+        assert_eq!(connected_tools(&state, "srv"), vec!["served".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_mcp_server_stops_it() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let url = mcp_stub("served").await;
+        create_connected_mcp_server(addr, &state, &url).await;
+
+        let deleted = reqwest::Client::new()
+            .delete(format!("http://{addr}/mcp/servers/srv"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        // A deleted server keeps no connection behind.
+        let availability = state.mcp.servers(&["srv".to_string()]);
+        assert!(availability.servers.is_empty());
+        assert_eq!(availability.unavailable, vec!["srv".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn updating_an_mcp_server_reconnects_it() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let url = mcp_stub("before").await;
+        create_connected_mcp_server(addr, &state, &url).await;
+        assert_eq!(connected_tools(&state, "srv"), vec!["before".to_string()]);
+
+        // The edited URL serves a different tool, so a connection that was
+        // not rebuilt still reports the old one.
+        let moved_url = mcp_stub("after").await;
+        let updated = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp/servers/srv"))
+            .json(&json!({ "url": moved_url, "auth": "none" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        wait_for("the edited server to reconnect", || {
+            let state = state.clone();
+            async move { connected_tools(&state, "srv") == vec!["after".to_string()] }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authorizing_a_non_oauth_server_is_bad_request() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers"))
+            .json(&json!({
+                "name": "srv",
+                "url": "https://srv.example",
+                "auth": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let authorize = client
+            .post(format!("http://{addr}/mcp/servers/srv/authorize"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authorize.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn authorizing_an_unknown_server_is_not_found() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers/ghost/authorize"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn authorizing_without_a_redirect_uri_is_bad_request() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        state
+            .store
+            .insert_mcp_server(&McpServerSecret {
+                name: "srv".to_string(),
+                url: "https://srv.example".to_string(),
+                enabled: true,
+                auth: McpAuth::OAuth,
+                bearer_token: None,
+                oauth_client_id: Some("client".to_string()),
+                oauth_client_secret: None,
+                oauth_access_token: None,
+                oauth_refresh_token: None,
+                oauth_expires_at_secs: None,
+                oauth_scope: None,
+                added_at_secs: 1,
+                updated_at_secs: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/mcp/servers/srv/authorize"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_oauth_callback_is_served_at_the_configured_path_and_rejects_an_unknown_state() {
+        // The callback success path is covered against the context directly in
+        // mcp_oauth.rs; here the route layer only confirms the callback is
+        // served at the configured path and rejects a state it never issued.
+        let dir = tempdir().unwrap();
+        let state = test_state_with_redirect_uri(&dir, Some("http://127.0.0.1:8090/hooks/oauth"));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        // No pending flow: the callback must fail cleanly rather than panic.
+        let callback = client
+            .get(format!("http://{addr}/hooks/oauth?code=x&state=missing"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
+        // Nothing is served at the path the URI does not name.
+        let elsewhere = client
+            .get(format!(
+                "http://{addr}/mcp/oauth/callback?code=x&state=missing"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_colliding_oauth_redirect_uri_leaves_the_router_working() {
+        // A bare origin resolves to "/", which the router already serves, so
+        // the callback is not registered there and the router still builds.
+        let dir = tempdir().unwrap();
+        let state = test_state_with_redirect_uri(&dir, Some("http://127.0.0.1:8090"));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        let root = client.get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        // The colliding callback was not registered.
+        let callback = client
+            .get(format!("http://{addr}/mcp/oauth/callback"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn oauth_callback_path_rejects_served_paths_and_accepts_a_free_one() {
+        for redirect_uri in [
+            "http://127.0.0.1:8090/",
+            "http://127.0.0.1:8090",
+            "http://127.0.0.1:8090/ui",
+            "http://127.0.0.1:8090/sessions",
+            "http://127.0.0.1:8090/sessions/abc",
+            "http://127.0.0.1:8090/mcp/servers",
+            // A path the router cannot register at all: a missing scheme
+            // leaves a path with no leading slash.
+            "localhost:8090/mcp/oauth/callback",
+            // A segment in axum's parameter syntax.
+            "http://127.0.0.1:8090/:callback",
+        ] {
+            assert!(
+                oauth_callback_path(redirect_uri).is_err(),
+                "{redirect_uri} should be rejected"
+            );
+        }
+        assert_eq!(
+            oauth_callback_path("http://127.0.0.1:8090/mcp/oauth/callback").unwrap(),
+            "/mcp/oauth/callback"
+        );
+        // The URL parser percent-encodes braces, so a brace path is a plain
+        // literal path, not axum parameter syntax.
+        assert_eq!(
+            oauth_callback_path("http://127.0.0.1:8090/oauth/{code").unwrap(),
+            "/oauth/%7Bcode"
+        );
+    }
+
+    #[tokio::test]
     async fn an_env_var_github_token_reaches_fetches_as_a_bearer_token() {
         let var = "BOSUN_TEST_GITHUB_TOKEN";
         unsafe {
@@ -6859,5 +8307,172 @@ mod tests {
         unsafe {
             std::env::remove_var(var);
         }
+    }
+
+    #[tokio::test]
+    async fn creating_a_session_with_an_enabled_mcp_server_stores_its_name() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &["test"], &[("coder", "test")], Some("coder"));
+        state
+            .store
+            .insert_mcp_server(&McpServerSecret {
+                name: "srv".into(),
+                url: "https://srv.example".into(),
+                enabled: true,
+                auth: McpAuth::None,
+                bearer_token: None,
+                oauth_client_id: None,
+                oauth_client_secret: None,
+                oauth_access_token: None,
+                oauth_refresh_token: None,
+                oauth_expires_at_secs: None,
+                oauth_scope: None,
+                added_at_secs: 1_700_000_000,
+                updated_at_secs: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "node-1",
+                "dir": "/tmp/x",
+                "persona": "coder",
+                "mcp_servers": ["srv"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session: Session = response.json().await.unwrap();
+        assert_eq!(session.mcp_servers, "srv");
+        let stored = state.store.get_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(stored.mcp_servers, "srv");
+    }
+
+    #[tokio::test]
+    async fn creating_a_session_with_no_mcp_servers_stores_an_empty_selection() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &["test"], &[("coder", "test")], Some("coder"));
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "node-1",
+                "dir": "/tmp/x",
+                "persona": "coder",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session: Session = response.json().await.unwrap();
+        assert_eq!(session.mcp_servers, "");
+        let stored = state.store.get_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(stored.mcp_servers, "");
+    }
+
+    #[tokio::test]
+    async fn creating_a_session_with_an_unknown_mcp_server_is_bad_request() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &["test"], &[("coder", "test")], Some("coder"));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "node-1",
+                "dir": "/tmp/x",
+                "persona": "coder",
+                "mcp_servers": ["ghost"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn creating_a_session_with_a_disabled_mcp_server_is_bad_request() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &["test"], &[("coder", "test")], Some("coder"));
+        state
+            .store
+            .insert_mcp_server(&McpServerSecret {
+                name: "srv".into(),
+                url: "https://srv.example".into(),
+                enabled: false,
+                auth: McpAuth::None,
+                bearer_token: None,
+                oauth_client_id: None,
+                oauth_client_secret: None,
+                oauth_access_token: None,
+                oauth_refresh_token: None,
+                oauth_expires_at_secs: None,
+                oauth_scope: None,
+                added_at_secs: 1_700_000_000,
+                updated_at_secs: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "node-1",
+                "dir": "/tmp/x",
+                "persona": "coder",
+                "mcp_servers": ["srv"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn resolve_mcp_servers_trims_deduplicates_and_preserves_order() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        for (name, enabled) in [("srv-a", true), ("srv-b", true)] {
+            state
+                .store
+                .insert_mcp_server(&McpServerSecret {
+                    name: name.into(),
+                    url: format!("https://{name}.example"),
+                    enabled,
+                    auth: McpAuth::None,
+                    bearer_token: None,
+                    oauth_client_id: None,
+                    oauth_client_secret: None,
+                    oauth_access_token: None,
+                    oauth_refresh_token: None,
+                    oauth_expires_at_secs: None,
+                    oauth_scope: None,
+                    added_at_secs: 1_700_000_000,
+                    updated_at_secs: None,
+                    last_error: None,
+                })
+                .await
+                .unwrap();
+        }
+        let resolved = resolve_mcp_servers(
+            &state,
+            &[
+                " srv-b ".to_string(),
+                "".to_string(),
+                "srv-a".to_string(),
+                "srv-b".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, "srv-b,srv-a");
     }
 }

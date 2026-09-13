@@ -13,6 +13,7 @@ use bosun_agent::agent_loop::LoopDeps;
 use bosun_agent::agent_loop::LoopEvent;
 use bosun_agent::agent_loop::LoopHandle;
 use bosun_agent::agent_loop::LoopMailbox;
+use bosun_agent::agent_loop::McpConnections;
 use bosun_agent::agent_loop::spawn_loop;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
@@ -45,6 +46,9 @@ pub struct AgentRegistry {
     /// the registry exists (it holds a weak reference back to it). None
     /// disables the `spawn` tool.
     spawner: RwLock<Option<Arc<dyn ChildSpawner>>>,
+    /// The control plane's shared MCP connections. Set at boot; None leaves
+    /// every session with the canonical tools only.
+    pub mcp: Option<Arc<dyn McpConnections>>,
 }
 
 impl AgentRegistry {
@@ -60,6 +64,7 @@ impl AgentRegistry {
             personas,
             prices,
             spawner: RwLock::new(None),
+            mcp: None,
         }
     }
 
@@ -117,6 +122,7 @@ impl AgentRegistry {
             price_output_per_mtok,
             spawner: self.spawner.read().unwrap().clone(),
             mailbox: Some(self.clone()),
+            mcp: self.mcp.clone(),
         };
         let handle = spawn_loop(session_id.to_string(), Arc::new(deps));
         self.loops
@@ -250,6 +256,7 @@ mod tests {
                 owner_id: "s1".into(),
                 permission: Permission::ReadWrite,
                 allowed_tools: "*".into(),
+                mcp_servers: "".into(),
                 state: SessionState::Creating,
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
@@ -321,6 +328,7 @@ mod tests {
                 owner_id: "s1".into(),
                 permission: Permission::ReadWrite,
                 allowed_tools: "*".into(),
+                mcp_servers: "".into(),
                 state: SessionState::Creating,
                 interrupt_cause: None,
                 created_at_secs: 1_700_000_000,
