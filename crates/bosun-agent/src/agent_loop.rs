@@ -1168,6 +1168,7 @@ async fn run_turn_inner(
         })
         .collect();
     let messages = order_tool_exchange(messages);
+    let messages = answer_interrupted_tool_calls(messages);
 
     // The two skill sources are fetched once per session and cached, so a
     // turn does not round-trip for them. The on-demand `skill` read still
@@ -2174,6 +2175,58 @@ fn order_tool_exchange(messages: Vec<Message>) -> Vec<Message> {
         }
     }
     ordered
+}
+
+/// Gives every tool call left without a result a synthetic error result, so a
+/// window that ends mid-call is still a valid request.
+///
+/// A tool call whose result never arrives is permanent: the control plane that
+/// was waiting for it is gone, and nothing will ever author it. Providers
+/// reject an assistant `tool_calls` message that no tool message answers, so
+/// each wake resends the same invalid history and fails identically, and the
+/// session cannot be resumed at all. A control plane restart does this to every
+/// session running a tool at the time, which is every deploy.
+///
+/// The result says the run was interrupted, that its effect is unknown, and to
+/// call the tool again if the work is still needed: the model cannot see that a
+/// command was cut off, and left to guess it may assume the work was done. A
+/// dangling `ask` never reaches here; those are dropped earlier, because a
+/// pending question is a live ask rather than an interrupted run.
+fn answer_interrupted_tool_calls(messages: Vec<Message>) -> Vec<Message> {
+    let answered: Vec<String> = messages
+        .iter()
+        .filter_map(|message| match &message.block {
+            Block::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        let interrupted = match &message.block {
+            Block::ToolCall { id, name, .. } if !answered.contains(id) => {
+                Some((id.clone(), name.clone()))
+            }
+            _ => None,
+        };
+        out.push(message);
+        if let Some((id, name)) = interrupted {
+            out.push(Message {
+                role: Role::User,
+                block: Block::ToolResult {
+                    id,
+                    name,
+                    is_error: true,
+                    content: json!({
+                        "error": "This call was interrupted and produced no result. \
+                                  Whether it ran, partly ran, or never started is unknown. \
+                                  Check the state it would have changed before relying on it, \
+                                  and call the tool again if you still need the result."
+                    }),
+                },
+            });
+        }
+    }
+    out
 }
 
 /// The origin leaf of the question `named` last raised into this session's
@@ -4008,6 +4061,78 @@ mod tests {
         let ordered = order_tool_exchange(vec![tool_call("call-1")]);
         assert_eq!(ordered.len(), 1, "a dangling call is not lost");
         assert_eq!(exchange_shape(&ordered), ["call call-1"]);
+    }
+
+    /// The shape a control plane restart leaves behind: a call dispatched, the
+    /// plane replaced before its result, then the user's prods. Providers
+    /// reject it, so every wake fails and the session cannot be resumed.
+    #[test]
+    fn an_interrupted_call_is_answered_so_the_window_stays_valid() {
+        let repaired = answer_interrupted_tool_calls(order_tool_exchange(vec![
+            tool_call("call-1"),
+            foreign_text("continue"),
+            foreign_text("go"),
+        ]));
+        assert_eq!(
+            exchange_shape(&repaired),
+            ["call call-1", "result call-1", "text continue", "text go"],
+            "the call is answered in place, before the messages that followed it"
+        );
+        let Block::ToolResult {
+            is_error, content, ..
+        } = &repaired[1].block
+        else {
+            panic!("the synthetic answer must be a tool result");
+        };
+        assert!(is_error, "an interrupted call did not succeed");
+        let error = content["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("call the tool again"),
+            "the model must be told to retry, got {error:?}"
+        );
+        assert!(
+            error.contains("unknown"),
+            "the model must be told the effect is unknown, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_that_already_has_a_result_is_not_answered_twice() {
+        let repaired = answer_interrupted_tool_calls(order_tool_exchange(vec![
+            tool_call("call-1"),
+            tool_result("call-1"),
+            tool_call("call-2"),
+            tool_result("call-2"),
+        ]));
+        assert_eq!(
+            exchange_shape(&repaired),
+            [
+                "call call-1",
+                "result call-1",
+                "call call-2",
+                "result call-2",
+            ]
+        );
+    }
+
+    /// Only the unanswered call in a parallel batch is filled.
+    #[test]
+    fn a_half_answered_batch_has_only_its_missing_result_synthesised() {
+        let repaired = answer_interrupted_tool_calls(order_tool_exchange(vec![
+            tool_call("call-1"),
+            tool_call("call-2"),
+            tool_result("call-1"),
+        ]));
+        assert_eq!(
+            exchange_shape(&repaired),
+            [
+                "call call-1",
+                "result call-1",
+                "call call-2",
+                "result call-2"
+            ],
+            "the answered call keeps its real result and the other gets a synthetic one"
+        );
     }
 
     #[tokio::test]
