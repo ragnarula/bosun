@@ -216,10 +216,20 @@ pub async fn run_call(
             let offset = parse_read_arg(args, "offset")?.unwrap_or(1);
             let limit = parse_read_arg(args, "limit")?;
             let read_path = path.clone();
-            let content = run_blocking(&state.session_dir, move |dir| {
-                tools::read_file(dir, &read_path, offset, limit)
-            })
-            .await?;
+            // A read at a ref reads history rather than the working copy, so
+            // it goes through git and the line window does not apply: the
+            // caller asked for the file as that commit has it.
+            let content = match args.get("ref").and_then(Value::as_str) {
+                Some(git_ref) => {
+                    tools::read_file_at_ref(&state.session_dir, &read_path, git_ref).await?
+                }
+                None => {
+                    run_blocking(&state.session_dir, move |dir| {
+                        tools::read_file(dir, &read_path, offset, limit)
+                    })
+                    .await?
+                }
+            };
             let value = json!({ "content": content });
             // The node judges a result against the spill budget on its
             // serialized text, so a file_read window is capped on that same
@@ -291,25 +301,46 @@ pub async fn run_call(
                 .await
                 .map(|paths| json!({ "paths": paths }))
         }
-        "git" => {
-            let Some(git_args) = args.get("args").and_then(Value::as_array) else {
-                return Err(ExecutorError::BadArgument { key: "args" });
+        "history_read" => {
+            let Some(op) = args.get("op").and_then(Value::as_str) else {
+                return Err(ExecutorError::BadArgument { key: "op" });
             };
-            let mut parsed = Vec::with_capacity(git_args.len());
-            for value in git_args {
-                let Some(arg) = value.as_str() else {
-                    return Err(ExecutorError::BadArgument {
-                        key: "args must be strings",
-                    });
-                };
-                parsed.push(arg.to_string());
-            }
-            tools::git(&state.session_dir, permission, &parsed)
-                .await
-                .map_err(ExecutorError::from)
-                .map(|out| {
-                    json!({ "stdout": out.stdout, "stderr": out.stderr, "exit_code": out.exit_code })
+            let paths: Vec<String> = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
                 })
+                .unwrap_or_default();
+            let git_ref = args.get("ref").and_then(Value::as_str);
+            let summary = args
+                .get("summary")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let grep = args.get("grep").and_then(Value::as_str);
+            let author = args.get("author").and_then(Value::as_str);
+            let output = tools::read_history(
+                &state.session_dir,
+                tools::HistoryQuery {
+                    op,
+                    paths: &paths,
+                    git_ref,
+                    summary,
+                    limit,
+                    grep,
+                    author,
+                },
+            )
+            .await?;
+            Ok(serde_json::to_value(output).expect("history output serializes"))
         }
         "webfetch" => {
             let Some(url) = args.get("url").and_then(Value::as_str) else {
@@ -874,7 +905,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            call(&state, "run-3", "git", json!({ "args": ["status"] }))
+            call(&state, "run-3", "history_read", json!({ "op": "status" }))
                 .await
                 .is_ok()
         );
@@ -1357,34 +1388,30 @@ mod tests {
         init_repo(dir.path());
         let state = state(dir.path(), Permission::ReadWrite);
 
-        let outcome = call(&state, "run-1", "git", json!({ "args": ["status"] }))
+        let outcome = call(&state, "run-1", "history_read", json!({ "op": "status" }))
             .await
-            .expect("git status should run");
+            .expect("history status should run");
         let CallOutcome::Result { content } = outcome else {
-            panic!("git must not stream");
+            panic!("history_read must not stream");
         };
-        assert!(content["stdout"].is_string(), "git output has stdout");
-        assert!(content["stderr"].is_string(), "git output has stderr");
-        assert!(content["exit_code"].is_number(), "git output has exit_code");
+        assert!(content["stdout"].is_string(), "history output has stdout");
+        assert!(content["stderr"].is_string(), "history output has stderr");
+        assert!(
+            content["exit_code"].is_number(),
+            "history output has exit_code"
+        );
         assert_eq!(content["exit_code"], 0);
 
-        let error = call_error(&state, "run-2", "git", json!({ "args": ["push"] })).await;
+        // There is no verb to name, so a mutating request is not a refused
+        // verb but an op that does not exist.
+        let error = call_error(&state, "run-2", "history_read", json!({ "op": "push" })).await;
         assert!(matches!(
             error,
-            ExecutorError::Tool(ToolError::GitPushForbidden)
+            ExecutorError::Tool(ToolError::HistoryOpNotAllowed { .. })
         ));
 
-        let error = call_error(
-            &state,
-            "run-3",
-            "git",
-            json!({ "args": ["checkout", "master"] }),
-        )
-        .await;
-        assert!(matches!(
-            error,
-            ExecutorError::Tool(ToolError::GitVerbNotAllowed { .. })
-        ));
+        let error = call_error(&state, "run-3", "history_read", json!({})).await;
+        assert!(matches!(error, ExecutorError::BadArgument { key: "op" }));
     }
 
     #[tokio::test]

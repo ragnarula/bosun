@@ -583,7 +583,7 @@ fn tool_glyph(text: &str) -> &'static str {
         "glob" => "✱",
         "ask" => "?",
         "todowrite" => "✓",
-        "git" => "⎇",
+        "history_read" => "⎇",
         "webfetch" => "↗",
         "skill" => "⚒",
         "spawn" => "⊕",

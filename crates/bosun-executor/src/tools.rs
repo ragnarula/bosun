@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::anyhow;
-use bosun_common::session::Permission;
 use bosun_common::skills::Skill;
 use bosun_common::skills::parse_skill_dir;
 use bosun_common::skills::read_skill_markdown;
@@ -25,22 +24,10 @@ const MAX_GREP_FILES: usize = 10_000;
 const MAX_GREP_LINE_CHARS: usize = 500;
 const MAX_GLOB_RESULTS: usize = 1000;
 const MAX_BODY_BYTES: usize = 1 << 20;
-const GIT_READ_VERBS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "rev-parse",
-    "ls-files",
-    "blame",
-    "describe",
-    "grep",
-    "show-ref",
-    "rev-list",
-    "ls-tree",
-    "cat-file",
-];
-const GIT_WRITE_VERBS: &[&str] = &["add", "commit"];
+/// How many commits `history` lists when the caller names no limit.
+const DEFAULT_LOG_LIMIT: usize = 20;
+/// The most it will list, so one call cannot return a whole repository.
+const MAX_LOG_LIMIT: usize = 200;
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -64,10 +51,10 @@ pub enum ToolError {
     TooManyResults { limit: usize },
     #[error("unsupported URL {url}: only http and https are allowed")]
     UnsupportedUrl { url: String },
-    #[error("git verb {verb} is not allowed")]
-    GitVerbNotAllowed { verb: String },
-    #[error("git push is forbidden")]
-    GitPushForbidden,
+    #[error("history op {op} is not one of diff, status, log, show")]
+    HistoryOpNotAllowed { op: String },
+    #[error("history {op} requires a ref")]
+    HistoryRefMissing { op: &'static str },
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -519,56 +506,141 @@ pub fn glob(session_dir: &Path, pattern: &str) -> Result<Vec<String>, ToolError>
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct GitOutput {
+pub struct HistoryOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
 }
 
-pub async fn git(
+/// Reads repository history: what changed, what is dirty, recent commits, and
+/// one commit's contents.
+///
+/// This replaces a general `git` tool. Four operations cover 84% of the git
+/// calls sessions actually made, and every one of them is a read, so there is
+/// no verb allowlist to keep in step with git and no mutating verb reachable
+/// through it. A session that needs to write history uses `shell`.
+///
+/// Arguments are passed to git as separate arguments, never through a shell,
+/// so a path, ref, or pattern cannot inject another command. Paths are
+/// resolved inside the session directory; refs are opaque to us and validated
+/// by git itself, which fails the call rather than inventing a result.
+pub struct HistoryQuery<'a> {
+    pub op: &'a str,
+    pub paths: &'a [String],
+    pub git_ref: Option<&'a str>,
+    pub summary: bool,
+    pub limit: Option<usize>,
+    pub grep: Option<&'a str>,
+    pub author: Option<&'a str>,
+}
+
+pub async fn read_history(
     session_dir: &Path,
-    permission: Permission,
-    args: &[String],
-) -> Result<GitOutput, ToolError> {
-    if args.iter().any(|arg| arg == "-C") {
-        // `-C <dir>` would run git in another directory, so it is refused
-        // outright.
-        return Err(ToolError::GitVerbNotAllowed {
-            verb: "-C".to_string(),
-        });
+    query: HistoryQuery<'_>,
+) -> Result<HistoryOutput, ToolError> {
+    let HistoryQuery {
+        op,
+        paths,
+        git_ref,
+        summary,
+        limit,
+        grep,
+        author,
+    } = query;
+    let mut args: Vec<String> = Vec::new();
+    match op {
+        "diff" => {
+            args.push("diff".into());
+            if let Some(reference) = git_ref {
+                args.push(reference.to_string());
+            }
+            if summary {
+                args.push("--stat".into());
+            }
+        }
+        "status" => {
+            args.push("status".into());
+            args.push("--porcelain".into());
+        }
+        "log" => {
+            let limit = limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
+            args.push("log".into());
+            args.push("--oneline".into());
+            args.push(format!("-{limit}"));
+            if let Some(pattern) = grep {
+                args.push(format!("--grep={pattern}"));
+            }
+            if let Some(name) = author {
+                args.push(format!("--author={name}"));
+            }
+            if let Some(reference) = git_ref {
+                args.push(reference.to_string());
+            }
+        }
+        "show" => {
+            // `show` with no ref would print HEAD, which `diff` and `log`
+            // already cover; naming the commit is the whole point of the op.
+            let Some(reference) = git_ref else {
+                return Err(ToolError::HistoryRefMissing { op: "show" });
+            };
+            args.push("show".into());
+            args.push(reference.to_string());
+            if summary {
+                args.push("--stat".into());
+            }
+        }
+        other => {
+            return Err(ToolError::HistoryOpNotAllowed {
+                op: other.to_string(),
+            });
+        }
     }
-    let verb = git_verb(args).ok_or(ToolError::Internal(anyhow!(
-        "git requires at least one argument"
-    )))?;
-    if verb == "push" {
-        return Err(ToolError::GitPushForbidden);
-    }
-    let is_read = GIT_READ_VERBS.contains(&verb);
-    let is_write = GIT_WRITE_VERBS.contains(&verb);
-    if !is_read && !is_write {
-        return Err(ToolError::GitVerbNotAllowed {
-            verb: verb.to_string(),
-        });
-    }
-    if is_write && permission != Permission::ReadWrite {
-        return Err(ToolError::ReadOnly { tool: "git" });
+    // `--` separates paths from refs, so a file named like a branch cannot be
+    // read as one. `status` takes paths too, but `show` does not.
+    if !paths.is_empty() && op != "show" {
+        args.push("--".into());
+        for path in paths {
+            resolve_path(session_dir, path)?;
+            args.push(path.clone());
+        }
     }
     let output = tokio::process::Command::new("git")
-        .args(args)
+        .args(&args)
         .current_dir(session_dir)
         .output()
         .await
         .with_context(|| format!("failed to run git in {}", session_dir.display()))?;
-    Ok(GitOutput {
+    Ok(HistoryOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
     })
 }
 
-/// The first argument is the git verb.
-fn git_verb(args: &[String]) -> Option<&str> {
-    args.first().map(String::as_str)
+/// Reads a file as it stood at `git_ref`, via `git show <ref>:<path>`. The path
+/// is resolved inside the session directory first and then made relative to it,
+/// because git resolves a `<ref>:<path>` spec from the repository root.
+pub async fn read_file_at_ref(
+    session_dir: &Path,
+    path: &str,
+    git_ref: &str,
+) -> Result<String, ToolError> {
+    let resolved = resolve_path(session_dir, path)?;
+    let relative = resolved.strip_prefix(session_dir).unwrap_or(&resolved);
+    let spec = format!("{git_ref}:{}", relative.to_string_lossy());
+    let output = tokio::process::Command::new("git")
+        .arg("show")
+        .arg(&spec)
+        .current_dir(session_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to run git in {}", session_dir.display()))?;
+    if !output.status.success() {
+        return Err(ToolError::NotFound {
+            path: format!("{path} at {git_ref}"),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 pub async fn webfetch(url: &str) -> Result<String, ToolError> {
@@ -1076,157 +1148,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_read_verbs_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        std::fs::write(root.join("f.txt"), "x").unwrap();
-        git_quiet(root, &["add", "."]);
-        git_quiet(root, &["commit", "-q", "-m", "init"]);
-
-        let out = git(root, Permission::ReadWrite, &["status".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(out.exit_code, 0);
-
-        let out = git(root, Permission::ReadWrite, &["log".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(out.exit_code, 0);
-        assert!(out.stdout.contains("init"));
-
-        let out = git(root, Permission::ReadWrite, &["diff".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(out.exit_code, 0);
-    }
-
-    #[tokio::test]
-    async fn git_rejects_push_in_any_form() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let err = git(root, Permission::ReadWrite, &["push".to_string()])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::GitPushForbidden));
-
-        // `-C <dir>` would run git in another directory, so it is refused
-        // before the verb is even considered.
-        let err = git(
-            root,
-            Permission::ReadWrite,
-            &["-C".to_string(), ".".to_string(), "push".to_string()],
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, ToolError::GitVerbNotAllowed { ref verb } if verb == "-C"));
-    }
-
-    #[tokio::test]
-    async fn git_refuses_mutating_read_verbs_even_with_read_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        // `branch`, `tag`, `config` and `remote` were removed from the read
-        // allowlist because they accept mutating subcommands.
-        for args in [
-            vec!["branch".to_string(), "foo".to_string()],
-            vec!["tag".to_string(), "v1".to_string()],
-            vec!["config".to_string(), "x".to_string()],
-            vec![
-                "remote".to_string(),
-                "add".to_string(),
-                "origin".to_string(),
-                "https://example.com/repo.git".to_string(),
-            ],
-        ] {
-            let err = git(root, Permission::ReadWrite, &args).await.unwrap_err();
-            assert!(
-                matches!(err, ToolError::GitVerbNotAllowed { .. }),
-                "args {args:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn git_rejects_disallowed_verbs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let err = git(
-            root,
-            Permission::ReadWrite,
-            &["checkout".to_string(), "master".to_string()],
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, ToolError::GitVerbNotAllowed { .. }));
-    }
-
-    #[tokio::test]
-    async fn git_write_verbs_require_read_write_permission() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let err = git(
-            root,
-            Permission::ReadOnly,
-            &["add".to_string(), ".".to_string()],
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, ToolError::ReadOnly { tool: "git" }));
-    }
-
-    #[tokio::test]
-    async fn git_commit_with_read_write_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        std::fs::write(root.join("f.txt"), "x").unwrap();
-
-        let out = git(
-            root,
-            Permission::ReadWrite,
-            &["add".to_string(), ".".to_string()],
-        )
-        .await
-        .unwrap();
-        assert_eq!(out.exit_code, 0);
-
-        let out = git(
-            root,
-            Permission::ReadWrite,
-            &["commit".to_string(), "-m".to_string(), "init".to_string()],
-        )
-        .await
-        .unwrap();
-        assert_eq!(out.exit_code, 0);
-
-        let out = git(root, Permission::ReadWrite, &["log".to_string()])
-            .await
-            .unwrap();
-        assert!(out.stdout.contains("init"));
-    }
-
-    #[tokio::test]
-    async fn git_nonzero_exit_returns_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let out = git(root, Permission::ReadWrite, &["status".to_string()])
-            .await
-            .unwrap();
-        assert_ne!(out.exit_code, 0);
-        assert!(!out.stderr.is_empty());
-    }
-
-    #[tokio::test]
     async fn webfetch_returns_body_from_local_server() {
         let body = serve_once(Arc::from(&b"hello from axum"[..])).await;
 
@@ -1313,16 +1234,292 @@ mod tests {
     }
 
     #[test]
-    fn git_output_round_trips() {
-        let out = GitOutput {
+    fn history_output_round_trips() {
+        let out = HistoryOutput {
             stdout: "stdout".into(),
             stderr: "stderr".into(),
             exit_code: 128,
         };
         let json = serde_json::to_value(&out).unwrap();
-        let decoded: GitOutput = serde_json::from_value(json).unwrap();
+        let decoded: HistoryOutput = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.stdout, "stdout");
         assert_eq!(decoded.stderr, "stderr");
         assert_eq!(decoded.exit_code, 128);
+    }
+
+    /// The four ops each answer, and none of them can reach a mutating verb:
+    /// the op is mapped to a fixed argument list, so there is no verb for a
+    /// caller to name.
+    #[tokio::test]
+    async fn history_read_answers_each_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        git_quiet(root, &["add", "."]);
+        git_quiet(root, &["commit", "-q", "-m", "first commit"]);
+        std::fs::write(root.join("f.txt"), "two\n").unwrap();
+
+        let diff = read_history(
+            root,
+            HistoryQuery {
+                op: "diff",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(diff.stdout.contains("-one"), "diff shows the change");
+
+        let summary = read_history(
+            root,
+            HistoryQuery {
+                op: "diff",
+                paths: &[],
+                git_ref: None,
+                summary: true,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(summary.stdout.contains("f.txt"), "a stat names the file");
+        assert!(!summary.stdout.contains("-one"), "a stat is not a patch");
+
+        let status = read_history(
+            root,
+            HistoryQuery {
+                op: "status",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            status.stdout.contains("f.txt"),
+            "status lists the dirty file"
+        );
+
+        let log = read_history(
+            root,
+            HistoryQuery {
+                op: "log",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(log.stdout.contains("first commit"));
+
+        let show = read_history(
+            root,
+            HistoryQuery {
+                op: "show",
+                paths: &[],
+                git_ref: Some("HEAD"),
+                summary: true,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(show.stdout.contains("first commit"));
+    }
+
+    #[tokio::test]
+    async fn history_read_filters_the_log_by_grep_and_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        git_quiet(root, &["add", "."]);
+        git_quiet(root, &["commit", "-q", "-m", "alpha change"]);
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        git_quiet(root, &["add", "."]);
+        git_quiet(root, &["commit", "-q", "-m", "beta change"]);
+
+        let hit = read_history(
+            root,
+            HistoryQuery {
+                op: "log",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: Some("alpha"),
+                author: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(hit.stdout.contains("alpha"), "grep keeps the match");
+        assert!(!hit.stdout.contains("beta"), "grep drops the rest");
+
+        let nobody = read_history(
+            root,
+            HistoryQuery {
+                op: "log",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: Some("nobody"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            nobody.stdout.trim().is_empty(),
+            "an unmatched author is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_read_refuses_an_unknown_op_and_a_show_without_a_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let err = read_history(
+            root,
+            HistoryQuery {
+                op: "push",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::HistoryOpNotAllowed { ref op } if op == "push"));
+
+        let err = read_history(
+            root,
+            HistoryQuery {
+                op: "show",
+                paths: &[],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::HistoryRefMissing { op: "show" }));
+    }
+
+    /// The log limit is bounded, so one call cannot return a whole repository.
+    #[tokio::test]
+    async fn history_read_clamps_the_log_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        git_quiet(root, &["add", "."]);
+        git_quiet(root, &["commit", "-q", "-m", "only commit"]);
+
+        for limit in [Some(0), Some(usize::MAX), None] {
+            let out = read_history(
+                root,
+                HistoryQuery {
+                    op: "log",
+                    paths: &[],
+                    git_ref: None,
+                    summary: false,
+                    limit,
+                    grep: None,
+                    author: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                out.stdout.contains("only commit"),
+                "limit {limit:?} still answers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_read_at_a_ref_reads_the_committed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("f.txt"), "committed\n").unwrap();
+        git_quiet(root, &["add", "."]);
+        git_quiet(root, &["commit", "-q", "-m", "init"]);
+        std::fs::write(root.join("f.txt"), "working copy\n").unwrap();
+
+        let at_head = read_file_at_ref(root, "f.txt", "HEAD").await.unwrap();
+        assert_eq!(
+            at_head, "committed\n",
+            "a ref read ignores the working copy"
+        );
+
+        let now = read_file(root, "f.txt", 1, None).unwrap();
+        assert_eq!(
+            now, "working copy\n",
+            "a plain read still sees the working copy"
+        );
+
+        let missing = read_file_at_ref(root, "f.txt", "does-not-exist")
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, ToolError::NotFound { .. }));
+    }
+
+    /// A path is resolved inside the session directory before it reaches git,
+    /// for both the history ops and a read at a ref.
+    #[tokio::test]
+    async fn history_and_ref_reads_refuse_a_path_outside_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let err = read_history(
+            root,
+            HistoryQuery {
+                op: "diff",
+                paths: &["../outside.txt".to_string()],
+                git_ref: None,
+                summary: false,
+                limit: None,
+                grep: None,
+                author: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::PathOutsideRoot { .. }));
+
+        let err = read_file_at_ref(root, "../outside.txt", "HEAD")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::PathOutsideRoot { .. }));
     }
 }

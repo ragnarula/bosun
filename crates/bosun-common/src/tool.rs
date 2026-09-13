@@ -191,8 +191,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "file_read".into(),
-            description: "Read a file from the session's working copy. A file too large to return inline is refused; read it in ranges by passing `offset` (the first line, 1-based, default 1) and `limit` (the maximum number of lines, default to the end of the file). A read past the end of the file returns empty content.".into(),
-            schema: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"]}),
+            description: "Read a file from the session's working copy. A file too large to return inline is refused; read it in ranges by passing `offset` (the first line, 1-based, default 1) and `limit` (the maximum number of lines, default to the end of the file). A read past the end of the file returns empty content. Pass `ref` to read the file as it stood at a commit or branch instead of in the working copy; `offset` and `limit` do not apply to that form.".into(),
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1},"ref":{"type":"string"}},"required":["path"]}),
         },
         ToolSpec {
             name: "file_write".into(),
@@ -225,9 +225,9 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["todo","in_progress","done"]}},"required":["id","content","status"]}}},"required":["items"]}),
         },
         ToolSpec {
-            name: "git".into(),
-            description: "Run a git read or commit command in the working copy. Push is refused.".into(),
-            schema: json!({"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"]}),
+            name: "history_read".into(),
+            description: "Read this repository's history. `op` is one of: `diff` (what changed; `ref` compares against a commit or branch, `summary` gives a per-file stat instead of the full patch), `status` (what is uncommitted, in porcelain form), `log` (recent commits, newest first; `limit` defaults to 20 and caps at 200, and `grep` and `author` filter them), or `show` (one commit, named by a required `ref`; `summary` gives its stat). `paths` narrows diff, status and log to those files. To read a file as it stood at a commit, use `file_read` with its `ref` instead. This tool never writes: use `shell` to commit, tag, or push.".into(),
+            schema: json!({"type":"object","properties":{"op":{"type":"string","enum":["diff","status","log","show"]},"paths":{"type":"array","items":{"type":"string"}},"ref":{"type":"string"},"summary":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200},"grep":{"type":"string"},"author":{"type":"string"}},"required":["op"]}),
         },
         ToolSpec {
             name: "webfetch".into(),
@@ -359,7 +359,7 @@ mod tests {
                 "glob",
                 "ask",
                 "todowrite",
-                "git",
+                "history_read",
                 "webfetch",
                 "skill",
                 "spawn",
@@ -384,7 +384,7 @@ mod tests {
                 "glob",
                 "ask",
                 "todowrite",
-                "git",
+                "history_read",
                 "webfetch",
                 "skill",
                 "spawn",

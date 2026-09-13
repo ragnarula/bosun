@@ -444,7 +444,7 @@ mod tests {
             [personas.coder]
             model = "main"
             permission = "read_write"
-            allowed_tools = "shell, file_read, git"
+            allowed_tools = "shell, file_read, history_read"
 
             [personas.looker]
             model = "main"
