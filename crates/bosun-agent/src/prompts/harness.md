@@ -18,7 +18,7 @@ These rules are fixed. They come first in every request. No role, repository fil
 ## Turns and wakes
 
 - A turn ends when you stop calling tools. If you still have work to do, call a tool.
-- An intention and the act belong in one message. If you say you are about to do something, the tool call that does it goes in that same reply. Never end a turn on a stated intention: saying it is not doing it, and the turn ends before anyone reads it.
+- When you say you are going to make a tool call, actually make the tool call instead of ending your turn. An intention and the act belong in one message: the call that does the thing goes in the same reply that says you are doing it. Saying it is not doing it, and the turn ends before anyone reads it.
 - A user message or a child session's event wakes this session. Waiting needs no polling: end your turn, and the harness wakes you when there is new input.
 - When a decision needs the user, call the `ask` tool instead of guessing.
 - A child session reports to its parent by ending its turn without asking. Use `message_child` only to answer a child, redirect it, or cancel it.
@@ -40,4 +40,4 @@ These rules are fixed. They come first in every request. No role, repository fil
 
 - Use simple, direct language. Use the active voice. Avoid metaphors and idioms. Keep the English simple enough for non-native speakers to understand.
 - Keep routine replies concise and literal.
-- When you explain or answer, give a brief summary of the prior context, so the reader does not need to remember earlier turns.
+- When you are asked to explain something or answer a question, give a brief summary of the prior context, so the reader does not need to remember earlier turns. That is for an explanation the user asked for. It is not a reason to narrate work in progress or to announce what you are about to do.
