@@ -1,7 +1,9 @@
 //! Minimal markdown rendering for the terminal client: turns a model's
 //! markdown text into styled, width-wrapped ratatui lines. Covers the subset
 //! models actually emit — headings, emphasis, inline code, code fences,
-//! links, lists, blockquotes, and rules — and leaves anything else plain.
+//! links, lists, blockquotes, and rules — and leaves anything else plain. A
+//! ```mermaid fence renders as a diagram; anything the diagram renderer
+//! cannot lay out keeps its source.
 
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -228,26 +230,154 @@ fn list_marker(line: &str) -> usize {
     0
 }
 
+/// The most entries the cache keeps, so its per-lookup scan stays cheap, and
+/// the most bytes it may hold in total. A redraw renders the whole transcript,
+/// not just the rows on screen, so the bound cannot be a count of visible
+/// diagrams.
+const DIAGRAM_CACHE_ENTRIES: usize = 64;
+const DIAGRAM_CACHE_BYTES: usize = 1024 * 1024;
+
+/// Rendered diagrams, kept between redraws of the transcript. Every redraw
+/// renders every line again, and one diagram costs 7 ms at ten nodes and 250
+/// ms at two hundred, so re-rendering an unchanged one would make scrolling
+/// and typing slow. Keyed by source and width, because the layout depends on
+/// both, and bounded in entries and in bytes so a long session cannot grow it
+/// without limit.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DiagramCache {
+    entries: Vec<((String, usize), Option<String>)>,
+}
+
+impl DiagramCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The diagram for `source` laid out within `width`, or None when the
+    /// crate cannot render one that fits. A miss is kept too: a source that
+    /// does not fit on this redraw will not fit on the next one either.
+    fn diagram_text(&mut self, source: &str, width: usize) -> Option<String> {
+        if let Some((_, rendered)) = self
+            .entries
+            .iter()
+            .find(|(key, _)| key.0 == source && key.1 == width)
+        {
+            return rendered.clone();
+        }
+        let rendered = render_diagram(source, width);
+        // An entry over the whole budget is not worth keeping: it would evict
+        // every older entry on the way in, and then itself, leaving the cache
+        // empty and every one of those diagrams to render again.
+        if entry_bytes(source, rendered.as_deref()) > DIAGRAM_CACHE_BYTES {
+            return rendered;
+        }
+        self.entries
+            .push(((source.to_string(), width), rendered.clone()));
+        // Drop the oldest until both bounds hold. A transcript can hold more
+        // diagrams than the bound, and a redraw walks them in order, so an
+        // entry evicted before the walk reaches it is one this pass renders
+        // again. Keeping the newest is what makes scrolling stable.
+        while self.entries.len() > DIAGRAM_CACHE_ENTRIES || self.held_bytes() > DIAGRAM_CACHE_BYTES
+        {
+            self.entries.remove(0);
+        }
+        rendered
+    }
+
+    /// The bytes the entries hold together.
+    fn held_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(key, rendered)| entry_bytes(&key.0, rendered.as_deref()))
+            .sum()
+    }
+}
+
+/// Whether every line of `rendered` fits `width`. The output pane wraps by
+/// display columns, so a wide glyph counts two.
+fn fits_columns(rendered: &str, width: usize) -> bool {
+    rendered
+        .lines()
+        .all(|line| Span::raw(line).width() <= width)
+}
+
+/// The bytes one entry holds: its source key and its rendered diagram, which
+/// are the only allocations it owns.
+fn entry_bytes(source: &str, rendered: Option<&str>) -> usize {
+    source.len() + rendered.map_or(0, str::len)
+}
+
+/// Renders `source` with the crate, or None when it errors or when even its
+/// most compact layout is wider than `width`. The crate returns that compact
+/// layout rather than an error when nothing fits, so the widest line decides.
+fn render_diagram(source: &str, width: usize) -> Option<String> {
+    let rendered = mermaid_text::render_with_width(source, Some(width)).ok()?;
+    if !fits_columns(&rendered, width) {
+        return None;
+    }
+    Some(rendered)
+}
+
+/// The fence body as a code block: its lines hard-wrapped to `width`. A fence
+/// renders this way when it is not a diagram, its diagram does not fit, or
+/// the crate cannot render it.
+fn code_block_rows(lines: &[&str], width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut rows = Vec::new();
+    for line in lines {
+        for chunk in wrap_chars(line, width) {
+            rows.push(vec![Span::styled(chunk, code_block())]);
+        }
+    }
+    rows
+}
+
+/// A rendered diagram as one code block. The crate has already laid every
+/// line out within the width it was given, so no line wraps, and its trailing
+/// newline is not a row of its own.
+fn diagram_rows(rendered: &str) -> Vec<Vec<Span<'static>>> {
+    rendered
+        .lines()
+        .map(|line| vec![Span::styled(line.to_string(), code_block())])
+        .collect()
+}
+
 /// Renders a markdown string as width-wrapped rows of styled spans. Blank
-/// lines are preserved so paragraphs keep their spacing.
-pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
+/// lines are preserved so paragraphs keep their spacing. A ```mermaid fence
+/// renders as a diagram, drawn from `cache` so a redraw does not pay for it
+/// again; every other fence shows its source.
+pub fn markdown_rows(
+    text: &str,
+    width: usize,
+    cache: &mut DiagramCache,
+) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut rows = Vec::new();
-    let mut in_code = false;
-    for raw in text.split('\n') {
+    let mut lines = text.split('\n');
+    while let Some(raw) = lines.next() {
         let trimmed = raw.trim_start();
-        if in_code {
-            if trimmed.starts_with("```") {
-                in_code = false;
-            } else {
-                for chunk in wrap_chars(raw, width) {
-                    rows.push(vec![Span::styled(chunk, code_block())]);
+        if let Some(info) = trimmed.strip_prefix("```") {
+            let language = info.split_whitespace().next().unwrap_or("");
+            let mut body = Vec::new();
+            let mut closed = false;
+            for line in lines.by_ref() {
+                if line.trim_start().starts_with("```") {
+                    closed = true;
+                    break;
                 }
+                body.push(line);
             }
-            continue;
-        }
-        if trimmed.starts_with("```") {
-            in_code = true;
+            // An open fence has no complete body to draw: while a message
+            // streams, the diagram it will become is still arriving.
+            let diagram = if closed && language.eq_ignore_ascii_case("mermaid") && !body.is_empty()
+            {
+                cache.diagram_text(&body.join("\n"), width)
+            } else {
+                None
+            };
+            match diagram {
+                Some(rendered) => rows.extend(diagram_rows(&rendered)),
+                None => rows.extend(code_block_rows(&body, width)),
+            }
             continue;
         }
         let line = raw.trim_end();
@@ -318,9 +448,15 @@ mod tests {
         row[index].style.fg
     }
 
+    /// Renders through a fresh cache, for the tests that are not about the
+    /// cache itself.
+    fn rendered(text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
+        markdown_rows(text, width, &mut DiagramCache::new())
+    }
+
     #[test]
     fn headings_are_bold_and_colored() {
-        let rows = markdown_rows("# Title\n\n## Section", 40);
+        let rows = rendered("# Title\n\n## Section", 40);
         assert_eq!(rows_text(&rows), vec!["Title", "", "Section"]);
         assert_eq!(fg(&rows[0], 0), Some(Color::Yellow));
         assert!(rows[0][0].style.add_modifier.contains(Modifier::BOLD));
@@ -329,7 +465,7 @@ mod tests {
 
     #[test]
     fn emphasis_and_inline_code_are_styled() {
-        let rows = markdown_rows("a **bold** b *it* c `code` d", 40);
+        let rows = rendered("a **bold** b *it* c `code` d", 40);
         assert_eq!(rows_text(&rows), vec!["a bold b it c code d"]);
         let row = &rows[0];
         let at = |needle: &str| {
@@ -344,13 +480,13 @@ mod tests {
 
     #[test]
     fn underscores_inside_words_stay_literal() {
-        let rows = markdown_rows("file_name.txt is fine", 40);
+        let rows = rendered("file_name.txt is fine", 40);
         assert_eq!(rows_text(&rows), vec!["file_name.txt is fine"]);
     }
 
     #[test]
     fn links_render_their_text() {
-        let rows = markdown_rows("see [docs](https://x) now", 40);
+        let rows = rendered("see [docs](https://x) now", 40);
         assert_eq!(rows_text(&rows), vec!["see docs now"]);
         let row = &rows[0];
         let bold = row
@@ -363,7 +499,7 @@ mod tests {
 
     #[test]
     fn code_fences_are_not_parsed() {
-        let rows = markdown_rows("```\n**raw**\n# not a heading\n```", 40);
+        let rows = rendered("```\n**raw**\n# not a heading\n```", 40);
         assert_eq!(rows_text(&rows), vec!["**raw**", "# not a heading"]);
         assert_eq!(fg(&rows[0], 0), Some(Color::White));
         assert!(rows[0][0].style.bg.is_some());
@@ -371,19 +507,19 @@ mod tests {
 
     #[test]
     fn blockquotes_and_lists_keep_their_markers() {
-        let rows = markdown_rows("> quoted\n- one\n1. two", 40);
+        let rows = rendered("> quoted\n- one\n1. two", 40);
         assert_eq!(rows_text(&rows), vec!["│ quoted", "- one", "1. two"]);
     }
 
     #[test]
     fn rules_render_as_a_full_line() {
-        let rows = markdown_rows("---", 10);
+        let rows = rendered("---", 10);
         assert_eq!(rows_text(&rows), vec!["──────────"]);
     }
 
     #[test]
     fn wrapping_respects_width_and_styles() {
-        let rows = markdown_rows("one **two three four** five", 12);
+        let rows = rendered("one **two three four** five", 12);
         assert!(rows.len() >= 2);
         let joined: String = rows_text(&rows).join(" ");
         assert_eq!(joined, "one two three four five");
@@ -391,7 +527,229 @@ mod tests {
 
     #[test]
     fn blank_lines_preserve_paragraph_spacing() {
-        let rows = markdown_rows("a\n\nb", 40);
+        let rows = rendered("a\n\nb", 40);
         assert_eq!(rows_text(&rows), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn a_mermaid_fence_renders_as_a_diagram() {
+        let rows = rendered("```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```", 80);
+        let rows = rows_text(&rows);
+        assert!(rows.iter().any(|row| row.contains("Start")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("End")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains('┌')), "{rows:?}");
+        // The source is drawn, not shown.
+        assert!(
+            !rows.iter().any(|row| row.contains("flowchart")),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("-->")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_mermaid_fence_reads_its_language_from_the_first_word_ignoring_case() {
+        let plain = rendered("```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```", 80);
+        let labelled = rendered(
+            "```MERMAID flowchart\nflowchart TD\n  A[Start] --> B[End]\n```",
+            80,
+        );
+        assert_eq!(rows_text(&plain), rows_text(&labelled));
+    }
+
+    #[test]
+    fn a_diagram_reads_as_one_code_block() {
+        let rows = rendered("```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```", 80);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert_eq!(row.len(), 1);
+            assert_eq!(row[0].style, code_block());
+        }
+    }
+
+    #[test]
+    fn a_mermaid_source_the_crate_cannot_render_keeps_its_source() {
+        // The info string is mermaid; it is the body the crate rejects, so the
+        // fence stays the code block it has always been.
+        let rows = rendered("```mermaid\nthis is not a diagram\n```", 80);
+        assert_eq!(rows_text(&rows), vec!["this is not a diagram"]);
+        assert_eq!(rows[0][0].style, code_block());
+    }
+
+    #[test]
+    fn an_open_mermaid_fence_keeps_its_source() {
+        // While a message streams, the fence has not closed yet and its
+        // diagram is still arriving.
+        let rows = rendered("```mermaid\nflowchart TD\n  A[Start] --> B[End]", 80);
+        assert_eq!(
+            rows_text(&rows),
+            vec!["flowchart TD", "  A[Start] --> B[End]"]
+        );
+    }
+
+    #[test]
+    fn an_empty_mermaid_body_contributes_no_row() {
+        let rows = rendered("```mermaid\n```\nafter", 40);
+        assert_eq!(rows_text(&rows), vec!["after"]);
+    }
+
+    #[test]
+    fn a_fence_that_is_not_mermaid_keeps_its_source() {
+        let rows = rendered("```rust\nlet x = 1;\n```", 40);
+        assert_eq!(rows_text(&rows), vec!["let x = 1;"]);
+        assert_eq!(rows[0][0].style, code_block());
+    }
+
+    #[test]
+    fn a_diagram_wider_than_the_width_keeps_its_source() {
+        // The most compact layout the crate can produce for this diagram is
+        // twelve columns wide, so it cannot fit ten.
+        let source = "```mermaid\ngraph LR\n  A --> B\n```";
+        assert_eq!(
+            rows_text(&rendered(source, 10)),
+            vec!["graph LR", "  A --> B"]
+        );
+        // The same diagram fits fifteen.
+        assert!(
+            rows_text(&rendered(source, 15))
+                .iter()
+                .any(|r| r.contains('┌'))
+        );
+    }
+
+    #[test]
+    fn a_diagram_wider_than_the_width_in_columns_keeps_its_source() {
+        // The labels are wide glyphs, so this layout is twelve characters and
+        // fifteen columns: counting characters would call it a fit, and the
+        // output pane would wrap the box art.
+        let body = "flowchart TD\n  A[使用者的問題] --> B[使用者的答案]";
+        let drawn = mermaid_text::render_with_width(body, Some(12)).unwrap();
+        assert!(drawn.lines().all(|line| line.chars().count() <= 12));
+        assert!(drawn.lines().any(|line| Span::raw(line).width() > 12));
+
+        let rows = rendered(&format!("```mermaid\n{body}\n```"), 12);
+        let text = rows_text(&rows);
+        assert!(!text.iter().any(|row| row.contains('┌')), "{text:?}");
+        assert!(text.iter().all(|row| row.chars().count() <= 12), "{text:?}");
+    }
+
+    #[test]
+    fn a_cached_diagram_is_reused_and_the_cache_keeps_its_entry_bound() {
+        let text = "```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```";
+        let mut cache = DiagramCache::new();
+        let first = markdown_rows(text, 80, &mut cache);
+        let second = markdown_rows(text, 80, &mut cache);
+        assert_eq!(rows_text(&first), rows_text(&second));
+        assert_eq!(cache.entries.len(), 1);
+
+        // A later render draws what the cache holds, rather than the source.
+        cache.entries[0].1 = Some("from the cache".to_string());
+        assert_eq!(
+            rows_text(&markdown_rows(text, 80, &mut cache)),
+            vec!["from the cache"]
+        );
+
+        // The oldest entry makes room once the cache is full. A redraw walks
+        // the transcript in order, so it is the newest entries a pass keeps.
+        for i in 0..DIAGRAM_CACHE_ENTRIES {
+            let body = format!("flowchart TD\n  N{i} --> M{i}");
+            markdown_rows(&format!("```mermaid\n{body}\n```"), 80 + i, &mut cache);
+        }
+        assert_eq!(cache.entries.len(), DIAGRAM_CACHE_ENTRIES);
+        assert!(
+            cache
+                .entries
+                .iter()
+                .all(|(key, _)| key.0 != "flowchart TD\n  A[Start] --> B[End]"),
+            "the oldest entry makes room"
+        );
+    }
+
+    #[test]
+    fn the_width_keys_a_cached_diagram_as_much_as_the_source() {
+        let text = "```mermaid\ngraph LR\n  A --> B\n```";
+        let mut cache = DiagramCache::new();
+        markdown_rows(text, 80, &mut cache);
+        // What one width kept is not what another width is given: at ten
+        // columns the diagram cannot fit, and the fence keeps its source.
+        cache.entries[0].1 = Some("eighty".to_string());
+        assert_eq!(
+            rows_text(&markdown_rows(text, 10, &mut cache)),
+            vec!["graph LR", "  A --> B"]
+        );
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_cached_failure_is_not_rendered_again() {
+        let text = "```mermaid\ngraph LR\n  A --> B\n```";
+        let mut cache = DiagramCache::new();
+        markdown_rows(text, 80, &mut cache);
+        // This source renders, but the cache holds a failure for it, and the
+        // cache decides: the fence keeps its source instead of being drawn.
+        cache.entries[0].1 = None;
+        assert_eq!(
+            rows_text(&markdown_rows(text, 80, &mut cache)),
+            vec!["graph LR", "  A --> B"]
+        );
+        assert_eq!(cache.entries.len(), 1, "the failure is not replaced");
+    }
+
+    #[test]
+    fn the_cache_keeps_itself_within_the_byte_bound() {
+        let mut cache = DiagramCache::new();
+        // No diagram renders to a megabyte, so the oversized entry is written
+        // straight in: what is under test is the bound, not the crate.
+        cache
+            .entries
+            .push((("x".repeat(DIAGRAM_CACHE_BYTES + 1), 1), None));
+        assert!(cache.held_bytes() > DIAGRAM_CACHE_BYTES);
+
+        let rows = markdown_rows("```mermaid\ngraph LR\n  A --> B\n```", 80, &mut cache);
+        assert!(rows_text(&rows).iter().any(|row| row.contains('┌')));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.held_bytes() <= DIAGRAM_CACHE_BYTES);
+    }
+
+    #[test]
+    fn a_push_over_the_byte_bound_evicts_the_oldest_entry() {
+        let mut cache = DiagramCache::new();
+        // Two sources of 600 KiB. No diagram renders that large, so the crate
+        // rejects both and each entry is its source text.
+        let first = "x".repeat(3 * DIAGRAM_CACHE_BYTES / 5);
+        let second = "y".repeat(3 * DIAGRAM_CACHE_BYTES / 5);
+
+        assert!(cache.diagram_text(&first, 80).is_none());
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.held_bytes() <= DIAGRAM_CACHE_BYTES);
+
+        // The second brings the total over the bound, so the first goes.
+        assert!(cache.diagram_text(&second, 80).is_none());
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].0.0, second, "the oldest entry goes");
+        assert!(cache.held_bytes() <= DIAGRAM_CACHE_BYTES);
+    }
+
+    #[test]
+    fn a_render_larger_than_the_byte_bound_is_returned_but_not_kept() {
+        let mut cache = DiagramCache::new();
+        markdown_rows("```mermaid\ngraph LR\n  A --> B\n```", 80, &mut cache);
+        assert_eq!(cache.entries.len(), 1);
+
+        // An entry over the whole budget would evict every older entry on the
+        // way in and then itself, so it is not kept. It is still rendered.
+        let huge = "x".repeat(DIAGRAM_CACHE_BYTES + 1);
+        assert!(cache.diagram_text(&huge, 80).is_none());
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].0.0, "graph LR\n  A --> B");
+        assert!(cache.held_bytes() <= DIAGRAM_CACHE_BYTES);
+    }
+
+    #[test]
+    fn fits_columns_counts_columns_not_characters() {
+        // Six characters, twelve columns: a count of characters would call
+        // this a fit at eleven.
+        assert_eq!("使用者的問題".chars().count(), 6);
+        assert!(fits_columns("使用者的問題", 12));
+        assert!(!fits_columns("使用者的問題", 11));
     }
 }

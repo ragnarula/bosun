@@ -11,6 +11,20 @@ pub async fn pane() -> impl IntoResponse {
     )
 }
 
+/// The mermaid bundle the pane renders diagram fences with: mermaid 12.0.0,
+/// vendored from the npm tarball and never edited. Embedded as data like the
+/// pane, so the control plane needs no build step and no asset directory.
+pub async fn mermaid_bundle() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            // 5.5 MB on every phone reload, and the bundle only changes with the control plane.
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        include_str!("ui/mermaid.min.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     const PANE: &str = include_str!("ui/index.html");
@@ -34,6 +48,57 @@ mod tests {
     /// the tokens of a call and not the line breaks a formatter chose.
     fn squeezed(source: &str) -> String {
         source.split_whitespace().collect()
+    }
+
+    #[test]
+    fn the_pane_loads_the_mermaid_bundle_from_an_absolute_path() {
+        assert!(
+            PANE.contains(
+                "<script src=\"/ui/mermaid.min.js\" id=\"mermaid-bundle\" defer></script>"
+            ),
+            "the pane is served at both / and /ui, so the bundle loads by absolute path"
+        );
+    }
+
+    #[test]
+    fn the_pane_renders_a_mermaid_fence_through_the_xml_parser() {
+        let diagram = squeezed(segment(PANE, "async function renderMermaid(", "\n}"));
+        for token in [
+            "startOnLoad: false",
+            "securityLevel: 'strict'",
+            "htmlLabels: false",
+            "theme: 'dark'",
+            "new DOMParser().parseFromString(svg, 'image/svg+xml')",
+            "parsed.querySelector('parsererror')",
+            "document.importNode(parsed.documentElement, true)",
+            // A failed render leaves this scratch element in the body.
+            "document.getElementById('d' + id)",
+            "holder.replaceWith(mdPre(source))",
+        ] {
+            assert!(
+                diagram.contains(&squeezed(token)),
+                "the diagram path must contain {token}"
+            );
+        }
+        let markdown = squeezed(PANE);
+        assert!(
+            markdown.contains(&squeezed("fenceLanguage = fenceInfo(line.slice(3))"))
+                && markdown.contains(&squeezed("if (closed && language === 'mermaid')"))
+                && markdown.contains(&squeezed("renderMermaid(container, source)"))
+                && markdown.contains(&squeezed("codeOut(true)"))
+                && markdown.contains(&squeezed("codeOut(false)")),
+            "only a closed fence whose language is mermaid may leave the <pre> path"
+        );
+    }
+
+    #[test]
+    fn the_pane_inserts_no_text_as_html() {
+        assert!(
+            !PANE.contains("innerHTML")
+                && !PANE.contains("insertAdjacentHTML")
+                && !PANE.contains("document.write"),
+            "model text must reach the DOM as nodes, never as parsed HTML"
+        );
     }
 
     #[test]

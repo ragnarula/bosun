@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bosun</title>
+<script src="/ui/mermaid.min.js" id="mermaid-bundle" defer></script>
 <style>
   :root {
     color-scheme: dark;
@@ -992,6 +993,8 @@
     color: var(--mono);
     white-space: pre;
   }
+  #transcript .md-mermaid { margin: 6px 0; overflow-x: auto; }
+  #transcript .md-mermaid svg { display: block; }
   #transcript blockquote {
     margin: 4px 0 8px;
     padding: 2px 0 2px 12px;
@@ -3719,9 +3722,80 @@ function appendAssistant(text, atMs) {
   scrollToBottom();
 }
 
+// A ```mermaid fence renders as SVG through the vendored bundle, which is
+// deferred and 5.5 MB, so it is usually still downloading when the fence
+// arrives. The diagram waits on that load, and every failure — a bundle that
+// never arrived, an invalid source, an SVG the parser rejects — puts the
+// fence's own text in a <pre> where the diagram would have gone, so the
+// transcript never loses text or shows half a diagram.
+const mermaidReady = new Promise((resolve, reject) => {
+  const bundle = $('mermaid-bundle');
+  bundle.addEventListener('load', () => resolve(window.mermaid));
+  bundle.addEventListener('error', () => reject(new Error('mermaid did not load')));
+});
+// A transcript with no diagram never awaits this; the catch keeps a failed
+// load out of the console as an unhandled rejection.
+mermaidReady.catch(() => {});
+
+let mermaidApi = null;
+let mermaidRenders = 0;
+
+function mdPre(source) {
+  const pre = document.createElement('pre');
+  pre.className = 'md-pre';
+  pre.textContent = source;
+  return pre;
+}
+
+async function renderMermaid(container, source) {
+  // The holder is in place before the first await, so the diagram keeps its
+  // place in the transcript while the bundle loads.
+  const holder = document.createElement('div');
+  holder.className = 'md-mermaid';
+  container.appendChild(holder);
+
+  try {
+    const mermaid = await mermaidReady;
+    if (!mermaidApi) {
+      // Configured once per page. htmlLabels works only at the top level:
+      // under `flowchart` it leaves HTML labels in <foreignObject>, which the
+      // XML parse below rejects.
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        htmlLabels: false,
+        theme: 'dark',
+      });
+      mermaidApi = mermaid;
+    }
+    mermaidRenders += 1;
+    // A fresh id per diagram: mermaid keys its scratch element on it, and one
+    // reused id leaves the previous render's element behind.
+    const id = 'md-mermaid-' + mermaidRenders;
+    let svg;
+    try {
+      ({ svg } = await mermaidApi.render(id, source));
+    } catch (error) {
+      // A render that throws leaves its scratch element in the body; mermaid
+      // removes it only on a render that reaches its end.
+      const scratch = document.getElementById('d' + id);
+      if (scratch) scratch.remove();
+      throw error;
+    }
+    const parsed = new DOMParser().parseFromString(svg, 'image/svg+xml');
+    if (parsed.querySelector('parsererror') || parsed.documentElement.localName !== 'svg') {
+      throw new Error('mermaid returned no SVG');
+    }
+    holder.appendChild(document.importNode(parsed.documentElement, true));
+  } catch {
+    holder.replaceWith(mdPre(source));
+  }
+}
+
 function renderMarkdown(container, text) {
   const lines = text.split('\n');
   let inCode = false;
+  let fenceLanguage = '';
   let code = [];
   let para = [];
   const paraOut = () => {
@@ -3731,13 +3805,17 @@ function renderMarkdown(container, text) {
     container.appendChild(paragraph);
     para = [];
   };
-  const codeOut = () => {
+  const codeOut = (closed) => {
     if (code.length === 0) return;
-    const pre = document.createElement('pre');
-    pre.className = 'md-pre';
-    pre.textContent = code.join('\n');
-    container.appendChild(pre);
+    const source = code.join('\n');
+    const language = fenceLanguage;
     code = [];
+    fenceLanguage = '';
+    if (closed && language === 'mermaid') {
+      renderMermaid(container, source);
+      return;
+    }
+    container.appendChild(mdPre(source));
   };
   let i = 0;
   while (i < lines.length) {
@@ -3745,7 +3823,7 @@ function renderMarkdown(container, text) {
     if (inCode) {
       if (raw.trimStart().startsWith('```')) {
         inCode = false;
-        codeOut();
+        codeOut(true);
       } else {
         code.push(raw);
       }
@@ -3756,6 +3834,7 @@ function renderMarkdown(container, text) {
     if (line.startsWith('```')) {
       paraOut();
       inCode = true;
+      fenceLanguage = fenceInfo(line.slice(3));
       i += 1;
       continue;
     }
@@ -3809,7 +3888,9 @@ function renderMarkdown(container, text) {
     i += 1;
   }
   paraOut();
-  if (inCode && code.length > 0) codeOut();
+  // Text that ends inside a fence is still streaming: it shows its source
+  // rather than a diagram of the part that arrived.
+  if (inCode && code.length > 0) codeOut(false);
 }
 
 function headingLevel(line) {
@@ -3832,6 +3913,14 @@ function listMarker(line) {
   if (/^[-*+]\s/.test(line)) return '• ';
   const numbered = line.match(/^\d+([.)])\s/);
   return numbered ? numbered[0].slice(0, -1) + ' ' : null;
+}
+
+// The language of an opening fence: its info string's first token, lowercased.
+// Anything after that token is a title or options, which the pane ignores; an
+// unknown language keeps the fence a plain <pre>.
+function fenceInfo(info) {
+  const token = info.trim().split(/\s+/)[0];
+  return token ? token.toLowerCase() : '';
 }
 
 // Splits inline text into styled tokens. Underscores stay literal so names

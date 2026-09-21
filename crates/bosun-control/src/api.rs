@@ -392,6 +392,7 @@ pub async fn recover(state: &AppState) {
 const RESERVED_PATHS: &[&str] = &[
     "/",
     "/ui",
+    "/ui/mermaid.min.js",
     "/poll",
     "/nodes",
     "/personas",
@@ -458,6 +459,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut app = Router::new()
         .route("/", get(crate::ui::pane))
         .route("/ui", get(crate::ui::pane))
+        .route("/ui/mermaid.min.js", get(crate::ui::mermaid_bundle))
         .route("/poll", post(poll))
         .route("/nodes", get(nodes))
         .route("/personas", get(personas))
@@ -2715,6 +2717,41 @@ mod tests {
             let body = response.text().await.unwrap();
             assert!(body.contains("Bosun"), "{path} contains the pane title");
         }
+    }
+
+    #[tokio::test]
+    async fn the_mermaid_bundle_is_served_for_the_pane() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/ui/mermaid.min.js"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript"),
+            "the bundle is served as JavaScript"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=86400"),
+            "a phone must not download 5.5 MB on every reload"
+        );
+        let body = response.text().await.unwrap();
+        // The pane renders through the global the bundle's last line sets.
+        assert!(
+            body.contains("globalThis[\"mermaid\"]"),
+            "the body is the mermaid bundle"
+        );
     }
 
     #[tokio::test]
@@ -8221,6 +8258,7 @@ mod tests {
             "http://127.0.0.1:8090/",
             "http://127.0.0.1:8090",
             "http://127.0.0.1:8090/ui",
+            "http://127.0.0.1:8090/ui/mermaid.min.js",
             "http://127.0.0.1:8090/sessions",
             "http://127.0.0.1:8090/sessions/abc",
             "http://127.0.0.1:8090/mcp/servers",

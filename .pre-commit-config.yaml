@@ -12,14 +12,19 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # The mermaid bundle is a vendored artifact, not source we edit here, so
+      # the whitespace and size checks skip it.
       - id: trailing-whitespace
+        exclude: ^crates/bosun-control/src/ui/mermaid\.min\.js$
       - id: end-of-file-fixer
+        exclude: ^crates/bosun-control/src/ui/mermaid\.min\.js$
       - id: check-yaml
         args: [--unsafe]
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=500]
+        exclude: ^crates/bosun-control/src/ui/mermaid\.min\.js$
 
   # Stage 2: Clippy (slower, but faster than tests)
   - repo: local
