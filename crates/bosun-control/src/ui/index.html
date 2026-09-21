@@ -3765,6 +3765,10 @@ async function renderMermaid(container, source) {
         securityLevel: 'strict',
         htmlLabels: false,
         theme: 'dark',
+        // Draw at the diagram's own size instead of shrinking it to the
+        // column: a wide flowchart scaled into a phone's column leaves its
+        // labels a few pixels tall, and the holder scrolls instead.
+        flowchart: { useMaxWidth: false },
       });
       mermaidApi = mermaid;
     }

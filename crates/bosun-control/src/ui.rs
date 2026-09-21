@@ -68,6 +68,7 @@ mod tests {
             "securityLevel: 'strict'",
             "htmlLabels: false",
             "theme: 'dark'",
+            "flowchart: { useMaxWidth: false }",
             "new DOMParser().parseFromString(svg, 'image/svg+xml')",
             "parsed.querySelector('parsererror')",
             "document.importNode(parsed.documentElement, true)",
