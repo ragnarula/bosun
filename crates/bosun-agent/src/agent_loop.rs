@@ -691,7 +691,7 @@ async fn handle_wake(
 
     let mut interrupted = false;
     let mut consecutive_empty = 0;
-    let mut nudged = false;
+    let mut nudges = 0u32;
     let mut window: Vec<(i64, Message)>;
     let mut live: Vec<LiveChild>;
     let mut refresh_newest: i64;
@@ -867,18 +867,24 @@ async fn handle_wake(
             // either the session's own todo list still holds an open item or
             // the reply's last sentence announces an action. An open item is
             // the session's own record that its work is unfinished, where a
-            // phrase is a guess about wording. Once per wake: a turn that ends
-            // in prose again reaches the finished arm below, which ends the
-            // wake there.
+            // phrase is a guess about wording. The nudge re-arms, because the
+            // nudge itself is read by the same model that just wrote prose:
+            // the first one often draws a turn that runs tools and again ends
+            // by announcing the rest, and stopping there leaves the session
+            // paused holding the work it just named. Each nudged turn is a
+            // full model call, so NUDGE_LIMIT bounds them and a request that
+            // only ever ends in prose waits for the operator instead.
             TurnOutcome::Finished { text }
                 if !interrupted
-                    && !nudged
+                    && nudges < NUDGE_LIMIT
                     && (has_open_todo(&state.todos) || announces_an_action(&text)) =>
             {
-                nudged = true;
+                nudges += 1;
                 warn!(
-                    msg = "turn ended with prose and made no tool call; nudging once",
+                    msg = "turn ended with prose and made no tool call; nudging",
                     session_id = %session_id,
+                    nudge = nudges,
+                    limit = NUDGE_LIMIT,
                 );
                 record_in_wake(
                     deps,
@@ -1330,6 +1336,21 @@ const ACTION_MARKERS: [&str; 7] = [
     "next, i ",
 ];
 
+/// The sequencing words a telegraphic announcement opens with: a model writes
+/// "Now the ignored e2e pair, which boots a real control plane" and names the
+/// work it has not begun, with no first-person verb for the markers above to
+/// catch. Only the first word of the last sentence matches, so the same word
+/// later in a report of finished work does not.
+const ANNOUNCEMENT_OPENERS: [&str; 3] = ["now", "next", "then"];
+
+/// The most nudges one wake appends. Each nudge runs a whole turn, which is a
+/// model call over the session's full transcript — over 100k input tokens in
+/// the observed sessions — so the limit is what stops a model that only ever
+/// writes prose. It is small on purpose: three covers the re-arm twice and no
+/// further, and a wake that exhausts it leaves the session waiting for the
+/// operator rather than spending on it without bound.
+const NUDGE_LIMIT: u32 = 3;
+
 /// The one message the loop appends to a wake whose turn ended with prose and
 /// made no tool call. It is authored in the user role, so the model reads it
 /// as the next message; the bracketed `[harness nudge]` attribution shows the
@@ -1343,12 +1364,22 @@ const ACTION_NUDGE: &str = "[harness nudge] your last message made no tool call 
 /// message, and this is the loop's backstop for a model that breaks that rule
 /// by describing the call in prose. The provider reports an ordinary stop for
 /// a reply that made the call and for one that only said it would, so the
-/// words of the last sentence are the only evidence there is; the list stays
-/// short and in one place so it is easy to tune. It is the only trigger a
-/// child session has, since only the root holds a todo list.
+/// words of the last sentence are the only evidence there is; the lists stay
+/// short and in one place so they are easy to tune. A missing announcement
+/// costs the operator a prod tens of minutes later, where a false one costs a
+/// single model call, so a match is preferred to a miss. It is the only
+/// trigger a child session has, since only the root holds a todo list.
 fn announces_an_action(text: &str) -> bool {
     let last = last_sentence(text).to_lowercase();
-    ACTION_MARKERS.iter().any(|marker| last.contains(marker))
+    if ACTION_MARKERS.iter().any(|marker| last.contains(marker)) {
+        return true;
+    }
+    let first = last
+        .split_whitespace()
+        .next()
+        .map(|word| word.trim_end_matches([',', ':', ';']))
+        .unwrap_or("");
+    ANNOUNCEMENT_OPENERS.contains(&first)
 }
 
 /// Whether the session's todo list holds work it never finished: at least one
@@ -5107,10 +5138,19 @@ mod tests {
                 StreamEvent::TextDelta("working on it".into()),
                 stop(2, 1),
             ],
-            // Both items are still open, so the reply above draws one nudge
-            // and the wake runs this third turn before it waits.
+            // Both items are still open, so every reply below draws a nudge
+            // until the wake has spent its budget; the reply after the last
+            // nudge ends the wake.
             vec![
                 StreamEvent::TextDelta("still working on it".into()),
+                stop(2, 1),
+            ],
+            vec![
+                StreamEvent::TextDelta("still working on it".into()),
+                stop(2, 1),
+            ],
+            vec![
+                StreamEvent::TextDelta("the list waits for the operator".into()),
                 stop(2, 1),
             ],
         ]));
@@ -5180,8 +5220,9 @@ mod tests {
         assert_eq!(tool_calls[0].result, Some(json!({ "ok": true })));
         assert!(!tool_calls[0].is_error);
 
-        // The still-open list drew one nudged turn, which is the third call.
-        assert_eq!(store.model_calls("s-todo").await.unwrap().len(), 3);
+        // The still-open list drew a nudged turn per open reply, up to the
+        // budget: four replied turns and the tool call that wrote the list.
+        assert_eq!(store.model_calls("s-todo").await.unwrap().len(), 5);
 
         handle.stop();
     }
@@ -7280,10 +7321,19 @@ mod tests {
                 stop(5, 3),
             ],
             vec![StreamEvent::TextDelta("working on it".into()), stop(2, 1)],
-            // The item above is still open, so that reply draws one nudge and
-            // the wake runs this third turn before it waits.
+            // The item above is still open, so every reply below draws a nudge
+            // until the wake has spent its budget; the reply after the last
+            // nudge ends the wake.
             vec![
                 StreamEvent::TextDelta("still working on it".into()),
+                stop(2, 1),
+            ],
+            vec![
+                StreamEvent::TextDelta("still working on it".into()),
+                stop(2, 1),
+            ],
+            vec![
+                StreamEvent::TextDelta("the list waits for the operator".into()),
                 stop(2, 1),
             ],
         ]));
@@ -9316,6 +9366,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_report_that_names_the_next_work_draws_a_nudge() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-next-work"))
+            .await
+            .unwrap();
+
+        // The reply reports the suite green and then names the work it starts
+        // next, in one telegraphic sentence with no first-person verb. The
+        // session's list holds nothing, so the words are the whole signal: the
+        // turn either draws a nudge or waits for the operator with the e2e pair
+        // it named still unrun.
+        let reply = "Full workspace suite green: 17 result groups, nothing failed. Now the ignored \
+                     e2e pair, which boots a real control plane and node.";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta(reply.into()), stop(9, 21)],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test -p bosun --test e2e -- --ignored"}"#
+                        .into(),
+                },
+                stop(14, 8),
+            ],
+            vec![
+                StreamEvent::TextDelta("the e2e pair passes".into()),
+                stop(20, 4),
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-next-work".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the nudged wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-next-work")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("root-nudge-next-work", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [reply, ACTION_NUDGE, "the e2e pair passes"],
+            "the sentence that named the e2e pair drew the nudge, and the nudged turn ran it"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            3,
+            "the announced turn, the nudged call, and the reply that ends the wake"
+        );
+        assert_eq!(
+            tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            1,
+            "the nudged turn's call ran"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_nudged_turn_that_announces_again_is_nudged_again() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-rearm"))
+            .await
+            .unwrap();
+
+        // The nudge is read by the model that wrote the prose, and the nudged
+        // turn announces the work again instead of making the call. The nudge
+        // re-arms, so the wake runs a second nudged turn that makes the call
+        // rather than pausing with the work it just named.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("Next I will run the failing test.".into()),
+                stop(8, 7),
+            ],
+            vec![
+                StreamEvent::TextDelta("I will run it after I check the refs.".into()),
+                stop(11, 9),
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test -p bosun-agent"}"#.into(),
+                },
+                stop(14, 8),
+            ],
+            vec![
+                StreamEvent::TextDelta("the suite passes".into()),
+                stop(20, 4),
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-rearm".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the re-armed wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-rearm")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("root-nudge-rearm", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Next I will run the failing test.",
+                ACTION_NUDGE,
+                "I will run it after I check the refs.",
+                ACTION_NUDGE,
+                "the suite passes"
+            ],
+            "the second announcement drew a second nudge, and the turn after it made the call"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            4,
+            "the announced turn, two nudged turns, and the reply that ends the wake"
+        );
+        assert_eq!(
+            tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            1,
+            "the re-armed turn's call ran"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn a_reply_that_reports_without_announcing_is_left_alone() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -9530,44 +9769,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_nudged_turn_that_also_ends_in_prose_gets_no_second_nudge() {
+    async fn a_wake_stops_nudging_at_the_limit() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
-            .create_session(&session("root-nudge-twice"))
+            .create_session(&session("root-nudge-limit"))
             .await
             .unwrap();
 
-        // Both turns announce and make no call. The nudge is once per wake, so
-        // the second prose reply ends the wake instead of spinning.
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                StreamEvent::TextDelta("Next I will run the failing test.".into()),
-                stop(8, 7),
-            ],
-            vec![
-                StreamEvent::TextDelta("I will run it shortly.".into()),
-                stop(8, 6),
-            ],
-            vec![
-                StreamEvent::TextDelta("a second nudge ran a third turn".into()),
-                stop(3, 6),
-            ],
-        ]));
+        // Every reply announces the next step and makes no call, so each one
+        // would end the wake and the loop appends a nudge instead — until the
+        // wake has spent its whole budget. Each nudged turn is a whole model
+        // call, which is what the budget is for: the reply after the last nudge
+        // ends the wake.
+        let announce = |text: &str| vec![StreamEvent::TextDelta(text.to_string()), stop(8, 6)];
+        let mut scripts: Vec<Vec<StreamEvent>> = (1..=NUDGE_LIMIT + 1)
+            .map(|nudge| announce(&format!("Next I will run the failing test ({nudge}).")))
+            .collect();
+        // A reply the wake runs only if the budget does not stop it.
+        scripts.push(announce("a turn past the limit ran"));
+        let provider = Arc::new(ScriptedProvider::new(scripts));
         let deps = Arc::new(test_deps(
             &store,
             provider.clone(),
             instant_tools(),
             Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
         ));
-        let handle = spawn_loop("root-nudge-twice".into(), deps);
+        let handle = spawn_loop("root-nudge-limit".into(), deps);
         handle.send(LoopEvent::Wake);
 
-        wait_for("the twice-announcing wake to wait for input", || {
+        wait_for("the nudged wake to wait for input", || {
             let store = store.clone();
             async move {
                 store
-                    .get_session("root-nudge-twice")
+                    .get_session("root-nudge-limit")
                     .await
                     .unwrap()
                     .unwrap()
@@ -9579,10 +9814,10 @@ mod tests {
 
         assert_eq!(
             provider.captured_calls().len(),
-            2,
-            "the wake ran exactly one nudged turn"
+            NUDGE_LIMIT as usize + 1,
+            "the wake ran one turn per reply up to the limit, and no more"
         );
-        let messages = store.messages("root-nudge-twice", false).await.unwrap();
+        let messages = store.messages("root-nudge-limit", false).await.unwrap();
         let texts: Vec<&str> = messages
             .iter()
             .filter_map(|(_, message)| match &message.block {
@@ -9591,13 +9826,13 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            texts,
-            [
-                "Next I will run the failing test.",
-                ACTION_NUDGE,
-                "I will run it shortly."
-            ],
-            "one nudge, and the second prose reply ends the wake"
+            texts.iter().filter(|text| **text == ACTION_NUDGE).count(),
+            NUDGE_LIMIT as usize,
+            "the wake appends a nudge per announced reply, up to the limit"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("past the limit")),
+            "no turn ran past the limit: {texts:#?}"
         );
 
         handle.stop();
@@ -9614,7 +9849,9 @@ mod tests {
 
         // The session's own list still holds an item it never finished, and
         // the reply that ends the turn reports rather than announces: there is
-        // no phrase to detect, so the open item is the whole signal.
+        // no phrase to detect, so the open item is the whole signal. Every
+        // reply after it carries that open item, so the wake spends its whole
+        // nudge budget before it waits.
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
                 StreamEvent::ToolCallDelta {
@@ -9642,6 +9879,14 @@ mod tests {
             ],
             vec![
                 StreamEvent::TextDelta("the suite passes".into()),
+                stop(9, 4),
+            ],
+            vec![
+                StreamEvent::TextDelta("the item is still open".into()),
+                stop(9, 4),
+            ],
+            vec![
+                StreamEvent::TextDelta("the list waits for the operator".into()),
                 stop(9, 4),
             ],
         ]));
@@ -9688,13 +9933,18 @@ mod tests {
                 format!("user: {ACTION_NUDGE}"),
                 "assistant: tool call shell".to_string(),
                 "assistant: the suite passes".to_string(),
+                format!("user: {ACTION_NUDGE}"),
+                "assistant: the item is still open".to_string(),
+                format!("user: {ACTION_NUDGE}"),
+                "assistant: the list waits for the operator".to_string(),
             ],
-            "the open todo draws the nudge, and the nudged turn makes the call"
+            "the open item draws the nudge, the nudged turn makes the call, and the replies that \
+             still carry the open item draw the rest of the budget"
         );
         assert_eq!(
             provider.captured_calls().len(),
-            4,
-            "the write, the report, the nudged call, and the reply that ends the wake"
+            6,
+            "the write, the report, the nudged call, and the replies up to the limit"
         );
         assert_eq!(
             tools
@@ -9905,12 +10155,35 @@ mod tests {
             "trailing whitespace leaves the sentence before it as the last one"
         );
         assert!(
+            announces_an_action(
+                "Full workspace suite green: 17 result groups, nothing failed. Now the ignored \
+                 e2e pair, which boots a real control plane and node."
+            ),
+            "a report that ends by naming the next piece of work announces an action"
+        );
+        assert!(
+            announces_an_action("Now the ignored e2e pair, which boots a real control plane."),
+            "a telegraphic sentence opens with the sequencing word and no first-person verb"
+        );
+        assert!(
+            announces_an_action("Next, the ADR and the template, then the children."),
+            "punctuation after the sequencing word leaves it as the sentence's first word"
+        );
+        assert!(
+            announces_an_action("Then mark sprint 012's stories and give the final report."),
+            "an imperative opening with the sequencing word announces the work it names"
+        );
+        assert!(
             !announces_an_action("The suite passes and nothing is left to do."),
             "a plain report announces nothing"
         );
         assert!(
             !announces_an_action("I will run the failing test. The suite passes."),
             "only the last sentence is read"
+        );
+        assert!(
+            !announces_an_action("The suite passes and nothing is left to do now."),
+            "a sequencing word that is not the sentence's first word is not an opener"
         );
         assert!(!announces_an_action(""), "an empty reply announces nothing");
     }
@@ -14347,10 +14620,16 @@ mod tests {
                 },
                 stop(2, 1),
             ],
+            // The item the root just wrote is open, so every reply below draws
+            // a nudge until the wake has spent its budget; the reply after the
+            // last nudge ends the wake.
             vec![StreamEvent::TextDelta("planned".into()), stop(1, 1)],
-            // The item the root just wrote is open, so the reply above draws
-            // one nudge and the wake runs this third turn before it waits.
             vec![StreamEvent::TextDelta("still planning".into()), stop(1, 1)],
+            vec![StreamEvent::TextDelta("still planning".into()), stop(1, 1)],
+            vec![
+                StreamEvent::TextDelta("the plan waits for the operator".into()),
+                stop(1, 1),
+            ],
         ]));
         let deps = Arc::new(test_deps(
             &store,
