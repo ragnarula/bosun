@@ -50,6 +50,10 @@ pub struct AgentRegistry {
     /// The control plane's shared MCP connections. Set at boot; None leaves
     /// every session with the canonical tools only.
     pub mcp: Option<Arc<dyn McpConnections>>,
+    /// The control plane's `nudge` setting, handed to every loop this
+    /// registry starts. Set from the config at boot; `new` leaves it on, the
+    /// default an absent config field gets.
+    pub nudge: bool,
 }
 
 impl AgentRegistry {
@@ -66,6 +70,7 @@ impl AgentRegistry {
             prices,
             spawner: RwLock::new(None),
             mcp: None,
+            nudge: true,
         }
     }
 
@@ -125,6 +130,7 @@ impl AgentRegistry {
             spawner: self.spawner.read().unwrap().clone(),
             mailbox: Some(self.clone()),
             mcp: self.mcp.clone(),
+            nudge: self.nudge,
         };
         let handle = spawn_loop(session_id.to_string(), Arc::new(deps));
         self.loops
@@ -312,6 +318,98 @@ mod tests {
             registry.live.read().unwrap().is_empty(),
             "stop leaves no live channel"
         );
+    }
+
+    /// Answers every turn with the prose the nudge exists for: a sentence that
+    /// announces the work and makes no tool call.
+    struct AnnouncingProvider;
+
+    impl Provider for AnnouncingProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+
+        fn chat_stream<'a>(
+            &'a self,
+            _call: ProviderCall<'a>,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+            let items: Vec<Result<StreamEvent, ProviderError>> = vec![
+                Ok(StreamEvent::TextDelta(
+                    "I will run the failing test.".into(),
+                )),
+                Ok(StreamEvent::Stop {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    stop_reason: StopReason::StopResponse,
+                }),
+            ];
+            Ok(stream::iter(items).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn nudge_off_starts_loops_that_leave_an_announcing_reply_alone() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                id: "s1".into(),
+                node: "node-1".into(),
+                repo_url: None,
+                git_ref: None,
+                dir: "/work".into(),
+                model: "mock-model".into(),
+                persona: None,
+                parent_id: None,
+                owner_id: "s1".into(),
+                permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
+                mcp_servers: "".into(),
+                state: SessionState::Creating,
+                interrupt_cause: None,
+                created_at_secs: 1_700_000_000,
+                prompt: None,
+                summary: None,
+            })
+            .await
+            .unwrap();
+
+        let mut registry = AgentRegistry::new(HashMap::new(), HashMap::new(), HashMap::new());
+        registry.nudge = false;
+        let registry = Arc::new(registry);
+        registry.start(
+            "s1",
+            store.clone(),
+            Arc::new(AnnouncingProvider),
+            Arc::new(TunnelRegistry::new()),
+            "mock-model",
+        );
+
+        registry.wake("s1");
+        wait_for("the wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store.get_session("s1").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let calls = store.model_calls("s1").await.unwrap();
+        assert_eq!(calls.len(), 1, "no nudge buys a second turn");
+        let messages = store.messages("s1", false).await.unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the announcing reply is the wake's only message: {:#?}",
+            messages
+        );
+
+        registry.stop("s1");
     }
 
     #[tokio::test]

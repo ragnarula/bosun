@@ -313,6 +313,11 @@ pub struct LoopDeps {
     /// The control plane's shared MCP connections, for the servers the
     /// session chose. None leaves a session with the canonical tools only.
     pub mcp: Option<Arc<dyn McpConnections>>,
+    /// Whether the loop appends the `[harness nudge]` message when a turn
+    /// ends with prose and no tool call. The control plane passes its
+    /// configured `nudge`; false makes every session on it take the
+    /// pre-nudge path.
+    pub nudge: bool,
 }
 
 /// State a session's loop keeps across wakes: the todo list, the cached
@@ -875,9 +880,12 @@ async fn handle_wake(
             // which is a full model call, so NUDGE_LIMIT bounds the nudges —
             // not the wake's model calls, which also carry the empty-reply
             // retries — and a request that only ever ends in prose waits for
-            // the operator instead.
+            // the operator instead. The control plane's `nudge` setting turns
+            // all of this off: with it false the turn takes the pre-nudge
+            // path, so no message is appended and no announcement is checked.
             TurnOutcome::Finished { text }
                 if !interrupted
+                    && deps.nudge
                     && nudges < NUDGE_LIMIT
                     && (has_open_todo(&state.todos) || announces_an_action(&text)) =>
             {
@@ -3971,6 +3979,7 @@ mod tests {
             spawner: None,
             mailbox: None,
             mcp: None,
+            nudge: true,
         }
     }
 
@@ -3999,6 +4008,7 @@ mod tests {
             spawner: None,
             mailbox: None,
             mcp: None,
+            nudge: true,
         }
     }
 
@@ -4044,6 +4054,20 @@ mod tests {
     ) -> LoopDeps {
         LoopDeps {
             mcp: Some(mcp),
+            ..test_deps(store, provider, tools, sink)
+        }
+    }
+
+    /// A deps with the nudge switched off, the way a control plane whose
+    /// `nudge` is false runs its loops.
+    fn test_deps_without_nudge(
+        store: &Store,
+        provider: Arc<dyn Provider>,
+        tools: Arc<MockTools>,
+        sink: Arc<CollectSink>,
+    ) -> LoopDeps {
+        LoopDeps {
+            nudge: false,
             ..test_deps(store, provider, tools, sink)
         }
     }
@@ -9464,6 +9488,66 @@ mod tests {
                 .count(),
             1,
             "the nudged turn's call ran"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_nudge_off_control_plane_leaves_an_announcing_reply_alone() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-off"))
+            .await
+            .unwrap();
+
+        // The same sentence that draws a nudge with the flag on: it reports
+        // the suite green and names the e2e pair it starts next.
+        let reply = "Full workspace suite green: 17 result groups, nothing failed. Now the ignored \
+                     e2e pair, which boots a real control plane and node.";
+        // A second script would run a whole turn if a nudge were appended.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta(reply.into()), stop(9, 21)],
+            vec![
+                StreamEvent::TextDelta("a nudged turn ran".into()),
+                stop(3, 6),
+            ],
+        ]));
+        let deps = Arc::new(test_deps_without_nudge(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-off".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-off")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "no nudge buys a second turn"
+        );
+        let messages = store.messages("root-nudge-off", false).await.unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the announcing reply is the wake's only message: {:#?}",
+            messages
         );
 
         handle.stop();

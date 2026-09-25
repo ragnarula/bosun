@@ -21,6 +21,10 @@ pub struct ControlConfig {
     pub tls_key: Option<PathBuf>,
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Whether the agent loop appends its `[harness nudge]` message when a
+    /// turn ends with prose and no tool call. Off leaves such a wake waiting
+    /// for the operator instead of buying another turn.
+    pub nudge: bool,
     pub models: HashMap<String, ModelConfig>,
     pub personas: HashMap<String, PersonaConfig>,
     pub default_persona: Option<String>,
@@ -127,6 +131,7 @@ impl Default for ControlConfig {
             tls_cert: None,
             tls_key: None,
             data_dir: default_data_dir(),
+            nudge: true,
             models: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
@@ -328,6 +333,14 @@ mod tests {
     fn sparse_config_keeps_the_data_dir_default() {
         let config: ControlConfig = toml::from_str("listen_addr = \"0.0.0.0:9000\"").unwrap();
         assert_eq!(config.data_dir, PathBuf::from("data"));
+    }
+
+    #[test]
+    fn nudge_defaults_to_true_and_parses_false() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert!(config.nudge);
+        let config: ControlConfig = toml::from_str("nudge = false").unwrap();
+        assert!(!config.nudge);
     }
 
     #[test]

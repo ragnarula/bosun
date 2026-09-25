@@ -379,6 +379,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     mcp.start().await;
     let mut loops = AgentRegistry::new(providers.clone(), config.personas.clone(), prices);
     loops.mcp = Some(mcp.clone());
+    loops.nudge = config.nudge;
 
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(

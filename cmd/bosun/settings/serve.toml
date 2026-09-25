@@ -2,6 +2,9 @@
 listen_addr = "127.0.0.1:8090"
 # node_timeout_secs = 30
 # data_dir = "data"
+# nudge = true  # append the loop's [harness nudge] message when a turn ends
+#               # with prose and no tool call; false leaves that wake waiting
+#               # for the operator
 
 # Models are the provider entries personas bind to by name. The api_key may be
 # a literal or an `env:VAR` reference read at boot.
