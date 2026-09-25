@@ -922,6 +922,36 @@ impl Store {
         .await
     }
 
+    /// The append time of the session's newest stamped event, in unix
+    /// seconds: the store's record of when the session last did anything.
+    /// None when the session has no stamped event. The stamp lives inside the
+    /// event payload, so the newest row that carries one is read and its stamp
+    /// taken; a row without one — an MCP warning, or an event appended before
+    /// events were stamped — is skipped rather than reported as no activity.
+    /// The query walks the `(session_id, seq)` index backwards and stops at
+    /// the first row it keeps, so it reads that row and the stamp-less rows
+    /// after it, never the session's whole history.
+    pub async fn last_activity_secs(&self, session_id: &str) -> Result<Option<i64>, StoreError> {
+        self.with_session(session_id, move |conn, session_id| {
+            let row = conn.query_row(
+                "SELECT payload FROM events
+                 WHERE session_id = ?1 AND json_extract(payload, '$.at_ms') IS NOT NULL
+                 ORDER BY seq DESC LIMIT 1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            );
+            let payload = match row {
+                Ok(payload) => payload,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let event: Event =
+                serde_json::from_str(&payload).context("failed to parse event payload")?;
+            Ok(event.at_ms().map(|at_ms| (at_ms / 1000) as i64))
+        })
+        .await
+    }
+
     /// The session's pending raised ask — the direct child whose question it
     /// surfaced, that question's origin leaf, and the surfaced Ask block's
     /// row — when one is.
@@ -3720,6 +3750,65 @@ mod tests {
         );
 
         let error = store.last_message("ghost").await.unwrap_err();
+        assert!(matches!(error, StoreError::SessionNotFound { id } if id == "ghost"));
+    }
+
+    #[tokio::test]
+    async fn last_activity_secs_reports_the_newest_stamped_event_or_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let store = Store::open(&path).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        // A session that has recorded nothing has nothing to report.
+        assert!(store.last_activity_secs("a").await.unwrap().is_none());
+
+        let before = (bosun_common::time::unix_ms(SystemTime::now()) / 1000) as i64;
+        store
+            .append_message("a", Role::User, &Block::Text { text: "go".into() })
+            .await
+            .unwrap();
+        let after = (bosun_common::time::unix_ms(SystemTime::now()) / 1000) as i64;
+        let stamped = store.last_activity_secs("a").await.unwrap().unwrap();
+        assert!(
+            (before..=after).contains(&stamped),
+            "the appended event's stamp {stamped} is outside {before}..={after}"
+        );
+
+        // The newest stamped event decides, and its milliseconds are dropped:
+        // a raw row with a known stamp is read back as whole unix seconds.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO events (session_id, payload) VALUES (?1, ?2)",
+            params![
+                "a",
+                r#"{"kind":"state","state":"waiting_for_input","at_ms":1700000000123}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            store.last_activity_secs("a").await.unwrap(),
+            Some(1_700_000_000)
+        );
+
+        // A newer row carrying no stamp — an MCP warning, the one event the
+        // store writes without one — does not hide the stamped row below it.
+        store
+            .append_event(
+                "a",
+                &Event::Warning {
+                    text: "MCP server srv-a is unavailable".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.last_activity_secs("a").await.unwrap(),
+            Some(1_700_000_000)
+        );
+
+        let error = store.last_activity_secs("ghost").await.unwrap_err();
         assert!(matches!(error, StoreError::SessionNotFound { id } if id == "ghost"));
     }
 

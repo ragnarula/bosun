@@ -3747,7 +3747,7 @@ mod tests {
                     true,
                     r#"{"persona":"reviewer","instructions":"review the change"}"#,
                 )],
-                vec![text_chunk("I will do it myself")],
+                vec![text_chunk("the spawn was refused; nothing else to do")],
             ])));
         let root_addr = scripted_provider(root_scripts).await;
 
@@ -4033,6 +4033,80 @@ mod tests {
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
         (state, store, root.id, child.id)
+    }
+
+    #[tokio::test]
+    async fn a_root_reads_its_childs_status_through_the_control_plane() {
+        // The root's turns: read the child's status, then answer the user.
+        // The child's provider holds no script, so a turn started in the child
+        // would fail the test: reading a status sends the child nothing.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![tool_call_fragment(
+                    "call-1",
+                    "session_status",
+                    r#"{"id":"child-s6"}"#,
+                )],
+                vec![text_chunk("the child is reviewing the patch")],
+            ])));
+        let dir = tempdir().unwrap();
+        let (state, store, root_id, child_id) =
+            state_with_child_tree(&dir, root_scripts, Arc::new(Mutex::new(VecDeque::new()))).await;
+        store
+            .set_state(&child_id, SessionState::Running)
+            .await
+            .unwrap();
+        store
+            .set_summary(&child_id, "reviewing the patch")
+            .await
+            .unwrap();
+
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions/{root_id}/messages"))
+            .json(&json!({ "content": "how is the child doing?" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        wait_for("the root to read the status and answer", || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move {
+                store.get_session(&root_id).await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let status = store
+            .tool_calls(&root_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|call| call.call_id == "call-1")
+            .and_then(|call| call.result)
+            .expect("the root's status call recorded a result");
+        assert_eq!(status["id"], "child-s6");
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["model"], "child-model");
+        assert!(
+            status["persona"].is_null(),
+            "the child runs without a persona, so the answer carries none: {status}"
+        );
+        assert_eq!(status["node"], "n1");
+        assert_eq!(status["dir"], "/tmp/x");
+        assert_eq!(status["summary"], "reviewing the patch");
+        assert!(
+            status["last_activity_secs"].as_i64().is_some(),
+            "the child's newest recorded event is when it last did anything: {status}"
+        );
+        assert!(
+            store.model_calls(&child_id).await.unwrap().is_empty(),
+            "reading a status runs no turn in the child"
+        );
     }
 
     #[tokio::test]

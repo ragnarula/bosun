@@ -691,6 +691,7 @@ async fn handle_wake(
 
     let mut interrupted = false;
     let mut consecutive_empty = 0;
+    let mut nudged = false;
     let mut window: Vec<(i64, Message)>;
     let mut live: Vec<LiveChild>;
     let mut refresh_newest: i64;
@@ -858,6 +859,38 @@ async fn handle_wake(
         };
         match outcome {
             TurnOutcome::ToolCalls if !interrupted => {}
+            // A turn that ended with prose would end the wake as if the work
+            // were done: it made no tool call and asked nothing, the stop
+            // reason is an ordinary stop, and the session would sit waiting
+            // for input until the operator prodded it. The loop appends the
+            // nudge as the next user message and runs one more turn, when
+            // either the session's own todo list still holds an open item or
+            // the reply's last sentence announces an action. An open item is
+            // the session's own record that its work is unfinished, where a
+            // phrase is a guess about wording. Once per wake: a turn that ends
+            // in prose again reaches the finished arm below, which ends the
+            // wake there.
+            TurnOutcome::Finished { text }
+                if !interrupted
+                    && !nudged
+                    && (has_open_todo(&state.todos) || announces_an_action(&text)) =>
+            {
+                nudged = true;
+                warn!(
+                    msg = "turn ended with prose and made no tool call; nudging once",
+                    session_id = %session_id,
+                );
+                record_in_wake(
+                    deps,
+                    session_id,
+                    &mut window,
+                    Role::User,
+                    &Block::Text {
+                        text: ACTION_NUDGE.to_string(),
+                    },
+                )
+                .await?;
+            }
             // A child that finished reports to its parent and stops — unless
             // it still has live children of its own. A child that spawned is
             // supervising: like a root waiting for the user, it waits for its
@@ -1084,6 +1117,48 @@ async fn live_children(
     Ok(live)
 }
 
+/// Whether `caller` may ask about `target`: itself, a session on its parent
+/// chain up to the tree root, or a session below it. Every other session — a
+/// sibling, a cousin, another tree — is outside the caller's line and is
+/// refused. The line is the boundary because it is the part of the tree the
+/// caller is answerable for; it constrains who may be asked about, never what
+/// a read may do, so a read-only session keeps the tool.
+async fn in_callers_line(
+    store: &bosun_store::store::Store,
+    caller: &str,
+    target: &str,
+) -> anyhow::Result<bool> {
+    if caller == target {
+        return Ok(true);
+    }
+    // The target is below the caller when the caller sits on the target's
+    // parent chain, and above the caller when the target sits on the
+    // caller's.
+    Ok(parent_chain_contains(store, target, caller).await?
+        || parent_chain_contains(store, caller, target).await?)
+}
+
+/// Whether `ancestor` sits on `session_id`'s parent chain, one or more levels
+/// up. The walk ends at the first root; a session row that is gone ends it
+/// too, since nothing above that row is reachable.
+async fn parent_chain_contains(
+    store: &bosun_store::store::Store,
+    session_id: &str,
+    ancestor: &str,
+) -> anyhow::Result<bool> {
+    let mut current = store.get_session(session_id).await?;
+    while let Some(session) = current {
+        let Some(parent_id) = session.parent_id else {
+            return Ok(false);
+        };
+        if parent_id == ancestor {
+            return Ok(true);
+        }
+        current = store.get_session(&parent_id).await?;
+    }
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)] // a turn needs the wake's whole context
 async fn run_turn(
     deps: &Arc<LoopDeps>,
@@ -1241,6 +1316,69 @@ fn empty_outcome_message(reason: StopReason) -> &'static str {
         StopReason::MaxTokens => "turn produced an empty truncated reply",
         StopReason::StopResponse | StopReason::Other => "turn produced an empty reply",
     }
+}
+
+/// The first-person future markers that make the last sentence of a reply an
+/// announcement of an action rather than a report of one.
+const ACTION_MARKERS: [&str; 7] = [
+    "i will",
+    "i'll",
+    "i am going to",
+    "i'm going to",
+    "let me ",
+    "next i ",
+    "next, i ",
+];
+
+/// The one message the loop appends to a wake whose turn ended with prose and
+/// made no tool call. It is authored in the user role, so the model reads it
+/// as the next message; the bracketed `[harness nudge]` attribution shows the
+/// transcript's reader that the harness, not the operator, asked.
+const ACTION_NUDGE: &str = "[harness nudge] your last message made no tool call and the work is not \
+     finished. Make the call now, or say plainly that you are finished.";
+
+/// Whether a turn's final message ends by announcing an action it never made.
+///
+/// The harness prompt requires an intention and the act it announces in one
+/// message, and this is the loop's backstop for a model that breaks that rule
+/// by describing the call in prose. The provider reports an ordinary stop for
+/// a reply that made the call and for one that only said it would, so the
+/// words of the last sentence are the only evidence there is; the list stays
+/// short and in one place so it is easy to tune. It is the only trigger a
+/// child session has, since only the root holds a todo list.
+fn announces_an_action(text: &str) -> bool {
+    let last = last_sentence(text).to_lowercase();
+    ACTION_MARKERS.iter().any(|marker| last.contains(marker))
+}
+
+/// Whether the session's todo list holds work it never finished: at least one
+/// item whose status is not `done`, the status the `todowrite` schema defines
+/// for a finished item.
+fn has_open_todo(todos: &[Value]) -> bool {
+    todos
+        .iter()
+        .any(|todo| todo["status"].as_str() != Some("done"))
+}
+
+/// The last sentence of `text`. A terminator ends a sentence only when
+/// whitespace or the text's end follows it, so the dot in a version number or
+/// a decimal is not treated as a boundary; trailing whitespace leaves the
+/// sentence before it as the last one.
+fn last_sentence(text: &str) -> &str {
+    let mut last = text.trim();
+    for (index, byte) in text.bytes().enumerate() {
+        if !matches!(byte, b'.' | b'!' | b'?') {
+            continue;
+        }
+        let rest = &text[index + 1..];
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if !rest.trim().is_empty() {
+            last = rest.trim();
+        }
+    }
+    last
 }
 
 #[allow(clippy::too_many_arguments)] // a turn needs the wake's whole context
@@ -2012,6 +2150,69 @@ async fn run_turn_inner(
                 .await;
                 let (content, is_error) = match outcome {
                     Ok(()) => (json!({ "ok": true }), false),
+                    Err(error) => (json!({ "error": error.to_string() }), true),
+                };
+                deps.store
+                    .complete_tool_call(session_id, &id, &content, is_error)
+                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error,
+                        content,
+                    },
+                )
+                .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
+            }
+            // Answers from the control-plane store alone: the named session is
+            // sent nothing, and the only row read about it is its newest
+            // stamped event, for its timestamp — no transcript text reaches
+            // the answer. So the answer is bounded and a read-only session may
+            // call it. The boundary is the caller's own line — itself, its
+            // parent chain, and its descendants; any other session, and an id
+            // that names no session, comes back as an error the model reads.
+            "session_status" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
+                let target_id = args["id"].as_str().unwrap_or_default().to_string();
+                let outcome = async {
+                    let Some(target) = deps.store.get_session(&target_id).await? else {
+                        anyhow::bail!("no session {target_id}");
+                    };
+                    if !in_callers_line(&deps.store, session_id, &target.id).await? {
+                        anyhow::bail!(
+                            "session {target_id} is neither an ancestor nor a descendant of this session"
+                        );
+                    }
+                    let last_activity_secs = deps.store.last_activity_secs(&target.id).await?;
+                    Ok::<Value, anyhow::Error>(json!({
+                        "id": target.id,
+                        "state": target.state,
+                        "persona": target.persona,
+                        "model": target.model,
+                        "node": target.node,
+                        "dir": target.dir,
+                        "summary": target.summary,
+                        "created_at_secs": target.created_at_secs,
+                        "last_activity_secs": last_activity_secs,
+                    }))
+                }
+                .await;
+                let (content, is_error) = match outcome {
+                    Ok(content) => (content, false),
                     Err(error) => (json!({ "error": error.to_string() }), true),
                 };
                 deps.store
@@ -3868,6 +4069,19 @@ mod tests {
         child
     }
 
+    /// The result the store recorded for one tool call, by call id: what the
+    /// model reads back from the turn that made the call.
+    async fn recorded_result(store: &Store, session_id: &str, call_id: &str) -> Value {
+        store
+            .tool_calls(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|call| call.call_id == call_id)
+            .and_then(|call| call.result)
+            .unwrap_or_else(|| panic!("no result recorded for {call_id}"))
+    }
+
     /// A fake spawner that records its request and answers `result` without
     /// starting anything: the loop under test must not depend on the child
     /// running inside the parent's turn.
@@ -4893,6 +5107,12 @@ mod tests {
                 StreamEvent::TextDelta("working on it".into()),
                 stop(2, 1),
             ],
+            // Both items are still open, so the reply above draws one nudge
+            // and the wake runs this third turn before it waits.
+            vec![
+                StreamEvent::TextDelta("still working on it".into()),
+                stop(2, 1),
+            ],
         ]));
         let deps = Arc::new(test_deps(
             &store,
@@ -4910,7 +5130,7 @@ mod tests {
                 let provider = provider.clone();
                 async move {
                     let calls = provider.captured_calls();
-                    calls.len() == 2 && calls[1].system.contains("Current todo list")
+                    calls.len() >= 2 && calls[1].system.contains("Current todo list")
                 }
             }
         })
@@ -4960,7 +5180,8 @@ mod tests {
         assert_eq!(tool_calls[0].result, Some(json!({ "ok": true })));
         assert!(!tool_calls[0].is_error);
 
-        assert_eq!(store.model_calls("s-todo").await.unwrap().len(), 2);
+        // The still-open list drew one nudged turn, which is the third call.
+        assert_eq!(store.model_calls("s-todo").await.unwrap().len(), 3);
 
         handle.stop();
     }
@@ -7059,6 +7280,12 @@ mod tests {
                 stop(5, 3),
             ],
             vec![StreamEvent::TextDelta("working on it".into()), stop(2, 1)],
+            // The item above is still open, so that reply draws one nudge and
+            // the wake runs this third turn before it waits.
+            vec![
+                StreamEvent::TextDelta("still working on it".into()),
+                stop(2, 1),
+            ],
         ]));
         let deps = Arc::new(test_deps_with_personas(
             &store,
@@ -7087,7 +7314,7 @@ mod tests {
                     let provider = provider.clone();
                     async move {
                         let calls = provider.captured_calls();
-                        calls.len() == 2
+                        calls.len() >= 2
                             && calls[1].system.contains("You are the coder persona.")
                             && calls[1].system.contains("Current todo list")
                     }
@@ -8985,6 +9212,664 @@ mod tests {
         handle.stop();
     }
 
+    #[tokio::test]
+    async fn a_reply_that_announces_an_action_is_nudged_once_and_the_next_turn_acts() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-nudge")).await.unwrap();
+
+        // The first reply announces the call and makes none, which would end
+        // the wake as an ordinary finish; the nudge hands the model its own
+        // message back and the second turn makes the call it announced.
+        let reply = "Filed the issue. Next I will run the failing test to confirm the shape.";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta(reply.into()), stop(9, 21)],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test -p bosun-agent"}"#.into(),
+                },
+                stop(14, 8),
+            ],
+            vec![
+                StreamEvent::TextDelta("the suite passes".into()),
+                stop(20, 4),
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the nudged wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        // The wake's whole conversation: the announced turn, the loop's nudge,
+        // the turn that makes the call, and the reply that ends the wake.
+        let messages = store.messages("root-nudge", false).await.unwrap();
+        let transcript: Vec<String> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(format!("{}: {}", message.role.as_str(), text)),
+                Block::ToolCall { name, .. } => {
+                    Some(format!("{}: tool call {name}", message.role.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            transcript,
+            [
+                format!("assistant: {reply}"),
+                format!("user: {ACTION_NUDGE}"),
+                "assistant: tool call shell".to_string(),
+                "assistant: the suite passes".to_string(),
+            ],
+            "the wake reads as the announced turn, the nudge, the call, the reply"
+        );
+
+        // The nudge reached the model as the next message, and the announced
+        // tool ran.
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 3, "the wake ran the nudged turn and its call");
+        assert!(
+            matches!(
+                calls[1].messages.last().map(|message| &message.block),
+                Some(Block::Text { text }) if text == ACTION_NUDGE
+            ),
+            "the nudged turn's request ends with the nudge: {:#?}",
+            calls[1].messages
+        );
+        let shell_calls: Vec<CapturedToolCall> = tools
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.name == "shell")
+            .cloned()
+            .collect();
+        assert_eq!(shell_calls.len(), 1, "the announced shell call ran once");
+        assert_eq!(
+            shell_calls[0].args["command"].as_str(),
+            Some("cargo test -p bosun-agent")
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_reports_without_announcing_is_left_alone() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-report"))
+            .await
+            .unwrap();
+
+        let reply = "The suite passes and the reset design is settled.";
+        // A second script would run a whole turn if a nudge were appended.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta(reply.into()), stop(9, 12)],
+            vec![
+                StreamEvent::TextDelta("a nudged turn ran".into()),
+                stop(3, 6),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-report".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the reporting wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-report")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "a turn that reports and announces nothing ends the wake"
+        );
+        let messages = store.messages("root-nudge-report", false).await.unwrap();
+        assert!(
+            !messages
+                .iter()
+                .any(|(_, message)| message.role == Role::User),
+            "a report draws no nudge: {:#?}",
+            messages
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_announces_and_then_makes_the_call_is_not_nudged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-called"))
+            .await
+            .unwrap();
+
+        // The announcing sentence is the same one that draws a nudge when the
+        // turn makes no call; here the call is in the reply, so the wake has
+        // its work under way and runs no nudge.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("I will run the failing test.".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test"}"#.into(),
+                },
+                stop(11, 9),
+            ],
+            vec![
+                StreamEvent::TextDelta("the suite passes".into()),
+                stop(6, 3),
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-called".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the calling wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-called")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            2,
+            "the turn's own call is the work; no nudge runs a third turn"
+        );
+        let messages = store.messages("root-nudge-called", false).await.unwrap();
+        assert!(
+            !messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::Text { text } if text == ACTION_NUDGE
+            )),
+            "a turn that made its call draws no nudge: {:#?}",
+            messages
+        );
+        assert_eq!(
+            tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            1,
+            "the announced call ran"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_asks_the_user_is_not_nudged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-ask"))
+            .await
+            .unwrap();
+
+        // The ask ends the turn deliberately, whatever the reply announced, so
+        // the model's question reaches the user and no nudge follows it.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("I will need your answer to this one.".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("ask".into()),
+                    args_delta: r#"{"message":"push the fix?","options":["yes","no"]}"#.into(),
+                },
+                stop(10, 7),
+            ],
+            vec![
+                StreamEvent::TextDelta("a nudged turn ran".into()),
+                stop(3, 6),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-ask".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root to wait for the answer", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-ask")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "an ask ends the wake; no nudge follows it"
+        );
+        let messages = store.messages("root-nudge-ask", false).await.unwrap();
+        assert!(
+            messages.iter().any(|(_, message)| matches!(
+                &message.block,
+                Block::Ask { message, child_id: None, .. } if message == "push the fix?"
+            )),
+            "the ask reaches the user: {:#?}",
+            messages
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|(_, message)| message.role == Role::User),
+            "an ask draws no nudge: {:#?}",
+            messages
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_nudged_turn_that_also_ends_in_prose_gets_no_second_nudge() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-twice"))
+            .await
+            .unwrap();
+
+        // Both turns announce and make no call. The nudge is once per wake, so
+        // the second prose reply ends the wake instead of spinning.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("Next I will run the failing test.".into()),
+                stop(8, 7),
+            ],
+            vec![
+                StreamEvent::TextDelta("I will run it shortly.".into()),
+                stop(8, 6),
+            ],
+            vec![
+                StreamEvent::TextDelta("a second nudge ran a third turn".into()),
+                stop(3, 6),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-twice".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the twice-announcing wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-twice")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            2,
+            "the wake ran exactly one nudged turn"
+        );
+        let messages = store.messages("root-nudge-twice", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Next I will run the failing test.",
+                ACTION_NUDGE,
+                "I will run it shortly."
+            ],
+            "one nudge, and the second prose reply ends the wake"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_plain_report_with_an_open_todo_is_nudged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-open-todo"))
+            .await
+            .unwrap();
+
+        // The session's own list still holds an item it never finished, and
+        // the reply that ends the turn reports rather than announces: there is
+        // no phrase to detect, so the open item is the whole signal.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("todowrite".into()),
+                    args_delta:
+                        r#"{"items":[{"id":"1","content":"run the suite","status":"in_progress"}]}"#
+                            .into(),
+                },
+                stop(6, 9),
+            ],
+            vec![
+                StreamEvent::TextDelta("The suite passes and the reset design is settled.".into()),
+                stop(5, 12),
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test"}"#.into(),
+                },
+                stop(14, 8),
+            ],
+            vec![
+                StreamEvent::TextDelta("the suite passes".into()),
+                stop(9, 4),
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-open-todo".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the nudged wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-open-todo")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("root-nudge-open-todo", false).await.unwrap();
+        let transcript: Vec<String> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(format!("{}: {}", message.role.as_str(), text)),
+                Block::ToolCall { name, .. } => {
+                    Some(format!("{}: tool call {name}", message.role.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            transcript,
+            [
+                "assistant: tool call todowrite".to_string(),
+                "assistant: The suite passes and the reset design is settled.".to_string(),
+                format!("user: {ACTION_NUDGE}"),
+                "assistant: tool call shell".to_string(),
+                "assistant: the suite passes".to_string(),
+            ],
+            "the open todo draws the nudge, and the nudged turn makes the call"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            4,
+            "the write, the report, the nudged call, and the reply that ends the wake"
+        );
+        assert_eq!(
+            tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            1,
+            "the nudged turn's call ran"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_plain_report_with_every_todo_done_is_not_nudged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-done-todo"))
+            .await
+            .unwrap();
+
+        // The same plainly-worded report, with nothing left open: the list
+        // says the session finished its work, so the wake ends there.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("todowrite".into()),
+                    args_delta:
+                        r#"{"items":[{"id":"1","content":"run the suite","status":"done"}]}"#.into(),
+                },
+                stop(6, 9),
+            ],
+            vec![
+                StreamEvent::TextDelta("The suite passes and the reset design is settled.".into()),
+                stop(5, 12),
+            ],
+            vec![
+                StreamEvent::TextDelta("a nudged turn ran".into()),
+                stop(3, 6),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-done-todo".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the reporting wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-done-todo")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            2,
+            "a finished list leaves nothing to nudge"
+        );
+        let messages = store.messages("root-nudge-done-todo", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["The suite passes and the reset design is settled."],
+            "no nudge follows a report with every item done"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_that_ends_in_a_plain_report_is_not_nudged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-child"))
+            .await
+            .unwrap();
+        store
+            .create_session(&child_session_of("child-nudge", "root-nudge-child"))
+            .await
+            .unwrap();
+
+        // Only the root is advertised `todowrite`, so a child's list is always
+        // empty: it ends its wake on the wording check alone, and a report
+        // that announces nothing reports to its parent rather than being
+        // nudged.
+        let reply = "The patch is applied and the suite passes.";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta(reply.into()), stop(4, 9)],
+            vec![
+                StreamEvent::TextDelta("a nudged turn ran".into()),
+                stop(3, 6),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-nudge".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to stop after reporting", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("child-nudge")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::Stopped
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "a child's plain report ends its wake"
+        );
+        let messages = store.messages("child-nudge", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, [reply], "no nudge follows the child's report");
+        assert!(
+            store
+                .messages("root-nudge-child", false)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, message)| matches!(
+                    &message.block,
+                    Block::ChildEvent {
+                        child_id,
+                        kind: ChildEventKind::Report,
+                        text,
+                        ..
+                    } if child_id == "child-nudge" && text == reply
+                )),
+            "the child reported to its parent instead"
+        );
+
+        handle.stop();
+    }
+
     #[test]
     fn empty_outcome_message_distinguishes_a_truncated_reply() {
         assert_eq!(
@@ -8996,6 +9881,55 @@ mod tests {
             empty_outcome_message(StopReason::MaxTokens),
             empty_outcome_message(StopReason::StopResponse),
             "a truncated reply logs as truncated, not as an empty response"
+        );
+    }
+
+    #[test]
+    fn announces_an_action_reads_the_last_sentence() {
+        assert!(
+            announces_an_action(
+                "Filed as #16. Checking on #1's progress. Next I will run the failing test."
+            ),
+            "a first-person future marker in the last sentence announces an action"
+        );
+        assert!(
+            announces_an_action("Let me rebuild the binary."),
+            "a sentence-capitalized marker matches"
+        );
+        assert!(
+            announces_an_action("I will bump the version to 0.9.33 and re-run the suite."),
+            "a dot inside a version number is not a sentence boundary"
+        );
+        assert!(
+            announces_an_action("I will run the failing test.\n"),
+            "trailing whitespace leaves the sentence before it as the last one"
+        );
+        assert!(
+            !announces_an_action("The suite passes and nothing is left to do."),
+            "a plain report announces nothing"
+        );
+        assert!(
+            !announces_an_action("I will run the failing test. The suite passes."),
+            "only the last sentence is read"
+        );
+        assert!(!announces_an_action(""), "an empty reply announces nothing");
+    }
+
+    #[test]
+    fn has_open_todo_counts_every_status_but_done() {
+        let item =
+            |status: &str| json!({ "id": "1", "content": "run the suite", "status": status });
+        assert!(has_open_todo(&[item("todo")]));
+        assert!(has_open_todo(&[item("in_progress")]));
+        assert!(!has_open_todo(&[item("done")]));
+        assert!(
+            has_open_todo(&[json!({ "id": "1", "content": "run the suite" })]),
+            "an item the schema would reject is not a finished one"
+        );
+        assert!(!has_open_todo(&[]));
+        assert!(
+            has_open_todo(&[item("done"), item("todo")]),
+            "one open item is enough"
         );
     }
 
@@ -11488,6 +12422,292 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_status_answers_with_a_childs_state_and_summary() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-ss1")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-ss1", "root-ss1"))
+            .await
+            .unwrap();
+        store
+            .set_state("child-ss1", SessionState::Running)
+            .await
+            .unwrap();
+        store
+            .set_summary("child-ss1", "reviewing the patch")
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("session_status".into()),
+                    args_delta: r#"{"id":"child-ss1"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-ss1".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root's turns to finish", || {
+            let store = store.clone();
+            async move {
+                store.get_session("root-ss1").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let status = recorded_result(&store, "root-ss1", "call-1").await;
+        assert_eq!(status["id"], "child-ss1");
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["persona"], "coder");
+        assert_eq!(status["model"], "mock-model");
+        assert_eq!(status["node"], "node-1");
+        assert_eq!(status["dir"], "/work");
+        assert_eq!(status["summary"], "reviewing the patch");
+        assert_eq!(status["created_at_secs"], json!(1_700_000_000));
+        assert!(
+            status["last_activity_secs"]
+                .as_i64()
+                .is_some_and(|secs| secs >= 1_700_000_000),
+            "the child's newest recorded event is when it last did anything: {status}"
+        );
+        let mut fields: Vec<&str> = status
+            .as_object()
+            .expect("the answer is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "created_at_secs",
+                "dir",
+                "id",
+                "last_activity_secs",
+                "model",
+                "node",
+                "persona",
+                "state",
+                "summary",
+            ],
+            "the answer holds exactly these fields, and no transcript text"
+        );
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_asks_about_itself_and_its_parent() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-ss2")).await.unwrap();
+        let mut child = child_session_of("child-ss2", "root-ss2");
+        child.permission = Permission::ReadOnly;
+        store.create_session(&child).await.unwrap();
+        store
+            .set_summary("root-ss2", "coordinating the change")
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("session_status".into()),
+                    args_delta: r#"{"id":"child-ss2"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("session_status".into()),
+                    args_delta: r#"{"id":"root-ss2"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-ss2".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to report and stop", || {
+            let store = store.clone();
+            async move {
+                store.get_session("child-ss2").await.unwrap().unwrap().state
+                    == SessionState::Stopped
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        let names: Vec<&str> = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"session_status"),
+            "a read-only session is offered the status tool: {names:?}"
+        );
+        assert!(
+            !names.contains(&"shell"),
+            "the read-only surface still drops the mutating tools: {names:?}"
+        );
+
+        let own = recorded_result(&store, "child-ss2", "call-1").await;
+        assert_eq!(own["id"], "child-ss2");
+        assert_eq!(own["state"], "running");
+        let parent = recorded_result(&store, "child-ss2", "call-2").await;
+        assert_eq!(parent["id"], "root-ss2");
+        assert_eq!(parent["summary"], "coordinating the change");
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn session_status_refuses_a_sibling_and_a_session_in_another_tree() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-ss3")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-ss3", "root-ss3"))
+            .await
+            .unwrap();
+        store
+            .create_session(&child_session_of("sibling-ss3", "root-ss3"))
+            .await
+            .unwrap();
+        store
+            .create_session(&session("other-root-ss3"))
+            .await
+            .unwrap();
+        store
+            .create_session(&child_session_of("other-child-ss3", "other-root-ss3"))
+            .await
+            .unwrap();
+
+        // The caller is `child-ss3`: its sibling shares its tree but not its
+        // line, and the other tree's session is further out still. Both are
+        // refused with the reason, and nothing about them is answered.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("session_status".into()),
+                    args_delta: r#"{"id":"sibling-ss3"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-2".into()),
+                    name: Some("session_status".into()),
+                    args_delta: r#"{"id":"other-child-ss3"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-ss3".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the child to report and stop", || {
+            let store = store.clone();
+            async move {
+                store.get_session("child-ss3").await.unwrap().unwrap().state
+                    == SessionState::Stopped
+            }
+        })
+        .await;
+
+        for (call_id, refused) in [("call-1", "sibling-ss3"), ("call-2", "other-child-ss3")] {
+            let result = recorded_result(&store, "child-ss3", call_id).await;
+            assert_eq!(
+                result["error"],
+                json!(format!(
+                    "session {refused} is neither an ancestor nor a descendant of this session"
+                )),
+                "{call_id} carries no status for {refused}: {result}"
+            );
+            assert!(
+                result["state"].is_null(),
+                "{call_id} answers nothing about {refused}: {result}"
+            );
+        }
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn session_status_refuses_an_unknown_id() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root-ss4")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("session_status".into()),
+                    args_delta: r#"{"id":"ghost"}"#.into(),
+                },
+                stop(2, 1),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-ss4".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the root's turns to finish", || {
+            let store = store.clone();
+            async move {
+                store.get_session("root-ss4").await.unwrap().unwrap().state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let result = recorded_result(&store, "root-ss4", "call-1").await;
+        assert_eq!(result["error"], json!("no session ghost"));
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn a_child_ask_authors_an_ask_event_to_its_parent_and_the_child_waits() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -13128,6 +14348,9 @@ mod tests {
                 stop(2, 1),
             ],
             vec![StreamEvent::TextDelta("planned".into()), stop(1, 1)],
+            // The item the root just wrote is open, so the reply above draws
+            // one nudge and the wake runs this third turn before it waits.
+            vec![StreamEvent::TextDelta("still planning".into()), stop(1, 1)],
         ]));
         let deps = Arc::new(test_deps(
             &store,

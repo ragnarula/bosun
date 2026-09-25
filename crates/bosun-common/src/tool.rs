@@ -249,6 +249,13 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             description: "Send a message to one of your child sessions, named in your live-children manifest. A child waiting for input has asked you a question: answer it or deny it with a reason here, and the child resumes from its own thread. If you surfaced a child's question to the user and the user redirects instead of answering, message that child to cancel its pending question. You can also use it to ask a working child for detail or to redirect it.".into(),
             schema: json!({"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}),
         },
+        // Read-only sessions keep this tool: the answer is read from the
+        // control-plane store, so the call changes nothing.
+        ToolSpec {
+            name: "session_status".into(),
+            description: "Read one session's status from the control plane, without reading that session's files and without sending it anything: its state, persona, model, node, working directory, the summary it wrote about what it is doing now, when it was created, and when it last did anything (unix seconds, from its newest dated event; null when it has none). `id` names the session; you may ask about yourself, a session on your parent chain up to the tree root, and any session below you. Any other session, and an id that does not exist, comes back as an error that says why. The answer carries no transcript text.".into(),
+            schema: json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}),
+        },
     ];
 
     match permission {
@@ -364,6 +371,7 @@ mod tests {
                 "skill",
                 "spawn",
                 "message_child",
+                "session_status",
             ]
         );
         for tool in &tools {
@@ -389,6 +397,9 @@ mod tests {
                 "skill",
                 "spawn",
                 "message_child",
+                // `session_status` answers from the store and changes
+                // nothing, so a read-only session keeps it.
+                "session_status",
             ]
         );
     }
@@ -425,6 +436,16 @@ mod tests {
             .find(|tool| tool.name == "message_child")
             .unwrap();
         assert_eq!(message_child.schema["required"], json!(["id", "text"]));
+    }
+
+    #[test]
+    fn session_status_schema_requires_the_session_id() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let session_status = tools
+            .iter()
+            .find(|tool| tool.name == "session_status")
+            .unwrap();
+        assert_eq!(session_status.schema["required"], json!(["id"]));
     }
 
     #[test]

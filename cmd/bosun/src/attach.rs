@@ -709,6 +709,7 @@ fn tool_glyph(text: &str) -> &'static str {
         "skill" => "⚒",
         "spawn" => "⊕",
         "message_child" => "⇄",
+        "session_status" => "◉",
         _ => "⚙",
     }
 }
