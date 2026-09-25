@@ -1374,11 +1374,13 @@ fn announces_an_action(text: &str) -> bool {
     if ACTION_MARKERS.iter().any(|marker| last.contains(marker)) {
         return true;
     }
+    // The opener is read as a bare word, so a comma, a colon, a quote or
+    // markdown emphasis around it does not stop the sentence from counting.
     let first = last
         .split_whitespace()
         .next()
-        .map(|word| word.trim_end_matches([',', ':', ';']))
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric());
     ANNOUNCEMENT_OPENERS.contains(&first)
 }
 
@@ -10168,6 +10170,10 @@ mod tests {
         assert!(
             announces_an_action("Next, the ADR and the template, then the children."),
             "punctuation after the sequencing word leaves it as the sentence's first word"
+        );
+        assert!(
+            announces_an_action("**Now** the ignored e2e pair runs."),
+            "emphasis around the sequencing word leaves the bare word to match"
         );
         assert!(
             announces_an_action("Then mark sprint 012's stories and give the final report."),
