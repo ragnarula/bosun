@@ -148,6 +148,53 @@ mod tests {
         );
     }
 
+    // These two pin the link scheme check and the branch that reads it.
+
+    #[test]
+    fn the_pane_follows_only_the_http_https_and_mailto_link_schemes() {
+        let check = squeezed(segment(PANE, "function isSafeLinkTarget(", "\n}"));
+        for token in [
+            "const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(target);",
+            "return ['http', 'https', 'mailto'].includes(scheme[1].toLowerCase());",
+        ] {
+            assert!(
+                check.contains(&squeezed(token)),
+                "the check must read the ASCII scheme before the first colon, allow only http, https and mailto, and compare without regard to case — so {token} stays"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_builds_an_anchor_only_for_a_target_the_check_allows() {
+        let inline = squeezed(segment(PANE, "function appendInline(", "\n}\n"));
+        assert!(
+            inline.contains(&squeezed("if (token.url && isSafeLinkTarget(token.url)) {")),
+            "the anchor branch must be guarded by the scheme check"
+        );
+        assert!(
+            inline.contains(&squeezed("link.href = token.url;"))
+                && inline.contains(&squeezed("link.textContent = token.text;")),
+            "an allowed target is still the href, and the anchor still shows the link's text"
+        );
+        assert!(
+            inline.contains(&squeezed("parent.appendChild(link); continue;")),
+            "the anchor branch must leave by continue, so a token the check refuses reaches the text path below it rather than an anchor"
+        );
+        // One place in the pane builds an anchor and one assigns an href, and
+        // both sit behind the guard. A check over the source can only see
+        // these spellings of the two calls.
+        assert_eq!(
+            PANE.matches("document.createElement('a')").count(),
+            1,
+            "the pane builds an anchor in one place, and that spelling sits behind the guard"
+        );
+        assert_eq!(
+            PANE.matches("link.href = ").count(),
+            1,
+            "the pane assigns an href in one place, and that spelling sits behind the guard"
+        );
+    }
+
     #[test]
     fn the_pane_routes_activity_frames_to_the_console() {
         assert!(

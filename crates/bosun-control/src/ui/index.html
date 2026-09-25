@@ -4074,9 +4074,28 @@ function parseInline(text) {
   return tokens;
 }
 
+// Whether a link target from a model's reply may become an href. A reply can
+// quote text the model did not write — a file it read, a page it fetched, a
+// tool's output — and the pane's own origin reaches the control plane's API,
+// so only a target whose scheme is http, https or mailto is followed. The
+// scheme is the ASCII characters before the first colon, compared without
+// regard to case, the way a browser reads one, so `JaVaScRiPt:x` is refused
+// with `javascript:x`. A target that opens with anything else is refused too:
+// `data:text/html,...`; a scheme-relative `//host/path` or a relative path
+// like `/ui` or `docs/x.md`, which a browser would resolve against the pane's
+// own origin; and a target with a leading space or tab, since the check reads
+// the target as it stands and does not trim. Whitespace after the scheme — a
+// trailing space, say — stays in the target, because it cannot change the
+// scheme, and a browser drops it when it resolves the URL.
+function isSafeLinkTarget(target) {
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(target);
+  if (scheme === null) return false;
+  return ['http', 'https', 'mailto'].includes(scheme[1].toLowerCase());
+}
+
 function appendInline(parent, text) {
   for (const token of parseInline(text)) {
-    if (token.url) {
+    if (token.url && isSafeLinkTarget(token.url)) {
       const link = document.createElement('a');
       link.className = 'md-link';
       link.href = token.url;
@@ -4086,6 +4105,9 @@ function appendInline(parent, text) {
       parent.appendChild(link);
       continue;
     }
+    // A link token with no target, or one the check refuses, falls through to
+    // this text path: the reader still sees the text the model wrote, without
+    // a live link.
     const classes = [];
     if (token.bold) classes.push('md-bold');
     if (token.italic) classes.push('md-italic');
