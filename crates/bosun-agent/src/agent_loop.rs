@@ -2694,14 +2694,16 @@ fn truncate_mcp_text(text: &str) -> String {
 }
 
 /// Maps the accumulated tool-call deltas into `(id, name, args)` triples;
-/// unparseable argument JSON becomes `Value::Null` with a warning.
+/// unparseable argument JSON becomes `Value::Null` with a warning. A call the
+/// stream never gave an id or a name is assembled all the same, and is logged
+/// at debug: without an identity, nothing it does can be traced back to it.
 fn parse_tool_calls(
     tool_calls: BTreeMap<usize, AccumulatedToolCall>,
     session_id: &str,
 ) -> Vec<(String, String, Value)> {
     tool_calls
-        .into_values()
-        .map(|call| {
+        .into_iter()
+        .map(|(index, call)| {
             let args = serde_json::from_str(&call.args_delta).unwrap_or_else(|error| {
                 warn!(
                     msg = "tool call arguments are not valid JSON",
@@ -2710,11 +2712,18 @@ fn parse_tool_calls(
                 );
                 Value::Null
             });
-            (
-                call.id.unwrap_or_default(),
-                call.name.unwrap_or_default(),
-                args,
-            )
+            let id = call.id.unwrap_or_default();
+            let name = call.name.unwrap_or_default();
+            if id.is_empty() || name.is_empty() {
+                debug!(
+                    msg = "tool call assembled without an id or a name",
+                    session_id = %session_id,
+                    index,
+                    has_id = !id.is_empty(),
+                    has_name = !name.is_empty(),
+                );
+            }
+            (id, name, args)
         })
         .collect()
 }

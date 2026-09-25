@@ -2,6 +2,7 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::stream;
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -86,7 +87,9 @@ fn take_block(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
 
 /// Parse one block's `event:` and `data:` fields, joining repeated `data:`
 /// lines with `\n`. Comment lines (`: ...`) and unknown fields are ignored;
-/// a block without data is skipped.
+/// a block without data is skipped. A line that is not a field at all is
+/// dropped with a debug line, because it says the stream is not the shape the
+/// parser reads.
 fn parse_block(block: &[u8]) -> Option<SseEvent> {
     let text = String::from_utf8_lossy(block);
     let mut event = None;
@@ -97,6 +100,10 @@ fn parse_block(block: &[u8]) -> Option<SseEvent> {
             continue;
         }
         let Some((field, value)) = line.split_once(':') else {
+            debug!(
+                msg = "sse line has no field separator; dropped",
+                line_bytes = line.len(),
+            );
             continue;
         };
         let value = value.strip_prefix(' ').unwrap_or(value);

@@ -4,6 +4,7 @@
 use futures_util::stream::BoxStream;
 use serde_json::Value;
 use serde_json::json;
+use tracing::debug;
 
 use crate::provider::Provider;
 use crate::provider::ProviderAdapter;
@@ -11,6 +12,7 @@ use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
 use crate::provider::StopReason;
 use crate::provider::StreamEvent;
+use crate::provider::json_shape;
 use crate::provider::messages_url;
 use crate::serialize::openai_messages;
 use crate::serialize::openai_tools;
@@ -89,6 +91,18 @@ impl OpenAiParser {
             return None;
         }
         self.stopped = true;
+        // A reason the adapter does not read maps to the catch-all, which ends
+        // the turn as an ordinary stop. Naming it is what tells a completion
+        // cut short in a shape the adapter does not know from a finished one.
+        if let Some(reason) = self.finish_reason.as_deref()
+            && reason != "stop"
+            && reason != "length"
+        {
+            debug!(
+                msg = "openai finish reason is not read; mapped to the catch-all",
+                finish_reason = %reason,
+            );
+        }
         let stop_reason = match self.finish_reason.as_deref() {
             Some("stop") => StopReason::StopResponse,
             Some("length") => StopReason::MaxTokens,
@@ -105,6 +119,11 @@ impl OpenAiParser {
 /// Turn one SSE chunk into [`StreamEvent`]s. The `[DONE]` marker and the
 /// final usage chunk both stop the completion; empty deltas are skipped.
 /// A chunk may carry text, tool call fragments, one per index, or both.
+///
+/// A field the adapter does not read — text or reasoning in a shape that is
+/// not a string, tool calls that are not an array, a call carrying nothing —
+/// is dropped with a debug line naming its shape, so a call the stream sent in
+/// a shape the adapter cannot read can be found in the logs.
 ///
 /// A usage chunk is parsed like any other before its stop is emitted. The
 /// Vercel AI Gateway carries `usage`, `finish_reason` and the turn's last
@@ -128,12 +147,21 @@ fn parse_event(
     if let Some(usage) = chunk.get("usage")
         && !usage.is_null()
     {
+        // A usage in a shape the adapter does not read leaves both counts at
+        // zero, which reads as a call that cost nothing.
+        if !usage.is_object() {
+            debug!(
+                msg = "openai usage is not an object; the call's tokens read as zero",
+                shape = json_shape(usage),
+            );
+        }
         parser.input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
         parser.output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
         usage_chunk = true;
     }
     let mut out = Vec::new();
-    if let Some(choices) = chunk["choices"].as_array() {
+    let choices_field = &chunk["choices"];
+    if let Some(choices) = choices_field.as_array() {
         if let Some(first) = choices.first()
             && let Some(reason) = first["finish_reason"].as_str()
         {
@@ -152,12 +180,30 @@ fn parse_event(
             {
                 events.push(StreamEvent::ReasoningDelta(thinking.to_string()));
             }
-            if let Some(text) = delta["content"].as_str()
+            // A reasoning field holding anything but a string is dropped, and
+            // the reply reads as if the model had sent no reasoning at all.
+            for field in ["reasoning_content", "reasoning"] {
+                if !delta[field].is_null() && delta[field].as_str().is_none() {
+                    debug!(
+                        msg = "openai reasoning is not a string; dropped",
+                        field,
+                        shape = json_shape(&delta[field]),
+                    );
+                }
+            }
+            let content = &delta["content"];
+            if let Some(text) = content.as_str()
                 && !text.is_empty()
             {
                 events.push(StreamEvent::TextDelta(text.to_string()));
+            } else if !content.is_null() && content.as_str().is_none() {
+                debug!(
+                    msg = "openai content is not a string; dropped",
+                    shape = json_shape(content),
+                );
             }
-            if let Some(calls) = delta["tool_calls"].as_array() {
+            let tool_calls = &delta["tool_calls"];
+            if let Some(calls) = tool_calls.as_array() {
                 for call in calls {
                     let index = call["index"].as_u64().unwrap_or(0) as usize;
                     let id = call["id"].as_str().map(str::to_string);
@@ -167,6 +213,11 @@ fn parse_event(
                         .unwrap_or_default()
                         .to_string();
                     if id.is_none() && name.is_none() && args_delta.is_empty() {
+                        debug!(
+                            msg = "openai tool call carries no name, no id and no arguments; \
+                                   dropped",
+                            index,
+                        );
                         continue;
                     }
                     events.push(StreamEvent::ToolCallDelta {
@@ -176,12 +227,22 @@ fn parse_event(
                         args_delta,
                     });
                 }
+            } else if !tool_calls.is_null() {
+                debug!(
+                    msg = "openai tool_calls is not an array; dropped",
+                    shape = json_shape(tool_calls),
+                );
             }
             if !events.is_empty() {
                 out = events;
                 break;
             }
         }
+    } else if !choices_field.is_null() {
+        debug!(
+            msg = "openai choices is not an array; the chunk is dropped",
+            shape = json_shape(choices_field),
+        );
     }
     if usage_chunk {
         out.extend(parser.stop());

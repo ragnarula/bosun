@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use futures_util::stream::BoxStream;
 use serde_json::Value;
 use serde_json::json;
+use tracing::debug;
 
 use crate::provider::Provider;
 use crate::provider::ProviderAdapter;
@@ -13,6 +14,7 @@ use crate::provider::ProviderCall;
 use crate::provider::ProviderError;
 use crate::provider::StopReason;
 use crate::provider::StreamEvent;
+use crate::provider::json_shape;
 use crate::provider::messages_url;
 use crate::serialize::anthropic_messages;
 use crate::serialize::anthropic_tools;
@@ -137,8 +139,11 @@ fn flush_tool_start(parser: &mut AnthropicParser, index: usize) -> Vec<StreamEve
     }]
 }
 
-/// Turn one SSE event into [`StreamEvent`]s. Unknown event kinds (ping) are
-/// skipped.
+/// Turn one SSE event into [`StreamEvent`]s. An event the parser does not
+/// understand is dropped with a debug line naming its shape, so a call the
+/// stream carried in a shape the adapter does not read can be found in the
+/// logs; the `ping` heartbeat is the one kind dropped silently, because it
+/// carries nothing for the turn.
 fn parse_event(
     event: &SseEvent,
     parser: &mut AnthropicParser,
@@ -147,6 +152,14 @@ fn parse_event(
         detail: format!("anthropic event data is not JSON: {error}"),
     })?;
     let Some(kind) = data["type"].as_str() else {
+        // The heartbeat can arrive as the SSE event name alone, with data the
+        // adapter has no use for.
+        if event.event.as_deref() != Some("ping") {
+            debug!(
+                msg = "anthropic event carries no type; dropped",
+                sse_event = ?event.event,
+            );
+        }
         return Ok(Vec::new());
     };
     match kind {
@@ -158,20 +171,31 @@ fn parse_event(
         }
         "content_block_start" => {
             let block = &data["content_block"];
-            if block["type"] == "tool_use" {
-                let index = data["index"].as_u64().unwrap_or(0) as usize;
-                let id = block["id"].as_str().map(str::to_string);
-                let name = block["name"].as_str().map(str::to_string);
-                // The start block holds the whole input, or `{}` when the
-                // arguments arrive as deltas instead.
-                let input = if block["input"].is_object() {
-                    block["input"].to_string()
-                } else {
-                    "{}".to_string()
-                };
-                parser
-                    .tool_starts
-                    .insert(index, ToolStart { id, name, input });
+            match block["type"].as_str() {
+                Some("tool_use") => {
+                    let index = data["index"].as_u64().unwrap_or(0) as usize;
+                    let id = block["id"].as_str().map(str::to_string);
+                    let name = block["name"].as_str().map(str::to_string);
+                    // The start block holds the whole input, or `{}` when the
+                    // arguments arrive as deltas instead.
+                    let input = if block["input"].is_object() {
+                        block["input"].to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    parser
+                        .tool_starts
+                        .insert(index, ToolStart { id, name, input });
+                }
+                // A text or thinking block carries nothing of its own: its
+                // content arrives as deltas.
+                Some("text" | "thinking") => {}
+                block_type => {
+                    debug!(
+                        msg = "anthropic content block type is not read; dropped",
+                        block_type = ?block_type,
+                    );
+                }
             }
             Ok(Vec::new())
         }
@@ -184,12 +208,23 @@ fn parse_event(
             let delta = &data["delta"];
             match delta["type"].as_str() {
                 Some("text_delta") => {
-                    let text = delta["text"].as_str().unwrap_or_default();
+                    let text = &delta["text"];
+                    let Some(text) = text.as_str() else {
+                        // A text delta that is not a string is dropped, and the
+                        // reply reads shorter than the model sent it.
+                        if !text.is_null() {
+                            debug!(
+                                msg = "anthropic text delta is not a string; dropped",
+                                index,
+                                shape = json_shape(text),
+                            );
+                        }
+                        return Ok(Vec::new());
+                    };
                     if text.is_empty() {
-                        Ok(Vec::new())
-                    } else {
-                        Ok(vec![StreamEvent::TextDelta(text.to_string())])
+                        return Ok(Vec::new());
                     }
+                    Ok(vec![StreamEvent::TextDelta(text.to_string())])
                 }
                 Some("input_json_delta") => {
                     // The deltas are the call's arguments, so the entry and the
@@ -210,7 +245,17 @@ fn parse_event(
                         }])
                     }
                 }
-                _ => Ok(Vec::new()),
+                // Thinking is accumulated from the whole reply, so its deltas
+                // carry nothing the loop needs.
+                Some("thinking_delta" | "signature_delta") => Ok(Vec::new()),
+                delta_type => {
+                    debug!(
+                        msg = "anthropic content delta type is not read; dropped",
+                        index,
+                        delta_type = ?delta_type,
+                    );
+                    Ok(Vec::new())
+                }
             }
         }
         "message_delta" => {
@@ -247,7 +292,16 @@ fn parse_event(
                 .unwrap_or_else(|| "unknown error".to_string());
             Err(ProviderError::Parse { detail: message })
         }
-        _ => Ok(Vec::new()),
+        // `ping` keeps the connection open and carries nothing for the turn.
+        "ping" => Ok(Vec::new()),
+        kind => {
+            debug!(
+                msg = "anthropic event type is not read; dropped",
+                kind = %kind,
+                sse_event = ?event.event,
+            );
+            Ok(Vec::new())
+        }
     }
 }
 

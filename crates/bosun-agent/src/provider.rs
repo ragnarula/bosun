@@ -5,6 +5,7 @@ use bosun_common::tool::ToolSpec;
 use futures_util::StreamExt;
 use futures_util::stream;
 use futures_util::stream::BoxStream;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::sse::SseError;
@@ -155,6 +156,19 @@ pub(crate) fn messages_url(base_url: &str, endpoint: &str) -> String {
         format!("{base}/{endpoint}")
     } else {
         format!("{base}/v1/{endpoint}")
+    }
+}
+
+/// The JSON type name of a value: the shape a debug line names when it drops
+/// the value, where the value itself is payload and stays out of the log.
+pub(crate) fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
