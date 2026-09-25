@@ -3061,6 +3061,7 @@ fn persona_catalog(deps: &LoopDeps) -> Vec<(String, String)> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use bosun_common::config::PersonaConfig;
@@ -3083,11 +3084,15 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::anthropic::Anthropic;
     use crate::provider::Provider;
     use crate::provider::ProviderCall;
     use crate::provider::ProviderError;
     use crate::provider::StopReason;
     use crate::provider::StreamEvent;
+    use crate::sse::SseEvent;
+    use crate::test_support::FakeProvider;
+    use crate::test_support::sse_response;
 
     fn session(id: &str) -> Session {
         Session {
@@ -6101,6 +6106,128 @@ mod tests {
                     )),
             "the second turn sees the tool result"
         );
+
+        handle.stop();
+    }
+
+    /// One SSE event for a fake provider's answer.
+    fn sse(name: &'static str, data: Value) -> SseEvent {
+        SseEvent {
+            event: Some(name.into()),
+            data: data.to_string(),
+        }
+    }
+
+    /// An answer that calls `shell` with no argument delta at all, then an
+    /// answer that ends the turn. The first answer is the real Anthropic wire
+    /// format, so the adapter is on the path the loop reads.
+    #[tokio::test]
+    async fn a_tool_use_with_no_argument_deltas_runs_the_tool() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-no-args")).await.unwrap();
+
+        let answer = Arc::new(AtomicUsize::new(0));
+        let server = FakeProvider::start(move |_| {
+            if answer.fetch_add(1, Ordering::SeqCst) == 0 {
+                sse_response(&[
+                    sse(
+                        "message_start",
+                        json!({
+                            "type": "message_start",
+                            "message": { "usage": { "input_tokens": 6, "output_tokens": 1 } },
+                        }),
+                    ),
+                    sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "shell",
+                                "input": {},
+                            },
+                        }),
+                    ),
+                    sse(
+                        "content_block_stop",
+                        json!({ "type": "content_block_stop", "index": 0 }),
+                    ),
+                    sse(
+                        "message_delta",
+                        json!({
+                            "type": "message_delta",
+                            "delta": { "stop_reason": "tool_use" },
+                            "usage": { "output_tokens": 4 },
+                        }),
+                    ),
+                    sse("message_stop", json!({ "type": "message_stop" })),
+                ])
+            } else {
+                sse_response(&[
+                    sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": { "type": "text_delta", "text": "ran it" },
+                        }),
+                    ),
+                    sse(
+                        "message_delta",
+                        json!({
+                            "type": "message_delta",
+                            "delta": { "stop_reason": "end_turn" },
+                            "usage": { "output_tokens": 2 },
+                        }),
+                    ),
+                    sse("message_stop", json!({ "type": "message_stop" })),
+                ])
+            }
+        })
+        .await;
+        let provider = Arc::new(Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        ));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-no-args".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the session to wait for input", || {
+            let store = store.clone();
+            async move {
+                let stored = store.get_session("s-no-args").await.unwrap().unwrap();
+                stored.state == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        {
+            let calls = tools.calls.lock().unwrap();
+            let shell_calls: Vec<&CapturedToolCall> =
+                calls.iter().filter(|call| call.name == "shell").collect();
+            assert_eq!(shell_calls.len(), 1, "the provider's call runs");
+            assert_eq!(shell_calls[0].args, json!({}));
+        }
+
+        let tool_calls = store.tool_calls("s-no-args").await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].call_id, "toolu_1");
+        assert_eq!(tool_calls[0].name, "shell");
+        assert_eq!(tool_calls[0].args, json!({}));
 
         handle.stop();
     }

@@ -1,7 +1,7 @@
 //! Anthropic Messages API adapter: serializes the canonical call and parses
 //! the streamed response back into [`StreamEvent`]s.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use futures_util::stream::BoxStream;
 use serde_json::Value;
@@ -94,18 +94,51 @@ impl Provider for Anthropic {
     }
 }
 
-/// Token counts, the stop reason and in-flight tool call identities carried
-/// between SSE events.
+/// Token counts, the stop reason and the started tool calls carried between
+/// SSE events.
 #[derive(Default)]
 struct AnthropicParser {
     input_tokens: u64,
     output_tokens: u64,
     stop_reason: Option<String>,
-    tool_starts: HashMap<usize, (Option<String>, Option<String>)>,
+    /// Tool calls that have started, by the index of their `content_block`.
+    /// Held in index order, so a stream that never finishes a call still emits
+    /// the calls in ascending block index.
+    tool_starts: BTreeMap<usize, ToolStart>,
 }
 
-/// Turn one SSE event into [`StreamEvent`]s. Unknown event kinds (ping,
-/// content_block_stop) and empty deltas are skipped.
+/// A tool call whose `content_block_start` has arrived and whose delta has not
+/// been emitted: the identity the delta carries, and the input the start block
+/// held.
+#[derive(Default)]
+struct ToolStart {
+    id: Option<String>,
+    name: Option<String>,
+    /// The start block's input as JSON, `{}` when it carries none. Arguments
+    /// that arrive as deltas are the call's arguments and this is dropped: the
+    /// loop appends each delta to the arguments it holds, so emitting the input
+    /// as well would make invalid JSON.
+    input: String,
+}
+
+/// The events for a tool call that sent no argument delta: the call is emitted
+/// with the input its start block held, `{}` for a tool that takes none, so the
+/// loop makes the call instead of ending the turn as if the model had called
+/// nothing.
+fn flush_tool_start(parser: &mut AnthropicParser, index: usize) -> Vec<StreamEvent> {
+    let Some(start) = parser.tool_starts.remove(&index) else {
+        return Vec::new();
+    };
+    vec![StreamEvent::ToolCallDelta {
+        index,
+        id: start.id,
+        name: start.name,
+        args_delta: start.input,
+    }]
+}
+
+/// Turn one SSE event into [`StreamEvent`]s. Unknown event kinds (ping) are
+/// skipped.
 fn parse_event(
     event: &SseEvent,
     parser: &mut AnthropicParser,
@@ -129,9 +162,22 @@ fn parse_event(
                 let index = data["index"].as_u64().unwrap_or(0) as usize;
                 let id = block["id"].as_str().map(str::to_string);
                 let name = block["name"].as_str().map(str::to_string);
-                parser.tool_starts.insert(index, (id, name));
+                // The start block holds the whole input, or `{}` when the
+                // arguments arrive as deltas instead.
+                let input = if block["input"].is_object() {
+                    block["input"].to_string()
+                } else {
+                    "{}".to_string()
+                };
+                parser
+                    .tool_starts
+                    .insert(index, ToolStart { id, name, input });
             }
             Ok(Vec::new())
+        }
+        "content_block_stop" => {
+            let index = data["index"].as_u64().unwrap_or(0) as usize;
+            Ok(flush_tool_start(parser, index))
         }
         "content_block_delta" => {
             let index = data["index"].as_u64().unwrap_or(0) as usize;
@@ -146,18 +192,20 @@ fn parse_event(
                     }
                 }
                 Some("input_json_delta") => {
-                    let (id, name) = parser.tool_starts.remove(&index).unwrap_or((None, None));
+                    // The deltas are the call's arguments, so the entry and the
+                    // input its start block held stop here.
+                    let start = parser.tool_starts.remove(&index).unwrap_or_default();
                     let args_delta = delta["partial_json"]
                         .as_str()
                         .unwrap_or_default()
                         .to_string();
-                    if id.is_none() && name.is_none() && args_delta.is_empty() {
+                    if start.id.is_none() && start.name.is_none() && args_delta.is_empty() {
                         Ok(Vec::new())
                     } else {
                         Ok(vec![StreamEvent::ToolCallDelta {
                             index,
-                            id,
-                            name,
+                            id: start.id,
+                            name: start.name,
                             args_delta,
                         }])
                     }
@@ -178,11 +226,19 @@ fn parse_event(
                 Some("max_tokens") => StopReason::MaxTokens,
                 _ => StopReason::Other,
             };
-            Ok(vec![StreamEvent::Stop {
+            let mut events = Vec::new();
+            // A tool block the stream never stopped still emits its call, so
+            // the flush at the end of the message leaves no started call
+            // behind.
+            while let Some((&index, _)) = parser.tool_starts.first_key_value() {
+                events.extend(flush_tool_start(parser, index));
+            }
+            events.push(StreamEvent::Stop {
                 input_tokens: parser.input_tokens,
                 output_tokens: parser.output_tokens,
                 stop_reason,
-            }])
+            });
+            Ok(events)
         }
         "error" => {
             let message = data["error"]["message"]
@@ -373,6 +429,269 @@ mod tests {
                 StreamEvent::Stop {
                     input_tokens: 25,
                     output_tokens: 30,
+                    stop_reason: StopReason::Other,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_use_whose_whole_input_arrives_in_the_start_block_is_emitted() {
+        let server_events = vec![
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 25, "output_tokens": 1 } },
+                }),
+            ),
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "shell",
+                        "input": { "command": "ls" },
+                    },
+                }),
+            ),
+            sse(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 12 },
+                }),
+            ),
+            sse("message_stop", json!({ "type": "message_stop" })),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
+
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("toolu_1".into()),
+                    name: Some("shell".into()),
+                    args_delta: "{\"command\":\"ls\"}".into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 25,
+                    output_tokens: 12,
+                    stop_reason: StopReason::Other,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_use_that_streams_no_arguments_is_emitted_with_empty_arguments() {
+        let server_events = vec![
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 25, "output_tokens": 1 } },
+                }),
+            ),
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "shell",
+                        "input": {},
+                    },
+                }),
+            ),
+            sse(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 12 },
+                }),
+            ),
+            sse("message_stop", json!({ "type": "message_stop" })),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
+
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("toolu_1".into()),
+                    name: Some("shell".into()),
+                    args_delta: "{}".into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 25,
+                    output_tokens: 12,
+                    stop_reason: StopReason::Other,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_argument_delta_after_a_whole_input_start_is_the_call() {
+        let server_events = vec![
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "shell",
+                        "input": { "command": "ls" },
+                    },
+                }),
+            ),
+            sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"command\":" },
+                }),
+            ),
+            sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": "\"ls\"}" },
+                }),
+            ),
+            sse(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse("message_stop", json!({ "type": "message_stop" })),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
+
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
+        let deltas: Vec<StreamEvent> = events
+            .into_iter()
+            .filter(|event| matches!(event, StreamEvent::ToolCallDelta { .. }))
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("toolu_1".into()),
+                    name: Some("shell".into()),
+                    args_delta: "{\"command\":".into(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    args_delta: "\"ls\"}".into(),
+                },
+            ],
+            "the deltas are the call's arguments, and the start block's input is not emitted as well"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_use_block_the_stream_never_stopped_is_emitted_at_the_end() {
+        let server_events = vec![
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 25, "output_tokens": 1 } },
+                }),
+            ),
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "shell",
+                        "input": {},
+                    },
+                }),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 12 },
+                }),
+            ),
+            sse("message_stop", json!({ "type": "message_stop" })),
+        ];
+        let server = FakeProvider::start(move |_| sse_response(&server_events)).await;
+        let provider = Anthropic::new(
+            "claude-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
+        );
+
+        let events = collect_stream(&provider, provider_call("claude-test")).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("toolu_1".into()),
+                    name: Some("shell".into()),
+                    args_delta: "{}".into(),
+                },
+                StreamEvent::Stop {
+                    input_tokens: 25,
+                    output_tokens: 12,
                     stop_reason: StopReason::Other,
                 },
             ]
