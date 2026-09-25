@@ -252,4 +252,91 @@ mod tests {
             "a live delta is not durable and must carry no time"
         );
     }
+
+    #[test]
+    fn the_pane_renders_a_markdown_table_from_the_pane_branch() {
+        let table = squeezed(segment(PANE, "function tableNode(", "\n}\n"));
+        for token in [
+            "holder.className = 'md-table-wrap'",
+            "table.className = 'md-table'",
+            "th.className = alignClass(align)",
+            "td.className = alignClass(align)",
+            "appendInline(th, header[index])",
+            "appendInline(td, row[index] === undefined ? '' : row[index])",
+        ] {
+            assert!(
+                table.contains(&squeezed(token)),
+                "the table builder must contain {token}"
+            );
+        }
+        let start = squeezed(segment(PANE, "function isTableStart(", "\n}\n"));
+        assert!(
+            start.contains(&squeezed(
+                "text.startsWith('|') && (text.match(/\\|/g) || []).length >= 2"
+            )),
+            "a lone pipe in prose is not a table row"
+        );
+        // Left is a cell's default, so the builder writes no class for it and
+        // the stylesheet has none.
+        assert!(
+            !PANE.contains("md-align-left"),
+            "a left column needs no alignment class"
+        );
+        assert!(
+            squeezed(segment(PANE, "function alignClass(", "\n}\n"))
+                .contains(&squeezed("align === 'left' ? '' : 'md-align-' + align")),
+            "only a right or centre column carries a class"
+        );
+        let markdown = squeezed(PANE);
+        assert!(
+            markdown.contains(&squeezed("if (isTableStart(line))"))
+                && markdown.contains(&squeezed("const aligns = tableAligns(lines[i + 1] || '')"))
+                && markdown.contains(&squeezed("if (aligns && aligns.length === header.length)"))
+                && markdown.contains(&squeezed("if (!text.includes('-')) return null;"))
+                && markdown.contains(&squeezed("body.push(tableCells(lines[i]))"))
+                && markdown.contains(&squeezed(
+                    "container.appendChild(tableNode(header, body, aligns))"
+                )),
+            "only a pipe row whose next line is a delimiter row of the same width may leave the prose path"
+        );
+        assert!(
+            markdown.contains(&squeezed("i += 2;")),
+            "the delimiter row draws as the header's rule, never as a row of its own"
+        );
+        assert!(
+            squeezed(segment(PANE, "function tableAligns(", "\n}\n")).contains(&squeezed(
+                "cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : 'left'"
+            )),
+            "a delimiter cell decides its column: :---: centre, ---: right, anything else left"
+        );
+    }
+
+    #[test]
+    fn the_pane_scrolls_a_wide_table_in_its_own_holder() {
+        let holder = segment(PANE, "#transcript .md-table-wrap {", "}");
+        assert!(
+            holder.contains("overflow-x: auto"),
+            "a wide table scrolls inside its holder, never sideways across the page"
+        );
+        let cell = segment(
+            PANE,
+            "#transcript .md-table th,\n  #transcript .md-table td {",
+            "}",
+        );
+        assert!(
+            cell.contains("border: 1px solid var(--border)") && cell.contains("color: var(--text)"),
+            "a cell's border and text come from the palette"
+        );
+        let header = segment(PANE, "#transcript .md-table th {", "}");
+        assert!(
+            header.contains("background: var(--panel-2)") && header.contains("color: var(--muted)"),
+            "the header row is a panel row, not a brighter one"
+        );
+        // The classes the builder writes are the classes the stylesheet sets.
+        assert!(
+            PANE.contains("#transcript .md-table .md-align-right { text-align: right; }")
+                && PANE.contains("#transcript .md-table .md-align-center { text-align: center; }"),
+            "both alignments a delimiter row can ask for must be styled"
+        );
+    }
 }

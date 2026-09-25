@@ -2285,6 +2285,22 @@ mod tests {
         assert!(!leads_with_a_clock(&rows[1]), "second row: {:?}", rows[1]);
     }
 
+    #[test]
+    fn a_table_times_only_its_first_row() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::Assistant,
+            text: "| a | b |\n|---|---|\n| c | d |".into(),
+            at_ms: Some(1_700_000_000_000),
+        });
+        let rows = row_texts(&transcript_rows(&mut state, 40));
+        assert_eq!(rows.len(), 3);
+        assert!(leads_with_a_clock(&rows[0]), "first row: {:?}", rows[0]);
+        // The table's later rows carry blanks, like any wrapped row.
+        assert!(!leads_with_a_clock(&rows[1]), "second row: {:?}", rows[1]);
+        assert!(!leads_with_a_clock(&rows[2]), "third row: {:?}", rows[2]);
+    }
+
     // The tests below pin fixed offsets: the local conversion itself is not
     // covered, because it follows the machine's timezone and an assertion on
     // the wall clock would pass or fail with the runner's zone. `time_gutter`

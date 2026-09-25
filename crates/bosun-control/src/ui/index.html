@@ -8,18 +8,18 @@
 <style>
   :root {
     color-scheme: dark;
-    --bg: #10131a;
-    --panel: #161a22;
-    --panel-2: #1d2230;
-    --border: #2b3242;
-    --text: #d8dde6;
-    --muted: #8a93a3;
-    --accent: #5b8cff;
-    --user: #d3b072;
-    --mono: #9fb7cc;
-    --error: #ff7070;
-    --ok: #4ed48e;
-    --warn: #e0a94b;
+    --bg: #1b1e25;
+    --panel: #23262e;
+    --panel-2: #2b2f39;
+    --border: #3a4150;
+    --text: #b3b9c3;
+    --muted: #969eae;
+    --accent: #8aa9f0;
+    --user: #c3ab86;
+    --mono: #9fb0c2;
+    --error: #d98d8d;
+    --ok: #86bd9e;
+    --warn: #cfa878;
     /* One-handed floor: every interactive target is at least this tall. */
     --touch-min-height: 44px;
   }
@@ -82,7 +82,7 @@
     border-radius: 8px;
     padding: 10px 16px;
     font-size: 13px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
   }
   #toast[hidden] { display: none; }
   #toast.error { border-color: var(--error); color: var(--error); }
@@ -192,7 +192,7 @@
     -webkit-tap-highlight-color: transparent;
     background: var(--accent);
     border: none;
-    color: var(--text);
+    color: var(--bg);
     font-weight: 600;
     border-radius: 8px;
     padding: 0 14px;
@@ -260,8 +260,8 @@
     min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
-  #skills-add .skills-add-actions .primary { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
-  #skills-add .skills-add-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #skills-add .skills-add-actions .primary { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
+  #skills-add .skills-add-actions button:active { background: var(--panel-2); border-color: var(--accent); color: var(--text); }
   #skills-add .btn-ref-toggle {
     background: none;
     border: none;
@@ -327,7 +327,7 @@
     -webkit-tap-highlight-color: transparent;
     background: var(--accent);
     border: none;
-    color: var(--text);
+    color: var(--bg);
     font-weight: 600;
     border-radius: 8px;
     padding: 0 14px;
@@ -394,8 +394,8 @@
     min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
-  #mcp-add .mcp-add-actions .primary { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
-  #mcp-add .mcp-add-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #mcp-add .mcp-add-actions .primary { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
+  #mcp-add .mcp-add-actions button:active { background: var(--panel-2); border-color: var(--accent); color: var(--text); }
   #mcp-add #form-mcp-bearer:focus { outline: none; border-color: var(--accent); }
 
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -524,7 +524,7 @@
     max-height: 100%;
     background: var(--panel);
     border-top: 1px solid var(--border);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
   }
   #new-session-form[hidden] { display: none; }
   .sheet-body {
@@ -629,8 +629,8 @@
     min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
-  .sheet-actions button:active { background: var(--panel-2); border-color: var(--accent); }
-  .sheet-actions .start { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
+  .sheet-actions button:active { background: var(--panel-2); border-color: var(--accent); color: var(--text); }
+  .sheet-actions .start { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
   #dir-browser {
     display: grid;
     gap: 8px;
@@ -750,7 +750,7 @@
     max-height: 100%;
     background: var(--panel);
     border-top: 1px solid var(--border);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
   }
   #view-sheet[hidden] { display: none; }
   .view-sheet-row { display: grid; gap: 8px; padding: 12px 16px; }
@@ -953,7 +953,7 @@
     border: 1px solid var(--accent);
     border-left: 4px solid var(--accent);
     border-radius: 8px;
-    background: rgba(91, 140, 255, 0.08);
+    background: rgba(138, 169, 240, 0.10);
     overflow-wrap: anywhere;
   }
   #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
@@ -995,6 +995,31 @@
   }
   #transcript .md-mermaid { margin: 6px 0; overflow-x: auto; }
   #transcript .md-mermaid svg { display: block; }
+  /* A markdown table: the holder scrolls sideways, as the diagram holder
+     does, so a table wider than a phone stays readable instead of squeezing
+     its columns or overflowing the transcript. */
+  #transcript .md-table-wrap { margin: 6px 0; overflow-x: auto; }
+  #transcript .md-table {
+    border-collapse: collapse;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  #transcript .md-table th,
+  #transcript .md-table td {
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    color: var(--text);
+    text-align: left;
+    /* A cell keeps its own line: the holder scrolls for a wide table. */
+    white-space: nowrap;
+  }
+  #transcript .md-table th {
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+  }
+  #transcript .md-table .md-align-right { text-align: right; }
+  #transcript .md-table .md-align-center { text-align: center; }
   #transcript blockquote {
     margin: 4px 0 8px;
     padding: 2px 0 2px 12px;
@@ -1112,7 +1137,7 @@
     min-height: var(--touch-min-height);
     -webkit-tap-highlight-color: transparent;
   }
-  .ask-free-actions .primary { background: var(--accent); border: none; color: var(--text); font-weight: 600; }
+  .ask-free-actions .primary { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
   @media (max-width: 640px) {
     header.top { flex-wrap: wrap; padding: 10px 12px; }
     main { padding: 0 12px 16px; }
@@ -1152,7 +1177,7 @@
       overflow-y: auto;
       border: 1px solid var(--border);
       border-radius: 10px;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
     }
     #view-sheet .view-sheet-head {
       position: sticky;
@@ -3713,7 +3738,7 @@ function appendMsg(role, text, atMs) {
 
 // Assistant turns render markdown like the terminal client; user text stays
 // plain. Renders the same subset the TUI parses: headings, emphasis, inline
-// code, code fences, links, lists, blockquotes, and rules.
+// code, code fences, links, lists, blockquotes, rules and tables.
 function appendAssistant(text, atMs) {
   const container = document.createElement('div');
   container.className = 'msg assistant';
@@ -3847,6 +3872,23 @@ function renderMarkdown(container, text) {
       i += 1;
       continue;
     }
+    if (isTableStart(line)) {
+      const header = tableCells(line);
+      const aligns = tableAligns(lines[i + 1] || '');
+      if (aligns && aligns.length === header.length) {
+        paraOut();
+        // The delimiter row decides each column's alignment; it is never a
+        // row of its own.
+        const body = [];
+        i += 2;
+        while (i < lines.length && lines[i].trimStart().startsWith('|')) {
+          body.push(tableCells(lines[i]));
+          i += 1;
+        }
+        container.appendChild(tableNode(header, body, aligns));
+        continue;
+      }
+    }
     const heading = headingLevel(line);
     if (heading > 0) {
       paraOut();
@@ -3917,6 +3959,37 @@ function listMarker(line) {
   if (/^[-*+]\s/.test(line)) return '• ';
   const numbered = line.match(/^\d+([.)])\s/);
   return numbered ? numbered[0].slice(0, -1) + ' ' : null;
+}
+
+// The cells of one table row: the text between its pipes, trimmed. A pipe at
+// either end is the table's edge, not a cell.
+function tableCells(line) {
+  const text = line.trim();
+  const inner = text.startsWith('|') ? text.slice(1) : text;
+  const body = inner.endsWith('|') ? inner.slice(0, -1) : inner;
+  return body.split('|').map((cell) => cell.trim());
+}
+
+// Whether a line opens a table: a trimmed line starting with `|` and holding
+// at least two of them. A lone `|` in prose is not one.
+function isTableStart(line) {
+  const text = line.trim();
+  return text.startsWith('|') && (text.match(/\|/g) || []).length >= 2;
+}
+
+// The alignment each cell of a delimiter row asks for, or null when the line
+// is not a delimiter row: only pipes, dashes, colons and spaces, with a dash.
+// `---:` is right, `:---:` centre, and anything else left.
+function tableAligns(line) {
+  const text = line.trim();
+  if (!text.includes('-')) return null;
+  for (const char of text) {
+    if (char !== '|' && char !== '-' && char !== ':' && char !== ' ') return null;
+  }
+  return tableCells(text).map((cell) =>
+    cell.startsWith(':') && cell.endsWith(':') ? 'center'
+      : cell.endsWith(':') ? 'right'
+      : 'left');
 }
 
 // The language of an opening fence: its info string's first token, lowercased.
@@ -4015,6 +4088,48 @@ function appendInline(parent, text) {
     span.textContent = token.text;
     parent.appendChild(span);
   }
+}
+
+// The class a cell carries for its column's alignment. A left column is what
+// a cell does by default, so it carries none.
+function alignClass(align) {
+  return align === 'left' ? '' : 'md-align-' + align;
+}
+
+// One markdown table: a header row and the body rows, inside a holder that
+// scrolls sideways rather than overflowing the transcript, like the diagram
+// holder. Every cell goes through appendInline, so links, emphasis and inline
+// code keep working inside it, and the alignment the delimiter row asked for
+// is a class on the cell.
+function tableNode(header, rows, aligns) {
+  const holder = document.createElement('div');
+  holder.className = 'md-table-wrap';
+  const table = document.createElement('table');
+  table.className = 'md-table';
+  const head = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  aligns.forEach((align, index) => {
+    const th = document.createElement('th');
+    th.className = alignClass(align);
+    appendInline(th, header[index]);
+    headRow.appendChild(th);
+  });
+  head.appendChild(headRow);
+  table.appendChild(head);
+  const body = document.createElement('tbody');
+  for (const row of rows) {
+    const tr = document.createElement('tr');
+    aligns.forEach((align, index) => {
+      const td = document.createElement('td');
+      td.className = alignClass(align);
+      appendInline(td, row[index] === undefined ? '' : row[index]);
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+  holder.appendChild(table);
+  return holder;
 }
 
 // Live deltas stream into one assistant paragraph until the turn's durable
