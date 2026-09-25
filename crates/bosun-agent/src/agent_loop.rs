@@ -871,9 +871,11 @@ async fn handle_wake(
             // nudge itself is read by the same model that just wrote prose:
             // the first one often draws a turn that runs tools and again ends
             // by announcing the rest, and stopping there leaves the session
-            // paused holding the work it just named. Each nudged turn is a
-            // full model call, so NUDGE_LIMIT bounds them and a request that
-            // only ever ends in prose waits for the operator instead.
+            // paused holding the work it just named. Every nudge buys a turn,
+            // which is a full model call, so NUDGE_LIMIT bounds the nudges —
+            // not the wake's model calls, which also carry the empty-reply
+            // retries — and a request that only ever ends in prose waits for
+            // the operator instead.
             TurnOutcome::Finished { text }
                 if !interrupted
                     && nudges < NUDGE_LIMIT
@@ -1366,9 +1368,10 @@ const ACTION_NUDGE: &str = "[harness nudge] your last message made no tool call 
 /// a reply that made the call and for one that only said it would, so the
 /// words of the last sentence are the only evidence there is; the lists stay
 /// short and in one place so they are easy to tune. A missing announcement
-/// costs the operator a prod tens of minutes later, where a false one costs a
-/// single model call, so a match is preferred to a miss. It is the only
-/// trigger a child session has, since only the root holds a todo list.
+/// costs the operator a prod tens of minutes later, where a false one costs
+/// the model calls of the turns it draws, one at least and up to NUDGE_LIMIT,
+/// so a match is preferred to a miss. It is the only trigger a child session
+/// has, since only the root holds a todo list.
 fn announces_an_action(text: &str) -> bool {
     let last = last_sentence(text).to_lowercase();
     if ACTION_MARKERS.iter().any(|marker| last.contains(marker)) {
@@ -9566,6 +9569,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rearm_from_the_opener_alone_runs_until_the_turn_makes_its_call() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("root-nudge-opener"))
+            .await
+            .unwrap();
+
+        // Neither reply carries a first-person marker and the session's list
+        // holds nothing, so the telegraphic opener is the whole signal: both
+        // the nudge and its re-arm turn on that rule alone.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("Now the ignored e2e pair.".into()),
+                stop(6, 4),
+            ],
+            vec![
+                StreamEvent::TextDelta("Now the refs and the template.".into()),
+                stop(6, 5),
+            ],
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"cargo test -p bosun-agent"}"#.into(),
+                },
+                stop(12, 7),
+            ],
+            vec![
+                StreamEvent::TextDelta("the pair passes".into()),
+                stop(18, 3),
+            ],
+        ]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("root-nudge-opener".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the re-armed wake to wait for input", || {
+            let store = store.clone();
+            async move {
+                store
+                    .get_session("root-nudge-opener")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == SessionState::WaitingForInput
+            }
+        })
+        .await;
+
+        let messages = store.messages("root-nudge-opener", false).await.unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Now the ignored e2e pair.",
+                ACTION_NUDGE,
+                "Now the refs and the template.",
+                ACTION_NUDGE,
+                "the pair passes"
+            ],
+            "both telegraphic replies drew a nudge, and the turn after the second made the call"
+        );
+        assert_eq!(
+            provider.captured_calls().len(),
+            4,
+            "the announced turn, two nudged turns, and the reply that ends the wake"
+        );
+        assert_eq!(
+            tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            1,
+            "the re-armed turn's call ran"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn a_reply_that_reports_without_announcing_is_left_alone() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -10197,9 +10298,10 @@ mod tests {
             "an imperative opening with the sequencing word announces the work it names"
         );
         // The accepted cost of leaning toward firing: a report whose last
-        // sentence happens to open with a sequencing word draws one model call
-        // it does not need, where a miss leaves the session idle for tens of
-        // minutes.
+        // sentence happens to open with a sequencing word draws a nudge it does
+        // not need, which is one model call — or up to NUDGE_LIMIT, when the
+        // replies it draws keep opening the same way — where a miss leaves the
+        // session idle for tens of minutes.
         assert!(
             announces_an_action("The suite is green. Then the tests passed."),
             "a finished report that opens with a sequencing word is read as an announcement"
@@ -10215,6 +10317,10 @@ mod tests {
         assert!(
             !announces_an_action("The suite passes and nothing is left to do now."),
             "a sequencing word that is not the sentence's first word is not an opener"
+        );
+        assert!(
+            !announces_an_action("Nowadays the suite is green."),
+            "a word that starts with a sequencing word is a different word"
         );
         assert!(!announces_an_action(""), "an empty reply announces nothing");
     }

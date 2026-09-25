@@ -139,11 +139,23 @@ fn flush_tool_start(parser: &mut AnthropicParser, index: usize) -> Vec<StreamEve
     }]
 }
 
+/// Logs a usage block the adapter cannot read: every count in one reads as
+/// zero, so a call whose usage arrives in another shape looks free.
+fn log_unread_usage(usage: &Value) {
+    if !usage.is_null() && !usage.is_object() {
+        debug!(
+            msg = "anthropic usage is not an object; the counts read as zero",
+            shape = json_shape(usage),
+        );
+    }
+}
+
 /// Turn one SSE event into [`StreamEvent`]s. An event the parser does not
 /// understand is dropped with a debug line naming its shape, so a call the
 /// stream carried in a shape the adapter does not read can be found in the
-/// logs; the `ping` heartbeat is the one kind dropped silently, because it
-/// carries nothing for the turn.
+/// logs. The kinds the adapter drops on purpose stay quiet: the `ping`
+/// heartbeat, the text and thinking block starts, and the thinking and
+/// signature deltas.
 fn parse_event(
     event: &SseEvent,
     parser: &mut AnthropicParser,
@@ -164,9 +176,9 @@ fn parse_event(
     };
     match kind {
         "message_start" => {
-            parser.input_tokens = data["message"]["usage"]["input_tokens"]
-                .as_u64()
-                .unwrap_or(0);
+            let usage = &data["message"]["usage"];
+            log_unread_usage(usage);
+            parser.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
             Ok(Vec::new())
         }
         "content_block_start" => {
@@ -188,8 +200,10 @@ fn parse_event(
                         .insert(index, ToolStart { id, name, input });
                 }
                 // A text or thinking block carries nothing of its own: its
-                // content arrives as deltas.
-                Some("text" | "thinking") => {}
+                // content arrives as deltas. A redacted thinking block is what
+                // the provider sends in place of thinking it withheld, and it
+                // carries nothing to read either.
+                Some("text" | "thinking" | "redacted_thinking") => {}
                 block_type => {
                     debug!(
                         msg = "anthropic content block type is not read; dropped",
@@ -230,10 +244,19 @@ fn parse_event(
                     // The deltas are the call's arguments, so the entry and the
                     // input its start block held stop here.
                     let start = parser.tool_starts.remove(&index).unwrap_or_default();
-                    let args_delta = delta["partial_json"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
+                    let partial = &delta["partial_json"];
+                    // A fragment that is not a string reads as no fragment at
+                    // all: the call then runs with the arguments the remaining
+                    // fragments parse to, which may be valid JSON the model
+                    // never sent.
+                    if !partial.is_null() && partial.as_str().is_none() {
+                        debug!(
+                            msg = "anthropic tool argument fragment is not a string; dropped",
+                            index,
+                            shape = json_shape(partial),
+                        );
+                    }
+                    let args_delta = partial.as_str().unwrap_or_default().to_string();
                     if start.id.is_none() && start.name.is_none() && args_delta.is_empty() {
                         Ok(Vec::new())
                     } else {
@@ -245,8 +268,8 @@ fn parse_event(
                         }])
                     }
                 }
-                // Thinking is accumulated from the whole reply, so its deltas
-                // carry nothing the loop needs.
+                // The adapter never forwards thinking: only the reply text
+                // reaches the loop, so these deltas carry nothing for it.
                 Some("thinking_delta" | "signature_delta") => Ok(Vec::new()),
                 delta_type => {
                     debug!(
@@ -259,7 +282,9 @@ fn parse_event(
             }
         }
         "message_delta" => {
-            parser.output_tokens = data["usage"]["output_tokens"].as_u64().unwrap_or(0);
+            let usage = &data["usage"];
+            log_unread_usage(usage);
+            parser.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
             if let Some(reason) = data["delta"]["stop_reason"].as_str() {
                 parser.stop_reason = Some(reason.to_string());
             }

@@ -91,17 +91,18 @@ impl OpenAiParser {
             return None;
         }
         self.stopped = true;
-        // A reason the adapter does not read maps to the catch-all, which ends
-        // the turn as an ordinary stop. Naming it is what tells a completion
-        // cut short in a shape the adapter does not know from a finished one.
-        if let Some(reason) = self.finish_reason.as_deref()
-            && reason != "stop"
-            && reason != "length"
-        {
-            debug!(
-                msg = "openai finish reason is not read; mapped to the catch-all",
-                finish_reason = %reason,
-            );
+        // `stop`, `length` and `tool_calls` are the reasons the adapter reads:
+        // `tool_calls` ends a completion that made calls, which is what most
+        // turns do, so a turn with a call stays quiet. Any other reason, and a
+        // completion that named none at all, maps to the catch-all, which ends
+        // the turn as an ordinary stop; naming it is what tells a completion
+        // cut short from a finished one.
+        match self.finish_reason.as_deref() {
+            Some("stop" | "length" | "tool_calls") => {}
+            reason => debug!(
+                msg = "openai finish reason maps to the catch-all",
+                finish_reason = ?reason,
+            ),
         }
         let stop_reason = match self.finish_reason.as_deref() {
             Some("stop") => StopReason::StopResponse,
@@ -208,10 +209,18 @@ fn parse_event(
                     let index = call["index"].as_u64().unwrap_or(0) as usize;
                     let id = call["id"].as_str().map(str::to_string);
                     let name = call["function"]["name"].as_str().map(str::to_string);
-                    let args_delta = call["function"]["arguments"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
+                    let arguments = &call["function"]["arguments"];
+                    // Arguments in another shape read as no arguments at all:
+                    // the call then runs with `null` arguments, and the loop
+                    // warns that the argument JSON did not parse.
+                    if !arguments.is_null() && arguments.as_str().is_none() {
+                        debug!(
+                            msg = "openai tool call arguments are not a string; dropped",
+                            index,
+                            shape = json_shape(arguments),
+                        );
+                    }
+                    let args_delta = arguments.as_str().unwrap_or_default().to_string();
                     if id.is_none() && name.is_none() && args_delta.is_empty() {
                         debug!(
                             msg = "openai tool call carries no name, no id and no arguments; \
