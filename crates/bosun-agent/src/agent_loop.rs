@@ -863,7 +863,7 @@ async fn handle_wake(
             // were done: it made no tool call and asked nothing, the stop
             // reason is an ordinary stop, and the session would sit waiting
             // for input until the operator prodded it. The loop appends the
-            // nudge as the next user message and runs one more turn, when
+            // nudge as the next user message and runs another turn, when
             // either the session's own todo list still holds an open item or
             // the reply's last sentence announces an action. An open item is
             // the session's own record that its work is unfinished, where a
@@ -1351,10 +1351,10 @@ const ANNOUNCEMENT_OPENERS: [&str; 3] = ["now", "next", "then"];
 /// operator rather than spending on it without bound.
 const NUDGE_LIMIT: u32 = 3;
 
-/// The one message the loop appends to a wake whose turn ended with prose and
-/// made no tool call. It is authored in the user role, so the model reads it
-/// as the next message; the bracketed `[harness nudge]` attribution shows the
-/// transcript's reader that the harness, not the operator, asked.
+/// The message the loop appends when a turn ends with prose and makes no tool
+/// call. It is authored in the user role, so the model reads it as the next
+/// message; the bracketed `[harness nudge]` attribution shows the transcript's
+/// reader that the harness, not the operator, asked.
 const ACTION_NUDGE: &str = "[harness nudge] your last message made no tool call and the work is not \
      finished. Make the call now, or say plainly that you are finished.";
 
@@ -1374,13 +1374,13 @@ fn announces_an_action(text: &str) -> bool {
     if ACTION_MARKERS.iter().any(|marker| last.contains(marker)) {
         return true;
     }
-    // The opener is read as a bare word, so a comma, a colon, a quote or
-    // markdown emphasis around it does not stop the sentence from counting.
+    // The opener is read as a bare word, so a comma, a colon, a quote, markdown
+    // emphasis or a dash around it leaves the word to match.
     let first = last
-        .split_whitespace()
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric())
         .next()
-        .unwrap_or("")
-        .trim_matches(|c: char| !c.is_alphanumeric());
+        .unwrap_or("");
     ANNOUNCEMENT_OPENERS.contains(&first)
 }
 
@@ -9782,8 +9782,12 @@ mod tests {
         // Every reply announces the next step and makes no call, so each one
         // would end the wake and the loop appends a nudge instead — until the
         // wake has spent its whole budget. Each nudged turn is a whole model
-        // call, which is what the budget is for: the reply after the last nudge
-        // ends the wake.
+        // call, which is why the budget is two or three and no more: the reply
+        // after the last nudge ends the wake.
+        assert!(
+            (2..=3).contains(&NUDGE_LIMIT),
+            "the nudge budget stays small: {NUDGE_LIMIT}"
+        );
         let announce = |text: &str| vec![StreamEvent::TextDelta(text.to_string()), stop(8, 6)];
         let mut scripts: Vec<Vec<StreamEvent>> = (1..=NUDGE_LIMIT + 1)
             .map(|nudge| announce(&format!("Next I will run the failing test ({nudge}).")))
@@ -10176,8 +10180,20 @@ mod tests {
             "emphasis around the sequencing word leaves the bare word to match"
         );
         assert!(
+            announces_an_action("Now—the ignored e2e pair runs."),
+            "a dash after the sequencing word leaves the bare word to match"
+        );
+        assert!(
             announces_an_action("Then mark sprint 012's stories and give the final report."),
             "an imperative opening with the sequencing word announces the work it names"
+        );
+        // The accepted cost of leaning toward firing: a report whose last
+        // sentence happens to open with a sequencing word draws one model call
+        // it does not need, where a miss leaves the session idle for tens of
+        // minutes.
+        assert!(
+            announces_an_action("The suite is green. Then the tests passed."),
+            "a finished report that opens with a sequencing word is read as an announcement"
         );
         assert!(
             !announces_an_action("The suite passes and nothing is left to do."),
