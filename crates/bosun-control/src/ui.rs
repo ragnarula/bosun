@@ -11,6 +11,20 @@ pub async fn pane() -> impl IntoResponse {
     )
 }
 
+/// The mermaid bundle the pane renders diagram fences with: mermaid 12.0.0,
+/// vendored from the npm tarball and never edited. Embedded as data like the
+/// pane, so the control plane needs no build step and no asset directory.
+pub async fn mermaid_bundle() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            // 5.5 MB on every phone reload, and the bundle only changes with the control plane.
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        include_str!("ui/mermaid.min.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     const PANE: &str = include_str!("ui/index.html");
@@ -34,6 +48,58 @@ mod tests {
     /// the tokens of a call and not the line breaks a formatter chose.
     fn squeezed(source: &str) -> String {
         source.split_whitespace().collect()
+    }
+
+    #[test]
+    fn the_pane_loads_the_mermaid_bundle_from_an_absolute_path() {
+        assert!(
+            PANE.contains(
+                "<script src=\"/ui/mermaid.min.js\" id=\"mermaid-bundle\" defer></script>"
+            ),
+            "the pane is served at both / and /ui, so the bundle loads by absolute path"
+        );
+    }
+
+    #[test]
+    fn the_pane_renders_a_mermaid_fence_through_the_xml_parser() {
+        let diagram = squeezed(segment(PANE, "async function renderMermaid(", "\n}"));
+        for token in [
+            "startOnLoad: false",
+            "securityLevel: 'strict'",
+            "htmlLabels: false",
+            "theme: 'dark'",
+            "flowchart: { useMaxWidth: false }",
+            "new DOMParser().parseFromString(svg, 'image/svg+xml')",
+            "parsed.querySelector('parsererror')",
+            "document.importNode(parsed.documentElement, true)",
+            // A failed render leaves this scratch element in the body.
+            "document.getElementById('d' + id)",
+            "holder.replaceWith(mdPre(source))",
+        ] {
+            assert!(
+                diagram.contains(&squeezed(token)),
+                "the diagram path must contain {token}"
+            );
+        }
+        let markdown = squeezed(PANE);
+        assert!(
+            markdown.contains(&squeezed("fenceLanguage = fenceInfo(line.slice(3))"))
+                && markdown.contains(&squeezed("if (closed && language === 'mermaid')"))
+                && markdown.contains(&squeezed("renderMermaid(container, source)"))
+                && markdown.contains(&squeezed("codeOut(true)"))
+                && markdown.contains(&squeezed("codeOut(false)")),
+            "only a closed fence whose language is mermaid may leave the <pre> path"
+        );
+    }
+
+    #[test]
+    fn the_pane_inserts_no_text_as_html() {
+        assert!(
+            !PANE.contains("innerHTML")
+                && !PANE.contains("insertAdjacentHTML")
+                && !PANE.contains("document.write"),
+            "model text must reach the DOM as nodes, never as parsed HTML"
+        );
     }
 
     #[test]
@@ -184,6 +250,93 @@ mod tests {
         assert!(
             !delta.contains("stampRow"),
             "a live delta is not durable and must carry no time"
+        );
+    }
+
+    #[test]
+    fn the_pane_renders_a_markdown_table_from_the_pane_branch() {
+        let table = squeezed(segment(PANE, "function tableNode(", "\n}\n"));
+        for token in [
+            "holder.className = 'md-table-wrap'",
+            "table.className = 'md-table'",
+            "th.className = alignClass(align)",
+            "td.className = alignClass(align)",
+            "appendInline(th, header[index])",
+            "appendInline(td, row[index] === undefined ? '' : row[index])",
+        ] {
+            assert!(
+                table.contains(&squeezed(token)),
+                "the table builder must contain {token}"
+            );
+        }
+        let start = squeezed(segment(PANE, "function isTableStart(", "\n}\n"));
+        assert!(
+            start.contains(&squeezed(
+                "text.startsWith('|') && (text.match(/\\|/g) || []).length >= 2"
+            )),
+            "a lone pipe in prose is not a table row"
+        );
+        // Left is a cell's default, so the builder writes no class for it and
+        // the stylesheet has none.
+        assert!(
+            !PANE.contains("md-align-left"),
+            "a left column needs no alignment class"
+        );
+        assert!(
+            squeezed(segment(PANE, "function alignClass(", "\n}\n"))
+                .contains(&squeezed("align === 'left' ? '' : 'md-align-' + align")),
+            "only a right or centre column carries a class"
+        );
+        let markdown = squeezed(PANE);
+        assert!(
+            markdown.contains(&squeezed("if (isTableStart(line))"))
+                && markdown.contains(&squeezed("const aligns = tableAligns(lines[i + 1] || '')"))
+                && markdown.contains(&squeezed("if (aligns && aligns.length === header.length)"))
+                && markdown.contains(&squeezed("if (!text.includes('-')) return null;"))
+                && markdown.contains(&squeezed("body.push(tableCells(lines[i]))"))
+                && markdown.contains(&squeezed(
+                    "container.appendChild(tableNode(header, body, aligns))"
+                )),
+            "only a pipe row whose next line is a delimiter row of the same width may leave the prose path"
+        );
+        assert!(
+            markdown.contains(&squeezed("i += 2;")),
+            "the delimiter row draws as the header's rule, never as a row of its own"
+        );
+        assert!(
+            squeezed(segment(PANE, "function tableAligns(", "\n}\n")).contains(&squeezed(
+                "cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : 'left'"
+            )),
+            "a delimiter cell decides its column: :---: centre, ---: right, anything else left"
+        );
+    }
+
+    #[test]
+    fn the_pane_scrolls_a_wide_table_in_its_own_holder() {
+        let holder = segment(PANE, "#transcript .md-table-wrap {", "}");
+        assert!(
+            holder.contains("overflow-x: auto"),
+            "a wide table scrolls inside its holder, never sideways across the page"
+        );
+        let cell = segment(
+            PANE,
+            "#transcript .md-table th,\n  #transcript .md-table td {",
+            "}",
+        );
+        assert!(
+            cell.contains("border: 1px solid var(--border)") && cell.contains("color: var(--text)"),
+            "a cell's border and text come from the palette"
+        );
+        let header = segment(PANE, "#transcript .md-table th {", "}");
+        assert!(
+            header.contains("background: var(--panel-2)") && header.contains("color: var(--muted)"),
+            "the header row is a panel row, not a brighter one"
+        );
+        // The classes the builder writes are the classes the stylesheet sets.
+        assert!(
+            PANE.contains("#transcript .md-table .md-align-right { text-align: right; }")
+                && PANE.contains("#transcript .md-table .md-align-center { text-align: center; }"),
+            "both alignments a delimiter row can ask for must be styled"
         );
     }
 }

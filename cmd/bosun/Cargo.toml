@@ -23,6 +23,7 @@ crossterm.workspace = true
 dialoguer.workspace = true
 futures-util.workspace = true
 hyper-util.workspace = true
+mermaid-text.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true
 semver.workspace = true

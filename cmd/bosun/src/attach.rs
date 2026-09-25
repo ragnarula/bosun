@@ -64,6 +64,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::markdown::DiagramCache;
 use crate::markdown::markdown_rows;
 use crate::state_name;
 
@@ -171,6 +172,9 @@ pub struct ClientState {
     /// waiting indicator and the debug console; activity never enters the
     /// transcript.
     pub activities: Vec<ActivityRecord>,
+    /// Rendered diagrams, held between redraws because a draw renders every
+    /// line again and one diagram costs milliseconds.
+    diagram_cache: DiagramCache,
 }
 
 impl ClientState {
@@ -184,6 +188,7 @@ impl ClientState {
             session_state,
             live_ask: None,
             activities: Vec::new(),
+            diagram_cache: DiagramCache::new(),
         }
     }
 
@@ -571,11 +576,12 @@ fn line_rows(
     text: &str,
     gutter: &str,
     width: usize,
+    cache: &mut DiagramCache,
 ) -> Vec<(LineKind, Vec<Span<'static>>)> {
     let inner = width.saturating_sub(TIME_GUTTER_WIDTH).max(1);
     let mut rows = Vec::new();
     if kind == LineKind::Assistant {
-        for (i, spans) in markdown_rows(text, inner).into_iter().enumerate() {
+        for (i, spans) in markdown_rows(text, inner, cache).into_iter().enumerate() {
             let mut row = Vec::with_capacity(spans.len() + 1);
             row.push(gutter_span(gutter, i == 0));
             row.extend(spans);
@@ -610,21 +616,41 @@ fn line_rows(
 }
 
 /// The wrapped, prefixed transcript rows as styled spans: the durable lines
-/// plus the live delta, wrapped to the width left after the time gutter.
-fn transcript_rows(state: &ClientState, width: usize) -> Vec<(LineKind, Vec<Span<'static>>)> {
+/// plus the live delta, wrapped to the width left after the time gutter. Its
+/// diagram cache is borrowed alongside the lines so a redraw can draw a
+/// diagram it has already rendered.
+fn transcript_rows(state: &mut ClientState, width: usize) -> Vec<(LineKind, Vec<Span<'static>>)> {
     let width = width.max(1);
     let mut rows = Vec::new();
-    for line in &state.lines {
+    let ClientState {
+        lines,
+        pending_delta,
+        diagram_cache,
+        ..
+    } = state;
+    for line in lines.iter() {
         let gutter = match line.at_ms {
             Some(at_ms) => Cow::Owned(time_gutter(at_ms, local_offset(at_ms))),
             None => Cow::Borrowed(BLANK_GUTTER),
         };
-        rows.extend(line_rows(line.kind, &line.text, &gutter, width));
+        rows.extend(line_rows(
+            line.kind,
+            &line.text,
+            &gutter,
+            width,
+            diagram_cache,
+        ));
     }
-    if let Some(pending) = &state.pending_delta {
+    if let Some(pending) = pending_delta.as_deref() {
         // A live delta is not durable yet, so it carries no time; the blank
         // gutter keeps it aligned with the durable assistant rows around it.
-        rows.extend(line_rows(LineKind::Assistant, pending, BLANK_GUTTER, width));
+        rows.extend(line_rows(
+            LineKind::Assistant,
+            pending,
+            BLANK_GUTTER,
+            width,
+            diagram_cache,
+        ));
     }
     rows
 }
@@ -841,7 +867,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         vertical: 1,
     });
     let width = inner.width as usize;
-    let rows = transcript_rows(&app.state, width);
+    let rows = transcript_rows(&mut app.state, width);
     app.viewport = inner.height;
     let max_scroll = rows.len().saturating_sub(inner.height as usize);
     app.max_scroll = max_scroll;
@@ -2166,7 +2192,7 @@ mod tests {
         });
         state.pending_delta = Some("streaming".into());
 
-        let rows = transcript_rows(&state, 40);
+        let rows = transcript_rows(&mut state, 40);
         assert_eq!(
             row_texts(&rows),
             vec![
@@ -2198,7 +2224,7 @@ mod tests {
         });
         // The gutter takes nine of the nineteen columns, so the text wraps at
         // ten.
-        let rows = transcript_rows(&state, 19);
+        let rows = transcript_rows(&mut state, 19);
         assert_eq!(
             row_texts(&rows),
             vec!["         one two", "         three four"]
@@ -2213,7 +2239,7 @@ mod tests {
             text: "## Done\n\nIt **works** now.".into(),
             at_ms: None,
         });
-        let rows = transcript_rows(&state, 40);
+        let rows = transcript_rows(&mut state, 40);
         assert_eq!(
             row_texts(&rows),
             vec!["         Done", "         ", "         It works now."]
@@ -2224,6 +2250,55 @@ mod tests {
         assert_eq!(spans[0].style.fg, Some(Color::DarkGray));
         assert_eq!(spans[1].style.fg, Some(Color::Cyan));
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn assistant_mermaid_fences_render_as_diagrams_in_the_transcript() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::Assistant,
+            text: "```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```".into(),
+            at_ms: None,
+        });
+        let rows = row_texts(&transcript_rows(&mut state, 40));
+        assert!(rows.iter().any(|row| row.contains('┌')), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Start")), "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("flowchart")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_diagram_times_only_its_first_row() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::Assistant,
+            text: "```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```".into(),
+            at_ms: Some(1_700_000_000_000),
+        });
+        let rows = row_texts(&transcript_rows(&mut state, 40));
+        assert!(rows.len() > 1);
+        assert!(rows.iter().any(|row| row.contains('┌')), "{rows:?}");
+        assert!(leads_with_a_clock(&rows[0]), "first row: {:?}", rows[0]);
+        // The diagram's later rows carry blanks, like any wrapped row.
+        assert!(!leads_with_a_clock(&rows[1]), "second row: {:?}", rows[1]);
+    }
+
+    #[test]
+    fn a_table_times_only_its_first_row() {
+        let mut state = ClientState::new(Permission::ReadWrite, SessionState::WaitingForInput);
+        state.push_line(Line {
+            kind: LineKind::Assistant,
+            text: "| a | b |\n|---|---|\n| c | d |".into(),
+            at_ms: Some(1_700_000_000_000),
+        });
+        let rows = row_texts(&transcript_rows(&mut state, 40));
+        assert_eq!(rows.len(), 3);
+        assert!(leads_with_a_clock(&rows[0]), "first row: {:?}", rows[0]);
+        // The table's later rows carry blanks, like any wrapped row.
+        assert!(!leads_with_a_clock(&rows[1]), "second row: {:?}", rows[1]);
+        assert!(!leads_with_a_clock(&rows[2]), "third row: {:?}", rows[2]);
     }
 
     // The tests below pin fixed offsets: the local conversion itself is not
@@ -2254,7 +2329,13 @@ mod tests {
     fn a_wrapped_entry_times_only_its_first_row() {
         // Nineteen columns leave five after the gutter and the "you: " prefix,
         // so the second row starts where the first one's text does.
-        let rows = line_rows(LineKind::User, "hello world", "22:13:20 ", 19);
+        let rows = line_rows(
+            LineKind::User,
+            "hello world",
+            "22:13:20 ",
+            19,
+            &mut DiagramCache::new(),
+        );
         assert_eq!(
             row_texts(&rows),
             vec!["22:13:20 you: hello", "              world"]
@@ -2271,6 +2352,7 @@ mod tests {
             "alpha beta gamma",
             "22:13:20 ",
             19,
+            &mut DiagramCache::new(),
         ));
         assert_eq!(rows, vec!["22:13:20 alpha beta", "         gamma"]);
     }
@@ -2285,7 +2367,7 @@ mod tests {
         });
         state.pending_delta = Some("streaming".into());
 
-        let rows = row_texts(&transcript_rows(&state, 19));
+        let rows = row_texts(&transcript_rows(&mut state, 19));
         assert_eq!(rows.len(), 3);
         assert!(leads_with_a_clock(&rows[0]), "first row: {:?}", rows[0]);
         assert!(!leads_with_a_clock(&rows[1]), "wrapped row: {:?}", rows[1]);
@@ -2301,7 +2383,7 @@ mod tests {
             at_ms: None,
         });
         assert_eq!(
-            row_texts(&transcript_rows(&state, 40)),
+            row_texts(&transcript_rows(&mut state, 40)),
             vec!["         you: hello"]
         );
     }
@@ -3520,6 +3602,38 @@ mod tests {
             bottom.contains("line 59"),
             "the view must follow to the newest row: {bottom:?}"
         );
+    }
+
+    #[test]
+    fn draw_shows_a_diagram_and_follows_to_its_last_row() {
+        use ratatui::backend::TestBackend;
+
+        // Layout: status row 0, output rows 1..=8 (inner 2..=7), input 9..=11.
+        // The pane shows six transcript rows and the diagram is eleven, so
+        // following has to land on its last row.
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut app = App::new(test_session());
+        app.state.push_line(Line {
+            kind: LineKind::Assistant,
+            text: "```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```".into(),
+            at_ms: None,
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..12).map(|y| buffer_row_text(buffer, y, 40)).collect();
+        let text = rows.join("\n");
+        assert!(text.contains("│ End │"), "the box art must render: {text}");
+        assert!(
+            rows[7].contains('└'),
+            "following must end on the diagram's last row: {:?}",
+            rows[7]
+        );
+        // Every diagram row carries the transcript's blank gutter.
+        let gutter = format!("│{BLANK_GUTTER}");
+        for (i, row) in rows[2..=7].iter().enumerate() {
+            assert!(row.starts_with(&gutter), "row {}: {row:?}", i + 2);
+        }
     }
 
     #[test]
