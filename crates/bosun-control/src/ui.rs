@@ -51,6 +51,52 @@ mod tests {
     }
 
     #[test]
+    fn the_pane_remembers_the_children_groups_the_user_opened() {
+        let declaration = PANE
+            .find("const openGroups = new Set();")
+            .expect("an open children group must outlive the render that showed it");
+        let render = PANE
+            .find("function renderSessions() {")
+            .expect("the pane must have a session-list render");
+        assert!(
+            declaration < render,
+            "the set must be declared before renderSessions, or a rebuild drops its state"
+        );
+        assert_eq!(
+            PANE.matches("openGroups = new Set()").count(),
+            1,
+            "one set holds the open groups; a second assignment would drop them mid-render"
+        );
+    }
+
+    #[test]
+    fn the_pane_restores_an_open_children_group_when_it_rerenders_the_list() {
+        let list = squeezed(segment(PANE, "function renderSessions() {", "\n}\n"));
+        for token in [
+            "const expanded = openGroups.has(root.id);",
+            "toggle.className = expanded ? 'children-toggle open' : 'children-toggle';",
+            "toggle.textContent = expanded ? 'hide children' : label;",
+            "line.hidden = !expanded;",
+        ] {
+            assert!(
+                list.contains(&squeezed(token)),
+                "the rebuilt list must read the remembered state for {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_records_the_children_group_the_toggle_opens_or_closes() {
+        let list = squeezed(segment(PANE, "function renderSessions() {", "\n}\n"));
+        assert!(
+            list.contains(&squeezed(
+                "if (open) openGroups.add(root.id); else openGroups.delete(root.id);"
+            )),
+            "the toggle must record its own state, so the next render restores it"
+        );
+    }
+
+    #[test]
     fn the_pane_loads_the_mermaid_bundle_from_an_absolute_path() {
         assert!(
             PANE.contains(

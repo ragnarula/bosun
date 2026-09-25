@@ -1515,6 +1515,11 @@ let nodes = [];
 let nodeOptionsSignature = null;
 let personas = [];
 let sessions = [];
+// The tree roots whose children the user has shown, by owner id: a root owns
+// itself, so the render reads it back with root.id, the same id its children
+// carry as owner_id. The list is rebuilt on every session poll and every open,
+// so this state has to outlive the toggle element that shows it.
+const openGroups = new Set();
 let current = null;   // the open session id
 let viewState = null; // the open session's last known state
 let statusTick = null; // the 1s header-label interval for the open session
@@ -2639,22 +2644,28 @@ function renderSessions() {
   }
   roots.sort(byActiveThenNewest);
   for (const group of groups.values()) group.sort(byActiveThenNewest);
+  // A stopped tree leaves no root, and its id would otherwise sit in the set
+  // for the life of the tab.
+  const liveRoots = new Set(roots.map((root) => root.id));
+  for (const id of openGroups) if (!liveRoots.has(id)) openGroups.delete(id);
   for (const root of roots) {
     const item = document.createElement('div');
     item.className = 'session-item';
     item.appendChild(appendSessionRow(root));
     const children = groups.get(root.id) || [];
     const lines = [];
+    const expanded = openGroups.has(root.id);
     if (children.length > 0) {
+      const label = children.length === 1 ? '1 child' : children.length + ' children';
       const toggle = document.createElement('button');
       toggle.type = 'button';
-      toggle.className = 'children-toggle';
-      toggle.textContent = children.length === 1 ? '1 child' : children.length + ' children';
+      toggle.className = expanded ? 'children-toggle open' : 'children-toggle';
+      toggle.textContent = expanded ? 'hide children' : label;
       toggle.addEventListener('click', () => {
         const open = toggle.classList.toggle('open');
-        toggle.textContent = open
-          ? 'hide children'
-          : (children.length === 1 ? '1 child' : children.length + ' children');
+        if (open) openGroups.add(root.id);
+        else openGroups.delete(root.id);
+        toggle.textContent = open ? 'hide children' : label;
         for (const line of lines) line.hidden = !open;
       });
       item.appendChild(toggle);
@@ -2662,7 +2673,7 @@ function renderSessions() {
     sessionListEl.appendChild(item);
     for (const child of children) {
       const line = childLine(child);
-      line.hidden = true;
+      line.hidden = !expanded;
       lines.push(line);
       sessionListEl.appendChild(line);
     }
