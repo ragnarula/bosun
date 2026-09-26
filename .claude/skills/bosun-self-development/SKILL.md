@@ -71,8 +71,8 @@ Done when the issue is closed with its release named, and the next issue is pick
 
 Sort every open issue into these tiers and take the highest that is not blocked.
 
-1. **Bugs.** Something that used to work, or was meant to, and does not. A `bug` label, or a report that names a broken behaviour, is enough.
-2. **Unblocking issues.** Anything that lets this loop run without a human in it: spawning sessions on other nodes, clearing context mid-session, seeing what another session is doing, watching a subagent, forking a conversation. These outrank ordinary features at their own tier because each one removes a reason to stop and wait.
+1. **What lets this loop run without a human in it.** This tier comes first, above everything else. Spawning sessions on other nodes, clearing context mid-session, seeing what another session is doing, watching a subagent, forking a conversation, and a deployment that does not stop running sessions, so a release costs no prods. Each one removes a reason to stop and wait for the operator.
+2. **Bugs.** Something that used to work, or was meant to, and does not. A `bug` label, or a report that names a broken behaviour, is enough.
 3. **Small features with clear scope.** A bounded change with nothing left to decide.
 4. **Research.** Everything else. Answer it with a comment and a ping, never with code.
 
