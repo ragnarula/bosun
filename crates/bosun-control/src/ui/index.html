@@ -3274,10 +3274,10 @@ function closeSession() {
   view.hidden = true;
 }
 
-// The header, the ⋯ sheet and the footer carry the open session's identity and
-// the shape a watch-only child gives them. Clearing them returns the pane's
-// no-session layout, so a session the pane cannot read yet shows nothing of the
-// session before it.
+// The header and the ⋯ sheet carry the open session's identity, and the footer
+// and the sheet rows carry the shape a watch-only child gives the pane.
+// Clearing them returns the pane's no-session layout, so a session the pane
+// cannot read yet shows nothing of the session before it.
 function clearHeader() {
   viewStateDot.className = 'dot';
   viewNode.textContent = '';
@@ -3402,8 +3402,8 @@ btnStop.addEventListener('click', async () => {
   try {
     await post('/stop', { session_id: id });
     toastOk('session stopped');
-    // The pane may have left this session while the stop was in flight: the
-    // session on screen now is not the one that was stopped.
+    // The pane may have left this session while the stop was in flight, so the
+    // close belongs only to a screen still showing the session that stopped.
     if (current === id) {
       markListEntry();
       closeSession();

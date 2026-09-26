@@ -585,11 +585,27 @@ mod tests {
             "the list entry keeps the path the pane was served at, so it needs no route of its own"
         );
         let stop = squeezed(segment(PANE, "btnStop.addEventListener('click'", "\n});"));
+        let captured = stop
+            .find(&squeezed("const id = current;"))
+            .expect("the stop must take the id of the session it was pressed for");
+        let posted = stop
+            .find(&squeezed("await post('/stop'"))
+            .expect("the stop must post that id");
         assert!(
-            stop.contains(&squeezed("const id = current;"))
-                && stop.contains(&squeezed("if (current === id) {"))
-                && stop.contains(&squeezed("markListEntry();")),
-            "a session stopped here must leave no `#s=` link behind, and a stop that lands after the user moved to another session must not close or rewrite that one"
+            captured < posted,
+            "the id must be taken before the post, or the reply is read against whatever session the pane shows by then"
+        );
+        let guarded = stop
+            .split_once(&squeezed("if (current === id) {"))
+            .expect("the close must be guarded by the session the pane shows now")
+            .1
+            .split_once('}')
+            .expect("the guard must close before the handler ends")
+            .0;
+        assert!(
+            guarded.contains(&squeezed("markListEntry();"))
+                && guarded.contains(&squeezed("closeSession();")),
+            "the entry rewrite and the close must both stand inside the guard, or a stop that lands after the user moved on rewrites the entry of the session on screen now"
         );
         let refresh = squeezed(segment(PANE, "async function refreshSessions(", "\n}\n"));
         assert!(
@@ -619,9 +635,13 @@ mod tests {
         let body = after
             .split_once(&squeezed("await response.json();"))
             .expect("the control plane's answer is read after the 404 branch");
+        let checked = body
+            .1
+            .split_once(&guard)
+            .expect("the session on screen must be checked after the body read too, or a late body writes the header of a session the pane left");
         assert!(
-            body.1.contains(&guard),
-            "the session on screen must be checked after the body read too, or a late body writes the header of a session the pane left"
+            checked.1.starts_with("updateHeader("),
+            "the check must stand between the body read and the header write, the only two things a late reply could reach"
         );
     }
 
