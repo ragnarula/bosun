@@ -453,18 +453,43 @@ mod tests {
     }
 
     #[test]
-    fn the_pane_tells_its_own_history_entry_by_the_state_it_writes() {
+    fn the_pane_tells_an_entry_of_its_own_by_the_state_it_writes() {
         let entry = squeezed(segment(PANE, "function paneEntry(", "\n}\n"));
         assert!(
             entry.contains(&squeezed("return { pane: id };")),
-            "an entry the pane owns carries the session it shows, and null for the list"
+            "a pane entry carries the session it shows, and null while it shows the list"
         );
-        let check = squeezed(segment(PANE, "function isPaneEntry(", "\n}\n"));
+        let own = squeezed(segment(PANE, "function isOwnEntry(", "\n}\n"));
         assert!(
-            check.contains(&squeezed(
+            own.contains(&squeezed(
                 "Object.prototype.hasOwnProperty.call(state, 'pane')"
-            )),
-            "the key tells the pane's entries from another page's, because a list entry's value is null"
+            )) && own.contains(&squeezed("&& state.pane === id")),
+            "the key tells the pane's entries from another page's, and the id tells the pane's own entry for a session from one the browser put a copied state on, such as a fragment pasted into the address bar"
+        );
+    }
+
+    #[test]
+    fn the_pane_writes_the_list_entry_under_every_session_it_pushes() {
+        let push = squeezed(segment(PANE, "function pushSession(", "\n}\n"));
+        let mark = push
+            .find("markListEntry();")
+            .expect("a pushed session needs the list entry under it");
+        let pushed = push
+            .find("history.pushState(")
+            .expect("a pushed session writes its own entry");
+        assert!(
+            mark < pushed,
+            "the list entry must be written before the session is pushed, or the entry under the session is whatever the browser had"
+        );
+        assert_eq!(
+            PANE.matches("history.pushState").count(),
+            1,
+            "one place pushes a session entry"
+        );
+        assert_eq!(
+            PANE.matches("history.replaceState").count(),
+            2,
+            "one place writes the list entry, and the session that takes over the one open writes its own entry in place"
         );
     }
 
@@ -473,11 +498,11 @@ mod tests {
         let open = squeezed(segment(PANE, "function openSession(", "\n}\n"));
         assert!(
             open.contains(&squeezed(
-                "if (current) history.replaceState(paneEntry(id), '', sessionLink(id));"
+                "if (current && isOwnEntry(history.state, current)) {"
             )) && open.contains(&squeezed(
-                "else history.pushState(paneEntry(id), '', sessionLink(id));"
-            )),
-            "from the list the session takes an entry of its own, so back reaches the list; from a session it takes that session's entry, so the list stays the only entry behind a session"
+                "history.replaceState(paneEntry(id), '', sessionLink(id));"
+            )) && open.contains(&squeezed("pushSession(id);")),
+            "the session already open owns the entry on screen and the new session takes it; from anywhere else the list entry goes under a pushed session, because the entry there may be one the pane did not write"
         );
         assert!(
             open.contains(&squeezed("showSession(id);")),
@@ -491,12 +516,7 @@ mod tests {
                 .expect("openSession must take the session id alone")
                 .0,
             "id",
-            "openSession takes the session id alone: the pane's own position decides push or replace, so no call site can choose"
-        );
-        assert_eq!(
-            PANE.matches("history.pushState").count(),
-            2,
-            "a session entry is written in two places only: openSession, and the list entry a fresh `#s=` load needs under it"
+            "openSession takes the session id alone: the pane's position decides push or replace, so no call site can choose"
         );
     }
 
@@ -505,7 +525,7 @@ mod tests {
         assert_eq!(
             PANE.matches("history.back()").count(),
             1,
-            "one way out of a session: the header's ‹ and the browser's back button must be the same call"
+            "one call leaves a session: the header's ‹ and the browser's back button must be the same one"
         );
         assert!(
             PANE.contains("btnBack.addEventListener('click', () => history.back())"),
@@ -516,44 +536,42 @@ mod tests {
             "a second way out of a session would drift from the browser's back button"
         );
         let follow = squeezed(segment(PANE, "function followHistory(", "\n}\n"));
-        assert!(
-            follow.contains(&squeezed("const id = sessionFromLink();"))
-                && follow.contains(&squeezed("if (id) showSession(id);"))
-                && follow.contains(&squeezed("else closeSession();")),
-            "the entry the browser moved to decides the screen: the session its fragment names, or the list"
-        );
+        for token in [
+            "const id = sessionFromLink();",
+            "if (id === current) return;",
+            "closeSession();",
+            "if (!isOwnEntry(history.state, id)) pushSession(id);",
+            "showSession(id);",
+        ] {
+            assert!(
+                follow.contains(&squeezed(token)),
+                "the fragment decides the screen — the session it names, or the list — and an entry the pane did not write gets the list entry under the session first: {token} stays"
+            );
+        }
         assert!(
             PANE.contains("window.addEventListener('popstate', followHistory)"),
             "back and forward must run the pane's own history path"
         );
     }
-    #[test]
-    fn the_pane_opens_the_session_a_loaded_link_names() {
-        assert!(
-            PANE.contains("restoreFromLink();"),
-            "a load must open the session the address bar names"
-        );
-        let restore = squeezed(segment(PANE, "function restoreFromLink(", "\n}\n"));
-        assert!(
-            restore.contains(&squeezed("const id = sessionFromLink();"))
-                && restore.contains(&squeezed("showSession(id);")),
-            "the load opens the session the fragment names"
-        );
-        assert!(
-            restore.contains(&squeezed("if (!id) { markListEntry(); return; }")),
-            "a load on anything else starts on the list, and marks the entry it starts on"
-        );
-    }
 
     #[test]
-    fn the_pane_writes_the_list_under_a_session_a_load_opened_from_another_page() {
-        let restore = squeezed(segment(PANE, "function restoreFromLink(", "\n}\n"));
+    fn the_pane_starts_on_the_entry_the_address_bar_names() {
+        let start = squeezed(segment(PANE, "function startFromLink(", "\n}\n"));
+        for token in [
+            "const id = sessionFromLink();",
+            "if (isOwnEntry(history.state, id)) {",
+            "if (!id) { markListEntry(); return; }",
+            "pushSession(id);",
+            "showSession(id);",
+        ] {
+            assert!(
+                start.contains(&squeezed(token)),
+                "a load starts on the session the fragment names, with the list entry written under it, or on the list: {token} stays"
+            );
+        }
         assert!(
-            restore.contains(&squeezed("if (!isPaneEntry(history.state)) {"))
-                && restore.contains(&squeezed(
-                    "history.pushState(paneEntry(id), '', sessionLink(id));"
-                )),
-            "an entry the pane did not write has no pane entry behind it, so the pane writes the list under the session: back returns to the list instead of leaving the pane, and forward reopens the session"
+            PANE.contains("startFromLink();"),
+            "the pane must run the load path when it starts"
         );
     }
 
@@ -577,19 +595,56 @@ mod tests {
                 && refresh.contains(&squeezed("markListEntry(); closeSession();")),
             "a session that ended on the node must leave no `#s=` link behind"
         );
+        let detail = squeezed(segment(PANE, "async function fetchSession(", "\n}\n"));
+        assert!(
+            detail.contains(&squeezed("if (response.status === 404) {"))
+                && detail.contains(&squeezed("markListEntry(); closeSession();")),
+            "an entry naming a session the control plane does not have must stop naming it, so the session screen and a reload do not outlive the session"
+        );
     }
 
     #[test]
-    fn the_pane_hides_the_session_sheets_when_it_closes_a_session() {
+    fn the_pane_ignores_a_reply_for_a_session_it_left() {
+        let detail = squeezed(segment(PANE, "async function fetchSession(", "\n}\n"));
+        assert_eq!(
+            detail
+                .matches(&squeezed("if (current !== id) return;"))
+                .count(),
+            2,
+            "a reply that arrives after the pane left the session must write nothing: one check guards the header and the close, and the body read can outlive the session too"
+        );
+    }
+
+    #[test]
+    fn the_pane_leaves_nothing_of_a_session_on_screen_when_it_closes_one() {
         let close = squeezed(segment(PANE, "function closeSession(", "\n}\n"));
         assert!(
             close.contains(&squeezed("askSheet.hidden = true;"))
                 && close.contains(&squeezed("viewSheet.hidden = true;")),
-            "the ⋯ sheet hangs outside the view element, and the ask sheet keeps its own state, so closing a session must hide each one"
+            "the ⋯ sheet is a sibling of #session-view and the ask sheet keeps its own state, so closing a session must hide each one"
+        );
+        assert!(
+            close.contains(&squeezed("clearHeader();")),
+            "the header and the sheet carry the open session's identity, so closing a session must clear them"
         );
         assert!(
             !close.contains("history."),
             "the teardown writes no history; the handlers that leave a session own that"
         );
+        let header = squeezed(segment(PANE, "function clearHeader(", "\n}\n"));
+        for field in [
+            "viewStateDot.className = 'dot'",
+            "viewNode.textContent = ''",
+            "viewDir.textContent = ''",
+            "viewIdCopy.textContent = ''",
+            "viewSheetMeta.textContent = ''",
+            "viewPermission.textContent = ''",
+            "personaName.value = ''",
+        ] {
+            assert!(
+                header.contains(&squeezed(field)),
+                "clearHeader must clear {field}, or the session the pane left keeps naming itself on screen"
+            );
+        }
     }
 }

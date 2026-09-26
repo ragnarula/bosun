@@ -3113,18 +3113,20 @@ newSessionForm.addEventListener('submit', async (event) => {
 
 // ---- Session history ----
 // The pane keeps two history entries: the session list, and the one open
-// session above it. The browser's back button and the header's ‹ both move
-// between them, so a session has one way in and one way out.
+// session above it. The browser's back button and the header's ‹ move between
+// them.
 
-// The state an entry the pane owns carries: null while it shows the list, and
-// the session id while it shows that session. A state without the key belongs
-// to another page, so the pane must not treat that entry as one of its own.
+// The state a pane entry carries: null while it shows the list, and the
+// session id while it shows that session. Another page's state carries no
+// `pane` key, and the browser copies the state it is on onto a fragment pasted
+// into the address bar, so the key alone does not say an entry shows the
+// session on screen.
 function paneEntry(id) {
   return { pane: id };
 }
 
-function isPaneEntry(state) {
-  return !!state && Object.prototype.hasOwnProperty.call(state, 'pane');
+function isOwnEntry(state, id) {
+  return !!state && Object.prototype.hasOwnProperty.call(state, 'pane') && state.pane === id;
 }
 
 // The address of an open session. The browser keeps the fragment, so the
@@ -3148,48 +3150,69 @@ function sessionFromLink() {
 
 // The current entry becomes the list entry, with the fragment off. The pane
 // marks the entry it starts on with this, and clears it whenever a session
-// leaves the screen without the back path, so the address bar always names
-// what is on screen.
+// leaves the screen without the back path, so the address bar names what is on
+// screen.
 function markListEntry() {
   history.replaceState(paneEntry(null), '', location.pathname + location.search);
+}
+
+// Pushes an open session's entry above the list: the current entry becomes the
+// list entry, and the session is written on top of it, so back reaches the
+// list rather than the page before the pane.
+function pushSession(id) {
+  markListEntry();
+  history.pushState(paneEntry(id), '', sessionLink(id));
 }
 
 // The pane's one way into a session: the entry and the fragment are written
 // here, so the header's ‹ and the browser's back leave by the same path.
 function openSession(id) {
-  // From the list the session takes an entry of its own, so back reaches the
-  // list. From a session it takes that session's entry, so the list stays the
-  // only entry behind a session.
-  if (current) history.replaceState(paneEntry(id), '', sessionLink(id));
-  else history.pushState(paneEntry(id), '', sessionLink(id));
+  // The session already open owns the entry on screen, and the new session
+  // takes it, so the list stays the entry behind a session. Anywhere else —
+  // the list, or an entry the pane did not write — the list entry goes under
+  // the session instead.
+  if (current && isOwnEntry(history.state, current)) {
+    history.replaceState(paneEntry(id), '', sessionLink(id));
+  } else {
+    pushSession(id);
+  }
   showSession(id);
 }
 
-// Back and forward move between the pane's two entries; the fragment names the
-// one the browser put on screen.
+// The pane follows the address bar: the session its fragment names, or the
+// list. Back, forward, and a fragment pasted into the address bar all arrive
+// here.
 function followHistory() {
   const id = sessionFromLink();
-  // The entry already on screen: rebuilding the view would drop the transcript
+  // The entry on screen already: rebuilding the view would drop the transcript
   // and reopen the stream for nothing.
   if (id === current) return;
-  if (id) showSession(id);
-  else closeSession();
+  if (!id) {
+    closeSession();
+    return;
+  }
+  // An entry the pane did not write — a link loaded from another page, a
+  // fragment pasted into the address bar — may sit above anything, so the pane
+  // puts its own list entry under the session before opening it: back reaches
+  // the list rather than the page, or the session, that came before.
+  if (!isOwnEntry(history.state, id)) pushSession(id);
+  showSession(id);
 }
 
-// A load on a `#s=` link opens that session; a load on anything else starts on
-// the list. A link loaded from another page leaves that page's entry behind
-// the session, so the pane writes the list entry under it first: back returns
-// to the list instead of leaving the pane.
-function restoreFromLink() {
+// The pane's load starts on the session its `#s=` fragment names, or on the
+// list. An entry the pane wrote keeps its state, so a reload adds no entry;
+// any other becomes the list entry, with the session pushed above it.
+function startFromLink() {
   const id = sessionFromLink();
+  if (isOwnEntry(history.state, id)) {
+    if (id) showSession(id);
+    return;
+  }
   if (!id) {
     markListEntry();
     return;
   }
-  if (!isPaneEntry(history.state)) {
-    markListEntry();
-    history.pushState(paneEntry(id), '', sessionLink(id));
-  }
+  pushSession(id);
   showSession(id);
 }
 
@@ -3246,17 +3269,49 @@ function closeSession() {
   askChips.textContent = '';
   askFree.hidden = true;
   chatRow.hidden = false;
-  // The ⋯ sheet hangs outside the view element, so hiding the view does not
+  // The ⋯ sheet is a sibling of #session-view, so hiding the view does not
   // hide it.
   viewSheet.hidden = true;
+  clearHeader();
   view.hidden = true;
+}
+
+// The header and the ⋯ sheet carry the open session's identity. Clearing them
+// leaves no other session's node, directory or id on screen while a session
+// the pane cannot read is fetched.
+function clearHeader() {
+  viewStateDot.className = 'dot';
+  viewNode.textContent = '';
+  viewDir.textContent = '';
+  viewIdCopy.textContent = '';
+  viewSheetMeta.textContent = '';
+  viewWaiting.textContent = '';
+  viewWaiting.hidden = true;
+  viewPermission.textContent = '';
+  btnPermission.textContent = 'Switch to read-only';
+  personaName.value = '';
 }
 
 async function fetchSession(id) {
   try {
     const response = await fetch('/sessions/' + encodeURIComponent(id));
+    // The pane may have left this session while the fetch was in flight: a
+    // late reply must not write the header, or close the view, of whichever
+    // session the pane shows now.
+    if (current !== id) return;
+    // The control plane has no such session: the entry the pane is on stops
+    // naming it, so the session screen does not outlive the session and a
+    // reload does not open it again.
+    if (response.status === 404) {
+      showStatus('session ' + id + ' ended');
+      markListEntry();
+      closeSession();
+      return;
+    }
     if (!response.ok) throw new Error('HTTP ' + response.status);
-    updateHeader(await response.json());
+    const session = await response.json();
+    if (current !== id) return;
+    updateHeader(session);
   } catch (error) {
     showStatus('session: ' + error.message);
   }
@@ -3349,8 +3404,9 @@ btnStop.addEventListener('click', async () => {
   }
 });
 
-// The thin header's back arrow returns to the session list by the browser's
-// own path; the sheet stays closed until the user opens it with ⋯.
+// The thin header's back arrow takes the same step the browser's back button
+// takes, so the list is the screen it returns to; the sheet stays closed until
+// the user opens it with ⋯.
 btnBack.addEventListener('click', () => history.back());
 
 // The status/phase line toggles the debug console. Opening it replays the
@@ -4489,10 +4545,10 @@ setInterval(refreshSessions, 3000);
 setInterval(refreshPersonas, 30000);
 setInterval(refreshSkillRepos, 30000);
 setInterval(refreshMcpServers, 30000);
-// The browser's back and forward buttons change which entry is on screen; the
-// pane loads whatever fragment is in the address bar when it starts.
+// The pane starts on the entry the address bar names, and follows it from
+// there.
 window.addEventListener('popstate', followHistory);
-restoreFromLink();
+startFromLink();
 </script>
 </body>
 </html>

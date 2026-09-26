@@ -19,10 +19,10 @@ Constraints fixed going in:
 ## Decision Drivers
 
 - One way out. A header control that closes a session itself drifts from what the browser's back button does.
-- Back must not leave the pane. A back press with the pane's own list behind it has to land on the list.
+- Back must not leave the pane. A back press from a session has to land on the list whenever the pane can decide what sits under the session.
 - A session has to survive a reload and be shareable as a link.
 - No new server route. The pane answers at two fixed paths, and `RESERVED_PATHS` in `crates/bosun-control/src/api.rs` keeps every path the router serves away from the OAuth callback's redirect URI.
-- Bounded history. A session opened from a session must not stack entries, or back walks a chain of sessions instead of leaving.
+- Bounded history. A session opened from a session must not stack entries, or one back press moves to another session instead of leaving.
 
 ## Options Considered
 
@@ -50,29 +50,38 @@ This leaves a shared link, or a link opened from another page, with a foreign en
 
 Two paths out of a session: the control tears the view down, the browser button moves an entry. They differ as soon as the URL or the entry changes, which is the state this decision introduces.
 
+**7. Leave an entry the pane did not write where it is, and repair history at load only. (rejected)**
+
+A fragment pasted into the address bar while a session is open creates an entry the pane did not write, above whatever the browser held — often another session's entry. With no repair, the `‹` control and the browser's back button move from that session to the session underneath it, so leaving a session reaches another session instead of the list. The same two calls that repair a link loaded from another page repair this one.
+
 ## Decision
 
 An open session is addressed as `#s=<session id>`, with the id percent-encoded — otherwise the pane is served at `/` and `/ui` exactly as before, and a reload or a shared link reopens the session.
 
-The pane owns two history entries: the session list, and the one open session above it. Every entry it writes carries a state object with a `pane` key: `{ pane: null }` for the list and `{ pane: "<id>" }` for a session. A state without that key belongs to another page, so the pane never treats such an entry as its own.
+The pane owns two history entries: the session list, and the one open session above it. Every entry it writes carries a state object with a `pane` key: `null` for the list, and the session id for a session. An entry is the pane's own for a session only when the state names that same session, because the browser copies the state it is on onto a fragment navigation, such as a pasted address. `paneEntry`, `isOwnEntry`, `sessionLink` and `sessionFromLink` in the pane are the whole of that bookkeeping.
 
-`openSession(id)` is the one way into a session: it writes the entry and the fragment, then hands the id to the view. Opened from the list it pushes, so back reaches the list; opened from a session — a child line, a child link, or the owner behind a watch-only child — it replaces that session's entry, so the list stays the entry directly under the session and no session stacks on another.
+`openSession(id)` is the one way into a session: it writes the entry and the fragment, then hands the id to the view. When the session already on screen owns the entry, the new session replaces it in place, so a session opened from a session — a child link in a transcript, or the owner behind a watch-only child — leaves the list as the entry directly under the session and adds no entry. Everywhere else, including an entry the pane did not write, the current entry becomes the list entry and the session is pushed above it.
 
-A load on a `#s=` link opens the session the fragment names. When the loaded entry is not the pane's own — a link opened from another page, a pasted address, a restored session that lost its state — the pane writes the list entry onto that entry and then pushes the session above it, so the browser's back button reaches the list instead of the previous page, and forward reopens the session. A reload of the pane's own session entry writes nothing, because the list entry is still below it.
+A load starts on the session its fragment names, or on the list. When the loaded entry is the pane's own, a reload keeps it and adds no entry. Otherwise the pane writes the list entry onto it and pushes the session above it, so the browser's back button reaches the list instead of the page the link came from, and forward reopens the session.
 
-`popstate` reads the fragment: the entry it names decides the screen, and an entry that names no session shows the list. The header's `‹` calls `history.back()`, so the control and the browser's button take the same path, and forward reopens the session both leave.
+`popstate` runs the same path on every back and forward: the fragment decides the screen, an entry naming no session shows the list, and a session entry the pane does not own gets the list entry written under it before the view opens. An entry already on screen is left alone, so a traversal does not rebuild the transcript or reopen the event stream for nothing.
 
-Paths that leave a session without going back — Stop, and a session that ended on the node — rewrite the current entry to the list entry, with the fragment off, so the address bar never names a session the pane does not show. Sheets stay out of history: the ask sheet and the ⋯ view sheet keep the close controls they had, and `closeSession()` also hides the ⋯ sheet, which hangs outside `#session-view` and would otherwise sit over the list.
+The header's `‹` calls `history.back()`, so the control and the browser's button take the same step and a session has one way out.
+
+A session stops being the entries' subject as soon as the pane knows it is gone: Stop, a poll that no longer lists the session, and a detail fetch that answers 404 each rewrite the current entry to the list entry, with the fragment off, and close the view. A detail reply that arrives after the pane has left its session writes nothing, so a slow reply from the control plane cannot paint a session the pane is no longer showing or close the one it is. An entry the pane is not on cannot be rewritten; visiting one whose session has since ended lands on the list for that reason.
+
+Sheets stay out of history. The ask sheet and the ⋯ view sheet keep the close controls they had. `closeSession()` also hides the ⋯ sheet, which is a sibling of `#session-view` rather than a child of it, and clears the header and the sheet's identity fields through `clearHeader`, so a session the pane cannot read shows no other session's node, directory or id.
 
 ## Consequences
 
-- The browser's back and forward buttons and the pane's `‹` are one path, so they cannot drift.
-- A back press from a session always lands on the list. A second back press then leaves the pane, as a browser's back button does when the pane's own entries run out.
-- A link opened from another page has the list entry written under it before the session shows: a tab opened on such a link holds one entry the user never visited, and the session's address bar is unchanged.
+- The browser's back and forward buttons and the pane's `‹` are one path, so they cannot drift. Back from a session reaches the list, and a second back press leaves the pane, as a browser's back button does when the pane's own entries run out.
+- The pane writes two entries where the browser had one: a link loaded from another page, or a fragment pasted into the address bar, leaves a list entry that the user never visited, so back returns to the list before it returns to that page.
+- Entering a session from the list writes the list entry onto the current entry and then pushes the session, which is two history writes for one tap. A session opened from a session replaces one entry instead.
+- An entry for a session that ends while the pane is elsewhere keeps its `#s=` fragment until the pane visits it. The pane cannot rewrite an entry it is not on, and the visit lands on the list once the detail fetch finds no session.
 - The id in the fragment is not sent to the control plane, so it is never logged there. It is also not available to a proxy, which is why the pane reads `location.hash` itself rather than asking the API.
-- Two entries mean the pane's state is now spread across the DOM and the history entry. A future view that writes entries must keep the `pane` state key, or the load path will write a list entry under it.
+- The pane's state is now split between the DOM and the history entry. A later view that writes entries must carry the `pane` state key, or the pane will treat its entries as another page's and write a list entry under them.
 - The open session lives in the address bar, so the pane reconnects its event stream and re-fetches the transcript on a reload. Nothing about the stream or the transcript changed.
-- `crates/bosun-control/src/ui.rs` checks the pane by matching source text; it has no browser. The new checks pin the fragment, the single close path, the load path and the fallback, and cannot see the rendered behaviour.
+- `crates/bosun-control/src/ui.rs` checks the pane by matching source text; it has no browser. The checks pin the fragment, the ownership rule, the single close path, the load path, the fragment clearing, the cleared identity and the late reply, and cannot see the rendered behaviour.
 
 ## Revisit When
 
