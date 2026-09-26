@@ -4751,16 +4751,15 @@ mod tests {
         let handle = spawn_loop("s-act-interrupt".into(), deps);
         handle.send(LoopEvent::Wake);
 
-        wait_for("the turn to start running", || {
+        // The session reads running from the start of the wake, before the
+        // request is built, so the interrupt waits for the request itself.
+        wait_for("the request to be sent", || {
             let store = store.clone();
             async move {
-                store
-                    .get_session("s-act-interrupt")
+                activities(&store, "s-act-interrupt")
                     .await
-                    .unwrap()
-                    .unwrap()
-                    .state
-                    == SessionState::Running
+                    .iter()
+                    .any(|(_, phase)| matches!(phase, ActivityPhase::RequestSent { .. }))
             }
         })
         .await;
@@ -4782,12 +4781,6 @@ mod tests {
         .await;
 
         let recorded = activities(&store, "s-act-interrupt").await;
-        assert!(
-            recorded
-                .iter()
-                .any(|(_, phase)| matches!(phase, ActivityPhase::RequestSent { .. })),
-            "the request is recorded before the interrupt: {recorded:?}"
-        );
         assert!(
             !recorded
                 .iter()
