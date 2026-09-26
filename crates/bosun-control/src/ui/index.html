@@ -833,7 +833,31 @@
     text-overflow: ellipsis;
   }
   #activity-log .activity-duration { flex: 0 0 auto; color: var(--muted); }
-  #transcript { flex: 1; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  /* The transcript and the control that returns the reader to its end. The
+     control floats inside this box, so it sits just above the composer whatever
+     height the composer takes. */
+  #transcript-wrap {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+  }
+  #transcript { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  #btn-bottom {
+    position: absolute;
+    right: 16px;
+    bottom: 14px;
+    width: var(--touch-min-height);
+    height: var(--touch-min-height);
+    padding: 0;
+    border-radius: 50%;
+    background: var(--panel-2);
+    color: var(--accent);
+    font-size: 18px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.32);
+  }
+  #btn-bottom:active { border-color: var(--accent); }
+  #btn-bottom[hidden] { display: none; }
   /* A stamped entry is one flex row: the time holds the leading gutter and the
      entry takes the rest of the width, so a block entry's first line shares
      the row with its time and still wraps on a narrow screen. */
@@ -1339,7 +1363,10 @@
     <button type="button" class="btn-more" id="btn-more" title="Session actions">⋯</button>
   </header>
   <div id="activity-log" hidden></div>
-  <div id="transcript"></div>
+  <div id="transcript-wrap">
+    <div id="transcript"></div>
+    <button type="button" id="btn-bottom" hidden title="Back to the newest line">↓</button>
+  </div>
   <div id="watch-banner" hidden>
     <div class="watch-note">watching child session — it is read-only</div>
     <button type="button" id="btn-watch-open">Open to act</button>
@@ -1491,6 +1518,7 @@ const personaName = $('persona-name');
 const btnPersona = $('btn-persona');
 const btnStop = $('btn-stop');
 const transcript = $('transcript');
+const btnBottom = $('btn-bottom');
 const input = $('input');
 const chatRow = $('chat-row');
 const btnSend = $('btn-send');
@@ -3261,6 +3289,10 @@ function closeSession() {
   if (askSyncTimer) window.clearTimeout(askSyncTimer);
   askSyncTimer = null;
   transcript.textContent = '';
+  // The next session opens on its newest line, so re-arm auto-follow and hide
+  // the control at this teardown.
+  stick = true;
+  syncBtnBottom();
   saveDraft();
   input.value = '';
   askSheet.hidden = true;
@@ -3646,10 +3678,20 @@ function scrollToBottom() {
 function jumpToBottom() {
   stick = true;
   transcript.scrollTop = transcript.scrollHeight;
+  syncBtnBottom();
 }
+
+// Auto-follow off means the reader is off the newest line, so the control and
+// the flag are the same state.
+function syncBtnBottom() {
+  btnBottom.hidden = stick;
+}
+
+btnBottom.addEventListener('click', jumpToBottom);
 
 transcript.addEventListener('scroll', () => {
   stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;
+  syncBtnBottom();
 });
 
 // A durable event's stamp as the reader's local clock time. The wire carries

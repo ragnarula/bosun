@@ -923,8 +923,10 @@ mod tests {
         );
         assert_eq!(
             block(&pane, &squeezed("function jumpToBottom")),
-            squeezed("stick = true; transcript.scrollTop = transcript.scrollHeight;"),
-            "jumpToBottom must set auto-scroll and move the transcript itself, not through the guarded follow: a keystroke from a scrolled-up reader would otherwise leave them where they were"
+            squeezed(
+                "stick = true; transcript.scrollTop = transcript.scrollHeight; syncBtnBottom();"
+            ),
+            "jumpToBottom must set auto-scroll, move the transcript itself rather than through the guarded follow, and hide the control the move makes redundant: a keystroke from a scrolled-up reader would otherwise leave them where they were, with a control still on screen"
         );
     }
 
@@ -980,8 +982,10 @@ mod tests {
         );
         assert_eq!(
             block(&pane, &squeezed("function jumpToBottom")),
-            squeezed("stick = true; transcript.scrollTop = transcript.scrollHeight;"),
-            "jumpToBottom must set auto-scroll and move the transcript itself, not through the guarded follow, or the answer to the sent message does not land in view"
+            squeezed(
+                "stick = true; transcript.scrollTop = transcript.scrollHeight; syncBtnBottom();"
+            ),
+            "jumpToBottom must set auto-scroll, move the transcript itself rather than through the guarded follow, and hide the control the move makes redundant, or the answer to the sent message does not land in view"
         );
         let wired = pane
             .split_once(&squeezed("btnSend.addEventListener('click', send);"))
@@ -1023,9 +1027,189 @@ mod tests {
         assert_eq!(
             block(&pane, &squeezed("transcript.addEventListener('scroll'")),
             squeezed(
-                "stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;"
+                "stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40; syncBtnBottom();"
             ),
-            "the listener must hold auto-scroll while the end of the transcript is in view: a listener that clears `stick` on every scroll takes back the jump a keystroke or a send just made, and the sent message and its answer land below the fold again"
+            "the listener must hold auto-scroll while the end of the transcript is in view, and put the control away with the flag it just read: a listener that clears `stick` on every scroll takes back the jump a keystroke or a send just made, and the sent message and its answer land below the fold again"
+        );
+    }
+
+    // The control that brings a reader who scrolled up back to the newest line.
+    // It lives in the transcript's box, so the session view hides it, and its
+    // two states are the two states of `stick`.
+
+    #[test]
+    fn the_pane_holds_the_bottom_control_with_the_transcript_it_moves() {
+        let view_at = PANE
+            .find("<div id=\"session-view\"")
+            .expect("the pane must have the session view");
+        let box_at = PANE
+            .find("<div id=\"transcript-wrap\"")
+            .expect("the pane must have the transcript's box");
+        assert!(
+            view_at < box_at,
+            "the box, and the control inside it, must stand in the session view, or they show over the list the view hides them with"
+        );
+        let region = segment(
+            PANE,
+            "<div id=\"transcript-wrap\">",
+            "<div id=\"watch-banner\"",
+        );
+        let closes = region
+            .rfind("</div>")
+            .expect("the box that holds the transcript must close before the watch banner");
+        let between = region
+            .split_once("id=\"transcript\"")
+            .expect("the box must hold the transcript")
+            .1
+            .split_once("id=\"btn-bottom\"")
+            .expect("the box must hold the control")
+            .0;
+        assert_eq!(
+            squeezed(between),
+            "></div><buttontype=\"button\"",
+            "the control is the transcript's next sibling inside the box, never its child: the teardown empties the transcript, and a control the pane built into it goes with the lines"
+        );
+        let held = region
+            .find("id=\"btn-bottom\"")
+            .expect("the box must hold the control");
+        assert!(
+            held < closes,
+            "the control must stand before the tag that closes the box, or its offset anchors to the session view instead, and it lands over the composer"
+        );
+        let tag = segment(PANE, "<button type=\"button\" id=\"btn-bottom\"", ">");
+        assert_eq!(
+            tag.split_whitespace().next(),
+            Some("hidden"),
+            "the control opens hidden, and the attribute stands first in its tag: a session opens on its newest line and `stick` opens armed, so the first paint shows the transcript alone"
+        );
+        assert_eq!(
+            PANE.matches("id=\"btn-bottom\"").count(),
+            1,
+            "one element carries the control's id"
+        );
+    }
+
+    #[test]
+    fn the_pane_floats_the_bottom_control_above_the_composer_at_thumb_size() {
+        for selector in [
+            "#transcript-wrap {",
+            "#btn-bottom {",
+            "#btn-bottom[hidden] {",
+        ] {
+            assert_eq!(
+                PANE.matches(selector).count(),
+                1,
+                "one rule for `{selector}`: a second rule with that selector wins over the one these checks read"
+            );
+        }
+        let wrap = segment(PANE, "#transcript-wrap {\n", "}\n");
+        assert_eq!(
+            squeezed(wrap),
+            squeezed("position: relative; flex: 1; min-height: 0; display: flex;"),
+            "the box takes the transcript's place in the view, anchors the control, and holds nothing else: a plain box loses the flex and the transcript grows to its content and spills over the composer, a floor above zero stops the box shrinking to leave the composer on screen, and any further declaration here moves the box out of its place"
+        );
+        let control = segment(PANE, "#btn-bottom {\n", "}\n");
+        for rule in [
+            "position: absolute",
+            "right: 16px",
+            "bottom: 14px",
+            "width: var(--touch-min-height)",
+            "height: var(--touch-min-height)",
+        ] {
+            assert!(
+                control.contains(rule),
+                "the control floats in the box's lower corner at the one-handed size floor: {rule} stays"
+            );
+        }
+        assert!(
+            PANE.contains("#btn-bottom[hidden] { display: none; }"),
+            "a hidden control must leave the screen, not sit over the transcript as an empty target"
+        );
+    }
+
+    #[test]
+    fn the_pane_shows_the_bottom_control_while_the_reader_is_off_the_newest_line() {
+        let pane = flattened();
+        assert_eq!(
+            pane.matches(&squeezed("function syncBtnBottom")).count(),
+            1,
+            "one `function syncBtnBottom` runs: JavaScript runs the last declaration, and these checks read the first"
+        );
+        assert!(
+            !pane.contains(&squeezed("syncBtnBottom =")),
+            "nothing assigns over `syncBtnBottom`: an assignment runs in place of the declaration these checks read"
+        );
+        assert!(
+            pane.contains(&squeezed("const btnBottom = $('btn-bottom');")),
+            "`const btnBottom = $('btn-bottom');` must stand: the checks below read that name for the control, and only a const binding keeps a later assignment from pointing it elsewhere"
+        );
+        assert_eq!(
+            pane.matches("btn-bottom").count(),
+            1,
+            "the script reaches the control by its id in the binding alone: a second lookup could write the control's state beside the one place that does"
+        );
+        assert_eq!(
+            block(&pane, &squeezed("function syncBtnBottom")),
+            squeezed("btnBottom.hidden = stick;"),
+            "the control is hidden while the transcript is at its end, the state `stick` holds: any other rule shows it to a reader who is already at the bottom, or hides it from the reader who is not"
+        );
+        let listener = block(&pane, &squeezed("transcript.addEventListener('scroll'"));
+        let read = listener
+            .find(&squeezed("stick = transcript.scrollTop"))
+            .expect("the listener must recompute auto-scroll from where the transcript sits");
+        let synced = listener
+            .find(&squeezed("syncBtnBottom();"))
+            .expect("the listener must sync the control, or a reader who scrolls up keeps a screen with no way back to the newest line");
+        assert!(
+            read < synced,
+            "the sync must stand after the flag is recomputed, or the control shows the state the reader just left"
+        );
+        assert_eq!(
+            pane.matches(&squeezed("btnBottom.hidden")).count(),
+            1,
+            "one place writes the control's hidden state, so a scroll, a move and a close cannot disagree"
+        );
+    }
+
+    #[test]
+    fn the_pane_returns_to_the_bottom_when_the_bottom_control_is_pressed() {
+        let pane = flattened();
+        assert_eq!(
+            pane.matches(&squeezed("btnBottom.addEventListener"))
+                .count(),
+            1,
+            "the control has one press path"
+        );
+        assert!(
+            pane.contains(&squeezed(
+                "function syncBtnBottom() { btnBottom.hidden = stick; } btnBottom.addEventListener('click', jumpToBottom);"
+            )),
+            "one press must run the composer's own forced move rather than a second copy of it, and the wiring must stand at the top level beside the rule it settles: a call inside a branch, or an assignment in place of the declaration, leaves the reader the control exists for with no way back"
+        );
+    }
+
+    #[test]
+    fn the_pane_resets_the_bottom_control_when_it_closes_a_session() {
+        let pane = flattened();
+        for session in ["closeSession", "showSession"] {
+            assert_eq!(
+                pane.matches(&squeezed(&format!("function {session}")))
+                    .count(),
+                1,
+                "one `function {session}` runs: JavaScript runs the last declaration, and these checks read the first"
+            );
+        }
+        let close = block(&pane, &squeezed("function closeSession("));
+        assert!(
+            close.contains(&squeezed(
+                "transcript.textContent = ''; stick = true; syncBtnBottom();"
+            )),
+            "the teardown must drop the transcript, re-arm auto-follow and put the control away as the statements it always reaches, in that order: a branch around them, or the sync before the flag, closes the view on the session the reader left with the control still over it"
+        );
+        let open = block(&pane, &squeezed("function showSession"));
+        assert!(
+            open.starts_with(&squeezed("closeSession();")),
+            "every open runs the teardown first, so a reopened session starts on its newest line with the control hidden"
         );
     }
 }
