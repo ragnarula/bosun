@@ -81,7 +81,7 @@ Sheets stay out of history. The ask sheet and the ⋯ view sheet keep the close 
 - The id in the fragment is not sent to the control plane, so it is never logged there. It is also not available to a proxy, which is why the pane reads `location.hash` itself rather than asking the API.
 - The pane's state is now split between the DOM and the history entry. A later view that writes entries must carry the `pane` state key, or the pane will treat its entries as another page's and write a list entry under them.
 - The open session lives in the address bar, so the pane reconnects its event stream and re-fetches the transcript on a reload. Nothing about the stream or the transcript changed.
-- `crates/bosun-control/src/ui.rs` checks the pane by matching source text; it has no browser, so it cannot see the rendered behaviour. Each check pins its subject to the branch it belongs to: the fragment on both writes, the ownership rule, the one back call, the load path and its reload branch, the fragment clearing on each path that clears it, the cleared identity and footer, and the reply that belongs to a session the pane has left.
+- `crates/bosun-control/src/ui.rs` checks the pane by matching source text; it has no browser, so it cannot see the rendered behaviour. Each check pins its subject to the branch it belongs to: the fragment on both writes and the reader that matches it, the ownership rule, the one back call, the load path and its reload branch, the fragment clearing on each path that clears it, the cleared identity and footer, and the reply that belongs to a session the pane has left.
 
 ## Revisit When
 
