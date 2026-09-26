@@ -3673,8 +3673,9 @@ function scrollToBottom() {
   if (stick) transcript.scrollTop = transcript.scrollHeight;
 }
 
-// A keystroke in the composer or a sent message asks for the newest lines, so
-// this one moves the transcript whatever `stick` said before.
+// A keystroke in the composer, a sent message and a press of the control all
+// ask for the newest lines, so this one moves the transcript whatever `stick`
+// said before.
 function jumpToBottom() {
   stick = true;
   transcript.scrollTop = transcript.scrollHeight;

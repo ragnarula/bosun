@@ -81,6 +81,38 @@ mod tests {
         panic!("the block after {start} must close");
     }
 
+    /// Where `needle` starts in the body of the block after `start`, at the
+    /// block's own level, so a check reads a statement the function always
+    /// reaches rather than one a branch may skip. `None` means the statement is
+    /// absent or stands inside a brace.
+    fn top_level(source: &str, start: &str, needle: &str) -> Option<usize> {
+        let after = source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("the pane must contain {start}"))
+            .1;
+        let mut depth = 0i32;
+        let mut opened = false;
+        for (at, ch) in after.char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => {
+                    depth -= 1;
+                    if opened && depth == 0 {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            if opened && depth == 1 && after[at..].starts_with(needle) {
+                return Some(at);
+            }
+        }
+        None
+    }
+
     /// The pane's script with its comments removed, so a count reads code: a
     /// comment that names a function, writes an assignment or holds a
     /// `return;` is prose about the script, not a second copy of it. The
@@ -163,14 +195,38 @@ mod tests {
         out
     }
 
-    /// `code()` with every run of whitespace removed and every double quote
-    /// written as a single one, so a check on a name or a spelling reads the
-    /// same text however the pane respaces a call or requotes a string.
+    /// `code()` with every run of whitespace outside a string literal removed,
+    /// and every double quote written as a single one, so a check on a name or
+    /// a spelling reads the same text however the pane respaces a call or
+    /// requotes a string. Whitespace inside a literal stays: there it is part
+    /// of a name the pane looks up, so an edit to one must read as a change.
     fn flattened() -> String {
-        code()
-            .split_whitespace()
-            .collect::<String>()
-            .replace('"', "'")
+        let body = code();
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars().peekable();
+        let mut quote = None;
+        while let Some(ch) = chars.next() {
+            if let Some(end) = quote {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if ch == end {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' | '`' => {
+                    quote = Some(ch);
+                    out.push(ch);
+                }
+                _ if ch.is_whitespace() => {}
+                _ => out.push(ch),
+            }
+        }
+        out.replace('"', "'")
     }
 
     #[test]
@@ -1078,9 +1134,9 @@ mod tests {
         );
         let tag = segment(PANE, "<button type=\"button\" id=\"btn-bottom\"", ">");
         assert_eq!(
-            tag.split_whitespace().next(),
-            Some("hidden"),
-            "the control opens hidden, and the attribute stands first in its tag: a session opens on its newest line and `stick` opens armed, so the first paint shows the transcript alone"
+            squeezed(tag),
+            squeezed("hidden title=\"Back to the newest line\""),
+            "the control opens hidden and its tag carries that attribute and a label, nothing else: an attribute that hides it another way, or one that turns the press off, leaves the reader with a control they cannot use"
         );
         assert_eq!(
             PANE.matches("id=\"btn-bottom\"").count(),
@@ -1102,25 +1158,24 @@ mod tests {
                 "one rule for `{selector}`: a second rule with that selector wins over the one these checks read"
             );
         }
-        let wrap = segment(PANE, "#transcript-wrap {\n", "}\n");
+        let wrap = segment(PANE, "#transcript-wrap {", "}");
         assert_eq!(
             squeezed(wrap),
             squeezed("position: relative; flex: 1; min-height: 0; display: flex;"),
             "the box takes the transcript's place in the view, anchors the control, and holds nothing else: a plain box loses the flex and the transcript grows to its content and spills over the composer, a floor above zero stops the box shrinking to leave the composer on screen, and any further declaration here moves the box out of its place"
         );
-        let control = segment(PANE, "#btn-bottom {\n", "}\n");
-        for rule in [
-            "position: absolute",
-            "right: 16px",
-            "bottom: 14px",
-            "width: var(--touch-min-height)",
-            "height: var(--touch-min-height)",
-        ] {
-            assert!(
-                control.contains(rule),
-                "the control floats in the box's lower corner at the one-handed size floor: {rule} stays"
-            );
-        }
+        let control = segment(PANE, "#btn-bottom {", "}");
+        assert_eq!(
+            squeezed(control),
+            squeezed(
+                "position: absolute; right: 16px; bottom: 14px;
+                 width: var(--touch-min-height); height: var(--touch-min-height);
+                 padding: 0; border-radius: 50%; background: var(--panel-2);
+                 color: var(--accent); font-size: 18px;
+                 box-shadow: 0 4px 12px rgba(0, 0, 0, 0.32);"
+            ),
+            "the control floats in the box's lower corner at the one-handed size floor, and the rule holds nothing else: a display or visibility rule here would keep the control off screen at the bottom too, where the reader has no way back"
+        );
         assert!(
             PANE.contains("#btn-bottom[hidden] { display: none; }"),
             "a hidden control must leave the screen, not sit over the transcript as an empty target"
@@ -1199,12 +1254,14 @@ mod tests {
                 "one `function {session}` runs: JavaScript runs the last declaration, and these checks read the first"
             );
         }
-        let close = block(&pane, &squeezed("function closeSession("));
+        let teardown = squeezed("function closeSession(");
+        let armed = top_level(&pane, &teardown, &squeezed("stick = true;"))
+            .expect("closing a session must re-arm auto-follow at a statement the teardown always reaches, or a branch around it leaves the session the pane opens next following nothing");
+        let synced = top_level(&pane, &teardown, &squeezed("syncBtnBottom();"))
+            .expect("closing a session must put the control away at a statement the teardown always reaches, or a branch around it leaves the control of the session the reader left over the next one");
         assert!(
-            close.contains(&squeezed(
-                "transcript.textContent = ''; stick = true; syncBtnBottom();"
-            )),
-            "the teardown must drop the transcript, re-arm auto-follow and put the control away as the statements it always reaches, in that order: a branch around them, or the sync before the flag, closes the view on the session the reader left with the control still over it"
+            armed < synced,
+            "the teardown must arm auto-follow before it syncs the control, or the control is left showing the state of the session the reader just left"
         );
         let open = block(&pane, &squeezed("function showSession"));
         assert!(
