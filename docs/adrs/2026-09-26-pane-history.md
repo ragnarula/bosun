@@ -68,7 +68,7 @@ A load starts on the session its fragment names, or on the list. When the loaded
 
 The header's `‹` calls `history.back()`, so the control and the browser's button take the same step and a session has one way out.
 
-A session stops being the entries' subject as soon as the pane knows it is gone: Stop, a poll that no longer lists the session, and a detail fetch that answers 404 each rewrite the current entry to the list entry, with the fragment off, and close the view. Each of those completions arrives after an await, so each checks that the session on screen is still the one it belongs to: a late detail reply, a late 404 and a late stop reply write nothing, close nothing, and rewrite no entry of the session the user moved to. An entry the pane is not on cannot be rewritten; visiting one whose session has since ended lands on the list for that reason.
+A session stops being the entries' subject as soon as the pane knows it is gone: Stop, a poll that no longer lists the session, and a detail fetch that answers 404 each rewrite the current entry to the list entry, with the fragment off, and close the view. Each of those completions arrives after an await, so each checks that the session it belongs to is still the one on screen: a detail reply, a 404 or a failure for a session the pane has left writes nothing, not even the shared status line, and a stop reply that lands after the user moved on closes nothing and rewrites no entry. An entry the pane is not on cannot be rewritten; visiting one whose session has since ended lands on the list for that reason.
 
 Sheets stay out of history. The ask sheet and the ⋯ view sheet keep the close controls they had. `closeSession()` also hides the ⋯ sheet, which is a sibling of `#session-view` rather than a child of it, and clears the header, the sheet's identity fields and the footer's watch-only shape through `clearHeader`, so a session the pane cannot read yet shows no other session's node, directory, id, input row or sheet controls.
 
@@ -81,7 +81,7 @@ Sheets stay out of history. The ask sheet and the ⋯ view sheet keep the close 
 - The id in the fragment is not sent to the control plane, so it is never logged there. It is also not available to a proxy, which is why the pane reads `location.hash` itself rather than asking the API.
 - The pane's state is now split between the DOM and the history entry. A later view that writes entries must carry the `pane` state key, or the pane will treat its entries as another page's and write a list entry under them.
 - The open session lives in the address bar, so the pane reconnects its event stream and re-fetches the transcript on a reload. Nothing about the stream or the transcript changed.
-- `crates/bosun-control/src/ui.rs` checks the pane by matching source text; it has no browser. The checks pin the fragment, the ownership rule, the single close path, the load path, the fragment clearing, the cleared identity and the late reply, and cannot see the rendered behaviour.
+- `crates/bosun-control/src/ui.rs` checks the pane by matching source text; it has no browser, so it cannot see the rendered behaviour. Each check pins its subject to the branch it belongs to: the fragment on both writes, the ownership rule, the one back call, the load path and its reload branch, the fragment clearing on each path that clears it, the cleared identity and footer, and the reply that belongs to a session the pane has left.
 
 ## Revisit When
 

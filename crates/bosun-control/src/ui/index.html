@@ -3318,6 +3318,9 @@ async function fetchSession(id) {
     if (current !== id) return;
     updateHeader(session);
   } catch (error) {
+    // A failure for a session the pane has left is not this screen's to
+    // report.
+    if (current !== id) return;
     showStatus('session: ' + error.message);
   }
 }

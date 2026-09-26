@@ -445,10 +445,16 @@ mod tests {
             "an open session is addressed as `#s=<session id>`"
         );
         let from_link = squeezed(segment(PANE, "function sessionFromLink(", "\n}\n"));
+        let (decode, bad_escape) = from_link
+            .split_once(&squeezed("catch (error) {"))
+            .expect("a hand-edited fragment must not throw out of the load path");
         assert!(
-            from_link.contains(&squeezed("/^#s=(.+)$/.exec(location.hash)"))
-                && from_link.contains(&squeezed("decodeURIComponent(match[1])")),
-            "a load reads back the fragment the pane writes, decoded the way it was encoded"
+            decode.contains(&squeezed("try { return decodeURIComponent(match[1]); }")),
+            "a load reads back the fragment the pane writes, decoded the way it was encoded, behind a try"
+        );
+        assert!(
+            bad_escape.contains(&squeezed("return null;")),
+            "a fragment whose escape does not decode names no session"
         );
     }
 
@@ -462,9 +468,9 @@ mod tests {
         let own = squeezed(segment(PANE, "function isOwnEntry(", "\n}\n"));
         assert!(
             own.contains(&squeezed(
-                "Object.prototype.hasOwnProperty.call(state, 'pane')"
-            )) && own.contains(&squeezed("&& state.pane === id")),
-            "the key tells the pane's entries from another page's, and the id tells the pane's own entry for a session from one the browser put a copied state on, such as a fragment pasted into the address bar"
+                "return !!state && Object.prototype.hasOwnProperty.call(state, 'pane') && state.pane === id;"
+            )),
+            "one expression decides ownership: a state that is null or carries no `pane` key is not the pane's, and the key's value has to be the session's id, because the browser copies the state it is on onto a pasted fragment"
         );
     }
 
@@ -485,6 +491,12 @@ mod tests {
             PANE.matches("history.pushState").count(),
             1,
             "one place pushes a session entry"
+        );
+        assert!(
+            push.contains(&squeezed(
+                "history.pushState(paneEntry(id), '', sessionLink(id));"
+            )),
+            "the pushed entry must carry the fragment, or a reload or a shared copy of it names no session"
         );
         assert_eq!(
             PANE.matches("history.replaceState").count(),
@@ -539,7 +551,6 @@ mod tests {
         for token in [
             "const id = sessionFromLink();",
             "if (id === current) return;",
-            "closeSession();",
             "if (!isOwnEntry(history.state, id)) pushSession(id);",
             "showSession(id);",
         ] {
@@ -548,6 +559,18 @@ mod tests {
                 "the fragment decides the screen — the session it names, or the list — and an entry the pane did not write gets the list entry under the session first: {token} stays"
             );
         }
+        let list_branch = follow
+            .split_once(&squeezed("if (!id) {"))
+            .expect("an entry naming no session shows the list")
+            .1
+            .split_once('}')
+            .expect("the branch must end before the code that opens a session")
+            .0;
+        assert!(
+            list_branch.contains(&squeezed("closeSession();"))
+                && list_branch.contains(&squeezed("return;")),
+            "an entry naming no session must close the view and stop there, or the code below runs against a missing id"
+        );
         assert!(
             PANE.contains("window.addEventListener('popstate', followHistory)"),
             "back and forward must run the pane's own history path"
@@ -572,6 +595,18 @@ mod tests {
         assert!(
             PANE.contains("startFromLink();"),
             "the pane must run the load path when it starts"
+        );
+        let reload = start
+            .split_once(&squeezed("if (isOwnEntry(history.state, id)) {"))
+            .expect("a reload must be told from a fresh link by the state the pane wrote")
+            .1
+            .split_once('}')
+            .expect("the branch must end before the code that writes an entry")
+            .0;
+        assert!(
+            reload.contains(&squeezed("if (id) showSession(id);"))
+                && reload.contains(&squeezed("return;")),
+            "the pane's own entry reopens its session and writes nothing, so a reload adds no entry and keeps the list under the session"
         );
     }
 
@@ -608,16 +643,30 @@ mod tests {
             "the entry rewrite and the close must both stand inside the guard, or a stop that lands after the user moved on rewrites the entry of the session on screen now"
         );
         let refresh = squeezed(segment(PANE, "async function refreshSessions(", "\n}\n"));
+        let gone = refresh
+            .split_once(&squeezed("if (current && !viewed) {"))
+            .expect("a poll must notice a session that left the list")
+            .1
+            .split_once('}')
+            .expect("the branch must end before the poll's other cases")
+            .0;
         assert!(
-            refresh.contains(&squeezed("showStatus('session ' + current + ' ended');"))
-                && refresh.contains(&squeezed("markListEntry(); closeSession();")),
-            "a session that ended on the node must leave no `#s=` link behind"
+            gone.contains(&squeezed("markListEntry();"))
+                && gone.contains(&squeezed("closeSession();")),
+            "a session that ended on the node must leave no `#s=` link behind, from the branch that notices the session is gone"
         );
         let detail = squeezed(segment(PANE, "async function fetchSession(", "\n}\n"));
+        let not_here = detail
+            .split_once(&squeezed("if (response.status === 404) {"))
+            .expect("the fetch must tell a session that is gone from one it cannot read")
+            .1
+            .split_once('}')
+            .expect("the branch must end before the reply's other cases")
+            .0;
         assert!(
-            detail.contains(&squeezed("if (response.status === 404) {"))
-                && detail.contains(&squeezed("markListEntry(); closeSession();")),
-            "an entry naming a session the control plane does not have must stop naming it, so the session screen and a reload do not outlive the session"
+            not_here.contains(&squeezed("markListEntry();"))
+                && not_here.contains(&squeezed("closeSession();")),
+            "an entry naming a session the control plane does not have must stop naming it from that branch, so the session screen and a reload do not outlive the session"
         );
     }
 
@@ -642,6 +691,18 @@ mod tests {
         assert!(
             checked.1.starts_with("updateHeader("),
             "the check must stand between the body read and the header write, the only two things a late reply could reach"
+        );
+        let caught = detail
+            .split_once(&squeezed("catch (error) {"))
+            .expect("the fetch must report the failures it owns")
+            .1
+            .split_once('}')
+            .expect("the catch must end")
+            .0;
+        assert!(
+            caught.contains(&guard)
+                && caught.contains(&squeezed("showStatus('session: ' + error.message);")),
+            "a failure for a session the pane has left must write nothing, not even the shared status line"
         );
     }
 
