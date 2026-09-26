@@ -799,34 +799,32 @@ mod tests {
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_reader_types_in_the_composer() {
-        let typing = squeezed(segment(
-            PANE,
-            "input.addEventListener('input',",
-            "\ninput.addEventListener('keydown'",
-        ));
-        assert!(
-            typing.contains(&squeezed("saveDraft();")),
-            "a keystroke must still keep the chat draft"
+        assert_eq!(
+            squeezed(&block(PANE, "input.addEventListener('input',")),
+            "saveDraft();jumpToBottom();",
+            "a keystroke must keep the chat draft and return the transcript to the bottom, or the message the reader is writing and the answer to it stay below the fold"
         );
-        assert!(
-            typing.contains(&squeezed("jumpToBottom();")),
-            "a keystroke must return the transcript to the bottom, or the message the reader is writing and the answer to it stay below the fold"
+        assert_eq!(
+            squeezed(&block(PANE, "function jumpToBottom()")),
+            "stick=true;transcript.scrollTop=transcript.scrollHeight;",
+            "jumpToBottom must re-arm auto-scroll and move the transcript itself: a guard on `stick` leaves a scrolled-up reader where they were, and the keystroke only catches up on the next event"
         );
-        let jump = squeezed(segment(PANE, "function jumpToBottom()", "\n}\n"));
-        assert!(
-            jump.contains(&squeezed("stick = true;"))
-                && jump.contains(&squeezed("transcript.scrollTop = transcript.scrollHeight;")),
-            "jumpToBottom must re-arm auto-follow and move the transcript itself"
-        );
-        assert!(
-            !jump.contains(&squeezed("scrollToBottom()")),
-            "the move must not run through the guarded follow: a scrolled-up reader would stay where they were, and only the next event would follow"
+        assert_eq!(
+            PANE.matches("function jumpToBottom()").count(),
+            1,
+            "the checks above read the first jumpToBottom, and a later definition is the one that would run"
         );
     }
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_composer_sends() {
         let send = squeezed(segment(PANE, "async function send()", "\n}\n"));
+        assert!(
+            send.contains(&squeezed(
+                "if (sending || !input.value.trim()) return; jumpToBottom();"
+            )),
+            "the return must stand beside the guard, so no path through send reaches the post without it"
+        );
         let jumps = send.find(&squeezed("jumpToBottom();")).expect(
             "a sent message must return the transcript to the bottom, or its answer lands below the fold",
         );
@@ -837,11 +835,16 @@ mod tests {
             jumps < posts,
             "the return must stand before the post, so the reader sees the bottom without waiting on the network"
         );
-        let jump = squeezed(segment(PANE, "function jumpToBottom()", "\n}\n"));
+        assert_eq!(
+            squeezed(&block(PANE, "function jumpToBottom()")),
+            "stick=true;transcript.scrollTop=transcript.scrollHeight;",
+            "jumpToBottom must re-arm auto-scroll and move the transcript itself, or the answer to the sent message does not follow"
+        );
         assert!(
-            jump.contains(&squeezed("stick = true;"))
-                && jump.contains(&squeezed("transcript.scrollTop = transcript.scrollHeight;")),
-            "jumpToBottom must re-arm auto-follow and move the transcript itself, or the answer to the sent message does not follow"
+            PANE.contains("btnSend.addEventListener('click', send);")
+                && squeezed(segment(PANE, "input.addEventListener('keydown'", "\n});"))
+                    .contains(&squeezed("send();")),
+            "the send button and the Ctrl/Cmd+Enter path must both reach send, the path this check reads"
         );
     }
 }

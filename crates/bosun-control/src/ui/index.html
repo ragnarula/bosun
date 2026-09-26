@@ -3642,9 +3642,9 @@ function scrollToBottom() {
   if (stick) transcript.scrollTop = transcript.scrollHeight;
 }
 
-// A keystroke in the composer and a sent message are the reader asking for the
-// newest lines, so this returns to the bottom whatever `stick` said and re-arms
-// auto-follow.
+// A keystroke in the composer or a sent message asks for the newest lines, so
+// this returns to the bottom and sets auto-scroll (`stick`) again, even after
+// the reader scrolled up.
 function jumpToBottom() {
   stick = true;
   transcript.scrollTop = transcript.scrollHeight;
