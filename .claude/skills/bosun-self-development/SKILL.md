@@ -1,7 +1,7 @@
 ---
 name: bosun-self-development
 description: Use when developing Bosun itself — pick the next issue from the tracker, rank it, see it through to a tagged release, then pick the next. Fires on "work on the next issue", "self-develop", "what should I build next", and after an issue or a release is finished, because that is when the loop repeats.
-version: 0.1.0
+version: 0.2.0
 ---
 
 # Bosun Self-Development
@@ -33,7 +33,7 @@ Done when the issue is either in hand or carries that comment and the ping.
 
 Work on one issue at a time: a builder child to make the change, a reviewer child to find what is wrong with it, and a fix round until no important finding remains. Keep the ledger that workflow describes — task, what changed, what review found, what was fixed, what was not.
 
-Branch off the default branch unless the operator named one. Commit as you go with messages in the repo's own style: a subject in the imperative and a body that says why.
+Work on `main`; do not create a branch. Commit as you go with messages in the repo's own style: a subject in the imperative and a body that says why.
 
 Done when every requirement in the issue is implemented and the ledger's findings are fixed or named as unfixed.
 
@@ -53,11 +53,14 @@ Done when you have output from the real thing showing the issue's behaviour, pas
 
 Every issue ships as its own release — that is the rule, and it is what makes a deployment finite.
 
-1. Bump `[workspace.package] version` in `Cargo.toml` by one patch.
-2. `cargo metadata --format-version 1 > /dev/null` to refresh `Cargo.lock`.
-3. Commit it: `Bump version to X.Y.Z`.
-4. `git tag vX.Y.Z` (lightweight, matching the existing tags).
-5. Push the branch, then the tag: `git push origin <branch> && git push origin vX.Y.Z`.
+Release from `main`, never from a branch.
+
+1. `git pull --ff-only origin main`, so the version you bump from is the latest one released.
+2. Bump `[workspace.package] version` in `Cargo.toml` by one patch.
+3. `cargo metadata --format-version 1 > /dev/null` to refresh `Cargo.lock`.
+4. Commit it: `Bump version to X.Y.Z`.
+5. `git tag vX.Y.Z` (lightweight, matching the existing tags).
+6. Push `main`, then the tag: `git push origin main && git push origin vX.Y.Z`. If either push is rejected, another session released first: pull again and bump to the next free version rather than reusing the number.
 
 Done when the tag's workflow finished green: `curl -s "https://api.github.com/repos/ragnarula/bosun/actions/runs?per_page=3"` shows the run for your commit `completed success`, and the release at `releases/tags/vX.Y.Z` carries its assets.
 
