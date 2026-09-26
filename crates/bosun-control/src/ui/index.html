@@ -3148,10 +3148,8 @@ function sessionFromLink() {
   }
 }
 
-// The current entry becomes the list entry, with the fragment off. The pane
-// marks the entry it starts on with this, and clears it whenever a session
-// leaves the screen without the back path, so the address bar names what is on
-// screen.
+// The current entry becomes the list entry, with the fragment off, so the
+// address bar names the list the pane shows.
 function markListEntry() {
   history.replaceState(paneEntry(null), '', location.pathname + location.search);
 }
@@ -3276,9 +3274,10 @@ function closeSession() {
   view.hidden = true;
 }
 
-// The header and the ⋯ sheet carry the open session's identity. Clearing them
-// leaves no other session's node, directory or id on screen while a session
-// the pane cannot read is fetched.
+// The header, the ⋯ sheet and the footer carry the open session's identity and
+// the shape a watch-only child gives them. Clearing them returns the pane's
+// no-session layout, so a session the pane cannot read yet shows nothing of the
+// session before it.
 function clearHeader() {
   viewStateDot.className = 'dot';
   viewNode.textContent = '';
@@ -3290,6 +3289,12 @@ function clearHeader() {
   viewPermission.textContent = '';
   btnPermission.textContent = 'Switch to read-only';
   personaName.value = '';
+  inputRow.hidden = false;
+  watchBanner.hidden = true;
+  rowPermission.hidden = false;
+  rowPersona.hidden = false;
+  rowInterrupt.hidden = false;
+  rowStop.hidden = false;
 }
 
 async function fetchSession(id) {
@@ -3393,11 +3398,16 @@ btnPersona.addEventListener('click', async () => {
 
 btnStop.addEventListener('click', async () => {
   if (!window.confirm('Stop and delete this session?')) return;
+  const id = current;
   try {
-    await post('/stop', { session_id: current });
+    await post('/stop', { session_id: id });
     toastOk('session stopped');
-    markListEntry();
-    closeSession();
+    // The pane may have left this session while the stop was in flight: the
+    // session on screen now is not the one that was stopped.
+    if (current === id) {
+      markListEntry();
+      closeSession();
+    }
     await refreshSessions();
   } catch (error) {
     toastError('stop: ' + error.message);
@@ -3405,8 +3415,7 @@ btnStop.addEventListener('click', async () => {
 });
 
 // The thin header's back arrow takes the same step the browser's back button
-// takes, so the list is the screen it returns to; the sheet stays closed until
-// the user opens it with ⋯.
+// takes, so the list is the screen it returns to.
 btnBack.addEventListener('click', () => history.back());
 
 // The status/phase line toggles the debug console. Opening it replays the

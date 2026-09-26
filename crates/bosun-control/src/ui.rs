@@ -586,8 +586,10 @@ mod tests {
         );
         let stop = squeezed(segment(PANE, "btnStop.addEventListener('click'", "\n});"));
         assert!(
-            stop.contains(&squeezed("markListEntry(); closeSession();")),
-            "a session stopped here must leave no `#s=` link behind"
+            stop.contains(&squeezed("const id = current;"))
+                && stop.contains(&squeezed("if (current === id) {"))
+                && stop.contains(&squeezed("markListEntry();")),
+            "a session stopped here must leave no `#s=` link behind, and a stop that lands after the user moved to another session must not close or rewrite that one"
         );
         let refresh = squeezed(segment(PANE, "async function refreshSessions(", "\n}\n"));
         assert!(
@@ -606,12 +608,20 @@ mod tests {
     #[test]
     fn the_pane_ignores_a_reply_for_a_session_it_left() {
         let detail = squeezed(segment(PANE, "async function fetchSession(", "\n}\n"));
-        assert_eq!(
-            detail
-                .matches(&squeezed("if (current !== id) return;"))
-                .count(),
-            2,
-            "a reply that arrives after the pane left the session must write nothing: one check guards the header and the close, and the body read can outlive the session too"
+        let guard = squeezed("if (current !== id) return;");
+        let (before, after) = detail
+            .split_once(&squeezed("if (response.status === 404) {"))
+            .expect("the fetch must tell a session that is gone from one it cannot read");
+        assert!(
+            before.contains(&guard),
+            "the session on screen must be checked before the 404 branch, or a late 404 closes the session the pane moved to"
+        );
+        let body = after
+            .split_once(&squeezed("await response.json();"))
+            .expect("the control plane's answer is read after the 404 branch");
+        assert!(
+            body.1.contains(&guard),
+            "the session on screen must be checked after the body read too, or a late body writes the header of a session the pane left"
         );
     }
 
@@ -638,8 +648,17 @@ mod tests {
             "viewDir.textContent = ''",
             "viewIdCopy.textContent = ''",
             "viewSheetMeta.textContent = ''",
+            "viewWaiting.textContent = ''",
+            "viewWaiting.hidden = true",
             "viewPermission.textContent = ''",
+            "btnPermission.textContent = 'Switch to read-only'",
             "personaName.value = ''",
+            "inputRow.hidden = false",
+            "watchBanner.hidden = true",
+            "rowPermission.hidden = false",
+            "rowPersona.hidden = false",
+            "rowInterrupt.hidden = false",
+            "rowStop.hidden = false",
         ] {
             assert!(
                 header.contains(&squeezed(field)),
