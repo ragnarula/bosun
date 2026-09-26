@@ -3625,8 +3625,7 @@ async function send() {
 }
 
 btnSend.addEventListener('click', send);
-// Keep the chat draft in sync with what the user is typing, and return to the
-// bottom so the message and the answer to it are in view.
+// Keep the chat draft in sync with what the user is typing.
 input.addEventListener('input', () => {
   saveDraft();
   jumpToBottom();
@@ -3643,8 +3642,7 @@ function scrollToBottom() {
 }
 
 // A keystroke in the composer or a sent message asks for the newest lines, so
-// this returns to the bottom and sets auto-scroll (`stick`) again, even after
-// the reader scrolled up.
+// this one moves the transcript whatever `stick` said before.
 function jumpToBottom() {
   stick = true;
   transcript.scrollTop = transcript.scrollHeight;

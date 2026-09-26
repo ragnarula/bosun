@@ -799,31 +799,46 @@ mod tests {
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_reader_types_in_the_composer() {
+        // Each check below reads its anchor at the first occurrence, so a
+        // second copy would leave the check reading text that does not run.
+        for anchor in ["input.addEventListener('input'", "function jumpToBottom"] {
+            assert_eq!(
+                PANE.matches(anchor).count(),
+                1,
+                "one copy of {anchor} runs; a second leaves these checks reading another one"
+            );
+        }
         assert_eq!(
             squeezed(&block(PANE, "input.addEventListener('input',")),
             "saveDraft();jumpToBottom();",
             "a keystroke must keep the chat draft and return the transcript to the bottom, or the message the reader is writing and the answer to it stay below the fold"
         );
         assert_eq!(
-            squeezed(&block(PANE, "function jumpToBottom()")),
+            squeezed(&block(PANE, "function jumpToBottom")),
             "stick=true;transcript.scrollTop=transcript.scrollHeight;",
-            "jumpToBottom must re-arm auto-scroll and move the transcript itself: a guard on `stick` leaves a scrolled-up reader where they were, and the keystroke only catches up on the next event"
-        );
-        assert_eq!(
-            PANE.matches("function jumpToBottom()").count(),
-            1,
-            "the checks above read the first jumpToBottom, and a later definition is the one that would run"
+            "jumpToBottom must set auto-scroll and move the transcript itself: a guard on `stick` leaves a scrolled-up reader where they were, and the keystroke only catches up on the next event"
         );
     }
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_composer_sends() {
-        let send = squeezed(segment(PANE, "async function send()", "\n}\n"));
+        for anchor in [
+            "async function send",
+            "function jumpToBottom",
+            "input.addEventListener('keydown'",
+        ] {
+            assert_eq!(
+                PANE.matches(anchor).count(),
+                1,
+                "one copy of {anchor} runs; a second leaves these checks reading another one"
+            );
+        }
+        let send = squeezed(&block(PANE, "async function send()"));
         assert!(
-            send.contains(&squeezed(
+            send.starts_with(&squeezed(
                 "if (sending || !input.value.trim()) return; jumpToBottom();"
             )),
-            "the return must stand beside the guard, so no path through send reaches the post without it"
+            "the return must be the first thing send does, so no statement ahead of it can leave the jump as dead code"
         );
         let jumps = send.find(&squeezed("jumpToBottom();")).expect(
             "a sent message must return the transcript to the bottom, or its answer lands below the fold",
@@ -836,15 +851,22 @@ mod tests {
             "the return must stand before the post, so the reader sees the bottom without waiting on the network"
         );
         assert_eq!(
-            squeezed(&block(PANE, "function jumpToBottom()")),
+            squeezed(&block(PANE, "function jumpToBottom")),
             "stick=true;transcript.scrollTop=transcript.scrollHeight;",
-            "jumpToBottom must re-arm auto-scroll and move the transcript itself, or the answer to the sent message does not follow"
+            "jumpToBottom must set auto-scroll and move the transcript itself, or the answer to the sent message does not follow"
         );
         assert!(
-            PANE.contains("btnSend.addEventListener('click', send);")
-                && squeezed(segment(PANE, "input.addEventListener('keydown'", "\n});"))
-                    .contains(&squeezed("send();")),
-            "the send button and the Ctrl/Cmd+Enter path must both reach send, the path this check reads"
+            PANE.contains("btnSend.addEventListener('click', send);"),
+            "the send button must reach send, the path this check reads"
+        );
+        assert_eq!(
+            squeezed(&block(PANE, "input.addEventListener('keydown'")),
+            squeezed(
+                "if (event.key === 'Enter' && (event.ctrlKey || event.metaKey))
+                 event.preventDefault();
+                 send();"
+            ),
+            "Ctrl/Cmd+Enter must reach the same send, or the key the reader presses on a phone keyboard sends nothing"
         );
     }
 }
