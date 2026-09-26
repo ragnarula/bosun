@@ -3605,6 +3605,7 @@ askInput.addEventListener('keydown', (event) => {
 
 async function send() {
   if (sending || !input.value.trim()) return;
+  jumpToBottom();
   sending = true;
   btnSend.disabled = true;
   try {
@@ -3624,8 +3625,12 @@ async function send() {
 }
 
 btnSend.addEventListener('click', send);
-// Keep the chat draft in sync with what the user is typing.
-input.addEventListener('input', saveDraft);
+// Keep the chat draft in sync with what the user is typing, and return to the
+// bottom so the message and the answer to it are in view.
+input.addEventListener('input', () => {
+  saveDraft();
+  jumpToBottom();
+});
 input.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
@@ -3635,6 +3640,14 @@ input.addEventListener('keydown', (event) => {
 
 function scrollToBottom() {
   if (stick) transcript.scrollTop = transcript.scrollHeight;
+}
+
+// A keystroke in the composer and a sent message are the reader asking for the
+// newest lines, so this returns to the bottom whatever `stick` said and re-arms
+// auto-follow.
+function jumpToBottom() {
+  stick = true;
+  transcript.scrollTop = transcript.scrollHeight;
 }
 
 transcript.addEventListener('scroll', () => {

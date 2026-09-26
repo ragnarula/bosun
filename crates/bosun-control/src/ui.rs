@@ -796,4 +796,52 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_pane_returns_to_the_bottom_when_the_reader_types_in_the_composer() {
+        let typing = squeezed(segment(
+            PANE,
+            "input.addEventListener('input',",
+            "\ninput.addEventListener('keydown'",
+        ));
+        assert!(
+            typing.contains(&squeezed("saveDraft();")),
+            "a keystroke must still keep the chat draft"
+        );
+        assert!(
+            typing.contains(&squeezed("jumpToBottom();")),
+            "a keystroke must return the transcript to the bottom, or the message the reader is writing and the answer to it stay below the fold"
+        );
+        let jump = squeezed(segment(PANE, "function jumpToBottom()", "\n}\n"));
+        assert!(
+            jump.contains(&squeezed("stick = true;"))
+                && jump.contains(&squeezed("transcript.scrollTop = transcript.scrollHeight;")),
+            "jumpToBottom must re-arm auto-follow and move the transcript itself"
+        );
+        assert!(
+            !jump.contains(&squeezed("scrollToBottom()")),
+            "the move must not run through the guarded follow: a scrolled-up reader would stay where they were, and only the next event would follow"
+        );
+    }
+
+    #[test]
+    fn the_pane_returns_to_the_bottom_when_the_composer_sends() {
+        let send = squeezed(segment(PANE, "async function send()", "\n}\n"));
+        let jumps = send.find(&squeezed("jumpToBottom();")).expect(
+            "a sent message must return the transcript to the bottom, or its answer lands below the fold",
+        );
+        let posts = send
+            .find(&squeezed("await post("))
+            .expect("send must post the message");
+        assert!(
+            jumps < posts,
+            "the return must stand before the post, so the reader sees the bottom without waiting on the network"
+        );
+        let jump = squeezed(segment(PANE, "function jumpToBottom()", "\n}\n"));
+        assert!(
+            jump.contains(&squeezed("stick = true;"))
+                && jump.contains(&squeezed("transcript.scrollTop = transcript.scrollHeight;")),
+            "jumpToBottom must re-arm auto-follow and move the transcript itself, or the answer to the sent message does not follow"
+        );
+    }
 }
