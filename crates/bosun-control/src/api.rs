@@ -603,6 +603,9 @@ async fn session_detail(
 pub struct ModelCallSummary {
     pub calls: Vec<ModelCall>,
     pub total_input_tokens: u64,
+    /// How many of `total_input_tokens` the provider read from its prompt
+    /// cache, over the calls that reported it.
+    pub total_cached_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cost: f64,
     pub completion_calls: u64,
@@ -622,6 +625,10 @@ async fn session_model_calls(
         total_input_tokens: calls
             .iter()
             .map(|call| call.input_tokens.unwrap_or(0))
+            .sum(),
+        total_cached_input_tokens: calls
+            .iter()
+            .map(|call| call.cached_input_tokens.unwrap_or(0))
             .sum(),
         total_output_tokens: calls
             .iter()
@@ -1931,6 +1938,7 @@ mod tests {
                 Ok(StreamEvent::TextDelta("hi".into())),
                 Ok(StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 }),
@@ -5832,6 +5840,7 @@ mod tests {
                 "anthropic",
                 "completion",
                 Some(100),
+                None,
                 Some(50),
                 Some(0.125),
             )
@@ -5844,6 +5853,7 @@ mod tests {
                 "anthropic",
                 "completion",
                 Some(200),
+                Some(150),
                 Some(10),
                 None,
             )
@@ -5856,6 +5866,7 @@ mod tests {
                 "anthropic",
                 "compaction",
                 Some(1000),
+                None,
                 None,
                 Some(0.25),
             )
@@ -5882,6 +5893,10 @@ mod tests {
             "the newest call's cost is recorded on its row"
         );
         assert_eq!(summary["total_input_tokens"], 1300);
+        assert_eq!(
+            summary["total_cached_input_tokens"], 150,
+            "calls that reported no cache count add nothing"
+        );
         assert_eq!(summary["total_output_tokens"], 60);
         assert_eq!(summary["total_cost"], 0.375);
         assert_eq!(summary["completion_calls"], 2);

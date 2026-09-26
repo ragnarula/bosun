@@ -24,6 +24,9 @@ pub struct ProviderCall<'a> {
     pub max_tokens: u32,
     pub system: &'a str,
     pub messages: Vec<Message>,
+    /// The session context block, which the serializers append after the
+    /// thread. `None` when the session has nothing to report.
+    pub session_context: Option<&'a str>,
     pub tools: Vec<ToolSpec>,
     /// Who the session whose thread is serialized asks: the user for a root
     /// session, its parent for a child session. Ask blocks render this.
@@ -84,7 +87,11 @@ pub enum StreamEvent {
         args_delta: String,
     },
     Stop {
+        /// Every input token the provider read, cached or not.
         input_tokens: u64,
+        /// How many of `input_tokens` the provider read from its prompt
+        /// cache. `None` when the provider did not report it.
+        cached_input_tokens: Option<u64>,
         output_tokens: u64,
         stop_reason: StopReason,
     },

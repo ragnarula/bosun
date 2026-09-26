@@ -18,6 +18,7 @@ use crate::provider::json_shape;
 use crate::provider::messages_url;
 use crate::serialize::anthropic_messages;
 use crate::serialize::anthropic_tools;
+use crate::serialize::append_anthropic_session_context;
 use crate::sse::SseEvent;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -47,6 +48,9 @@ impl Anthropic {
 
     fn request_body(&self, call: &ProviderCall<'_>) -> Value {
         let mut body = anthropic_messages(call.system, &call.messages, call.ask_recipient);
+        if let Some(context) = call.session_context {
+            append_anthropic_session_context(&mut body["messages"], context);
+        }
         body["model"] = json!(call.model);
         body["max_tokens"] = json!(call.max_tokens);
         body["stream"] = json!(true);
@@ -101,6 +105,7 @@ impl Provider for Anthropic {
 #[derive(Default)]
 struct AnthropicParser {
     input_tokens: u64,
+    cached_input_tokens: Option<u64>,
     output_tokens: u64,
     stop_reason: Option<String>,
     /// Tool calls that have started, by the index of their `content_block`.
@@ -178,7 +183,15 @@ fn parse_event(
         "message_start" => {
             let usage = &data["message"]["usage"];
             log_unread_usage(usage);
-            parser.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+            // Anthropic's `input_tokens` leaves out the tokens it read from
+            // or wrote to its cache. They are added back so `input_tokens`
+            // counts every input token, as it does for the other adapters.
+            let cache_read = usage["cache_read_input_tokens"].as_u64();
+            let cache_write = usage["cache_creation_input_tokens"].as_u64();
+            parser.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0)
+                + cache_read.unwrap_or(0)
+                + cache_write.unwrap_or(0);
+            parser.cached_input_tokens = cache_read;
             Ok(Vec::new())
         }
         "content_block_start" => {
@@ -305,6 +318,7 @@ fn parse_event(
             }
             events.push(StreamEvent::Stop {
                 input_tokens: parser.input_tokens,
+                cached_input_tokens: parser.cached_input_tokens,
                 output_tokens: parser.output_tokens,
                 stop_reason,
             });
@@ -507,6 +521,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 25,
+                    cached_input_tokens: None,
                     output_tokens: 30,
                     stop_reason: StopReason::Other,
                 },
@@ -572,6 +587,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 25,
+                    cached_input_tokens: None,
                     output_tokens: 12,
                     stop_reason: StopReason::Other,
                 },
@@ -637,6 +653,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 25,
+                    cached_input_tokens: None,
                     output_tokens: 12,
                     stop_reason: StopReason::Other,
                 },
@@ -770,6 +787,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 25,
+                    cached_input_tokens: None,
                     output_tokens: 12,
                     stop_reason: StopReason::Other,
                 },
@@ -811,6 +829,7 @@ mod tests {
             events,
             vec![StreamEvent::Stop {
                 input_tokens: 3,
+                cached_input_tokens: None,
                 output_tokens: 7,
                 stop_reason: StopReason::StopResponse,
             }]
@@ -851,10 +870,43 @@ mod tests {
             events,
             vec![StreamEvent::Stop {
                 input_tokens: 3,
+                cached_input_tokens: None,
                 output_tokens: 7,
                 stop_reason: StopReason::MaxTokens,
             }]
         );
+    }
+
+    #[test]
+    fn cache_reads_and_writes_count_as_input_and_reads_count_as_cached() {
+        // Anthropic's `input_tokens` leaves the cached tokens out.
+        let mut parser = AnthropicParser::default();
+        let start = sse(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": { "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 4000,
+                    "cache_creation_input_tokens": 200,
+                    "output_tokens": 1,
+                } },
+            }),
+        );
+        parse_event(&start, &mut parser).expect("message_start parses");
+        let stop = parse_event(
+            &sse("message_stop", json!({ "type": "message_stop" })),
+            &mut parser,
+        )
+        .expect("message_stop parses");
+        assert!(matches!(
+            stop.last(),
+            Some(StreamEvent::Stop {
+                input_tokens: 4210,
+                cached_input_tokens: Some(4000),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

@@ -51,6 +51,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::prompt::LiveChild;
+use crate::prompt::session_context;
 use crate::prompt::system_prompt;
 use crate::provider::AskRecipient;
 use crate::provider::ProviderCall;
@@ -385,6 +386,8 @@ impl LoopDeps {
 
 /// One model call's cost in dollars: the per-million-token prices times the
 /// token counts, rounded to six decimals. Missing token counts cost zero.
+/// Cached input tokens are priced as ordinary input, so for a provider that
+/// discounts cache reads the cost is an upper bound.
 fn model_call_cost(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -394,6 +397,45 @@ fn model_call_cost(
     let cost = input_tokens.unwrap_or(0) as f64 / 1e6 * price_input_per_mtok
         + output_tokens.unwrap_or(0) as f64 / 1e6 * price_output_per_mtok;
     (cost * 1e6).round() / 1e6
+}
+
+/// The token counts a provider reported for one call.
+#[derive(Debug, Clone, Copy)]
+struct CallTokens {
+    input: u64,
+    /// How many of `input` the provider read from its prompt cache; `None`
+    /// when it did not say.
+    cached_input: Option<u64>,
+    output: u64,
+}
+
+/// Records one model call of `kind` with its counts and its cost at the turn
+/// model's prices.
+async fn record_model_call(
+    deps: &LoopDeps,
+    session_id: &str,
+    turn: &TurnModel,
+    kind: &str,
+    tokens: CallTokens,
+) -> anyhow::Result<()> {
+    deps.store
+        .append_model_call(
+            session_id,
+            turn.provider.model(),
+            turn.provider.name(),
+            kind,
+            Some(tokens.input),
+            tokens.cached_input,
+            Some(tokens.output),
+            Some(model_call_cost(
+                Some(tokens.input),
+                Some(tokens.output),
+                turn.price_input_per_mtok,
+                turn.price_output_per_mtok,
+            )),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn append_activity(
@@ -1591,9 +1633,7 @@ async fn run_turn_inner(
             .repo_standards_cache
             .as_ref()
             .expect("populated above"),
-        &state.todos,
         &skills,
-        live,
         // The persona catalog is advertised only to sessions whose surface
         // includes `spawn`: it is the list of personas they may spawn.
         tools
@@ -1601,6 +1641,7 @@ async fn run_turn_inner(
             .any(|tool| tool.name == "spawn")
             .then(|| persona_catalog(deps)),
     );
+    let context = session_context(&state.todos, live);
     append_activity(
         deps,
         session_id,
@@ -1616,6 +1657,7 @@ async fn run_turn_inner(
         max_tokens: turn.provider.max_output_tokens(),
         system: &system,
         messages,
+        session_context: context.as_deref(),
         tools,
         ask_recipient,
     })?;
@@ -2420,26 +2462,23 @@ async fn collect_stream(
                         }
                         StreamEvent::Stop {
                             input_tokens,
+                            cached_input_tokens,
                             output_tokens,
                             stop_reason: reason,
                         } => {
                             state.last_input_tokens = input_tokens;
-                            deps.store
-                                .append_model_call(
-                                    session_id,
-                                    turn.provider.model(),
-                                    turn.provider.name(),
-                                    "completion",
-                                    Some(input_tokens),
-                                    Some(output_tokens),
-                                    Some(model_call_cost(
-                                        Some(input_tokens),
-                                        Some(output_tokens),
-                                        turn.price_input_per_mtok,
-                                        turn.price_output_per_mtok,
-                                    )),
-                                )
-                                .await?;
+                            record_model_call(
+                                deps,
+                                session_id,
+                                turn,
+                                "completion",
+                                CallTokens {
+                                    input: input_tokens,
+                                    cached_input: cached_input_tokens,
+                                    output: output_tokens,
+                                },
+                            )
+                            .await?;
                             stopped = true;
                             stop_reason = reason;
                             append_activity(
@@ -2910,7 +2949,7 @@ async fn maybe_compact(
             .await?;
             let tail: Vec<(i64, Message)> = window.drain(..retire).collect();
             let tail_last_id = tail.last().expect("retire is at least one").0;
-            if let Some((text, input_tokens, output_tokens)) =
+            if let Some((text, tokens)) =
                 summarize_tail(turn, session_id, ask_recipient, &tail, signal).await
             {
                 let summary = Message {
@@ -2930,22 +2969,7 @@ async fn maybe_compact(
                     },
                 )
                 .await?;
-                deps.store
-                    .append_model_call(
-                        session_id,
-                        turn.provider.model(),
-                        turn.provider.name(),
-                        "compaction",
-                        input_tokens,
-                        output_tokens,
-                        Some(model_call_cost(
-                            input_tokens,
-                            output_tokens,
-                            turn.price_input_per_mtok,
-                            turn.price_output_per_mtok,
-                        )),
-                    )
-                    .await?;
+                record_model_call(deps, session_id, turn, "compaction", tokens).await?;
                 window.push((summary_id, summary));
                 // The summarized window is smaller; do not re-trigger on the
                 // pre-compaction count until another completion fills context.
@@ -2974,7 +2998,7 @@ async fn summarize_tail(
     ask_recipient: AskRecipient,
     tail: &[(i64, Message)],
     signal: &Arc<InterruptSignal>,
-) -> Option<(String, Option<u64>, Option<u64>)> {
+) -> Option<(String, CallTokens)> {
     let mut prompt = String::from(SUMMARIZATION_PROMPT);
     for (_, message) in tail {
         // Thinking is working-out, not conversation: summarizing it would
@@ -3084,7 +3108,7 @@ async fn refresh_summary(
     // No turn is in flight while the loop sits between wakes, so nothing can
     // interrupt this call: the loop itself is what would deliver one.
     let signal = Arc::new(InterruptSignal::new());
-    let Some((text, input_tokens, output_tokens)) =
+    let Some((text, tokens)) =
         ask_out_of_band(&turn, session_id, "summary", prompt, ask_recipient, &signal).await
     else {
         return Ok(());
@@ -3100,22 +3124,7 @@ async fn refresh_summary(
     if !text.is_empty() {
         deps.store.set_summary(session_id, text).await?;
     }
-    deps.store
-        .append_model_call(
-            session_id,
-            turn.provider.model(),
-            turn.provider.name(),
-            "summary",
-            input_tokens,
-            output_tokens,
-            Some(model_call_cost(
-                input_tokens,
-                output_tokens,
-                turn.price_input_per_mtok,
-                turn.price_output_per_mtok,
-            )),
-        )
-        .await?;
+    record_model_call(deps, session_id, &turn, "summary", tokens).await?;
     state.summarized_at = Some(Instant::now());
     state.summarized_through = newest;
     debug!(
@@ -3139,7 +3148,7 @@ async fn ask_out_of_band(
     prompt: String,
     ask_recipient: AskRecipient,
     signal: &Arc<InterruptSignal>,
-) -> Option<(String, Option<u64>, Option<u64>)> {
+) -> Option<(String, CallTokens)> {
     let messages = vec![Message {
         role: Role::User,
         block: Block::Text { text: prompt },
@@ -3149,6 +3158,7 @@ async fn ask_out_of_band(
         max_tokens: MAX_TOKENS,
         system: "",
         messages,
+        session_context: None,
         tools: vec![],
         ask_recipient,
     }) {
@@ -3166,9 +3176,7 @@ async fn ask_out_of_band(
     };
 
     let mut text = String::new();
-    let mut input_tokens = None;
-    let mut output_tokens = None;
-    let mut stopped = false;
+    let mut tokens = None;
 
     loop {
         if signal.flag.load(Ordering::Acquire) {
@@ -3186,10 +3194,17 @@ async fn ask_out_of_band(
                 // thinking is not part of the answer it returns.
                 Some(Ok(StreamEvent::ToolCallDelta { .. })) => {}
                 Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
-                Some(Ok(StreamEvent::Stop { input_tokens: input, output_tokens: output, .. })) => {
-                    input_tokens = Some(input);
-                    output_tokens = Some(output);
-                    stopped = true;
+                Some(Ok(StreamEvent::Stop {
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    ..
+                })) => {
+                    tokens = Some(CallTokens {
+                        input: input_tokens,
+                        cached_input: cached_input_tokens,
+                        output: output_tokens,
+                    });
                 }
                 Some(Err(error)) => {
                     warn!(
@@ -3216,7 +3231,7 @@ async fn ask_out_of_band(
         }
     }
 
-    if !stopped {
+    let Some(tokens) = tokens else {
         warn!(
             msg = "out-of-band stream ended without a stop event",
             call = %call,
@@ -3224,8 +3239,8 @@ async fn ask_out_of_band(
             provider = %turn.provider.name()
         );
         return None;
-    }
-    Some((text, input_tokens, output_tokens))
+    };
+    Some((text, tokens))
 }
 
 /// One message as plain text for the summarizer. `ask_recipient` is whose
@@ -3402,6 +3417,8 @@ mod tests {
         model: String,
         system: String,
         messages: Vec<Message>,
+        /// The session context block, empty when the call carried none.
+        session_context: String,
         tools: Vec<ToolSpec>,
         ask_recipient: AskRecipient,
     }
@@ -3474,6 +3491,7 @@ mod tests {
                 model: call.model.to_string(),
                 system: call.system.to_string(),
                 messages: call.messages.clone(),
+                session_context: call.session_context.unwrap_or_default().to_string(),
                 tools: call.tools.clone(),
                 ask_recipient: call.ask_recipient,
             });
@@ -4222,6 +4240,7 @@ mod tests {
     fn stop(input_tokens: u64, output_tokens: u64) -> StreamEvent {
         StreamEvent::Stop {
             input_tokens,
+            cached_input_tokens: None,
             output_tokens,
             stop_reason: StopReason::StopResponse,
         }
@@ -4236,7 +4255,12 @@ mod tests {
         let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("hello".into()),
-            stop(5, 2),
+            StreamEvent::Stop {
+                input_tokens: 5,
+                cached_input_tokens: Some(4),
+                output_tokens: 2,
+                stop_reason: StopReason::StopResponse,
+            },
         ]]));
         let deps = Arc::new(test_deps(
             &store,
@@ -4277,6 +4301,7 @@ mod tests {
         let calls = store.model_calls("s1").await.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].input_tokens, Some(5));
+        assert_eq!(calls[0].cached_input_tokens, Some(4));
         assert_eq!(calls[0].output_tokens, Some(2));
         assert_eq!(calls[0].model, "mock-model");
         assert_eq!(calls[0].provider, "mock");
@@ -5213,7 +5238,7 @@ mod tests {
                 let provider = provider.clone();
                 async move {
                     let calls = provider.captured_calls();
-                    calls.len() >= 2 && calls[1].system.contains("Current todo list")
+                    calls.len() >= 2 && calls[1].session_context.contains("Current todo list")
                 }
             }
         })
@@ -5221,11 +5246,19 @@ mod tests {
 
         let calls = provider.captured_calls();
         assert!(
-            !calls[0].system.contains("Current todo list"),
+            !calls[0].session_context.contains("Current todo list"),
             "the first turn has no todos yet"
         );
-        assert!(calls[1].system.contains("0. [todo] write tests"));
-        assert!(calls[1].system.contains("1. [in_progress] fix the bug"));
+        assert!(calls[1].session_context.contains("0. [todo] write tests"));
+        assert!(
+            calls[1]
+                .session_context
+                .contains("1. [in_progress] fix the bug")
+        );
+        assert_eq!(
+            calls[0].system, calls[1].system,
+            "writing the todo list leaves the system prompt, and the provider's cached prefix, as it was"
+        );
 
         wait_for("the session to wait for input", || {
             let store = store.clone();
@@ -5599,6 +5632,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5607,6 +5641,7 @@ mod tests {
                 StreamEvent::TextDelta("loaded deploy".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5621,6 +5656,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5629,6 +5665,7 @@ mod tests {
                 StreamEvent::TextDelta("loaded runbook".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5643,6 +5680,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5651,6 +5689,7 @@ mod tests {
                 StreamEvent::TextDelta("review ambiguous".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5666,6 +5705,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5674,6 +5714,7 @@ mod tests {
                 StreamEvent::TextDelta("loaded checkout".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5827,6 +5868,7 @@ mod tests {
                 StreamEvent::TextDelta("turn one".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5835,6 +5877,7 @@ mod tests {
                 StreamEvent::TextDelta("turn two".into()),
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -5950,6 +5993,7 @@ mod tests {
             StreamEvent::TextDelta("turn one".into()),
             StreamEvent::Stop {
                 input_tokens: 1,
+                cached_input_tokens: None,
                 output_tokens: 1,
                 stop_reason: StopReason::StopResponse,
             },
@@ -6033,6 +6077,7 @@ mod tests {
             StreamEvent::TextDelta("turn one".into()),
             StreamEvent::Stop {
                 input_tokens: 1,
+                cached_input_tokens: None,
                 output_tokens: 1,
                 stop_reason: StopReason::StopResponse,
             },
@@ -7409,7 +7454,7 @@ mod tests {
                         let calls = provider.captured_calls();
                         calls.len() >= 2
                             && calls[1].system.contains("You are the coder persona.")
-                            && calls[1].system.contains("Current todo list")
+                            && calls[1].session_context.contains("Current todo list")
                     }
                 }
             },
@@ -7419,10 +7464,10 @@ mod tests {
         let calls = provider.captured_calls();
         assert!(calls[0].system.contains("You are the coder persona."));
         assert!(
-            !calls[0].system.contains("Current todo list"),
+            !calls[0].session_context.contains("Current todo list"),
             "the first turn has no todos yet"
         );
-        assert!(calls[1].system.contains("0. [todo] write tests"));
+        assert!(calls[1].session_context.contains("0. [todo] write tests"));
 
         handle.stop();
     }
@@ -9077,6 +9122,7 @@ mod tests {
         // takes the same retry-and-fail path as a clean empty response.
         let truncated = || StreamEvent::Stop {
             input_tokens: 1,
+            cached_input_tokens: None,
             output_tokens: 0,
             stop_reason: StopReason::MaxTokens,
         };
@@ -9142,6 +9188,7 @@ mod tests {
             StreamEvent::TextDelta("working on it".into()),
             StreamEvent::Stop {
                 input_tokens: 1,
+                cached_input_tokens: None,
                 output_tokens: 1,
                 stop_reason: StopReason::MaxTokens,
             },
@@ -11252,10 +11299,10 @@ mod tests {
         let calls = root_provider.captured_calls();
         assert!(
             calls[0]
-                .system
+                .session_context
                 .contains(&manifest_line("child-t1", "coder", "creating", "none")),
             "the first parent turn lists the working child: {}",
-            calls[0].system
+            calls[0].session_context
         );
 
         // The child completes: its loop authors the event into the parent's
@@ -11297,19 +11344,19 @@ mod tests {
             "the reaction turn surfaces the child's authored event"
         );
         assert!(
-            calls[1].system.contains(&manifest_line(
+            calls[1].session_context.contains(&manifest_line(
                 "child-t1",
                 "coder",
                 "stopped",
                 "made the change"
-            )) || calls[1].system.contains(&manifest_line(
+            )) || calls[1].session_context.contains(&manifest_line(
                 "child-t1",
                 "coder",
                 "running",
                 "made the change"
             )),
             "the reaction turn's manifest still lists the child with its last message: {}",
-            calls[1].system
+            calls[1].session_context
         );
 
         wait_for("the parent to wait for input again", || {
@@ -11403,14 +11450,14 @@ mod tests {
 
         let calls = provider.captured_calls();
         assert!(
-            calls[0].system.contains(&manifest_line(
+            calls[0].session_context.contains(&manifest_line(
                 "child-t2",
                 "coder",
                 "stopped",
                 "the work is done"
             )),
             "the surfacing wake lists the stopped child: {}",
-            calls[0].system
+            calls[0].session_context
         );
 
         // The next wake — a user message — no longer lists the child: the
@@ -11438,14 +11485,14 @@ mod tests {
 
         let calls = provider.captured_calls();
         assert!(
-            !calls[1].system.contains("child-t2"),
+            !calls[1].session_context.contains("child-t2"),
             "a handled completion leaves the manifest: {}",
-            calls[1].system
+            calls[1].session_context
         );
         assert!(
-            !calls[1].system.contains("Live children:"),
+            !calls[1].session_context.contains("Live children:"),
             "no live children remain: {}",
-            calls[1].system
+            calls[1].session_context
         );
         let stored = store.get_session("child-t2").await.unwrap().unwrap();
         assert_eq!(
@@ -11526,14 +11573,14 @@ mod tests {
 
         let calls = provider.captured_calls();
         assert!(
-            calls[0].system.contains(&manifest_line(
+            calls[0].session_context.contains(&manifest_line(
                 "child-tw3",
                 "coder",
                 "stopped",
                 "the work is done"
             )),
             "the surfacing wake lists the stopped child: {}",
-            calls[0].system
+            calls[0].session_context
         );
 
         // The next wake — a user message — no longer lists the child: the
@@ -11562,9 +11609,9 @@ mod tests {
 
         let calls = provider.captured_calls();
         assert!(
-            !calls[1].system.contains("Live children:"),
+            !calls[1].session_context.contains("Live children:"),
             "no live children remain: {}",
-            calls[1].system
+            calls[1].session_context
         );
 
         handle.stop();
@@ -11665,11 +11712,14 @@ mod tests {
             "the queued wake's turn surfaces the mid-turn event"
         );
         assert!(
-            calls[1]
-                .system
-                .contains(&manifest_line("child-t3", "coder", "stopped", "child done")),
+            calls[1].session_context.contains(&manifest_line(
+                "child-t3",
+                "coder",
+                "stopped",
+                "child done"
+            )),
             "the queued wake's manifest lists the child that finished mid-turn: {}",
-            calls[1].system
+            calls[1].session_context
         );
 
         wait_for("the parent to wait for input", || {
@@ -11810,17 +11860,19 @@ mod tests {
             calls[1].messages
         );
         assert!(
-            calls[1]
-                .system
-                .contains(&manifest_line("child-t4a", "coder", "stopped", "a done"))
-                && calls[1].system.contains(&manifest_line(
-                    "child-t4b",
-                    "coder",
-                    "stopped",
-                    "b done"
-                )),
+            calls[1].session_context.contains(&manifest_line(
+                "child-t4a",
+                "coder",
+                "stopped",
+                "a done"
+            )) && calls[1].session_context.contains(&manifest_line(
+                "child-t4b",
+                "coder",
+                "stopped",
+                "b done"
+            )),
             "the surfacing wake lists both stopped children: {}",
-            calls[1].system
+            calls[1].session_context
         );
 
         wait_for("the parent to wait for input", || {
@@ -11996,14 +12048,14 @@ mod tests {
             calls[1].messages
         );
         assert!(
-            calls[1].system.contains(&manifest_line(
+            calls[1].session_context.contains(&manifest_line(
                 "child-mw",
                 "coder",
                 "stopped",
                 "mid-wake done"
             )),
             "the next turn's manifest reports the child's current state and latest message: {}",
-            calls[1].system
+            calls[1].session_context
         );
 
         // The surfaced completion was not resumed, so the next user wake no
@@ -12030,9 +12082,9 @@ mod tests {
 
         let calls = root_provider.captured_calls();
         assert!(
-            !calls[2].system.contains("child-mw"),
+            !calls[2].session_context.contains("child-mw"),
             "the child leaves the manifest once its event was handled: {}",
-            calls[2].system
+            calls[2].session_context
         );
 
         let parent_messages = store.messages("root-mw", false).await.unwrap();
@@ -12586,37 +12638,39 @@ mod tests {
         // The child may already be running again (resumed by its queued
         // parent message) or still stopped when the wake snapshots.
         assert!(
-            calls[2]
-                .system
-                .contains(&manifest_line("child-mr", "coder", "running", "task done"))
-                || calls[2].system.contains(&manifest_line(
-                    "child-mr",
-                    "coder",
-                    "stopped",
-                    "task done"
-                )),
+            calls[2].session_context.contains(&manifest_line(
+                "child-mr",
+                "coder",
+                "running",
+                "task done"
+            )) || calls[2].session_context.contains(&manifest_line(
+                "child-mr",
+                "coder",
+                "stopped",
+                "task done"
+            )),
             "the report after the message still lists the child: {}",
-            calls[2].system
+            calls[2].session_context
         );
         assert!(
-            calls[3].system.contains(&manifest_line(
+            calls[3].session_context.contains(&manifest_line(
                 "child-mr",
                 "coder",
                 "stopped",
                 "here is the detail"
-            )) || calls[3].system.contains(&manifest_line(
+            )) || calls[3].session_context.contains(&manifest_line(
                 "child-mr",
                 "coder",
                 "running",
                 "here is the detail"
             )),
             "the answer's wake still lists the child: {}",
-            calls[3].system
+            calls[3].session_context
         );
         assert!(
-            !calls[4].system.contains("child-mr"),
+            !calls[4].session_context.contains("child-mr"),
             "the child leaves the manifest once its answer was handled: {}",
-            calls[4].system
+            calls[4].session_context
         );
 
         let parent_messages = store.messages("root-mr", false).await.unwrap();

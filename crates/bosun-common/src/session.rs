@@ -252,6 +252,11 @@ pub enum Event {
         #[serde(rename = "call_kind")]
         kind: String,
         input_tokens: Option<u64>,
+        /// How many of `input_tokens` the provider read from its prompt
+        /// cache. `None` when the provider did not report it, and on events
+        /// stored before the count was recorded.
+        #[serde(default)]
+        cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost: Option<f64>,
     },
@@ -602,6 +607,7 @@ mod tests {
                 provider: "anthropic".into(),
                 kind: "completion".into(),
                 input_tokens: Some(100),
+                cached_input_tokens: None,
                 output_tokens: Some(50),
                 cost: Some(0.001),
             },
@@ -685,6 +691,7 @@ mod tests {
             provider: "anthropic".into(),
             kind: "completion".into(),
             input_tokens: None,
+            cached_input_tokens: None,
             output_tokens: None,
             cost: None,
         })
@@ -742,6 +749,7 @@ mod tests {
                 provider: "anthropic".into(),
                 kind: "completion".into(),
                 input_tokens: None,
+                cached_input_tokens: None,
                 output_tokens: None,
                 cost: None,
             },

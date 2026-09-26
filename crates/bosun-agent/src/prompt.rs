@@ -50,17 +50,19 @@ fn state_name(state: SessionState) -> &'static str {
 }
 
 /// Builds the system prompt in layers: the fixed harness contract first, then
-/// the persona's role text when it has one, then the session's live context —
-/// the repo-standard files present in the working copy, the persona catalog
-/// for spawn-capable sessions, skill advertisements, the todo list, and the
-/// manifest of children whose state or latest authored event this wake is
-/// reacting to. The system prompt is never stored.
+/// the persona's role text when it has one, then the parts of the session's
+/// context that hold for the whole session — the repo-standard files present
+/// in the working copy, the persona catalog for spawn-capable sessions, and
+/// skill advertisements. The system prompt is never stored.
+///
+/// Everything here must stay the same from one request to the next. Providers
+/// cache a request's prefix, and the system prompt is the start of that prefix:
+/// a change here makes the provider read the whole thread again at full price.
+/// Context that changes during a session belongs in [`session_context`].
 pub(crate) fn system_prompt(
     persona: Option<&str>,
     repo_standards: &[String],
-    todos: &[Value],
     skills: &[Skill],
-    live: &[LiveChild],
     catalog: Option<Vec<(String, String)>>,
 ) -> String {
     let mut prompt = HARNESS_CONTRACT.to_string();
@@ -91,27 +93,47 @@ pub(crate) fn system_prompt(
             prompt.push_str(&format!("\n{}", skill_ad_line(skill)));
         }
     }
+    prompt
+}
+
+/// The heading of the session context block. It says who wrote the block,
+/// because the block is appended to a message someone else wrote.
+const SESSION_CONTEXT_HEADING: &str = "[session context] Written by the harness for this request: \
+     the session's state as it stands now. It is not part of the message it is attached to, \
+     and it replaces any earlier session context.";
+
+/// The parts of the session's context that change during a session: the todo
+/// list, and the manifest of children whose state or latest authored event
+/// this wake is reacting to. `None` when there is neither.
+///
+/// The serializers append this block to the end of the request, after the
+/// thread, so a change to it leaves the cached prefix of the thread intact.
+pub(crate) fn session_context(todos: &[Value], live: &[LiveChild]) -> Option<String> {
+    if todos.is_empty() && live.is_empty() {
+        return None;
+    }
+    let mut context = SESSION_CONTEXT_HEADING.to_string();
     if !todos.is_empty() {
-        prompt.push_str("\n\nCurrent todo list:");
+        context.push_str("\n\nCurrent todo list:");
         for (index, todo) in todos.iter().enumerate() {
             let content = todo["content"].as_str().unwrap_or_default();
             let status = todo["status"].as_str().unwrap_or_default();
-            prompt.push_str(&format!("\n{index}. [{status}] {content}"));
+            context.push_str(&format!("\n{index}. [{status}] {content}"));
         }
     }
     if !live.is_empty() {
-        prompt.push_str("\n\nLive children:");
+        context.push_str("\n\nLive children:");
         for child in live {
             let persona = child.persona.as_deref().unwrap_or("default");
             let last = child.last_authored.as_deref().unwrap_or("none");
-            prompt.push_str(&format!(
+            context.push_str(&format!(
                 "\n- {} (persona: {persona}, state: {}, last message: {last})",
                 child.id,
                 state_name(child.state)
             ));
         }
     }
-    prompt
+    Some(context)
 }
 
 #[cfg(test)]
@@ -152,13 +174,13 @@ mod tests {
     #[test]
     fn a_persona_body_follows_the_contract() {
         let persona = "You are a reviewer.";
-        let prompt = system_prompt(Some(persona), &[], &[], &[], &[], None);
+        let prompt = system_prompt(Some(persona), &[], &[], None);
         assert!(prompt.starts_with(&format!("{HARNESS_CONTRACT}\n\n{persona}")));
     }
 
     #[test]
     fn no_persona_leaves_the_contract_alone() {
-        let prompt = system_prompt(None, &[], &[], &[], &[], None);
+        let prompt = system_prompt(None, &[], &[], None);
         assert_eq!(prompt, HARNESS_CONTRACT);
     }
 
@@ -167,9 +189,7 @@ mod tests {
         let prompt = system_prompt(
             Some("You are a reviewer."),
             &["STANDARDS.md".into()],
-            &[json!({ "content": "write tests", "status": "todo" })],
             &[skill("checkout")],
-            &[child("child-1")],
             Some(vec![("coder".into(), "writes code".into())]),
         );
         let persona_at = prompt.find("You are a reviewer.").expect("persona text");
@@ -178,16 +198,30 @@ mod tests {
         let skills_at = prompt
             .find("Skills available in this session:")
             .expect("skills");
-        let todos_at = prompt.find("Current todo list:").expect("todos");
-        let live_at = prompt.find("Live children:").expect("live children");
         assert!(
-            persona_at < standards_at
-                && standards_at < catalog_at
-                && catalog_at < skills_at
-                && skills_at < todos_at
-                && todos_at < live_at,
+            persona_at < standards_at && standards_at < catalog_at && catalog_at < skills_at,
             "the context blocks follow the persona in order: {prompt}"
         );
+    }
+
+    #[test]
+    fn a_session_with_no_todos_and_no_live_children_has_no_session_context() {
+        assert_eq!(session_context(&[], &[]), None);
+    }
+
+    #[test]
+    fn the_session_context_names_its_author_then_lists_todos_then_children() {
+        let context = session_context(
+            &[json!({ "content": "write tests", "status": "todo" })],
+            &[child("child-1")],
+        )
+        .expect("a context with a todo and a child");
+        assert!(context.starts_with(SESSION_CONTEXT_HEADING));
+        let todos_at = context.find("0. [todo] write tests").expect("todos");
+        let live_at = context
+            .find("- child-1 (persona: coder, state: running, last message: none)")
+            .expect("live children");
+        assert!(todos_at < live_at, "todos come before children: {context}");
     }
 
     #[test]

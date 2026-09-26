@@ -405,6 +405,7 @@ fn event_lines(event: &Event) -> Vec<Line> {
             model,
             kind,
             input_tokens,
+            cached_input_tokens,
             output_tokens,
             cost,
             ..
@@ -412,6 +413,9 @@ fn event_lines(event: &Event) -> Vec<Line> {
             let mut detail = Vec::new();
             if let Some(input) = input_tokens {
                 detail.push(format!("{input} in"));
+            }
+            if let Some(cached) = cached_input_tokens {
+                detail.push(format!("{cached} cached"));
             }
             if let Some(output) = output_tokens {
                 detail.push(format!("{output} out"));
@@ -2745,6 +2749,7 @@ mod tests {
             provider: "x".into(),
             kind: "completion".into(),
             input_tokens: Some(10),
+            cached_input_tokens: None,
             output_tokens: Some(2),
             cost: Some(0.01),
         };
@@ -2753,6 +2758,25 @@ mod tests {
             vec![Line {
                 kind: LineKind::ModelCall,
                 text: "alpha completion (10 in, 2 out, $0.0100)".into(),
+                at_ms: None,
+            }]
+        );
+
+        let cached = Event::ModelCall {
+            at_ms: None,
+            model: "alpha".into(),
+            provider: "x".into(),
+            kind: "completion".into(),
+            input_tokens: Some(10),
+            cached_input_tokens: Some(8),
+            output_tokens: Some(2),
+            cost: None,
+        };
+        assert_eq!(
+            event_lines(&cached),
+            vec![Line {
+                kind: LineKind::ModelCall,
+                text: "alpha completion (10 in, 8 cached, 2 out)".into(),
                 at_ms: None,
             }]
         );
@@ -2871,6 +2895,7 @@ mod tests {
                 provider: "x".into(),
                 kind: "completion".into(),
                 input_tokens: Some(10),
+                cached_input_tokens: None,
                 output_tokens: Some(2),
                 cost: Some(0.01),
             },

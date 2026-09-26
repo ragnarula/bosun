@@ -239,6 +239,7 @@ mod tests {
                 Ok(StreamEvent::TextDelta("hi".into())),
                 Ok(StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 }),
@@ -343,6 +344,7 @@ mod tests {
                 )),
                 Ok(StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::StopResponse,
                 }),

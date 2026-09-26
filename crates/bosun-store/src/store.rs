@@ -62,6 +62,9 @@ pub struct ModelCall {
     pub provider: String,
     pub kind: String,
     pub input_tokens: Option<u64>,
+    /// How many of `input_tokens` the provider read from its prompt cache.
+    /// `None` when the provider did not report it.
+    pub cached_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cost: Option<f64>,
     pub started_at_secs: i64,
@@ -172,6 +175,7 @@ CREATE TABLE IF NOT EXISTS model_calls (
   provider TEXT NOT NULL,
   kind TEXT NOT NULL,
   input_tokens INTEGER,
+  cached_input_tokens INTEGER,
   output_tokens INTEGER,
   cost REAL,
   started_at_secs INTEGER NOT NULL
@@ -314,6 +318,15 @@ impl Store {
             // the challenge's scope.
             conn.execute("ALTER TABLE mcp_servers ADD COLUMN oauth_scope TEXT", [])
                 .context("failed to add the oauth_scope column")?;
+        }
+        if !column_exists(&conn, "model_calls", "cached_input_tokens")? {
+            // A call recorded before the column existed has no cache count,
+            // which NULL states.
+            conn.execute(
+                "ALTER TABLE model_calls ADD COLUMN cached_input_tokens INTEGER",
+                [],
+            )
+            .context("failed to add the cached_input_tokens column")?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -826,6 +839,7 @@ impl Store {
         provider: &str,
         kind: &str,
         input_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost: Option<f64>,
     ) -> Result<i64, StoreError> {
@@ -839,14 +853,15 @@ impl Store {
             let started_at_secs = (at_ms / 1000) as i64;
             let tx = transaction(conn)?;
             tx.execute(
-                "INSERT INTO model_calls (session_id, model, provider, kind, input_tokens, output_tokens, cost, started_at_secs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO model_calls (session_id, model, provider, kind, input_tokens, cached_input_tokens, output_tokens, cost, started_at_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session_id,
                     model,
                     provider,
                     kind,
                     input_tokens,
+                    cached_input_tokens,
                     output_tokens,
                     cost,
                     started_at_secs,
@@ -860,6 +875,7 @@ impl Store {
                 provider,
                 kind,
                 input_tokens,
+                cached_input_tokens,
                 output_tokens,
                 cost,
             })?;
@@ -874,7 +890,7 @@ impl Store {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, session_id, model, provider, kind, input_tokens, output_tokens, cost, started_at_secs
+                    "SELECT id, session_id, model, provider, kind, input_tokens, cached_input_tokens, output_tokens, cost, started_at_secs
                      FROM model_calls WHERE session_id = ?1 ORDER BY id",
                 )
                 .context("failed to prepare model call query")?;
@@ -890,6 +906,7 @@ impl Store {
                     provider: row.get("provider")?,
                     kind: row.get("kind")?,
                     input_tokens: row.get("input_tokens")?,
+                    cached_input_tokens: row.get("cached_input_tokens")?,
                     output_tokens: row.get("output_tokens")?,
                     cost: row.get("cost")?,
                     started_at_secs: row.get("started_at_secs")?,
@@ -2562,6 +2579,7 @@ mod tests {
                 "anthropic",
                 "completion",
                 Some(100),
+                None,
                 Some(50),
                 None,
             )
@@ -2711,6 +2729,7 @@ mod tests {
                 "anthropic",
                 "completion",
                 Some(100),
+                Some(80),
                 Some(50),
                 Some(0.001),
             )
@@ -2726,6 +2745,7 @@ mod tests {
         assert_eq!(call.provider, "anthropic");
         assert_eq!(call.kind, "completion");
         assert_eq!(call.input_tokens, Some(100));
+        assert_eq!(call.cached_input_tokens, Some(80));
         assert_eq!(call.output_tokens, Some(50));
         assert_eq!(call.cost, Some(0.001));
         assert!(call.started_at_secs >= before);
@@ -2739,6 +2759,7 @@ mod tests {
                 provider,
                 kind,
                 input_tokens,
+                cached_input_tokens,
                 output_tokens,
                 cost,
                 ..
@@ -2746,6 +2767,7 @@ mod tests {
                 && provider == "anthropic"
                 && kind == "completion"
                 && *input_tokens == Some(100)
+                && *cached_input_tokens == Some(80)
                 && *output_tokens == Some(50)
                 && *cost == Some(0.001)
         ));
@@ -2775,7 +2797,16 @@ mod tests {
             .await
             .unwrap();
         store
-            .append_model_call("a", "claude", "anthropic", "completion", None, None, None)
+            .append_model_call(
+                "a",
+                "claude",
+                "anthropic",
+                "completion",
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -2819,6 +2850,7 @@ mod tests {
                     "anthropic",
                     "completion",
                     Some(1),
+                    None,
                     Some(2),
                     None,
                 )
@@ -2892,6 +2924,7 @@ mod tests {
                 "claude",
                 "anthropic",
                 "completion",
+                None,
                 None,
                 None,
                 None,
@@ -3083,6 +3116,57 @@ mod tests {
         assert_eq!(
             session.mcp_servers, "",
             "a pre-S6 row selects no MCP servers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_call_recorded_before_cache_counts_is_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE model_calls (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   provider TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   input_tokens INTEGER,
+                   output_tokens INTEGER,
+                   cost REAL,
+                   started_at_secs INTEGER NOT NULL
+                 );
+                 INSERT INTO model_calls (session_id, model, provider, kind, input_tokens, output_tokens, cost, started_at_secs)
+                 VALUES ('a', 'claude', 'anthropic', 'completion', 100, 50, 0.0, 1700000000);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+        store
+            .append_model_call(
+                "a",
+                "claude",
+                "anthropic",
+                "completion",
+                Some(200),
+                Some(150),
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = store.model_calls("a").await.unwrap();
+        assert_eq!(
+            calls[0].cached_input_tokens, None,
+            "a call recorded before the column has no cache count"
+        );
+        assert_eq!(
+            calls[1].cached_input_tokens,
+            Some(150),
+            "the migrated column takes a write"
         );
     }
 

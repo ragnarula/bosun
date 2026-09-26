@@ -30,6 +30,13 @@ pub fn anthropic_messages(
     }
 }
 
+/// Appends the session context to the end of an Anthropic message list.
+pub fn append_anthropic_session_context(messages: &mut Value, context: &str) {
+    if let Some(messages) = messages.as_array_mut() {
+        messages.push(json!({ "type": "text", "text": context }));
+    }
+}
+
 /// Anthropic names the parameters object `input_schema`.
 pub fn anthropic_tools(tools: &[ToolSpec]) -> Value {
     let tools: Vec<Value> = tools
@@ -197,6 +204,35 @@ fn fill_missing_thinking(out: &mut [Value]) {
             value["reasoning_content"] = json!(" ");
         }
     }
+}
+
+/// Appends the session context to an OpenAI message list: to the content of
+/// the last message the model reads as input, a user message or a tool
+/// result, and as a user message of its own only when the list holds neither.
+///
+/// Joining a message rather than adding a user message keeps the turn as it
+/// is: a user message ends the turn in flight, and the provider then stops
+/// expecting that turn's reasoning. The message joined is normally the last
+/// one. After compaction the session's summary, an assistant message, ends the
+/// thread, and the context joins the input message before it; compaction has
+/// already changed the start of the thread, so no cached prefix is lost there.
+///
+/// The cost is that the message the context joined differs from the same
+/// message in the next request, so the provider's cached prefix ends there
+/// instead of at the end of the thread.
+pub fn append_openai_session_context(messages: &mut Value, context: &str) {
+    let Some(messages) = messages.as_array_mut() else {
+        return;
+    };
+    let input = messages.iter_mut().rev().find(|message| {
+        matches!(message["role"].as_str(), Some("user" | "tool")) && message["content"].is_string()
+    });
+    if let Some(input) = input {
+        let content = input["content"].as_str().unwrap_or_default();
+        input["content"] = json!(format!("{content}\n\n{context}"));
+        return;
+    }
+    messages.push(json!({ "role": "user", "content": context }));
 }
 
 /// OpenAI wraps each function in a `function` object.
@@ -1073,6 +1109,101 @@ mod tests {
                 { "type": "text", "text": "go" },
                 { "type": "text", "text": "done" },
             ] })
+        );
+    }
+
+    #[test]
+    fn the_session_context_joins_a_final_tool_result() {
+        let mut value = openai_messages(
+            "",
+            &[user("go"), tool_call("c1"), tool_result("c1")],
+            AskRecipient::User,
+        );
+        append_openai_session_context(&mut value, "[session context] todos");
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out.len(), 3, "no message is added");
+        assert_eq!(out[2]["role"], json!("tool"));
+        assert_eq!(out[2]["content"], json!("out\n\n[session context] todos"));
+    }
+
+    #[test]
+    fn the_session_context_joins_a_final_user_message() {
+        let mut value = openai_messages("", &[user("go")], AskRecipient::User);
+        append_openai_session_context(&mut value, "[session context] todos");
+
+        assert_eq!(
+            value,
+            json!([{ "role": "user", "content": "go\n\n[session context] todos" }])
+        );
+    }
+
+    #[test]
+    fn the_session_context_after_a_final_summary_joins_the_input_before_it() {
+        // Compaction appends the session's summary, an assistant message, at
+        // the end of the thread. A user message after it would start a turn
+        // nobody asked for.
+        let summary = Message {
+            role: Role::Assistant,
+            block: Block::Summary {
+                text: "did things".into(),
+            },
+        };
+        let mut value = openai_messages(
+            "",
+            &[user("go"), tool_call("c1"), tool_result("c1"), summary],
+            AskRecipient::User,
+        );
+        append_openai_session_context(&mut value, "[session context] todos");
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out.len(), 4, "no message is added");
+        assert_eq!(out[2]["content"], json!("out\n\n[session context] todos"));
+        assert_eq!(out[3]["content"], json!("did things"));
+    }
+
+    #[test]
+    fn the_session_context_with_no_input_message_is_a_user_message() {
+        let mut value = openai_messages("", &[assistant("hello")], AskRecipient::User);
+        append_openai_session_context(&mut value, "[session context] todos");
+
+        assert_eq!(
+            value,
+            json!([
+                { "role": "assistant", "content": "hello" },
+                { "role": "user", "content": "[session context] todos" },
+            ])
+        );
+    }
+
+    #[test]
+    fn the_anthropic_session_context_is_the_final_text_block() {
+        let mut value = anthropic_messages("", &[user("go")], AskRecipient::User);
+        append_anthropic_session_context(&mut value["messages"], "[session context] todos");
+
+        assert_eq!(
+            value["messages"],
+            json!([
+                { "type": "text", "text": "go" },
+                { "type": "text", "text": "[session context] todos" },
+            ])
+        );
+    }
+
+    #[test]
+    fn the_thread_before_the_session_context_is_unchanged() {
+        // The provider caches the request's prefix, so everything before the
+        // last message must serialize the same with and without the context.
+        let messages = vec![user("go"), tool_call("c1"), tool_result("c1")];
+        let plain = openai_messages("system", &messages, AskRecipient::User);
+        let mut with_context = plain.clone();
+        append_openai_session_context(&mut with_context, "[session context] todos");
+
+        let plain = plain.as_array().unwrap();
+        let with_context = with_context.as_array().unwrap();
+        assert_eq!(
+            plain[..plain.len() - 1],
+            with_context[..with_context.len() - 1]
         );
     }
 }

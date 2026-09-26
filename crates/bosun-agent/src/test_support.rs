@@ -118,6 +118,7 @@ pub fn provider_call(model: &'static str) -> ProviderCall<'static> {
         model,
         max_tokens: 100,
         system: "You are Bosun.",
+        session_context: None,
         messages: vec![Message {
             role: Role::User,
             block: Block::Text {

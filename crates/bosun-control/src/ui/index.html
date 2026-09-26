@@ -4322,6 +4322,7 @@ function renderMessage(message, atMs) {
 function modelCallLine(event) {
   const parts = [];
   if (event.input_tokens != null) parts.push(event.input_tokens + ' in');
+  if (event.cached_input_tokens != null) parts.push(event.cached_input_tokens + ' cached');
   if (event.output_tokens != null) parts.push(event.output_tokens + ' out');
   // The terminal formats the cost with Rust's `{:.4}` (half to even), this
   // uses `toFixed(4)` (half away from zero). The two differ only on an exact

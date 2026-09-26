@@ -14,6 +14,7 @@ use crate::provider::StopReason;
 use crate::provider::StreamEvent;
 use crate::provider::json_shape;
 use crate::provider::messages_url;
+use crate::serialize::append_openai_session_context;
 use crate::serialize::openai_messages;
 use crate::serialize::openai_tools;
 use crate::sse::SseEvent;
@@ -36,11 +37,15 @@ impl OpenAi {
     }
 
     fn request_body(&self, call: &ProviderCall<'_>) -> Value {
+        let mut messages = openai_messages(call.system, &call.messages, call.ask_recipient);
+        if let Some(context) = call.session_context {
+            append_openai_session_context(&mut messages, context);
+        }
         json!({
             "model": call.model,
             "max_tokens": call.max_tokens,
             "stream": true,
-            "messages": openai_messages(call.system, &call.messages, call.ask_recipient),
+            "messages": messages,
             "tools": openai_tools(&call.tools),
             "stream_options": { "include_usage": true },
         })
@@ -80,6 +85,7 @@ impl Provider for OpenAi {
 #[derive(Default)]
 struct OpenAiParser {
     input_tokens: u64,
+    cached_input_tokens: Option<u64>,
     output_tokens: u64,
     finish_reason: Option<String>,
     stopped: bool,
@@ -111,6 +117,7 @@ impl OpenAiParser {
         };
         Some(StreamEvent::Stop {
             input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
             output_tokens: self.output_tokens,
             stop_reason,
         })
@@ -158,6 +165,12 @@ fn parse_event(
         }
         parser.input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
         parser.output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+        // OpenAI and the gateways that follow it report cache reads in
+        // `prompt_tokens_details`; DeepSeek's own API reports them as
+        // `prompt_cache_hit_tokens`.
+        parser.cached_input_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_cache_hit_tokens"].as_u64());
         usage_chunk = true;
     }
     let mut out = Vec::new();
@@ -311,6 +324,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_session_context_ends_the_request_and_the_system_prompt_is_untouched() {
+        let server = FakeProvider::start(|_| sse_response(&[])).await;
+        let provider = OpenAi::new(
+            "gpt-test",
+            "sk-test",
+            Some(&server.url()),
+            crate::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+        let mut call = provider_call("gpt-test");
+        call.session_context = Some("[session context] todos");
+
+        collect_stream(&provider, call).await;
+
+        assert_eq!(
+            server.captured().body["messages"],
+            json!([
+                { "role": "system", "content": "You are Bosun." },
+                { "role": "user", "content": "hello\n\n[session context] todos" },
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn streams_text_and_tool_call_deltas_to_a_single_stop() {
         let server_events = vec![
             sse(json!({
@@ -397,6 +433,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 10,
+                    cached_input_tokens: None,
                     output_tokens: 5,
                     stop_reason: StopReason::Other,
                 },
@@ -434,6 +471,7 @@ mod tests {
                 StreamEvent::TextDelta("Hi".into()),
                 StreamEvent::Stop {
                     input_tokens: 4,
+                    cached_input_tokens: None,
                     output_tokens: 2,
                     stop_reason: StopReason::StopResponse,
                 },
@@ -471,6 +509,7 @@ mod tests {
                 StreamEvent::TextDelta("Bye".into()),
                 StreamEvent::Stop {
                     input_tokens: 4,
+                    cached_input_tokens: None,
                     output_tokens: 2,
                     stop_reason: StopReason::MaxTokens,
                 },
@@ -509,6 +548,7 @@ mod tests {
                 StreamEvent::TextDelta("Bye".into()),
                 StreamEvent::Stop {
                     input_tokens: 4,
+                    cached_input_tokens: None,
                     output_tokens: 2,
                     stop_reason: StopReason::MaxTokens,
                 },
@@ -570,6 +610,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 7,
+                    cached_input_tokens: None,
                     output_tokens: 3,
                     stop_reason: StopReason::Other,
                 },
@@ -621,6 +662,7 @@ mod tests {
                 },
                 StreamEvent::Stop {
                     input_tokens: 1,
+                    cached_input_tokens: None,
                     output_tokens: 1,
                     stop_reason: StopReason::Other,
                 },
@@ -760,6 +802,58 @@ mod tests {
             ]
         );
         assert!(matches!(events.last(), Some(StreamEvent::Stop { .. })));
+    }
+
+    /// The stop a completion reports once its usage chunk arrives.
+    fn stop_for_usage(usage: Value) -> StreamEvent {
+        let mut parser = OpenAiParser::default();
+        let events = parse_event(&sse(json!({ "choices": [], "usage": usage })), &mut parser)
+            .expect("a usage chunk parses");
+        events
+            .last()
+            .cloned()
+            .expect("a usage chunk stops the call")
+    }
+
+    #[test]
+    fn cached_tokens_are_read_from_either_field() {
+        // OpenAI and the gateways that follow it nest the count; DeepSeek's
+        // own API reports it flat.
+        for usage in [
+            json!({
+                "prompt_tokens": 4232,
+                "completion_tokens": 3,
+                "prompt_tokens_details": { "cached_tokens": 4096 },
+            }),
+            json!({
+                "prompt_tokens": 4232,
+                "completion_tokens": 3,
+                "prompt_cache_hit_tokens": 4096,
+            }),
+        ] {
+            assert_eq!(
+                stop_for_usage(usage.clone()),
+                StreamEvent::Stop {
+                    input_tokens: 4232,
+                    cached_input_tokens: Some(4096),
+                    output_tokens: 3,
+                    stop_reason: StopReason::Other,
+                },
+                "for {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usage_without_a_cache_count_reports_none_rather_than_zero() {
+        let stop = stop_for_usage(json!({ "prompt_tokens": 10, "completion_tokens": 1 }));
+        assert!(matches!(
+            stop,
+            StreamEvent::Stop {
+                cached_input_tokens: None,
+                ..
+            }
+        ));
     }
 
     #[test]

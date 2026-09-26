@@ -3,6 +3,8 @@
 **Date:** 2026-09-12
 **Author:** Raghav
 
+> Superseded in part by `2026-09-26-session-context-after-the-thread.md`: the todo list and the live-children manifest leave the system prompt and follow the thread as a session context block. The contract, the persona role, the repo-standards notice, the persona catalog, and the skill advertisements stay in the system prompt as decided here.
+
 ## Context
 
 Today `system_prompt` uses `persona.unwrap_or(DEFAULT_SYSTEM_PROMPT)`, so a persona's prompt file is the whole system prompt and a one-line default is the fallback. A session cannot tell a fixed operating contract from a role, an instruction in a repository file it reads, or an instruction injected into tool output. There is nowhere to state a trust order.
