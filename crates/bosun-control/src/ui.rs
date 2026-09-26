@@ -81,6 +81,61 @@ mod tests {
         panic!("the block after {start} must close");
     }
 
+    /// The pane's script with its comments removed, so a count reads code: a
+    /// comment that names a function, writes an assignment or holds a
+    /// `return;` is prose about the script, not a second copy of it. The
+    /// quotes keep a `//` inside a string out of the stripper's way.
+    fn code() -> String {
+        let body = PANE
+            .split_once("<script>\n")
+            .expect("the pane must carry the inline script")
+            .1
+            .split_once("\n</script>")
+            .expect("the inline script must close")
+            .0;
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars().peekable();
+        let mut quote = None;
+        while let Some(ch) = chars.next() {
+            if let Some(end) = quote {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if ch == end {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' | '`' => {
+                    quote = Some(ch);
+                    out.push(ch);
+                }
+                '/' if chars.peek() == Some(&'/') => {
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            out.push(next);
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     #[test]
     fn the_pane_remembers_the_children_groups_the_user_opened() {
         let declaration = PANE
@@ -799,23 +854,37 @@ mod tests {
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_reader_types_in_the_composer() {
+        let pane = code();
         assert_eq!(
-            PANE.matches("input.addEventListener('input'").count(),
+            pane.matches("function jumpToBottom").count(),
             1,
-            "one listener takes the composer's keystrokes; these checks read the first occurrence"
+            "one `function jumpToBottom` runs: JavaScript runs the last declaration, and these checks read the first"
         );
         assert_eq!(
-            PANE.matches("jumpToBottom").count(),
-            3,
-            "the name stands at one definition and the two call sites: a fourth mention assigns over it or shadows it, and would run in place of the definition these checks read"
+            pane.matches("input.addEventListener('input'").count(),
+            1,
+            "one `input.addEventListener('input'` runs; these checks read the first"
+        );
+        for declaration in [
+            "const input = $('input');",
+            "const transcript = $('transcript');",
+        ] {
+            assert!(
+                pane.contains(declaration),
+                "`{declaration}` must stand: the checks below read that name for the element, and only a const binding keeps a later assignment from pointing it elsewhere"
+            );
+        }
+        assert!(
+            !pane.contains("jumpToBottom =") && !pane.contains("jumpToBottom="),
+            "nothing assigns over `jumpToBottom`: an assignment runs in place of the declaration these checks read"
         );
         assert_eq!(
-            squeezed(&block(PANE, "input.addEventListener('input',")),
+            squeezed(&block(&pane, "input.addEventListener('input',")),
             "saveDraft();jumpToBottom();",
             "a keystroke must keep the chat draft and return the transcript to the bottom, or the message the reader is writing and the answer to it stay below the fold"
         );
         assert_eq!(
-            squeezed(&block(PANE, "function jumpToBottom")),
+            squeezed(&block(&pane, "function jumpToBottom")),
             "stick=true;transcript.scrollTop=transcript.scrollHeight;",
             "jumpToBottom must set auto-scroll and move the transcript itself, not through the guarded follow: a keystroke from a scrolled-up reader would otherwise leave them where they were"
         );
@@ -823,26 +892,31 @@ mod tests {
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_composer_sends() {
+        let pane = code();
         assert_eq!(
-            PANE.matches("async function send").count(),
+            pane.matches("function send(").count(),
             1,
-            "one send runs; these checks read the first occurrence"
+            "one `function send(` runs: JavaScript runs the last declaration, so a second one leaves the button and the Enter key with a no-op"
         );
         assert_eq!(
-            PANE.matches("input.addEventListener('keydown'").count(),
+            pane.matches("input.addEventListener('keydown'").count(),
             1,
-            "one listener takes the composer's keys; this check reads the first occurrence"
+            "one `input.addEventListener('keydown'` runs; this check reads the first"
         );
         assert_eq!(
-            PANE.matches("btnSend.addEventListener('click'").count(),
+            pane.matches("btnSend.addEventListener('click'").count(),
             1,
-            "one button sends; this check reads the first occurrence"
+            "one `btnSend.addEventListener('click'` runs; this check reads the first"
         );
         assert!(
-            !PANE.contains("send ="),
-            "nothing assigns over send, or the button and the Enter key reach that assignment instead of the definition this check reads"
+            !pane.contains("send =") && !pane.contains("send="),
+            "nothing assigns over `send`: an assignment runs in place of the declaration these checks read"
         );
-        let send = squeezed(&block(PANE, "async function send()"));
+        assert!(
+            pane.contains("const btnSend = $('btn-send');"),
+            "`const btnSend = $('btn-send');` must stand: the checks below read that name for the button, and only a const binding keeps a later assignment from pointing it elsewhere"
+        );
+        let send = squeezed(&block(&pane, "function send("));
         assert!(
             send.starts_with(&squeezed(
                 "if (sending || !input.value.trim()) return; jumpToBottom();"
@@ -860,16 +934,26 @@ mod tests {
             "the return must stand before the post, so the reader sees the bottom without waiting on the network"
         );
         assert_eq!(
-            squeezed(&block(PANE, "function jumpToBottom")),
+            send[..posts].matches(&squeezed("return;")).count(),
+            1,
+            "the one `return;` before the post is the guard's: a second one between the guard and the post skips the jump, strands `sending`, or sends nothing"
+        );
+        assert_eq!(
+            squeezed(&block(&pane, "function jumpToBottom")),
             "stick=true;transcript.scrollTop=transcript.scrollHeight;",
             "jumpToBottom must set auto-scroll and move the transcript itself, not through the guarded follow, or the answer to the sent message does not land in view"
         );
         assert!(
-            PANE.contains("btnSend.addEventListener('click', send);"),
-            "the send button must reach send, the path this check reads"
+            !squeezed(segment(
+                &pane,
+                "btnSend.addEventListener('click', send);",
+                "function scrollToBottom() {",
+            ))
+            .contains("btnSend"),
+            "nothing after `btnSend.addEventListener('click', send);` names `btnSend` again: a statement there undoes the wiring or disables the button, and a phone has no other way to send"
         );
         assert_eq!(
-            squeezed(&block(PANE, "input.addEventListener('keydown'")),
+            squeezed(&block(&pane, "input.addEventListener('keydown'")),
             squeezed(
                 "if (event.key === 'Enter' && (event.ctrlKey || event.metaKey))
                  event.preventDefault();
@@ -881,17 +965,22 @@ mod tests {
 
     #[test]
     fn the_pane_keeps_following_while_the_end_of_the_transcript_is_in_view() {
+        let pane = code();
         assert!(
-            PANE.contains("let stick = true;"),
-            "stick opens armed and the scroll listener and jumpToBottom both assign it, so it must stay a mutable flag"
+            pane.contains("let stick = true;"),
+            "`let stick = true;` must stand: the flag opens armed, and the scroll listener and jumpToBottom both assign it"
+        );
+        assert!(
+            pane.contains("const transcript = $('transcript');"),
+            "`const transcript = $('transcript');` must stand: the checks here read that name for the box that scrolls, and only a const binding keeps a later assignment from pointing it elsewhere"
         );
         assert_eq!(
-            PANE.matches("transcript.addEventListener('scroll'").count(),
+            pane.matches("transcript.addEventListener('scroll'").count(),
             1,
-            "one listener reads the reader's scroll; this check reads the first occurrence"
+            "one `transcript.addEventListener('scroll'` runs; this check reads the first"
         );
         assert_eq!(
-            squeezed(&block(PANE, "transcript.addEventListener('scroll'")),
+            squeezed(&block(&pane, "transcript.addEventListener('scroll'")),
             "stick=transcript.scrollTop+transcript.clientHeight>=transcript.scrollHeight-40;",
             "the listener must hold auto-scroll while the end of the transcript is in view: a listener that clears `stick` on every scroll takes back the jump a keystroke or a send just made, and the sent message and its answer land below the fold again"
         );
