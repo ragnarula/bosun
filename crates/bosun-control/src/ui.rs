@@ -799,15 +799,16 @@ mod tests {
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_reader_types_in_the_composer() {
-        // Each check below reads its anchor at the first occurrence, so a
-        // second copy would leave the check reading text that does not run.
-        for anchor in ["input.addEventListener('input'", "function jumpToBottom"] {
-            assert_eq!(
-                PANE.matches(anchor).count(),
-                1,
-                "one copy of {anchor} runs; a second leaves these checks reading another one"
-            );
-        }
+        assert_eq!(
+            PANE.matches("input.addEventListener('input'").count(),
+            1,
+            "one listener takes the composer's keystrokes; these checks read the first occurrence"
+        );
+        assert_eq!(
+            PANE.matches("jumpToBottom").count(),
+            3,
+            "the name stands at one definition and the two call sites: a fourth mention assigns over it or shadows it, and would run in place of the definition these checks read"
+        );
         assert_eq!(
             squeezed(&block(PANE, "input.addEventListener('input',")),
             "saveDraft();jumpToBottom();",
@@ -816,23 +817,31 @@ mod tests {
         assert_eq!(
             squeezed(&block(PANE, "function jumpToBottom")),
             "stick=true;transcript.scrollTop=transcript.scrollHeight;",
-            "jumpToBottom must set auto-scroll and move the transcript itself: a guard on `stick` leaves a scrolled-up reader where they were, and the keystroke only catches up on the next event"
+            "jumpToBottom must set auto-scroll and move the transcript itself, not through the guarded follow: a keystroke from a scrolled-up reader would otherwise leave them where they were"
         );
     }
 
     #[test]
     fn the_pane_returns_to_the_bottom_when_the_composer_sends() {
-        for anchor in [
-            "async function send",
-            "function jumpToBottom",
-            "input.addEventListener('keydown'",
-        ] {
-            assert_eq!(
-                PANE.matches(anchor).count(),
-                1,
-                "one copy of {anchor} runs; a second leaves these checks reading another one"
-            );
-        }
+        assert_eq!(
+            PANE.matches("async function send").count(),
+            1,
+            "one send runs; these checks read the first occurrence"
+        );
+        assert_eq!(
+            PANE.matches("input.addEventListener('keydown'").count(),
+            1,
+            "one listener takes the composer's keys; this check reads the first occurrence"
+        );
+        assert_eq!(
+            PANE.matches("btnSend.addEventListener('click'").count(),
+            1,
+            "one button sends; this check reads the first occurrence"
+        );
+        assert!(
+            !PANE.contains("send ="),
+            "nothing assigns over send, or the button and the Enter key reach that assignment instead of the definition this check reads"
+        );
         let send = squeezed(&block(PANE, "async function send()"));
         assert!(
             send.starts_with(&squeezed(
@@ -853,7 +862,7 @@ mod tests {
         assert_eq!(
             squeezed(&block(PANE, "function jumpToBottom")),
             "stick=true;transcript.scrollTop=transcript.scrollHeight;",
-            "jumpToBottom must set auto-scroll and move the transcript itself, or the answer to the sent message does not follow"
+            "jumpToBottom must set auto-scroll and move the transcript itself, not through the guarded follow, or the answer to the sent message does not land in view"
         );
         assert!(
             PANE.contains("btnSend.addEventListener('click', send);"),
@@ -867,6 +876,24 @@ mod tests {
                  send();"
             ),
             "Ctrl/Cmd+Enter must reach the same send, or the key the reader presses on a phone keyboard sends nothing"
+        );
+    }
+
+    #[test]
+    fn the_pane_keeps_following_while_the_end_of_the_transcript_is_in_view() {
+        assert!(
+            PANE.contains("let stick = true;"),
+            "stick opens armed and the scroll listener and jumpToBottom both assign it, so it must stay a mutable flag"
+        );
+        assert_eq!(
+            PANE.matches("transcript.addEventListener('scroll'").count(),
+            1,
+            "one listener reads the reader's scroll; this check reads the first occurrence"
+        );
+        assert_eq!(
+            squeezed(&block(PANE, "transcript.addEventListener('scroll'")),
+            "stick=transcript.scrollTop+transcript.clientHeight>=transcript.scrollHeight-40;",
+            "the listener must hold auto-scroll while the end of the transcript is in view: a listener that clears `stick` on every scroll takes back the jump a keystroke or a send just made, and the sent message and its answer land below the fold again"
         );
     }
 }
