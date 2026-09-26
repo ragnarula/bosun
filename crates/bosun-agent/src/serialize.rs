@@ -47,38 +47,133 @@ pub fn anthropic_tools(tools: &[ToolSpec]) -> Value {
 
 /// OpenAI puts the system prompt in the first message. An empty system prompt
 /// is omitted: hosted APIs reject a system message without content.
+///
+/// Each completion goes back as the one assistant message the model wrote:
+/// its reply text and all of its tool calls together, followed by the calls'
+/// results. See [`openai_completion`] for why.
+///
 /// A thinking model may require its own reasoning back. DeepSeek rejects a
 /// request whose in-flight turn carries an assistant message without
 /// `reasoning_content`, and rejects a reasoning-only assistant message, so a
-/// [`Block::Reasoning`] is not serialized on its own: it rides on each
-/// assistant message the same completion produced. A completed turn needs
-/// none, which is why a user message clears it. Tool results sit inside a
-/// turn and serialize as role `tool`, so they leave it standing.
+/// [`Block::Reasoning`] is not serialized on its own: it rides on the
+/// assistant message its completion produced, and on later ones until a newer
+/// Reasoning replaces it. A completed turn needs none, which is why a user
+/// message clears it. Tool results sit inside a turn and serialize as role
+/// `tool`, so they leave it standing.
 pub fn openai_messages(system: &str, messages: &[Message], ask_recipient: AskRecipient) -> Value {
     let mut out: Vec<Value> = Vec::new();
     if !system.is_empty() {
         out.push(json!({ "role": "system", "content": system }));
     }
     let mut thinking: Option<&str> = None;
-    for message in messages {
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
         if let Block::Reasoning { text } = &message.block {
             thinking = Some(text);
+            index += 1;
             continue;
         }
-        let mut value = openai_message(message, ask_recipient);
-        match value["role"].as_str() {
-            Some("assistant") => {
-                if let Some(text) = thinking {
-                    value["reasoning_content"] = json!(text);
-                }
+        if let Some((mut completion, next)) = openai_completion(messages, index, ask_recipient) {
+            if let Some(text) = thinking {
+                completion[0]["reasoning_content"] = json!(text);
             }
-            Some("user") => thinking = None,
-            _ => {}
+            out.extend(completion);
+            index = next;
+            continue;
+        }
+        let value = openai_message(message, ask_recipient);
+        if value["role"] == "user" {
+            thinking = None;
         }
         out.push(value);
+        index += 1;
     }
     fill_missing_thinking(&mut out);
     Value::Array(out)
+}
+
+/// The completion that opens at `start`, as one assistant message followed by
+/// the results of its calls, and the index just past it; `None` when
+/// `messages[start]` is not an assistant reply or tool call.
+///
+/// The transcript stores a completion in pieces: its reply text, then each
+/// call just before it runs, each followed by its result. Sent back as it is
+/// stored, the reply becomes an assistant message of its own, and the chat
+/// template ends it with an end-of-turn token. Every earlier turn then shows
+/// the model a message that announces work and stops, and the model copies
+/// that pattern: it starts ending turns with an announcement and no call.
+///
+/// A completion is its reply text, if any, then its calls. The first call
+/// belongs to it when it follows the text directly or opens the completion
+/// itself: a reply without calls ends the turn, so the next completion never
+/// follows it directly. Each later call belongs when it carries
+/// `continues_completion`; a call stored before that flag existed starts a
+/// completion of its own. A message between calls, other than a call's result,
+/// also ends the completion, so nothing is reordered past it.
+fn openai_completion(
+    messages: &[Message],
+    start: usize,
+    ask_recipient: AskRecipient,
+) -> Option<(Vec<Value>, usize)> {
+    let mut index = start;
+    let mut content = Value::Null;
+    if let Some(Message {
+        role: Role::Assistant,
+        block: Block::Text { text },
+    }) = messages.get(index)
+    {
+        content = json!(text);
+        index += 1;
+    }
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    while let Some(Message {
+        role: Role::Assistant,
+        block:
+            Block::ToolCall {
+                id,
+                name,
+                args,
+                continues_completion,
+            },
+    }) = messages.get(index)
+    {
+        if !calls.is_empty() && !continues_completion {
+            break;
+        }
+        calls.push(openai_tool_call(id, name, args));
+        index += 1;
+        if let Some(
+            result @ Message {
+                block: Block::ToolResult { id: result_id, .. },
+                ..
+            },
+        ) = messages.get(index)
+            && result_id == id
+        {
+            results.push(openai_message(result, ask_recipient));
+            index += 1;
+        }
+    }
+    if index == start {
+        return None;
+    }
+    let mut message = json!({ "role": "assistant", "content": content });
+    if !calls.is_empty() {
+        message["tool_calls"] = Value::Array(calls);
+    }
+    let mut out = vec![message];
+    out.extend(results);
+    Some((out, index))
+}
+
+fn openai_tool_call(id: &str, name: &str, args: &Value) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": { "name": name, "arguments": args.to_string() },
+    })
 }
 
 /// The thinking a model owes back is not always thinking it produced:
@@ -89,8 +184,8 @@ pub fn openai_messages(system: &str, messages: &[Message], ask_recipient: AskRec
 ///
 /// Every assistant message in the turn in flight is filled, not just the tool
 /// calls: the provider rejects the request when any of them lacks the field,
-/// and one completion becomes several assistant messages here — its reply and
-/// one per tool call. The turn in flight is the run after the last message
+/// and a turn in flight holds one assistant message per completion. The turn
+/// in flight is the run after the last message
 /// addressed to the model as `user`; a slice with no such message has no turn
 /// boundary to work from and is left alone.
 fn fill_missing_thinking(out: &mut [Value]) {
@@ -140,7 +235,7 @@ fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
             "content": tool_result_text(*is_error, content),
         }),
         (Role::Assistant, Block::Text { text }) => json!({ "type": "text", "text": text }),
-        (Role::Assistant, Block::ToolCall { id, name, args }) => json!({
+        (Role::Assistant, Block::ToolCall { id, name, args, .. }) => json!({
             "type": "tool_use",
             "id": id,
             "name": name,
@@ -200,14 +295,10 @@ fn openai_message(message: &Message, ask_recipient: AskRecipient) -> Value {
             "content": tool_result_text(*is_error, content),
         }),
         (Role::Assistant, Block::Text { text }) => json!({ "role": "assistant", "content": text }),
-        (Role::Assistant, Block::ToolCall { id, name, args }) => json!({
+        (Role::Assistant, Block::ToolCall { id, name, args, .. }) => json!({
             "role": "assistant",
             "content": null,
-            "tool_calls": [{
-                "id": id,
-                "type": "function",
-                "function": { "name": name, "arguments": args.to_string() },
-            }],
+            "tool_calls": [openai_tool_call(id, name, args)],
         }),
         (
             _,
@@ -344,6 +435,7 @@ mod tests {
                     id: "call-3".into(),
                     name: "shell".into(),
                     args: json!({ "command": "ls" }),
+                    continues_completion: false,
                 },
             },
             Message {
@@ -376,6 +468,7 @@ mod tests {
                     id: "call-4".into(),
                     name: "git".into(),
                     args: json!({ "args": ["status"] }),
+                    continues_completion: false,
                 },
             },
             Message {
@@ -714,6 +807,7 @@ mod tests {
                 id: id.into(),
                 name: "shell".into(),
                 args: json!({ "command": "ls" }),
+                continues_completion: false,
             },
         }
     }
@@ -762,29 +856,162 @@ mod tests {
         assert_eq!(out[3]["reasoning_content"], json!("plan it"));
     }
 
+    fn continuing_call(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            block: Block::ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                args: json!({ "command": "ls" }),
+                continues_completion: true,
+            },
+        }
+    }
+
     #[test]
     fn an_assistant_message_in_flight_without_thinking_is_filled() {
         // deepseek-v4.1-flash returns some completions with no reasoning and
         // then rejects the next one for not carrying any, so the turn in
-        // flight must always present the field.
-        // One completion becomes an assistant reply and an assistant tool
-        // call, and the provider rejects the turn if either lacks the field.
+        // flight must always present the field, on every completion in it.
         let messages = vec![
             user("go"),
             assistant("reading it"),
             tool_call("c1"),
             tool_result("c1"),
+            assistant("done"),
         ];
         let value = openai_messages("", &messages, AskRecipient::User);
         let out = value.as_array().expect("messages serialize as an array");
 
         assert_eq!(out[1]["reasoning_content"], json!(" "));
-        assert_eq!(out[2]["reasoning_content"], json!(" "));
         assert_eq!(
-            out[3]["reasoning_content"],
+            out[2]["reasoning_content"],
             Value::Null,
             "a tool result carries none"
         );
+        assert_eq!(out[3]["reasoning_content"], json!(" "));
+    }
+
+    #[test]
+    fn a_completion_goes_back_as_one_assistant_message() {
+        // Sent as a reply message and one message per call, every earlier
+        // turn shows the model a message that announces work and ends, and
+        // the model copies it.
+        let messages = vec![
+            user("go"),
+            assistant("reading both"),
+            tool_call("c1"),
+            tool_result("c1"),
+            continuing_call("c2"),
+            tool_result("c2"),
+            assistant("done"),
+        ];
+        let call = |id: &str| {
+            json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": "shell", "arguments": "{\"command\":\"ls\"}" },
+            })
+        };
+        assert_eq!(
+            openai_messages("", &messages, AskRecipient::User),
+            json!([
+                { "role": "user", "content": "go" },
+                {
+                    "role": "assistant",
+                    "content": "reading both",
+                    "tool_calls": [call("c1"), call("c2")],
+                    "reasoning_content": " ",
+                },
+                { "role": "tool", "tool_call_id": "c1", "content": "out" },
+                { "role": "tool", "tool_call_id": "c2", "content": "out" },
+                { "role": "assistant", "content": "done", "reasoning_content": " " },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_completion_without_text_still_carries_all_its_calls() {
+        let messages = vec![
+            user("go"),
+            tool_call("c1"),
+            tool_result("c1"),
+            continuing_call("c2"),
+            tool_result("c2"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["content"], Value::Null);
+        assert_eq!(out[1]["tool_calls"][0]["id"], json!("c1"));
+        assert_eq!(out[1]["tool_calls"][1]["id"], json!("c2"));
+        assert_eq!(out[2]["tool_call_id"], json!("c1"));
+        assert_eq!(out[3]["tool_call_id"], json!("c2"));
+    }
+
+    #[test]
+    fn a_call_without_the_flag_opens_the_next_completion() {
+        // The model wrote c2 after it read c1's result, so c2 must not read
+        // as a call made alongside c1. A call stored before the flag existed
+        // reads the same way.
+        let messages = vec![
+            user("go"),
+            tool_call("c1"),
+            tool_result("c1"),
+            tool_call("c2"),
+            tool_result("c2"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool"]);
+        assert_eq!(out[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(out[3]["tool_calls"][0]["id"], json!("c2"));
+    }
+
+    #[test]
+    fn a_message_between_calls_ends_the_completion() {
+        // A user message that landed mid-completion stays where it is rather
+        // than being moved past the completion's later calls.
+        let messages = vec![
+            user("go"),
+            tool_call("c1"),
+            tool_result("c1"),
+            user("also check the tests"),
+            continuing_call("c2"),
+            tool_result("c2"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "user", "assistant", "tool"]
+        );
+        assert_eq!(out[4]["tool_calls"][0]["id"], json!("c2"));
+    }
+
+    #[test]
+    fn a_completions_thinking_is_sent_once() {
+        let messages = vec![
+            user("go"),
+            thinking("plan it"),
+            assistant("reading both"),
+            tool_call("c1"),
+            tool_result("c1"),
+            continuing_call("c2"),
+            tool_result("c2"),
+        ];
+        let value = openai_messages("", &messages, AskRecipient::User);
+        let out = value.as_array().expect("messages serialize as an array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["reasoning_content"], json!("plan it"));
+        assert_eq!(out[2]["reasoning_content"], Value::Null);
+        assert_eq!(out[3]["reasoning_content"], Value::Null);
     }
 
     #[test]

@@ -115,6 +115,17 @@ pub enum Block {
         id: String,
         name: String,
         args: Value,
+        /// True when an earlier call from the same completion precedes this
+        /// one. The loop records each call just before it runs, so a
+        /// completion's calls sit apart, each followed by its result, and
+        /// nothing else in the transcript says where one completion ends and
+        /// the next begins. Serialization reads this to send a completion back
+        /// as the one assistant message the model wrote. Skipped when false,
+        /// so a completion's first call serializes byte-identically to the
+        /// transcript format before the flag; a call stored before the flag
+        /// reads as false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        continues_completion: bool,
     },
     ToolResult {
         id: String,
@@ -403,6 +414,7 @@ mod tests {
                 id: "call-1".into(),
                 name: "file_read".into(),
                 args: serde_json::json!({"path": "src/main.rs"}),
+                continues_completion: true,
             },
             Block::ToolResult {
                 id: "call-1".into(),
@@ -507,14 +519,37 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_stored_before_the_completion_flag_reads_as_a_first_call() {
+        let block: Block = serde_json::from_value(serde_json::json!({
+            "kind": "tool_call",
+            "id": "call-1",
+            "name": "shell",
+            "args": {"command": "ls"},
+        }))
+        .unwrap();
+        assert!(matches!(
+            block,
+            Block::ToolCall {
+                continues_completion: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn block_uses_snake_case_kind_tags() {
         let json = serde_json::to_value(Block::ToolCall {
             id: "call-1".into(),
             name: "shell".into(),
             args: serde_json::json!({"command": "ls"}),
+            continues_completion: false,
         })
         .unwrap();
         assert_eq!(json["kind"], "tool_call");
+        assert!(
+            json.get("continues_completion").is_none(),
+            "a completion's first call omits the flag"
+        );
 
         let json = serde_json::to_value(Block::Ask {
             message: "continue?".into(),

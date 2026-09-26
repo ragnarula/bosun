@@ -1701,10 +1701,12 @@ async fn run_turn_inner(
         return Ok(TurnOutcome::Finished { text });
     }
 
-    for (id, name, args) in calls {
+    for (index, (id, name, args)) in calls.into_iter().enumerate() {
         // Commit each tool call to the transcript just before dispatching it,
         // so calls after an ask or a mid-turn interrupt never leave a phantom
-        // tool_use without a result.
+        // tool_use without a result. Every call after the first is marked as
+        // part of this completion, so serialization can send the completion
+        // back as one assistant message.
         record_in_wake(
             deps,
             session_id,
@@ -1714,6 +1716,7 @@ async fn run_turn_inner(
                 id: id.clone(),
                 name: name.clone(),
                 args: args.clone(),
+                continues_completion: index > 0,
             },
         )
         .await?;
@@ -3232,7 +3235,7 @@ fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
     match block {
         Block::Reasoning { .. } => unreachable!("a filtered reasoning block"),
         Block::Text { text } => text.clone(),
-        Block::ToolCall { id, name, args } => format!("tool call {name} (id {id}): {args}"),
+        Block::ToolCall { id, name, args, .. } => format!("tool call {name} (id {id}): {args}"),
         Block::ToolResult {
             id,
             name,
@@ -4302,6 +4305,7 @@ mod tests {
                     id: "call-1".into(),
                     name: "file_read".into(),
                     args: json!({ "path": "README.md" }),
+                    continues_completion: false,
                 },
             )
             .await
@@ -4976,6 +4980,7 @@ mod tests {
                 id: id.into(),
                 name: "shell".into(),
                 args: json!({ "command": "ls" }),
+                continues_completion: false,
             },
         }
     }
@@ -7742,6 +7747,20 @@ mod tests {
         assert_eq!(tool_calls[1].call_id, "call-2");
         assert!(tool_calls.iter().all(|call| !call.is_error));
 
+        // The next request sends the completion back as the one assistant
+        // message the model wrote, both calls on it, then both results.
+        let sent = provider.calls.lock().unwrap()[1].messages.clone();
+        let request = crate::serialize::openai_messages("", &sent, AskRecipient::User);
+        let assistant: Vec<&Value> = request
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect();
+        assert_eq!(assistant.len(), 1, "one assistant message: {request}");
+        assert_eq!(assistant[0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(assistant[0]["tool_calls"][1]["id"], "call-2");
+
         handle.stop();
     }
 
@@ -7905,7 +7924,7 @@ mod tests {
         assert!(
             messages.iter().any(|(_, message)| matches!(
                 &message.block,
-                Block::ToolCall { id, name, args } if id == "call-1"
+                Block::ToolCall { id, name, args, .. } if id == "call-1"
                     && name == "shell"
                     && args == &json!({ "command": "cargo build" })
             )),

@@ -2577,6 +2577,7 @@ mod tests {
                     id: "1".into(),
                     name: "shell".into(),
                     args: json!({"cmd": "ls"}),
+                    continues_completion: false,
                 },
             },
         };
@@ -2826,6 +2827,7 @@ mod tests {
                 id: "1".into(),
                 name: "shell".into(),
                 args: json!({ "cmd": "ls" }),
+                continues_completion: false,
             }),
             assistant_message(Block::ToolResult {
                 id: "1".into(),

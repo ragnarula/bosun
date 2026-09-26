@@ -2490,6 +2490,7 @@ mod tests {
                     id: "call-1".into(),
                     name: "shell".into(),
                     args: json!({"command": "ls"}),
+                    continues_completion: false,
                 },
             )
             .await
