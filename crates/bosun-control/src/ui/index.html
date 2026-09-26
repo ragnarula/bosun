@@ -2923,6 +2923,7 @@ async function refreshSessions() {
     const viewed = sessions.find((session) => session.id === current);
     if (current && !viewed) {
       showStatus('session ' + current + ' ended');
+      markListEntry();
       closeSession();
     } else if (viewed && !view.hidden) {
       viewStateDot.className = 'dot ' + viewed.state;
@@ -3110,7 +3111,91 @@ newSessionForm.addEventListener('submit', async (event) => {
   }
 });
 
+// ---- Session history ----
+// The pane keeps two history entries: the session list, and the one open
+// session above it. The browser's back button and the header's ‹ both move
+// between them, so a session has one way in and one way out.
+
+// The state an entry the pane owns carries: null while it shows the list, and
+// the session id while it shows that session. A state without the key belongs
+// to another page, so the pane must not treat that entry as one of its own.
+function paneEntry(id) {
+  return { pane: id };
+}
+
+function isPaneEntry(state) {
+  return !!state && Object.prototype.hasOwnProperty.call(state, 'pane');
+}
+
+// The address of an open session. The browser keeps the fragment, so the
+// control plane needs no route for it and a reload or a shared link reopens
+// the session.
+function sessionLink(id) {
+  return '#s=' + encodeURIComponent(id);
+}
+
+// The session the address bar names, or null when it names the list.
+function sessionFromLink() {
+  const match = /^#s=(.+)$/.exec(location.hash);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch (error) {
+    // A hand-edited fragment carrying a bad escape names no session.
+    return null;
+  }
+}
+
+// The current entry becomes the list entry, with the fragment off. The pane
+// marks the entry it starts on with this, and clears it whenever a session
+// leaves the screen without the back path, so the address bar always names
+// what is on screen.
+function markListEntry() {
+  history.replaceState(paneEntry(null), '', location.pathname + location.search);
+}
+
+// The pane's one way into a session: the entry and the fragment are written
+// here, so the header's ‹ and the browser's back leave by the same path.
 function openSession(id) {
+  // From the list the session takes an entry of its own, so back reaches the
+  // list. From a session it takes that session's entry, so the list stays the
+  // only entry behind a session.
+  if (current) history.replaceState(paneEntry(id), '', sessionLink(id));
+  else history.pushState(paneEntry(id), '', sessionLink(id));
+  showSession(id);
+}
+
+// Back and forward move between the pane's two entries; the fragment names the
+// one the browser put on screen.
+function followHistory() {
+  const id = sessionFromLink();
+  // The entry already on screen: rebuilding the view would drop the transcript
+  // and reopen the stream for nothing.
+  if (id === current) return;
+  if (id) showSession(id);
+  else closeSession();
+}
+
+// A load on a `#s=` link opens that session; a load on anything else starts on
+// the list. A link loaded from another page leaves that page's entry behind
+// the session, so the pane writes the list entry under it first: back returns
+// to the list instead of leaving the pane.
+function restoreFromLink() {
+  const id = sessionFromLink();
+  if (!id) {
+    markListEntry();
+    return;
+  }
+  if (!isPaneEntry(history.state)) {
+    markListEntry();
+    history.pushState(paneEntry(id), '', sessionLink(id));
+  }
+  showSession(id);
+}
+
+// The view half of opening: the session's header, transcript and event stream,
+// with the previous session's teardown first.
+function showSession(id) {
   closeSession();
   current = id;
   view.hidden = false;
@@ -3161,6 +3246,9 @@ function closeSession() {
   askChips.textContent = '';
   askFree.hidden = true;
   chatRow.hidden = false;
+  // The ⋯ sheet hangs outside the view element, so hiding the view does not
+  // hide it.
+  viewSheet.hidden = true;
   view.hidden = true;
 }
 
@@ -3253,6 +3341,7 @@ btnStop.addEventListener('click', async () => {
   try {
     await post('/stop', { session_id: current });
     toastOk('session stopped');
+    markListEntry();
     closeSession();
     await refreshSessions();
   } catch (error) {
@@ -3260,9 +3349,9 @@ btnStop.addEventListener('click', async () => {
   }
 });
 
-// The thin header's back arrow returns to the session list; the sheet stays
-// closed until the user opens it with ⋯.
-btnBack.addEventListener('click', closeSession);
+// The thin header's back arrow returns to the session list by the browser's
+// own path; the sheet stays closed until the user opens it with ⋯.
+btnBack.addEventListener('click', () => history.back());
 
 // The status/phase line toggles the debug console. Opening it replays the
 // buffered activity rows, so a session watched after the fact shows history.
@@ -4400,6 +4489,10 @@ setInterval(refreshSessions, 3000);
 setInterval(refreshPersonas, 30000);
 setInterval(refreshSkillRepos, 30000);
 setInterval(refreshMcpServers, 30000);
+// The browser's back and forward buttons change which entry is on screen; the
+// pane loads whatever fragment is in the address bar when it starts.
+window.addEventListener('popstate', followHistory);
+restoreFromLink();
 </script>
 </body>
 </html>
