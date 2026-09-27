@@ -492,8 +492,8 @@ mod tests {
             "renderMessage(event.message, event.at_ms)",
             "appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs)",
             "appendAssistant(block.text, atMs)",
-            "appendToolStrip(block.name, args, atMs)",
-            "appendToolResult(block.name, payload, block.is_error, atMs)",
+            "appendToolStrip(block.name, args, atMs, block.id)",
+            "appendToolResult(block.name, payload, block.is_error, atMs, block.id)",
             "appendReasoningPanel(block.text, atMs)",
             "appendLine('summary', block.text, atMs)",
             "appendLine('unknown', JSON.stringify(block), atMs)",
@@ -1387,6 +1387,118 @@ mod tests {
         }
     }
 
+    // A child has a name: its own summary once its model wrote one, otherwise
+    // the first line of the instructions it was spawned with.
+
+    #[test]
+    fn the_pane_names_a_child_by_its_summary_then_its_instructions() {
+        let pane = flattened();
+        let naming = block(&pane, &squeezed("function childName("));
+        assert!(
+            naming.contains(&squeezed(
+                "if (child.summary) return clip(child.summary, CHILD_NAME_MAX);"
+            )),
+            "the child's own one-line summary comes first, cut to a row"
+        );
+        assert!(
+            naming.contains(&squeezed("(child.prompt || '')"))
+                && naming.contains(&squeezed(".map((line) => line.trim())"))
+                && naming.contains(&squeezed(".find((line) => line);")),
+            "and without one, the first line of the instructions that is not blank"
+        );
+        assert!(
+            naming.contains(&squeezed(
+                "return first ? clip(first, CHILD_NAME_MAX) : child.id;"
+            )),
+            "with the id as the last resort"
+        );
+        let header = block(&pane, &squeezed("function updateChildPanelDot("));
+        assert!(
+            header.contains(&squeezed(
+                "childPanelTitle.textContent = child ? childName(child) : '';"
+            )) && header.contains(&squeezed("childPanelTitle.title = child ? child.id : '';")),
+            "the panel's header shows the name and keeps the id in its tooltip"
+        );
+        let line = block(&pane, &squeezed("case 'child_event':"));
+        assert!(
+            line.contains(&squeezed(
+                "link.textContent = childName(child) || block.child_id;"
+            )) && PANE.contains(
+                "link.title = block.child_id + ' (opens the child as the session view)';"
+            ),
+            "the child's line leads with the name and keeps the id in its tooltip"
+        );
+    }
+
+    // The panel lists the open session's children, and every block that names a
+    // child carries the control that follows it.
+
+    #[test]
+    fn the_pane_lists_the_children_and_watches_them_wherever_they_are_named() {
+        let pane = flattened();
+        let list = block(&pane, &squeezed("function renderChildList("));
+        assert!(
+            list.contains(&squeezed(
+                "sessions.filter((session) => session.parent_id === current)"
+            )),
+            "the list is the open session's direct children, from the poll the pane already runs"
+        );
+        assert!(
+            PANE.contains("dot.className = 'dot ' + child.state;")
+                && list.contains(&squeezed("name.textContent = childName(child);")),
+            "each row carries the child's state and its name"
+        );
+        assert!(
+            PANE.contains("'child-row' + (child.id === childFollow ? ' followed' : '')"),
+            "the followed child is marked"
+        );
+        assert!(
+            list.contains(&squeezed("id.textContent = child.id.slice(0, 8);")),
+            "and the row keeps the id in its detail column"
+        );
+        assert!(
+            list.contains(&squeezed(
+                "row.addEventListener('click', () => followChild(child.id));"
+            )),
+            "a row follows its child"
+        );
+        assert!(
+            pane.matches(&squeezed("renderChildList();")).count() >= 3,
+            "the list is refreshed when a child is followed, when the panel closes, and by the sessions poll"
+        );
+
+        // One control, in every place a child is named: the child's line, the
+        // ask row, a `spawn` result and a `message_child` result.
+        let control = block(&pane, &squeezed("function watchControl("));
+        assert!(
+            control.contains(&squeezed("watch.className = 'child-watch';"))
+                && control.contains(&squeezed("followChild(childId)")),
+            "the control is built once and follows the child it names"
+        );
+        assert!(
+            pane.matches(&squeezed("watchControl(")).count() >= 4,
+            "and it is used wherever a child is named"
+        );
+        let result = block(&pane, &squeezed("function appendToolResult("));
+        assert!(
+            result.contains(&squeezed("payload.child_id"))
+                && result.contains(&squeezed("callArgs.get(id)")),
+            "a result names its child from its own payload, or from the call it answers"
+        );
+        let strip = block(&pane, &squeezed("function appendToolStrip("));
+        assert!(
+            strip.contains(&squeezed("if (id) callArgs.set(id, args);")),
+            "the call's arguments are kept, so a `message_child` result can name its child"
+        );
+        let ask = block(&pane, &squeezed("function renderAskBox("));
+        assert!(
+            ask.contains(&squeezed(
+                "if (block.child_id) box.appendChild(watchControl(block.child_id));"
+            )),
+            "a child's ask row carries it too"
+        );
+    }
+
     // The subagent panel: a second reader of a child's own stream, beside the
     // session's transcript rather than in place of it.
 
@@ -1604,10 +1716,8 @@ mod tests {
     #[test]
     fn the_pane_follows_a_child_from_its_line_and_shrinks_the_panel_to_a_sheet() {
         assert!(
-            PANE.contains("watch.className = 'child-watch'")
-                && PANE
-                    .contains("watch.addEventListener('click', () => followChild(block.child_id))"),
-            "the child's line carries the control that follows it in the panel"
+            PANE.contains("line.appendChild(watchControl(block.child_id));"),
+            "the child's line carries the control that follows it in the panel, built the one way every place that names a child builds it"
         );
         assert!(
             PANE.contains("link.addEventListener('click', () => openSession(block.child_id))"),

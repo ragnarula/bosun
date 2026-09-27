@@ -72,8 +72,21 @@ On a screen wider than 640px the panel is a column beside the transcript, 420px 
 
 The two transcripts share one rule set: the block rules are scoped `:is(#transcript, #child-transcript)`, so a block draws the same in either, and a new block kind needs no second set of styles.
 
+## A child has a name, the panel lists the session's children, and every mention follows
+
+The panel watched one child at a time, chosen from the line that carried the control; a child was shown by its uuid; and three places named a child without offering a way to follow it — a `spawn` result, a `message_child` result, and a child's own ask row. The issue asked for all three, and the operator fixed the shape: a name from the child's own one-line summary, otherwise the first line of the instructions it was spawned with; the panel lists the open session's direct children, running and stopped, with the followed one marked; and every transcript block that renders a child id carries the `watch` control.
+
+`childName(child)` is the one place a child's display name is decided: its `summary` — the same model-written line the session list leads with — when it has one, otherwise the first line of its `prompt` that is not blank, trimmed and cut to `CHILD_NAME_MAX`, and its id when it has neither. The id is never lost: it is the header's tooltip, the transcript line's tooltip, and the list row's detail column.
+
+The panel's list is the open session's **direct** children from the sessions poll the pane already runs, so a child appears without waiting for its first event, a state change arrives with the poll, and a name arrives with the child's first summary. The whole subtree stays out: #23 is where children fold under their parent in the session list, and the panel is about the session it is showing. A row carries the child's state dot, its name, and the first eight characters of its id; the followed child is marked; a click follows it. A child with no line and no spawn result is still out of reach — the list is inside the panel, and the panel opens by following something — which the spawn result's new control closes for every child that was spawned.
+
+`watchControl(childId)` builds the control once, and the four places that name a child use it: the child's line in either transcript, a child's ask row, a `spawn` result (which carries the child id it made), and a `message_child` result (which answers `{"ok": true}`). The last one has no child of its own, so the pane keeps the arguments of the calls it has drawn, by call id, and a result names the child its call named. That map is the pane's own: the store's tool-call rows are what a reader would need for the same lookup across a reload.
+
+A name can repeat, and two children can share a summary or open with the same instruction. The id in the detail column and the tooltips are what tell them apart, which is why the operator left the uuid in the text where it was already written rather than removing it.
+
 ## Consequences
 
+- The panel reads a child's name and state from the session list, so a child's name lags until its model writes a summary and the poll carries it. Before that the first line of its instructions stands in, which is what a reader has anyway.
 - Watching a child costs one more event stream and one more column, and the reader keeps the parent's place throughout: the parent's transcript does not move, its composer does not change, and the back button still leaves the session.
 - The panel made the block renderers target-agnostic. That is a small indirection — one variable the frame handlers set and restore — but it is load-bearing: a renderer that appended to the session's transcript directly would draw a child's lines into the parent.
 - A child's frames are filtered by kind rather than reusing `handleFrame`. The session-state arms of that function are the reason: they would drive the session's dot, its activity console and its ask composer from the child's stream.

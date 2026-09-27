@@ -904,6 +904,46 @@
     -webkit-tap-highlight-color: transparent;
   }
   #child-panel .child-panel-head button:active { color: var(--accent); }
+  /* The open session's children: one row each, the followed one marked. The
+     transcript below takes the rest of the panel. */
+  #child-list {
+    flex: 0 0 auto;
+    max-height: 40%;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--border);
+  }
+  #child-list[hidden] { display: none; }
+  .child-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: var(--touch-min-height);
+    padding: 4px 10px;
+    background: none;
+    border: none;
+    border-left: 2px solid transparent;
+    text-align: left;
+    font-size: 12px;
+    color: var(--text);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .child-row:active { background: var(--panel-2); }
+  .child-row.followed { border-left-color: var(--accent); background: var(--panel-2); }
+  .child-row .child-row-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .child-row .child-row-id {
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+  .child-list-note { display: block; padding: 8px 10px; color: var(--muted); font-size: 12px; }
+  /* The child panel's transcript is the only transcript that is not the whole
+     view: it takes what the list leaves. */
   #child-transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; font-size: 13px; }
   /* The control on a child's line that follows it here: the child's id opens it
      as the session view, as it always did. */
@@ -1456,6 +1496,7 @@
         <span class="child-panel-title" id="child-panel-title"></span>
         <button type="button" id="btn-child-collapse" title="Collapse the panel">✕</button>
       </div>
+      <div id="child-list"></div>
       <div id="child-transcript"></div>
     </div>
   </div>
@@ -1621,6 +1662,7 @@ const btnBottom = $('btn-bottom');
 const childPanel = $('child-panel');
 const childTranscript = $('child-transcript');
 const childPanelTitle = $('child-panel-title');
+const childList = $('child-list');
 const childPanelDot = $('child-panel-dot');
 const btnChildCollapse = $('btn-child-collapse');
 const input = $('input');
@@ -3062,6 +3104,7 @@ async function refreshSessions() {
     sessions = await response.json();
     renderSessions();
     updateChildPanelDot();
+    renderChildList();
     // The waiting label follows the freshest list too: a child's state
     // changes without a state event for the open session, so the event
     // stream alone would leave it stale between fetches.
@@ -3969,7 +4012,13 @@ const TOOL_SUMMARY_LIMIT = 120;
 
 // One-line tool strip: the glyph, the tool name, and a compact label of what
 // it acted on. The full args stay hidden until the line is clicked.
-function appendToolStrip(name, args, atMs) {
+// The arguments of the calls the transcript has drawn, by call id: a result
+// that does not name a child itself (`message_child` answers `{"ok": true}`)
+// is followed by the child its call named.
+const callArgs = new Map();
+
+function appendToolStrip(name, args, atMs, id) {
+  if (id) callArgs.set(id, args);
   const line = document.createElement('div');
   line.className = 'line tool';
   const glyph = document.createElement('span');
@@ -4051,9 +4100,14 @@ function appendReasoningPanel(text, atMs) {
   scrollToBottom();
 }
 
-function appendToolResult(name, payload, error, atMs) {
+function appendToolResult(name, payload, error, atMs, id) {
   const text = payload == null ? '' : String(payload);
   if (!error && text === '') return;
+  // A `spawn` answers with the child it made; a `message_child` answers with
+  // `ok`, so its child comes from the call's arguments.
+  const args = id ? callArgs.get(id) : undefined;
+  const named = (payload && typeof payload === 'object' && payload.child_id) ||
+    (args && args.id ? args.id : undefined);
   const line = document.createElement('div');
   line.className = 'tool-result' + (error ? ' error' : '');
   if (error) {
@@ -4066,6 +4120,7 @@ function appendToolResult(name, payload, error, atMs) {
   const body = document.createElement('span');
   body.textContent = preview;
   line.appendChild(body);
+  if (named) line.appendChild(watchControl(named));
   if (preview !== text) {
     line.classList.add('clipped');
     const hint = document.createElement('span');
@@ -4600,6 +4655,7 @@ function renderAskBox(block, atMs) {
     note.textContent = 'answered: ' + block.answer;
     box.appendChild(note);
   }
+  if (block.child_id) box.appendChild(watchControl(block.child_id));
   out.appendChild(stampRow(box, atMs));
   scrollToBottom();
   openAskBox = { key, el: box, answered: !!block.answer };
@@ -4644,7 +4700,7 @@ function renderBlock(message, atMs) {
       break;
     case 'tool_call': {
       const args = block.args == null ? {} : block.args;
-      appendToolStrip(block.name, args, atMs);
+      appendToolStrip(block.name, args, atMs, block.id);
       break;
     }
     case 'tool_result': {
@@ -4653,7 +4709,7 @@ function renderBlock(message, atMs) {
         typeof content === 'string' || content === null
           ? String(content)
           : readableValue(content);
-      appendToolResult(block.name, payload, block.is_error, atMs);
+      appendToolResult(block.name, payload, block.is_error, atMs, block.id);
       break;
     }
     case 'ask':
@@ -4684,21 +4740,16 @@ function renderBlock(message, atMs) {
       const head = document.createElement('span');
       head.textContent = '[child ';
       line.appendChild(head);
+      const child = sessions.find((session) => session.id === block.child_id);
       const link = document.createElement('span');
       link.className = 'child-link';
-      link.textContent = block.child_id;
-      link.title = 'expand child ' + block.child_id + ' (watch-only)';
+      link.textContent = childName(child) || block.child_id;
+      link.title = block.child_id + ' (opens the child as the session view)';
       link.addEventListener('click', () => openSession(block.child_id));
       line.appendChild(link);
-      // Beside the id, which opens the child as the session view: this follows
-      // it in the panel, without leaving the parent's place.
-      const watch = document.createElement('button');
-      watch.type = 'button';
-      watch.className = 'child-watch';
-      watch.textContent = 'watch';
-      watch.title = 'follow child ' + block.child_id + ' in the panel';
-      watch.addEventListener('click', () => followChild(block.child_id));
-      line.appendChild(watch);
+      // Beside the name, which opens the child as the session view: this
+      // follows it in the panel, without leaving the parent's place.
+      line.appendChild(watchControl(block.child_id));
       const tail = document.createElement('span');
       tail.textContent = ' ' + (block.event_kind || 'report') + '] ' + block.text;
       line.appendChild(tail);
@@ -4720,9 +4771,81 @@ function renderBlock(message, atMs) {
 // transcript, not a second session view. It starts closed, and closing the
 // session takes it with it.
 
+/// How wide a child's name may be before it is cut: one line of a panel row.
+const CHILD_NAME_MAX = 60;
+
+// What a child is called: its own one-line summary once its model has written
+// one, otherwise the first line of the instructions it was spawned with. The id
+// is the last resort, and it stays in the title and the list's detail column, so
+// two children whose names read alike are still tellable apart.
+function childName(child) {
+  if (!child) return '';
+  if (child.summary) return clip(child.summary, CHILD_NAME_MAX);
+  const first = (child.prompt || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line);
+  return first ? clip(first, CHILD_NAME_MAX) : child.id;
+}
+
+// The control that follows a child in the panel, wherever the transcript names
+// one: the child's line carries it, and so does every other block that names a
+// child, so a reader can follow from where the child is mentioned.
+function watchControl(childId) {
+  const watch = document.createElement('button');
+  watch.type = 'button';
+  watch.className = 'child-watch';
+  watch.textContent = 'watch';
+  watch.title = 'follow child ' + childId + ' in the panel';
+  watch.addEventListener('click', (event) => {
+    // The line it sits in may expand on a tap of its own.
+    event.stopPropagation();
+    followChild(childId);
+  });
+  return watch;
+}
+
+// The open session's direct children, running and stopped, each with its state
+// and its name. The followed one is marked, and a row follows its child.
+function renderChildList() {
+  const children = sessions.filter((session) => session.parent_id === current);
+  childList.textContent = '';
+  childList.hidden = children.length === 0;
+  if (!children.length) {
+    const note = document.createElement('span');
+    note.className = 'child-list-note';
+    note.textContent = 'no children';
+    childList.appendChild(note);
+    childList.hidden = false;
+    return;
+  }
+  for (const child of children) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'child-row' + (child.id === childFollow ? ' followed' : '');
+    row.title = child.id;
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + child.state;
+    row.appendChild(dot);
+    const name = document.createElement('span');
+    name.className = 'child-row-name';
+    name.textContent = childName(child);
+    row.appendChild(name);
+    const id = document.createElement('span');
+    id.className = 'child-row-id';
+    id.textContent = child.id.slice(0, 8);
+    row.appendChild(id);
+    row.addEventListener('click', () => followChild(child.id));
+    childList.appendChild(row);
+  }
+}
+
 function updateChildPanelDot() {
   const child = sessions.find((session) => session.id === childFollow);
   childPanelDot.className = child ? 'dot ' + child.state : 'dot';
+  // The name arrives with the child's first summary, so the poll refreshes it.
+  childPanelTitle.textContent = child ? childName(child) : '';
+  childPanelTitle.title = child ? child.id : '';
 }
 
 // Follows `id` in the panel: the previous child's stream closes first, so one
@@ -4738,8 +4861,8 @@ function followChild(id) {
   childFollow = id;
   childStick = true;
   childAskBox = null;
-  childPanelTitle.textContent = id;
   updateChildPanelDot();
+  renderChildList();
   childPanel.hidden = false;
   // EventSource reconnects automatically; the child's durable frames carry
   // their seq as the SSE id, so the browser resumes with Last-Event-ID.
@@ -4770,6 +4893,7 @@ function closeChildPanel() {
   childPanelTitle.textContent = '';
   updateChildPanelDot();
   childPanel.hidden = true;
+  renderChildList();
 }
 
 // The panel's own frame handler: a child's durable messages render into the
