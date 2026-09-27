@@ -5,6 +5,8 @@
 //! gets the child's id back and continues; the child runs concurrently and
 //! reports when it completes.
 
+use std::cmp::Ordering;
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -120,23 +122,16 @@ async fn spawn_child(
                 placement.node
             ))
         })?;
-    // The child keeps the parent's repository only when it runs in the
-    // parent's own directory; one placed elsewhere works in a directory that
-    // holds no such clone.
-    let in_parent_dir = dir == parent.dir;
+    // The child keeps the parent's repository only when the placement is the
+    // parent's own place: its node and its directory. A child placed anywhere
+    // else works in a directory that holds no such clone, whatever path the
+    // node reports back.
+    let (repo_url, git_ref) = inherited_repo(&parent, &placement);
     let child = Session {
         id: child_id.clone(),
         node: placement.node.clone(),
-        repo_url: if in_parent_dir {
-            parent.repo_url.clone()
-        } else {
-            None
-        },
-        git_ref: if in_parent_dir {
-            parent.git_ref.clone()
-        } else {
-            None
-        },
+        repo_url,
+        git_ref,
         dir,
         model: persona.model.clone(),
         persona: Some(persona_name),
@@ -214,7 +209,7 @@ fn placement(
             dir: Some(PathBuf::from(&parent.dir)),
         });
     };
-    if nodes.node(named, now).is_none() {
+    let Some(health) = nodes.node(named, now) else {
         return Err(SpawnError::Failed(
             if nodes.list(now).iter().any(|health| health.name == named) {
                 format!("node {named} is not up")
@@ -222,11 +217,44 @@ fn placement(
                 format!("unknown node {named}")
             },
         ));
+    };
+    if dir.is_none() && !can_place_without_a_dir(&health.version) {
+        return Err(SpawnError::Failed(format!(
+            "node {named} runs {}, which cannot start a session without a directory; update the node or name one",
+            health.version
+        )));
     }
     Ok(Placement {
         node: named.to_string(),
         dir: dir.map(PathBuf::from),
     })
+}
+
+/// The repository fields a child's row carries: the parent's only in the
+/// parent's own place — its node and its directory. The comparison is against
+/// the placement, never against the path the node reports back: another node
+/// may hold an unrelated directory at the same path, and a node is free to
+/// report a canonicalised one.
+fn inherited_repo(parent: &Session, placement: &Placement) -> (Option<String>, Option<String>) {
+    let own_place = placement.node == parent.node
+        && placement.dir.as_deref() == Some(Path::new(parent.dir.as_str()));
+    if own_place {
+        (parent.repo_url.clone(), parent.git_ref.clone())
+    } else {
+        (None, None)
+    }
+}
+
+/// Whether a node can take a start command that names no directory. The field
+/// arrived with this release, so a node that reports an older version — or one
+/// whose version cannot be read — cannot parse the command, and the poll's
+/// whole response goes with it: the caller would wait out the spawn timeout and
+/// then read "unreachable" for a node the registry calls up.
+fn can_place_without_a_dir(version: &str) -> bool {
+    matches!(
+        bosun_common::version::compare(version, bosun_common::version::VERSION),
+        Some(Ordering::Equal) | Some(Ordering::Greater)
+    )
 }
 
 /// A store write failure inside a spawn is an internal error: the caller can
@@ -295,11 +323,17 @@ mod tests {
         }
     }
 
-    /// A registry holding one record per node, last heard from at `seen`.
+    /// A registry holding one record per node, last heard from at `seen`, each
+    /// reporting this binary's version.
     fn nodes(seen: &[(&str, SystemTime)]) -> NodeRegistry {
         let registry = NodeRegistry::new(Duration::from_secs(10));
         for (name, at) in seen {
-            registry.upsert(name, "0.9.40", UpdateStatus::UpToDate, *at);
+            registry.upsert(
+                name,
+                bosun_common::version::VERSION,
+                UpdateStatus::UpToDate,
+                *at,
+            );
         }
         registry
     }
@@ -409,6 +443,109 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "dir needs node: without a node the child starts in the parent's directory"
+        );
+    }
+
+    #[test]
+    fn a_child_in_the_parents_own_place_keeps_the_parents_repository() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now)]);
+        let parent = parent("n1", "/work/repo");
+        let placement =
+            placement(&registry, &parent, None, None, now).expect("the unchanged path resolves");
+        let (repo_url, git_ref) = inherited_repo(&parent, &placement);
+        assert_eq!(
+            repo_url, parent.repo_url,
+            "a child in the parent's own copy holds that clone"
+        );
+        assert_eq!(git_ref, parent.git_ref);
+    }
+
+    #[test]
+    fn a_child_on_another_node_keeps_no_repository_even_at_the_same_path() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now), ("n2", now)]);
+        let parent = parent("n1", "/work/repo");
+        // The same path string on another node is another directory, which
+        // need not hold the parent's clone, so the child must not claim it.
+        let placement = placement(
+            &registry,
+            &parent,
+            Some("n2"),
+            Some(parent.dir.as_str()),
+            now,
+        )
+        .expect("another node may be named");
+        assert_eq!(
+            placement.dir.as_deref(),
+            Some(Path::new(parent.dir.as_str())),
+            "the placement names the parent's path, on another node"
+        );
+        let (repo_url, git_ref) = inherited_repo(&parent, &placement);
+        assert_eq!(repo_url, None);
+        assert_eq!(git_ref, None);
+    }
+
+    #[test]
+    fn a_child_in_another_directory_keeps_no_repository() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now)]);
+        let parent = parent("n1", "/work/repo");
+        let placement = placement(&registry, &parent, Some("n1"), Some("/work/other"), now)
+            .expect("the parent's own node may be named with another directory");
+        let (repo_url, git_ref) = inherited_repo(&parent, &placement);
+        assert_eq!(repo_url, None);
+        assert_eq!(git_ref, None);
+    }
+
+    #[test]
+    fn a_node_older_than_this_release_needs_a_directory() {
+        let now = SystemTime::now();
+        let registry = NodeRegistry::new(Duration::from_secs(10));
+        registry.upsert("n1", "0.0.1", UpdateStatus::UpToDate, now);
+
+        let error = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("n1"),
+            None,
+            now,
+        )
+        .expect_err("an older node cannot parse a start with no directory");
+        assert_eq!(
+            error.to_string(),
+            "node n1 runs 0.0.1, which cannot start a session without a directory; update the node or name one"
+        );
+
+        // Naming a directory still works: that command carries no new field.
+        let placement = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("n1"),
+            Some("/work/repo"),
+            now,
+        )
+        .expect("a named directory asks nothing new of the node");
+        assert_eq!(placement.dir.as_deref(), Some(Path::new("/work/repo")));
+    }
+
+    #[test]
+    fn a_node_whose_version_cannot_be_read_needs_a_directory() {
+        let now = SystemTime::now();
+        let registry = NodeRegistry::new(Duration::from_secs(10));
+        registry.upsert("n1", "unknown", UpdateStatus::UpToDate, now);
+
+        let error = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("n1"),
+            None,
+            now,
+        )
+        .expect_err("a version that cannot be read cannot be trusted with the new field");
+        assert_eq!(
+            error.to_string(),
+            "node n1 runs unknown, which cannot start a session without a directory; update the node or name one"
         );
     }
 }

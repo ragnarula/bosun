@@ -2175,18 +2175,6 @@ async fn run_turn_inner(
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                // A placement the caller left blank is the same as one it did
-                // not send.
-                let node = args["node"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|node| !node.is_empty())
-                    .map(str::to_string);
-                let dir = args["dir"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|dir| !dir.is_empty())
-                    .map(str::to_string);
                 let outcome = async {
                     let Some(persona) = deps.personas.get(&persona_name) else {
                         anyhow::bail!("unknown persona {persona_name}");
@@ -2197,6 +2185,11 @@ async fn run_turn_inner(
                     let Some(spawner) = &deps.spawner else {
                         anyhow::bail!("spawn is not available");
                     };
+                    // Read the placement before the spawner is reached: a call
+                    // that names a node it cannot name must answer with an
+                    // error, never with a child somewhere else.
+                    let node = placement_arg(&args, "node")?;
+                    let dir = placement_arg(&args, "dir")?;
                     let child_id = spawner
                         .spawn(
                             deps.store.clone(),
@@ -2205,8 +2198,8 @@ async fn run_turn_inner(
                                 persona_name: persona_name.clone(),
                                 persona: persona.clone(),
                                 instructions: instructions.clone(),
-                                node: node.clone(),
-                                dir: dir.clone(),
+                                node,
+                                dir,
                             },
                         )
                         .await
@@ -2824,6 +2817,30 @@ fn parse_tool_calls(
             (id, name, args)
         })
         .collect()
+}
+
+/// One `spawn` placement argument: the name the caller gave, or nothing when it
+/// gave none or left it blank. A value that is not a string is the caller's
+/// mistake and is refused: a call that asks for a node it cannot name must not
+/// place the child in the parent's own copy instead.
+fn placement_arg(args: &Value, field: &str) -> anyhow::Result<Option<String>> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            Ok((!text.is_empty()).then(|| text.to_string()))
+        }
+        Some(other) => anyhow::bail!(
+            "{field} must be a string, and the call sent {}",
+            match other {
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+                Value::Number(_) => "a number",
+                Value::Bool(_) => "a boolean",
+                _ => "a value of another kind",
+            }
+        ),
+    }
 }
 
 /// Whether an allowed-tools parse result (`None` = every tool) permits `name`.
@@ -10872,6 +10889,68 @@ mod tests {
             "a placement the caller left blank keeps the parent's node"
         );
         assert_eq!(requests[0].dir, None);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_placement_that_is_not_a_string_is_a_tool_error() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-8")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"review the diff","node":5}"#
+                        .into(),
+                },
+                stop(3, 2),
+            ],
+            vec![StreamEvent::TextDelta("carrying on".into()), stop(1, 1)],
+        ]));
+        let spawner = Arc::new(FakeSpawner::ok("child-8"));
+        let deps = Arc::new(test_deps_with_spawner(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::from([(
+                "mock-model".to_string(),
+                provider.clone() as Arc<dyn Provider>,
+            )]),
+            spawner.clone(),
+        ));
+        let handle = spawn_loop("parent-8".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the parent's turn to continue past the refused call", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let result = recorded_result(&store, "parent-8", "call-1").await;
+        assert_eq!(
+            result,
+            json!({ "error": "node must be a string, and the call sent a number" }),
+            "a node the caller cannot name is an error, never a child in the parent's own copy"
+        );
+        assert!(
+            spawner.requested().is_empty(),
+            "no child starts from a call whose placement could not be read"
+        );
 
         handle.stop();
     }

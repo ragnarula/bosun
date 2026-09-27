@@ -3997,6 +3997,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spawn_with_no_directory_lands_where_the_node_chose() {
+        // The same cross-node placement, with no directory named: the node
+        // picks one under its own work directory and reports it back, and the
+        // child's row carries that path and no repository.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![spawn_call_fragment(
+                    true,
+                    r#"{"persona":"reviewer","instructions":"review the change","node":"n2"}"#,
+                )],
+                vec![text_chunk("acknowledged")],
+                vec![text_chunk("thanks for the review")],
+            ])));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
+            vec![vec![text_chunk("the change looks good")]],
+        )));
+        let root_addr = scripted_provider(root_scripts).await;
+        let child_addr = scripted_provider(child_scripts).await;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let node_timeout = Duration::from_secs(4);
+        let nodes = Arc::new(NodeRegistry::new(node_timeout));
+        let commands = Arc::new(CommandQueue::new(node_timeout));
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let providers = HashMap::from([
+            (
+                "main-model".to_string(),
+                openai_provider_with_model(root_addr, "main-model"),
+            ),
+            (
+                "reviewer-model".to_string(),
+                openai_provider_with_model(child_addr, "reviewer-model"),
+            ),
+        ]);
+        let personas = HashMap::from([
+            (
+                "coder".to_string(),
+                PersonaConfig {
+                    model: "main-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Makes changes".into(),
+                    system_prompt: None,
+                },
+            ),
+            (
+                "reviewer".to_string(),
+                PersonaConfig {
+                    model: "reviewer-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Reviews changes".into(),
+                    system_prompt: None,
+                },
+            ),
+        ]);
+        let loops = Arc::new(AgentRegistry::new(
+            providers.clone(),
+            personas.clone(),
+            HashMap::new(),
+        ));
+        let state = Arc::new(AppState {
+            registry: nodes.clone(),
+            commands: commands.clone(),
+            tunnels: tunnels.clone(),
+            store: store.clone(),
+            github: dead_github(),
+            loops,
+            providers,
+            personas,
+            default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+        });
+        state.loops.attach_child_spawner(nodes, commands, tunnels);
+
+        let addr = serve(state.clone()).await;
+        let seen_n2: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        fake_node(addr, "n1", Arc::new(Mutex::new(Vec::new())));
+        fake_node(addr, "n2", seen_n2.clone());
+
+        wait_for("both fake nodes to register", {
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                async move {
+                    let now = SystemTime::now();
+                    state.registry.node("n1", now).is_some()
+                        && state.registry.node("n2", now).is_some()
+                }
+            }
+        })
+        .await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/work/repo",
+                "persona": "coder",
+                "prompt": "fan this out to the other machine"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let root: Value = response.json().await.unwrap();
+        let root_id = root["id"].as_str().unwrap().to_string();
+
+        wait_for("the child report to reach the parent's thread", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let messages = store.messages(&root_id, false).await.unwrap();
+                    messages.iter().any(|(_, message)| {
+                        matches!(
+                            &message.block,
+                            Block::ChildEvent { text, .. } if text == "the change looks good"
+                        )
+                    })
+                }
+            }
+        })
+        .await;
+
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        let child_id = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ToolResult { name, content, .. } if name == "spawn" => {
+                    content["child_id"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .expect("the spawn result names the child");
+
+        let child = store
+            .get_session(&child_id)
+            .await
+            .unwrap()
+            .expect("the child's row exists");
+        assert_eq!(child.node, "n2");
+        assert_eq!(
+            child.dir,
+            format!("/work/{child_id}"),
+            "the row carries the directory the node chose, under its own work directory"
+        );
+        assert_eq!(
+            child.parent_id.as_deref(),
+            Some(root_id.as_str()),
+            "a child placed by another node is still the caller's child"
+        );
+        assert_eq!(
+            child.repo_url, None,
+            "a directory the node made holds no clone of the parent's repository"
+        );
+
+        let seen = seen_n2.lock().unwrap().clone();
+        let start = seen.iter().find_map(|command| match command {
+            NodeCommand::Start {
+                session_id, dir, ..
+            } if session_id == &child_id => Some(dir.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            start,
+            Some(None),
+            "the start command carried no directory: choosing one was the node's to do"
+        );
+    }
+
+    #[tokio::test]
     async fn a_node_that_refuses_a_start_command_fails_the_spawn_cleanly() {
         // A real node refuses a child executor whose directory sits outside
         // its browse roots, even when the control plane requested it. The
