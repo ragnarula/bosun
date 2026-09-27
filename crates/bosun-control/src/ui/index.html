@@ -76,7 +76,9 @@
     /* A toast reports; it never takes a tap, and it must not cover the composer
        while it is up. */
     pointer-events: none;
-    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+    /* The layout viewport's bottom is where the keyboard is drawn, so the
+       toast offsets by whatever the visual viewport loses there. */
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
     z-index: 20;
     transform: translateX(-50%);
     max-width: calc(100% - 40px);
@@ -202,7 +204,9 @@
     padding: 0 14px;
   }
   .skills-head .btn-skills-add:active { filter: brightness(1.2); }
-  #skills-list { flex: 1; background: var(--bg); overflow-y: auto; }
+  /* A scroll container reaches the physical bottom with cover on, so its last
+     rows would sit in the Home indicator's strip. */
+  #skills-list { flex: 1; background: var(--bg); overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
   #skills-list .empty { color: var(--muted); padding: 16px 14px; }
   #skills-list .repo-row { padding: 12px 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
   .repo-primary {
@@ -337,7 +341,7 @@
     padding: 0 14px;
   }
   .mcp-head .btn-mcp-add:active { filter: brightness(1.2); }
-  #mcp-list { flex: 1; background: var(--bg); overflow-y: auto; }
+  #mcp-list { flex: 1; background: var(--bg); overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
   #mcp-list .empty { color: var(--muted); padding: 16px 14px; }
   #mcp-list .mcp-row { padding: 12px 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
   .mcp-primary {
@@ -624,7 +628,9 @@
     flex: 0 0 auto;
     display: grid;
     gap: 8px;
-    padding: 10px 16px;
+    /* With `viewport-fit=cover` this row reaches the physical bottom, so its
+       buttons would sit in the Home indicator's strip. */
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px));
     border-top: 1px solid var(--border);
     background: var(--panel);
   }
@@ -1340,7 +1346,9 @@
       z-index: 11;
       border-left: none;
     }
-    #child-transcript { padding: 12px 14px; }
+    /* The narrow padding is a shorthand: it would drop the base rule's inset,
+       which is the same mistake the harness caught on the composer's row. */
+    #child-transcript { padding: 12px 14px max(12px, env(safe-area-inset-bottom, 0px)); }
   }
   @media (max-width: 560px) {
     .view-header .view-title .view-dir { max-width: 40%; }
@@ -3946,22 +3954,42 @@ btnBottom.addEventListener('click', jumpToBottom);
 // keyboard is drawn, and a tap at the very bottom edge can fall in the Home
 // indicator's strip instead of the field. The visual viewport is the part of the
 // page the reader can actually see, so the view rides it: its height, and its
-// offset when the page is pushed up. A phone without one, or a desktop, never
-// runs this.
+// offset when the page is pushed up.
+//
+// The visual viewport exists on modern desktops as well, where it is the whole
+// page and the numbers never change; this runs there harmlessly, and its only
+// cost on a window resize is one read of the transcript's geometry. A browser
+// without one attaches no listeners at all.
 function syncVisualViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
   view.style.height = viewport.height + 'px';
   view.style.top = viewport.offsetTop + 'px';
+  // What the keyboard covers of the layout viewport's bottom, for anything that
+  // is fixed to it: the visual viewport is shorter than the layout one, and sits
+  // offset from its top, so the strip below it is what is left over.
+  const covered = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
+  document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');
   // The keyboard changes the transcript's height, and no scroll event comes
   // with it: this is the resize #19 named as stale, and the control catches up
   // here.
   syncStick();
 }
 
+// A resize arrives in bursts — iOS sends one per frame while the keyboard
+// animates — and one read and one write per frame is all this needs.
+let visualViewportFrame = null;
+function scheduleVisualViewportSync() {
+  if (visualViewportFrame !== null) return;
+  visualViewportFrame = window.requestAnimationFrame(() => {
+    visualViewportFrame = null;
+    syncVisualViewport();
+  });
+}
+
 if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', syncVisualViewport);
-  window.visualViewport.addEventListener('scroll', syncVisualViewport);
+  window.visualViewport.addEventListener('resize', scheduleVisualViewportSync);
+  window.visualViewport.addEventListener('scroll', scheduleVisualViewportSync);
 }
 
 // Whether the transcript is at its end, and the control that shows when it is

@@ -1545,16 +1545,21 @@ mod tests {
         );
         assert!(
             pane.contains(&squeezed(
-                "window.visualViewport.addEventListener('resize', syncVisualViewport);"
-            )) && pane.contains(&squeezed(
-                "window.visualViewport.addEventListener('scroll', syncVisualViewport);"
+                "window.visualViewport.addEventListener('scroll', scheduleVisualViewportSync);"
             )),
-            "both the resize and the scroll of the visual viewport are followed"
+            "and the scroll as well as the resize: iOS moves the page under the keyboard, which arrives as a scroll"
         );
-        // Every rule that writes the row's padding, the narrow-screen one
-        // included: a shorthand in a media query was what dropped the inset
-        // where it matters most, which the browser harness caught.
-        for rule in [".input-row {"] {
+        // Every rule that writes a bottom row's padding, the narrow-screen ones
+        // included: a shorthand in a media query is what dropped the inset where
+        // it matters most, which the browser harness caught on the composer and
+        // this loop then found a rule later on the panel's transcript.
+        for rule in [
+            ".input-row {",
+            "#child-transcript {",
+            ".sheet-actions {",
+            "#skills-list {",
+            "#mcp-list {",
+        ] {
             let mut rest = PANE;
             let mut read = 0;
             while let Some((_, after)) = rest.split_once(rule) {
@@ -1575,8 +1580,30 @@ mod tests {
             "the sheet that anchors to the bottom keeps clear of the Home indicator; the desktop variant is a side sheet and needs no inset"
         );
         assert!(
-            PANE.contains("bottom: calc(20px + env(safe-area-inset-bottom, 0px));"),
-            "and the toast sits above the indicator rather than in it"
+            PANE.contains(
+                "bottom: calc(20px + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));"
+            ),
+            "and the toast sits above the indicator rather than in it, and above the keyboard: it is fixed to the layout viewport's bottom, which is where the keyboard is drawn"
+        );
+        assert!(
+            PANE.contains(
+                "const covered = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);"
+            ) && PANE.contains(
+                "document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');"
+            ),
+            "which is the strip the visual viewport leaves uncovered, written once for every element fixed to that bottom"
+        );
+        assert!(
+            PANE.contains("if (window.visualViewport) {")
+                && PANE.contains(
+                    "window.visualViewport.addEventListener('resize', scheduleVisualViewportSync);"
+                ),
+            "and the listeners attach only where a visual viewport exists: an old browser would throw on `window.visualViewport.addEventListener`, and the guard is what keeps the pane running there"
+        );
+        assert!(
+            PANE.contains("let visualViewportFrame = null;")
+                && PANE.contains("window.requestAnimationFrame(() => {"),
+            "a resize arrives in bursts while the keyboard animates, so one sync per frame is the most this asks for"
         );
         assert!(
             PANE.contains("pointer-events: none;"),
