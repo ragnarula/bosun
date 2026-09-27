@@ -26,6 +26,10 @@
   }
   * { box-sizing: border-box; }
   * { -webkit-tap-highlight-color: transparent; }
+  /* The document never scrolls: the session view is a full-height box inside
+     it, and Safari's reveal-scroll on focus has nothing to move. This is what
+     the fixed-container family of the iOS focus failure comes down to. */
+  html, body { height: 100%; overflow: hidden; }
   body {
     margin: 0;
     background: var(--bg);
@@ -691,7 +695,9 @@
   .dir-entry .dir-name { flex: 1; word-break: break-all; }
   .dir-entry .dir-repo { color: var(--accent); font-size: 11px; }
   #session-view {
-    position: fixed;
+    /* Absolute, not fixed: the container the composer lives in must not be a
+       fixed layer, whose geometry iOS does not reflow when the keyboard opens. */
+    position: absolute;
     inset: 0;
     z-index: 10;
     background: var(--bg);
@@ -756,6 +762,23 @@
     -webkit-tap-highlight-color: transparent;
   }
   .view-header .btn-more:active { color: var(--accent); }
+  /* Only ever shown in an installed web app, where some iOS versions show no
+     keyboard for any field at all (WebKit bug 279904) and no page can fix it. */
+  #standalone-note {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+    background: var(--panel-2);
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+  }
+  #standalone-note button { min-height: 28px; padding: 2px 10px; }
   #view-sheet {
     position: fixed;
     left: 0;
@@ -1579,6 +1602,10 @@
   </div>
 </div>
 
+<div id="standalone-note" hidden>
+  <span>This web-app mode can block the keyboard — open the pane in Safari.</span>
+  <button type="button" id="btn-standalone-dismiss" title="Dismiss">✕</button>
+</div>
 <div id="view-sheet" hidden>
   <div class="view-sheet-head">
     <span>Session actions</span>
@@ -1688,6 +1715,8 @@ const viewWaiting = $('view-waiting');
 const activityLog = $('activity-log');
 const btnBack = $('btn-back');
 const viewSheet = $('view-sheet');
+const standaloneNote = $('standalone-note');
+const btnStandaloneDismiss = $('btn-standalone-dismiss');
 const btnMore = $('btn-more');
 const btnSheetClose = $('btn-sheet-close');
 const btnCopyId = $('btn-copy-id');
@@ -3798,9 +3827,17 @@ function renderAskComposer(ask) {
     askFree.hidden = false;
     if (!coarsePointer()) askInput.focus();
   }
+  // The reader is typing: leave the composer in place. Hiding it takes the
+  // focus with it, and a programmatic re-focus right after is the one iOS
+  // treats as "already focused" and answers with no keyboard. The question is
+  // not lost: leaving the field re-runs the ask sync.
+  if (document.activeElement === input) return;
   askSheet.hidden = false;
   chatRow.hidden = true;
 }
+
+// A blur is the moment the refusal above can be retried.
+input.addEventListener('blur', scheduleAskSync);
 
 function applyAskComposer() {
   if (view.hidden || inputRow.hidden) return;
@@ -3869,7 +3906,7 @@ btnAskType.addEventListener('click', () => {
   btnAskType.hidden = true;
   askFree.hidden = false;
   btnAskBack.hidden = false;
-  askInput.focus();
+  if (!coarsePointer()) askInput.focus();
 });
 
 btnAskBack.addEventListener('click', () => {
@@ -3911,7 +3948,10 @@ async function send() {
   } finally {
     sending = false;
     btnSend.disabled = false;
-    input.focus();
+    // Only where a focus is the reader's: on a touch screen iOS may treat this
+    // re-focus as one it already has and withhold the keyboard, so the tap that
+    // follows asks for it instead.
+    if (!coarsePointer()) input.focus();
   }
 }
 
@@ -3956,6 +3996,23 @@ function syncBtnBottom() {
 
 btnBottom.addEventListener('click', jumpToBottom);
 
+// An installed web app can never show a keyboard for any field on some iOS
+// versions, and no page can work around it: say so once, and only there. A tab
+// is not affected, so a tab never sees this.
+if (
+  window.navigator.standalone === true ||
+  window.matchMedia('(display-mode: standalone)').matches
+) {
+  if (window.localStorage.getItem('bosun-standalone-note') !== 'dismissed') {
+    standaloneNote.hidden = false;
+  }
+}
+
+btnStandaloneDismiss.addEventListener('click', () => {
+  standaloneNote.hidden = true;
+  window.localStorage.setItem('bosun-standalone-note', 'dismissed');
+});
+
 // iOS Safari does not shrink the layout viewport when the keyboard opens, so a
 // session view pinned to that height keeps the composer exactly where the
 // keyboard is drawn, and a tap at the very bottom edge can fall in the Home
@@ -3971,11 +4028,15 @@ function syncVisualViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
   view.style.height = viewport.height + 'px';
-  view.style.top = viewport.offsetTop + 'px';
+  // No `top`: on some iOS versions the visual viewport's offset stays stale
+  // after the keyboard closes, and writing it left the whole view offset. The
+  // offset still says how much of the layout viewport the keyboard covers,
+  // clamped so a stale value cannot invent a negative strip.
   // What the keyboard covers of the layout viewport's bottom, for anything that
   // is fixed to it: the visual viewport is shorter than the layout one, and sits
   // offset from its top, so the strip below it is what is left over.
-  const covered = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
+  const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);
+  const covered = Math.max(0, window.innerHeight - viewport.height - offset);
   document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');
   // The keyboard changes the transcript's height, and no scroll event comes
   // with it: this is the resize #19 named as stale, and the control catches up
@@ -3997,6 +4058,9 @@ function scheduleVisualViewportSync() {
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', scheduleVisualViewportSync);
   window.visualViewport.addEventListener('scroll', scheduleVisualViewportSync);
+  // Leaving a field is when the numbers settle: the keyboard's close arrives as
+  // a resize, but not always before the next paint.
+  document.addEventListener('focusout', scheduleVisualViewportSync);
 }
 
 // Whether the transcript is at its end, and the control that shows when it is

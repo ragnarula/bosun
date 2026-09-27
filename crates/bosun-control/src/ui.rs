@@ -1519,6 +1519,114 @@ mod tests {
         }
     }
 
+    // The session view is a full-height box inside a locked document, not a
+    // fixed layer: a fixed container is what iOS fails to reflow when the
+    // keyboard opens, which is the family the focus failure comes from.
+
+    #[test]
+    fn the_pane_takes_the_session_view_out_of_the_fixed_layer() {
+        assert!(
+            PANE.contains("html, body { height: 100%; overflow: hidden; }"),
+            "the document must not scroll, or Safari's reveal-scroll on focus has somewhere to move it"
+        );
+        let view_rule = segment(PANE, "#session-view {", "}");
+        assert!(
+            view_rule.contains("position: absolute;") && view_rule.contains("inset: 0;"),
+            "and the session view fills it absolutely"
+        );
+        // The layers left alone, and why they are not the same case: a fixed
+        // element's containing block is the viewport, not the session view, so
+        // the other overlays are unaffected by this change.
+        for layer in ["#view-sheet {", "#standalone-note {"] {
+            assert!(
+                segment(PANE, layer, "}").contains("position: fixed;"),
+                "`{layer}` stays a fixed layer for now"
+            );
+        }
+        assert!(
+            PANE.contains("position: fixed;\n      inset: 0;\n      width: auto;"),
+            "and the child panel keeps the fixed shape it takes at phone widths"
+        );
+    }
+
+    // The two focuses that were not gated: on a touch screen iOS may treat a
+    // programmatic re-focus as one it already has and answer with no keyboard,
+    // so the tap that follows asks for the keyboard instead.
+
+    #[test]
+    fn the_pane_gates_the_last_two_programmatic_focuses() {
+        assert!(
+            segment(
+                PANE,
+                "function send(",
+                "btnSend.addEventListener('click', send);"
+            )
+            .contains("if (!coarsePointer()) input.focus();"),
+            "send re-focuses the composer only where the focus is the reader's"
+        );
+        assert!(
+            segment(PANE, "btnAskType.addEventListener('click', () => {", "});")
+                .contains("if (!coarsePointer()) askInput.focus();"),
+            "and the ask field's focus after the `answer in your own words` tap is gated the same way"
+        );
+        assert_eq!(
+            PANE.matches("askInput.focus();").count(),
+            2,
+            "the ask field has exactly two focuses, both gated"
+        );
+    }
+
+    // An installed web app can never show a keyboard for any field on some iOS
+    // versions (WebKit bug 279904), and no page can work around it.
+
+    #[test]
+    fn the_pane_warns_about_the_standalone_keyboard_bug() {
+        assert!(
+            PANE.contains("This web-app mode can block the keyboard — open the pane in Safari."),
+            "the notice says what to do, because the pane cannot fix this"
+        );
+        assert!(
+            PANE.contains("window.navigator.standalone === true")
+                && PANE.contains("window.matchMedia('(display-mode: standalone)').matches"),
+            "both ways of being an installed app are checked"
+        );
+        assert!(
+            PANE.contains("standaloneNote.hidden = false;")
+                && PANE.contains("if (\n  window.navigator.standalone === true ||"),
+            "and the notice shows there, inside that check alone"
+        );
+        assert!(
+            PANE.contains("window.localStorage.getItem('bosun-standalone-note') !== 'dismissed'")
+                && PANE
+                    .contains("window.localStorage.setItem('bosun-standalone-note', 'dismissed');"),
+            "it is dismissible, and stays dismissed"
+        );
+        assert!(
+            PANE.contains("<div id=\"standalone-note\" hidden>"),
+            "and it ships hidden, so a tab never sees it"
+        );
+    }
+
+    // The ask swap never takes the composer away from a reader who is typing in
+    // it: that focus loss, and the re-focus after it, is what iOS answers with
+    // no keyboard.
+
+    #[test]
+    fn the_pane_never_hides_a_composer_that_has_focus() {
+        // The start omits the brace, which `block` counts from.
+        let swap = block(&flattened(), &squeezed("function renderAskComposer(ask) "));
+        assert!(
+            swap.contains(&squeezed("if (document.activeElement === input) return;"))
+                && swap.contains(&squeezed("askSheet.hidden = false;"))
+                && swap.contains(&squeezed("chatRow.hidden = true;")),
+            "the swap is refused while the composer holds the focus, and made in every other case"
+        );
+        assert!(
+            PANE.contains("input.addEventListener('blur', scheduleAskSync);"),
+            "and leaving the field retries it, so the question is not lost"
+        );
+    }
+
     // The composer rides the iOS keyboard: the session view follows the visual
     // viewport, which is the part of the page a reader can see, and the bottom
     // rows keep clear of the Home indicator's strip.
@@ -1535,9 +1643,19 @@ mod tests {
         let handler = block(&pane, &squeezed("function syncVisualViewport("));
         assert!(
             handler.contains(&squeezed("const viewport = window.visualViewport;"))
-                && handler.contains(&squeezed("view.style.height = viewport.height + 'px';"))
-                && handler.contains(&squeezed("view.style.top = viewport.offsetTop + 'px';")),
-            "the session view takes the visible height and offset, so the composer is not left where the keyboard is drawn"
+                && handler.contains(&squeezed("view.style.height = viewport.height + 'px';")),
+            "the session view takes the visible height, so the composer is not left where the keyboard is drawn"
+        );
+        assert!(
+            !PANE.contains("view.style.top")
+                && handler.contains(&squeezed(
+                    "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
+                )),
+            "and it never takes the offset: on some iOS versions that value stays stale after the keyboard closes, which left the whole view offset — the offset is read only for the covered strip, clamped"
+        );
+        assert!(
+            PANE.contains("document.addEventListener('focusout', scheduleVisualViewportSync);"),
+            "and leaving a field re-syncs, because the keyboard's close does not always arrive as a resize before the next paint"
         );
         assert!(
             handler.contains(&squeezed("syncStick();")),
@@ -1610,7 +1728,7 @@ mod tests {
         );
         assert!(
             PANE.contains(
-                "const covered = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);"
+                "const covered = Math.max(0, window.innerHeight - viewport.height - offset);"
             ) && PANE.contains(
                 "document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');"
             ),
