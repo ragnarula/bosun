@@ -401,8 +401,7 @@ impl Store {
             let session = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
-                         FROM sessions WHERE id = ?1",
+                        &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
                     )
                     .context("failed to prepare session query")?;
                 let mut rows = stmt
@@ -536,10 +535,9 @@ impl Store {
         let id = id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
-                     FROM sessions WHERE id = ?1",
-                )
+                .prepare(&format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"
+                ))
                 .context("failed to prepare session query")?;
             let mut rows = stmt.query([id]).context("failed to query session")?;
             match rows.next().context("failed to read session row")? {
@@ -553,10 +551,9 @@ impl Store {
     pub async fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
-                     FROM sessions ORDER BY id",
-                )
+                .prepare(&format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY id"
+                ))
                 .context("failed to prepare session list query")?;
             let mut rows = stmt.query([]).context("failed to query sessions")?;
             let mut sessions = Vec::new();
@@ -574,10 +571,9 @@ impl Store {
         let parent_id = parent_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
-                     FROM sessions WHERE parent_id = ?1 ORDER BY id",
-                )
+                .prepare(&format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions WHERE parent_id = ?1 ORDER BY id"
+                ))
                 .context("failed to prepare child session query")?;
             let mut rows = stmt
                 .query([parent_id])
@@ -2079,6 +2075,10 @@ fn append_event(
 
 /// Inserts a message row and its matching `Event::Message` inside the
 /// caller's transaction, so a write that spans sessions stays atomic.
+/// A session's columns, in the order `session_from_row` reads them: one place
+/// names them, so a query cannot drift from the row it builds.
+const SESSION_COLUMNS: &str = "id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary";
+
 /// Writes one session row, in whatever transaction the caller holds: a fork
 /// writes its row inside the transaction that copies the thread it started from.
 fn insert_session(conn: &rusqlite::Connection, session: &Session) -> Result<(), anyhow::Error> {
@@ -3145,6 +3145,100 @@ mod tests {
         assert!(
             store.get_session("fork").await.unwrap().is_none(),
             "and no fork row is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_refuses_a_source_that_vanished() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("original")).await.unwrap();
+        store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::Text {
+                    text: "the task".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_state("original", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let source = store.fork_source("original").await.unwrap().unwrap();
+
+        // The session was removed while the fork's clone ran.
+        store.remove_session("original").await.unwrap();
+        let error = store
+            .fork_session(&session("fork"), "original", &source.window)
+            .await
+            .expect_err("a source that is gone is refused");
+        assert!(
+            matches!(&error, StoreError::SessionNotFound { id } if id == "original"),
+            "a vanished source is missing, not unforkable: {error:?}"
+        );
+        assert!(
+            store.get_session("fork").await.unwrap().is_none(),
+            "and no fork row is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_a_held_row_that_was_archived_after_the_read() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("original")).await.unwrap();
+        let first = store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::Text {
+                    text: "first".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "original",
+                Role::Assistant,
+                &Block::Text {
+                    text: "second".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_state("original", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let source = store.fork_source("original").await.unwrap().unwrap();
+
+        // A compaction retires the first row after the read: the snapshot is
+        // still what the fork copies, archived or not.
+        store.mark_archived("original", first).await.unwrap();
+        let copied = store
+            .fork_session(&session("fork"), "original", &source.window)
+            .await
+            .unwrap();
+
+        assert_eq!(copied, 2, "the held rows are copied");
+        let fork_thread: Vec<String> = store
+            .messages("fork", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fork_thread,
+            ["first", "second"],
+            "including the row the original has since retired"
         );
     }
 

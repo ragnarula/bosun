@@ -7433,6 +7433,151 @@ mod tests {
         );
     }
 
+    /// A fake node that takes the original out of `waiting_for_input` while it
+    /// answers the fork's clone, so the copy's re-check refuses a source that
+    /// moved on — the race the stop below exists for.
+    fn node_that_moves_the_source_on(
+        addr: SocketAddr,
+        node_name: &'static str,
+        store: Store,
+        original: &'static str,
+        seen: Arc<Mutex<Vec<NodeCommand>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = reqwest::Client::new();
+        tokio::spawn(async move {
+            let mut result: Option<CommandResult> = None;
+            loop {
+                let poll = json!({
+                    "node_name": node_name,
+                    "status": "up",
+                    "version": bosun_common::version::VERSION,
+                    "result": result,
+                });
+                let response: Value = match client
+                    .post(format!("http://{addr}/poll"))
+                    .json(&poll)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.json().await.unwrap(),
+                    Err(_) => break,
+                };
+                let Some(command) = response["command"].clone().as_object().cloned() else {
+                    result = None;
+                    continue;
+                };
+                let command: NodeCommand = serde_json::from_value(Value::Object(command)).unwrap();
+                seen.lock().unwrap().push(command.clone());
+                match command {
+                    NodeCommand::Clone {
+                        ref repo_url,
+                        ref git_ref,
+                        ref session_id,
+                        ..
+                    } => {
+                        // The original takes a turn in the window the clone
+                        // leaves open.
+                        store
+                            .set_state(original, SessionState::Running)
+                            .await
+                            .unwrap();
+                        let id = command.id();
+                        result = Some(CommandResult::Session {
+                            id,
+                            session: SessionInfo {
+                                id: session_id.clone(),
+                                repo_url: Some(repo_url.clone()),
+                                git_ref: git_ref.clone(),
+                                dir: Some(std::path::PathBuf::from("/work").join(session_id)),
+                                status: "running".into(),
+                            },
+                        });
+                    }
+                    NodeCommand::Stop { .. } => {
+                        result = Some(CommandResult::Stop { id: command.id() });
+                    }
+                    _ => break,
+                }
+            }
+        })
+    }
+
+    /// A fork whose source moved on while its clone ran is refused, and the
+    /// clone it no longer needs is stopped: leaving it keeps a working copy, a
+    /// persisted session and a boot restore for a fork that does not exist.
+    #[tokio::test]
+    async fn fork_stops_the_clone_a_refused_fork_no_longer_needs() {
+        let dir = tempdir().unwrap();
+        let (state, _, _) = state_with_provider(&dir, Arc::new(Mutex::new(VecDeque::new()))).await;
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
+        let addr = serve(state.clone()).await;
+        let seen: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let node = node_that_moves_the_source_on(
+            addr,
+            "n1",
+            state.store.clone(),
+            "original-1",
+            seen.clone(),
+        );
+
+        let mut original = session("original-1");
+        original.model = "main-model".into();
+        original.state = SessionState::WaitingForInput;
+        original.repo_url = Some("https://example.com/repo".into());
+        state.store.create_session(&original).await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/sessions/original-1/fork"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "the source moved on while the clone ran"
+        );
+
+        wait_for("the stop the refused fork enqueued", {
+            let seen = seen.clone();
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .iter()
+                        .any(|command| matches!(command, NodeCommand::Stop { .. }))
+                }
+            }
+        })
+        .await;
+        let commands = seen.lock().unwrap().clone();
+        let cloned = commands
+            .iter()
+            .find_map(|command| match command {
+                NodeCommand::Clone { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .expect("the node cloned for the fork");
+        let stopped = commands
+            .iter()
+            .find_map(|command| match command {
+                NodeCommand::Stop { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .expect("and it was told to stop it");
+        assert_eq!(
+            stopped, cloned,
+            "the stop names the clone the fork no longer needs"
+        );
+        assert!(
+            state.store.get_session(&cloned).await.unwrap().is_none(),
+            "and no fork row was written"
+        );
+        node.abort();
+    }
+
     /// The fork refusals are variants, and each one is a status: the mapping is
     /// checked here, rather than in the wording of a response body.
     #[test]
@@ -7522,7 +7667,16 @@ mod tests {
         original.state = SessionState::WaitingForInput;
         original.repo_url = Some("https://example.com/repo".into());
         original.git_ref = Some("main".into());
+        // Values the defaults would not produce, so the fork's asserts can fail.
+        original.prompt = Some("the prompt the original started from".into());
+        original.allowed_tools = "file_read,grep".into();
+        original.mcp_servers = "srv-a".into();
         state.store.create_session(&original).await.unwrap();
+        state
+            .store
+            .set_summary("original-1", "the original's summary")
+            .await
+            .unwrap();
         state
             .store
             .append_message(
@@ -7568,9 +7722,19 @@ mod tests {
         assert_eq!(fork.node, original.node);
         assert_eq!(fork.repo_url, original.repo_url);
         assert_eq!(fork.git_ref, original.git_ref);
-        assert_eq!(fork.allowed_tools, original.allowed_tools);
-        assert_eq!(fork.prompt, None, "a fork carries no prompt of its own");
-        assert_eq!(fork.summary, None, "and no summary of its own yet");
+        assert_eq!(
+            fork.allowed_tools, "file_read,grep",
+            "the fork carries the original's allow-list, not the default"
+        );
+        assert_eq!(fork.mcp_servers, "srv-a", "and its MCP selection");
+        assert_eq!(
+            fork.prompt, None,
+            "a fork carries no prompt of its own, though the original has one"
+        );
+        assert_eq!(
+            fork.summary, None,
+            "and no summary of its own, though the original has one"
+        );
         assert_ne!(fork.dir, original.dir, "the fork gets its own working copy");
         assert_eq!(
             fork.state,
