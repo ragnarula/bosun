@@ -69,7 +69,9 @@ Done when the tag's workflow finished green — `curl -s "https://api.github.com
 
 Follow the `bosun-deployment` skill for the release you just cut. Then comment on the issue with the tag and what shipped, close it, and return to step 1.
 
-Done when the issue is closed with its release named, and the next issue is picked.
+Leave no deployment's sessions behind: once a deployment has verified, stop the sessions of the older deployments in the deployment directory the `bosun-deployment` skill names — `POST /stop` with the session id on that control plane; a stop removes the session and its subtree, children included — keeping only the deployment you just ran.
+
+Done when the issue is closed with its release named, the older deployments' sessions are stopped, and the next issue is picked.
 
 ## Ranking
 
