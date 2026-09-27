@@ -493,7 +493,7 @@ mod tests {
             "appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs)",
             "appendAssistant(block.text, atMs)",
             "appendToolStrip(block.name, args, atMs, block.id)",
-            "appendToolResult(block.name, payload, block.is_error, atMs, block.id)",
+            "appendToolResult(block.name, payload, block.is_error, atMs, block.id, content)",
             "appendReasoningPanel(block.text, atMs)",
             "appendLine('summary', block.text, atMs)",
             "appendLine('unknown', JSON.stringify(block), atMs)",
@@ -1387,6 +1387,30 @@ mod tests {
         }
     }
 
+    // The panel's list rows are the panel's: their rules are scoped to it, so a
+    // session-list row keeps the height it had.
+
+    #[test]
+    fn the_pane_scopes_the_child_rows_to_the_panel_list() {
+        assert!(
+            PANE.contains("#child-list .child-row {"),
+            "the row's rule names the list it belongs to"
+        );
+        for rule in [
+            "\n  .child-row {",
+            "\n  .child-row:active {",
+            "\n  .child-row.followed {",
+            "\n  .child-row .child-row-name {",
+            "\n  .child-row .child-row-id {",
+            "\n  .child-list-note {",
+        ] {
+            assert!(
+                !PANE.contains(rule),
+                "the row rules must not be global: `{rule}` styled every row in the pane, including the session list's, whose minimum height was a narrow-screen rule"
+            );
+        }
+    }
+
     // A child has a name: its own summary once its model wrote one, otherwise
     // the first line of the instructions it was spawned with.
 
@@ -1412,12 +1436,12 @@ mod tests {
             )),
             "with the id as the last resort"
         );
-        let header = block(&pane, &squeezed("function updateChildPanelDot("));
         assert!(
-            header.contains(&squeezed(
-                "childPanelTitle.textContent = child ? childName(child) : '';"
-            )) && header.contains(&squeezed("childPanelTitle.title = child ? child.id : '';")),
-            "the panel's header shows the name and keeps the id in its tooltip"
+            PANE.contains("function updateChildPanelDot(")
+                && PANE.contains("if (child) {")
+                && PANE.contains("childPanelTitle.textContent = childName(child);")
+                && PANE.contains("childPanelTitle.title = child.id;"),
+            "the panel's header shows the name and keeps the id in its tooltip, and a child the list has dropped leaves the last name standing"
         );
         let line = block(&pane, &squeezed("case 'child_event':"));
         assert!(
@@ -1445,8 +1469,14 @@ mod tests {
         );
         assert!(
             PANE.contains("dot.className = 'dot ' + child.state;")
+                && list.contains(&squeezed("childList.appendChild(row);"))
                 && list.contains(&squeezed("name.textContent = childName(child);")),
-            "each row carries the child's state and its name"
+            "each row the list appends carries the child's state and its name"
+        );
+        assert!(
+            list.contains(&squeezed("const children = current ?"))
+                && list.contains(&squeezed(": [];")),
+            "and no session open means no children: every root would match a null parent"
         );
         assert!(
             PANE.contains("'child-row' + (child.id === childFollow ? ' followed' : '')"),
@@ -1479,11 +1509,35 @@ mod tests {
             pane.matches(&squeezed("watchControl(")).count() >= 4,
             "and it is used wherever a child is named"
         );
+        let named = block(&pane, &squeezed("function namedChild("));
+        assert!(
+            named.contains(&squeezed(
+                "if (content && typeof content === 'object' && content.child_id)"
+            )),
+            "a result names its child from its content, which is an object before anything flattens it"
+        );
+        assert!(
+            named.contains(&squeezed(
+                "if (name !== 'message_child' || !id) return undefined;"
+            )) && named.contains(&squeezed("if (error) return undefined;")),
+            "and only a `message_child` that succeeded is asked for the child its call named"
+        );
         let result = block(&pane, &squeezed("function appendToolResult("));
         assert!(
-            result.contains(&squeezed("payload.child_id"))
-                && result.contains(&squeezed("callArgs.get(id)")),
-            "a result names its child from its own payload, or from the call it answers"
+            result.contains(&squeezed(
+                "const named = namedChild(content, name, error, id);"
+            )) && result.contains(&squeezed("callArgs.delete(id);")),
+            "the result asks it about the content it was given, and drops the call's arguments once it has them"
+        );
+        assert!(
+            block(&pane, &squeezed("case 'tool_result':")).contains(&squeezed(
+                "appendToolResult(block.name, payload, block.is_error, atMs, block.id, content);"
+            )),
+            "the renderer hands it the raw content, not the flattened string the line shows"
+        );
+        assert!(
+            PANE.contains("callArgs.clear();"),
+            "and the map belongs to the transcript: `closeChildPanel` clears it, and `closeSession` closes the panel, so nothing survives the session it was filled in"
         );
         let strip = block(&pane, &squeezed("function appendToolStrip("));
         assert!(

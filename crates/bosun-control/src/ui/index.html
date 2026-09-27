@@ -913,7 +913,7 @@
     border-bottom: 1px solid var(--border);
   }
   #child-list[hidden] { display: none; }
-  .child-row {
+  #child-list .child-row {
     display: grid;
     grid-template-columns: auto 1fr auto;
     align-items: center;
@@ -929,19 +929,19 @@
     color: var(--text);
     -webkit-tap-highlight-color: transparent;
   }
-  .child-row:active { background: var(--panel-2); }
-  .child-row.followed { border-left-color: var(--accent); background: var(--panel-2); }
-  .child-row .child-row-name {
+  #child-list .child-row:active { background: var(--panel-2); }
+  #child-list .child-row.followed { border-left-color: var(--accent); background: var(--panel-2); }
+  #child-list .child-row .child-row-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .child-row .child-row-id {
+  #child-list .child-row .child-row-id {
     color: var(--muted);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px;
   }
-  .child-list-note { display: block; padding: 8px 10px; color: var(--muted); font-size: 12px; }
+  #child-list .child-list-note { display: block; padding: 8px 10px; color: var(--muted); font-size: 12px; }
   /* The child panel's transcript is the only transcript that is not the whole
      view: it takes what the list leaves. */
   #child-transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; font-size: 13px; }
@@ -4100,14 +4100,27 @@ function appendReasoningPanel(text, atMs) {
   scrollToBottom();
 }
 
-function appendToolResult(name, payload, error, atMs, id) {
+// The child a result names, or undefined. A `spawn` answers with the child it
+// made, in its content; a `message_child` answers `ok`, so its child comes from
+// the arguments of the call it answers. Only those two tools are asked: another
+// tool's `id` argument is not a child, and a failed call's child may not exist.
+function namedChild(content, name, error, id) {
+  if (error) return undefined;
+  if (content && typeof content === 'object' && content.child_id) {
+    return content.child_id;
+  }
+  if (name !== 'message_child' || !id) return undefined;
+  const args = callArgs.get(id);
+  return args && args.id ? args.id : undefined;
+}
+
+function appendToolResult(name, payload, error, atMs, id, content) {
   const text = payload == null ? '' : String(payload);
+  const named = namedChild(content, name, error, id);
+  // The arguments a result has just consumed are dropped: their child is known
+  // now, and the map holds one object per call otherwise.
+  if (id && name === 'message_child') callArgs.delete(id);
   if (!error && text === '') return;
-  // A `spawn` answers with the child it made; a `message_child` answers with
-  // `ok`, so its child comes from the call's arguments.
-  const args = id ? callArgs.get(id) : undefined;
-  const named = (payload && typeof payload === 'object' && payload.child_id) ||
-    (args && args.id ? args.id : undefined);
   const line = document.createElement('div');
   line.className = 'tool-result' + (error ? ' error' : '');
   if (error) {
@@ -4709,7 +4722,7 @@ function renderBlock(message, atMs) {
         typeof content === 'string' || content === null
           ? String(content)
           : readableValue(content);
-      appendToolResult(block.name, payload, block.is_error, atMs, block.id);
+      appendToolResult(block.name, payload, block.is_error, atMs, block.id, content);
       break;
     }
     case 'ask':
@@ -4808,7 +4821,11 @@ function watchControl(childId) {
 // The open session's direct children, running and stopped, each with its state
 // and its name. The followed one is marked, and a row follows its child.
 function renderChildList() {
-  const children = sessions.filter((session) => session.parent_id === current);
+  // No open session means no children: `closeSession` nulls `current` before
+  // this runs, and every root would match a null parent.
+  const children = current
+    ? sessions.filter((session) => session.parent_id === current)
+    : [];
   childList.textContent = '';
   childList.hidden = children.length === 0;
   if (!children.length) {
@@ -4844,8 +4861,12 @@ function updateChildPanelDot() {
   const child = sessions.find((session) => session.id === childFollow);
   childPanelDot.className = child ? 'dot ' + child.state : 'dot';
   // The name arrives with the child's first summary, so the poll refreshes it.
-  childPanelTitle.textContent = child ? childName(child) : '';
-  childPanelTitle.title = child ? child.id : '';
+  // A child the list has dropped keeps the name it had: this is a header, not a
+  // status line.
+  if (child) {
+    childPanelTitle.textContent = childName(child);
+    childPanelTitle.title = child.id;
+  }
 }
 
 // Follows `id` in the panel: the previous child's stream closes first, so one
@@ -4886,6 +4907,9 @@ function closeChildPanel() {
     childEs.close();
     childEs = null;
   }
+  // The call arguments are the transcript's: another session may reuse a call
+  // id, and a result that never came must not outlive the thread it was for.
+  callArgs.clear();
   childFollow = null;
   childStick = true;
   childAskBox = null;
