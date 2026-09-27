@@ -1827,6 +1827,9 @@ async fn run_turn_inner(
                 )
                 .await?;
             }
+            // The completion is done and its counts are in, so the session can
+            // be told how full its context is before the turn goes on.
+            append_context_note(deps, session_id, window, state.last_input_tokens).await?;
 
             let calls: Vec<Call> = parse_tool_calls(tool_calls, session_id);
 
@@ -3142,6 +3145,54 @@ const INTERRUPTED_CALL_TEXT: &str = "This call was interrupted and produced no r
                                     Check the state it would have changed before relying on it, \
                                     and call the tool again if you still need the result.";
 
+/// The line a context-size note reads as: the tokens the last completion
+/// reported, the window they are measured against, and the count that fires the
+/// next compaction. Its percentage is the note's own warning, which is why the
+/// loop writes no separate one. Both clients word this line the same way, each
+/// in its own file, as they do for the other blocks that read as prose.
+pub(crate) fn context_size_line(tokens: u64, window: u64, compact_at: u64) -> String {
+    format!(
+        "context: {tokens} / {window} tokens ({}%), compaction at {compact_at}",
+        tokens * 100 / window
+    )
+}
+
+/// The input-token count at which the loop tells the session how full its
+/// context is. Half the window: the note is itself part of the context it
+/// describes, and a young session has nothing to decide about.
+const CONTEXT_NOTE_AT_TOKENS: u64 = CONTEXT_WINDOW_TOKENS / 2;
+
+/// Appends the note that says how full the context is, when it is full enough to
+/// matter. The count is the completion's own reported input tokens, not an
+/// estimate of the next request: the loop already has it, and an estimate would
+/// describe a request that has not been built. It is a durable message, so the
+/// reader replays the counts' history and the model reads the note in its next
+/// window — which is also why it is written once per completion and not every
+/// turn regardless of size.
+async fn append_context_note(
+    deps: &LoopDeps,
+    session_id: &str,
+    window: &mut Vec<(i64, Message)>,
+    tokens: u64,
+) -> anyhow::Result<()> {
+    if tokens < CONTEXT_NOTE_AT_TOKENS {
+        return Ok(());
+    }
+    record_in_wake(
+        deps,
+        session_id,
+        window,
+        Role::Assistant,
+        &Block::ContextSize {
+            tokens,
+            window: CONTEXT_WINDOW_TOKENS,
+            compact_at: deps.compact_at_input_tokens,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Gives every tool call left without a result a synthetic error result, so a
 /// window that ends mid-call is still a valid request.
 ///
@@ -3627,6 +3678,11 @@ fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
             )
         }
         Block::Summary { text } => format!("summary: {text}"),
+        Block::ContextSize {
+            tokens,
+            window,
+            compact_at,
+        } => context_size_line(*tokens, *window, *compact_at),
         Block::ContextCleared { reason, .. } => crate::serialize::cleared_text(reason),
         Block::ChildEvent {
             child_id,
@@ -19742,6 +19798,235 @@ mod tests {
             request_texts(&requests[0])
         );
     }
+    // The loop tells the session how full its context is once the last
+    // completion's input tokens reached half the window, and says nothing while
+    // it is younger than that.
+
+    #[tokio::test]
+    async fn a_full_context_is_stated_in_the_transcript() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-context")).await.unwrap();
+        store
+            .append_message(
+                "s-context",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![StreamEvent::TextDelta("working".into()), stop(600_000, 20)],
+            vec![StreamEvent::TextDelta("still working".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_compact_at(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            COMPACT_AT_INPUT_TOKENS,
+        ));
+        let handle = spawn_loop("s-context".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the first turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-context").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        // One note, with the completion's own count and the loop's limits.
+        let noted: Vec<(u64, u64, u64)> = store
+            .messages("s-context", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, message)| match message.block {
+                Block::ContextSize {
+                    tokens,
+                    window,
+                    compact_at,
+                } => Some((tokens, window, compact_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            noted,
+            [(600_000, CONTEXT_WINDOW_TOKENS, COMPACT_AT_INPUT_TOKENS)],
+            "the note states the completion's tokens, the window and the count that fires compaction"
+        );
+
+        // A second turn runs, and its request carries the note: the model reads
+        // it in the window it describes.
+        store
+            .append_message(
+                "s-context",
+                Role::User,
+                &Block::Text {
+                    text: "carry on".into(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::UserMessage);
+        wait_for("the second turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let carried = request_texts(&provider.captured_calls()[1]);
+        assert!(
+            carried
+                .iter()
+                .any(|text| text.starts_with("context: 600000 / ")),
+            "the next request carries the note: {carried:?}"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_young_context_is_not_stated() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-young")).await.unwrap();
+        store
+            .append_message(
+                "s-young",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // One token under half the window: the note would be noise, and it is
+        // part of the context it describes.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("working".into()),
+            stop(CONTEXT_NOTE_AT_TOKENS - 1, 20),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-young".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-young").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            !store
+                .messages("s-young", true)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::ContextSize { .. })),
+            "a context under half the window is not stated"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_compaction_still_fires_with_a_note_in_the_thread() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&session("s-note-compact"))
+            .await
+            .unwrap();
+        fill_transcript(&store, "s-note-compact").await;
+
+        // The first completion fills the context past the compaction threshold,
+        // so a note is written and the next turn compacts.
+        // The first turn calls a tool, so the wake runs a second one, which is
+        // where the compaction the count asked for happens.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"work"}"#.into(),
+                },
+                stop(600_000, 20),
+            ],
+            vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
+            vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_compact_at(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            500,
+        ));
+        let handle = spawn_loop("s-note-compact".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the session to wait for input", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store
+                        .get_session("s-note-compact")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        // The note is a message like any other: compaction fires and the
+        // summary stands where the retired tail was.
+        let active = store.messages("s-note-compact", false).await.unwrap();
+        assert!(
+            active
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::Summary { text } if text == "compacted")),
+            "compaction still fires with a note in the thread"
+        );
+        assert!(
+            active
+                .iter()
+                .any(|(_, message)| matches!(&message.block, Block::ContextSize { .. })),
+            "and the note the turn wrote survives in the window when it is not retired"
+        );
+
+        handle.stop();
+    }
+
     #[tokio::test]
     async fn an_interrupt_records_the_call_it_cancelled() {
         let dir = tempdir().unwrap();

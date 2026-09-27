@@ -290,6 +290,17 @@ fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
             "text": ask_text(ask_recipient, child_id.as_deref(), ask, answer.as_deref())
         }),
         (_, Block::Summary { text }) => json!({ "type": "text", "text": text }),
+        (
+            _,
+            Block::ContextSize {
+                tokens,
+                window,
+                compact_at,
+            },
+        ) => json!({
+            "type": "text",
+            "text": crate::agent_loop::context_size_line(*tokens, *window, *compact_at)
+        }),
         (_, Block::ContextCleared { reason, .. }) => json!({
             "type": "text",
             "text": cleared_text(reason)
@@ -354,6 +365,19 @@ fn openai_message(message: &Message, ask_recipient: AskRecipient) -> Value {
         }),
         (_, Block::Summary { text }) => {
             json!({ "role": message.role.as_str(), "content": text })
+        }
+        (
+            _,
+            Block::ContextSize {
+                tokens,
+                window,
+                compact_at,
+            },
+        ) => {
+            json!({
+                "role": message.role.as_str(),
+                "content": crate::agent_loop::context_size_line(*tokens, *window, *compact_at)
+            })
         }
         (_, Block::ContextCleared { reason, .. }) => {
             json!({ "role": message.role.as_str(), "content": cleared_text(reason) })

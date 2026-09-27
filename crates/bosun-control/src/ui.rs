@@ -1670,6 +1670,31 @@ mod tests {
         );
     }
 
+    // The context-size note: the loop's own count of how full the context is,
+    // drawn as a line of its own in both transcripts.
+
+    #[test]
+    fn the_pane_draws_the_context_size_note() {
+        let case = segment(PANE, "case 'context_size':", "break;");
+        assert!(
+            case.contains("'context: ' + block.tokens + ' / ' + block.window")
+                && case.contains("'%), compaction at ' + block.compact_at"),
+            "the line states the tokens, the window, the percentage and the count that fires compaction"
+        );
+        assert!(
+            case.contains("Math.floor((block.tokens * 100) / block.window)"),
+            "and the percentage is the note's own warning, rounded the way the terminal rounds it"
+        );
+        assert!(
+            case.contains("appendLine(\n        'context',"),
+            "it is a line of its own, like a summary"
+        );
+        assert!(
+            PANE.contains(":is(#transcript, #child-transcript) .context {"),
+            "and it is styled for both transcripts, since a child's frames draw with the same renderers"
+        );
+    }
+
     // The subagent panel: a second reader of a child's own stream, beside the
     // session's transcript rather than in place of it.
 

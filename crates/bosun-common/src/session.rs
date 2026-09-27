@@ -165,6 +165,21 @@ pub enum Block {
     Summary {
         text: String,
     },
+    /// How full the context was when a completion finished: that completion's
+    /// input tokens, the window the loop measures them against, and the count
+    /// that fires the next compaction. The loop appends one once the count
+    /// reaches half the window, so the model can see how full it is — and so can
+    /// the reader — and decide to compact, clear, or write something down before
+    /// it loses it. It is a message and not an activity because the model has to
+    /// read it: an activity reaches the reader alone.
+    ContextSize {
+        /// The last completion's reported input tokens.
+        tokens: u64,
+        /// The context window those tokens are measured against.
+        window: u64,
+        /// The input-token count at which the loop compacts the thread.
+        compact_at: u64,
+    },
     /// The record of a context clear: the session discarded the thread above
     /// this point and continued from `instructions`. The row is durable and
     /// visible, and the loop archives it with the history it closes, so the

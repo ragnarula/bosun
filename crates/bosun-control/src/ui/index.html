@@ -1055,6 +1055,11 @@
   :is(#transcript, #child-transcript) .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
   :is(#transcript, #child-transcript) .error { color: var(--error); }
   :is(#transcript, #child-transcript) .state { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) .context {
+    color: var(--muted);
+    text-align: center;
+    font-size: 12px;
+  }
   :is(#transcript, #child-transcript) .summary {
     color: var(--muted);
     font-style: italic;
@@ -4761,6 +4766,17 @@ function renderBlock(message, atMs) {
       break;
     case 'summary':
       appendLine('summary', block.text, atMs);
+      break;
+    case 'context_size':
+      // How full the context was when the last completion finished. The line is
+      // the loop's own count, not an estimate, and its percentage is the only
+      // warning there is.
+      appendLine(
+        'context',
+        'context: ' + block.tokens + ' / ' + block.window + ' tokens (' +
+          Math.floor((block.tokens * 100) / block.window) + '%), compaction at ' + block.compact_at,
+        atMs
+      );
       break;
     case 'context_cleared':
       // The break the session made in its own thread: a divider naming why it
