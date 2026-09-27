@@ -5041,8 +5041,6 @@ mod tests {
                 stop(1000, 20),
             ],
             vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
-            // The compacted turn ends the wake, and its own count crosses the
-            // note's threshold, so the note is written after the summary.
             vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
         ]));
         let deps = Arc::new(test_deps_with_compact_at(
@@ -18669,8 +18667,6 @@ mod tests {
             ],
             vec![StreamEvent::TextDelta("carrying on".into()), stop(1000, 20)],
             vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
-            // The compacted turn ends the wake, and its own count crosses the
-            // note's threshold, so the note is written after the summary.
             vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
         ]));
         let deps = Arc::new(test_deps_with_compact_at(
@@ -20062,7 +20058,11 @@ mod tests {
             !thread.iter().any(|text| text.starts_with("context: ")),
             "no note sits inside that completion: {thread:?}"
         );
-        assert!(result > call, "the call and its result stay together");
+        assert_eq!(
+            result,
+            call + 1,
+            "the call and its result stay adjacent, with no note between them: {thread:?}"
+        );
 
         handle.stop();
     }
@@ -20134,9 +20134,8 @@ mod tests {
         fill_transcript(&store, "s-note-compact").await;
 
         // The first completion fills the context past the compaction threshold,
-        // so a note is written and the next turn compacts.
-        // The first turn calls a tool, so the wake runs a second one, which is
-        // where the compaction the count asked for happens.
+        // and it ends with a tool call, so it writes no note itself: the wake
+        // runs a second turn, and that is where the compaction happens.
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
                 StreamEvent::ToolCallDelta {
