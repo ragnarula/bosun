@@ -4003,7 +4003,7 @@ btnBottom.addEventListener('click', jumpToBottom);
 // page the reader can actually see, so the view rides it: its height always,
 // and its offset whenever the visible viewport is pushed or shortened. Those
 // two numbers do not say what moved it — the keyboard, or a pinch zoom — and
-// both leave the visible window somewhere below the document's top.
+// both can leave the visible window somewhere below the document's top.
 //
 // The visual viewport exists on modern desktops as well, where it is the whole
 // page and the numbers never change; this runs there harmlessly, and a window
@@ -4026,10 +4026,20 @@ function syncVisualViewport() {
   // bottom, and the strip is then zero with the keyboard still up; reading that
   // as "no keyboard" wrote `top: 0`, which put the view's bottom edge a
   // keyboard-height above the keyboard, and the home column's session list
-  // showed in the gap.
+  // showed in the gap. So the offset decides.
+  //
+  // The offset the view takes is clamped to the short viewport's own height: a
+  // page the keyboard has pushed and a value left stale by an older keyboard
+  // look alike in these two numbers, and riding a stale one that stands past
+  // the keyboard would put the composer under it. The clamp costs nothing in a
+  // reading that is consistent — a pushed page's offset is exactly what its
+  // short viewport leaves of the layout viewport — and holds the view's bottom
+  // edge at the keyboard either way.
   const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);
   const covered = Math.max(0, window.innerHeight - viewport.height - offset);
-  view.style.top = (viewport.height < window.innerHeight && offset > 0) ? offset + 'px' : '0px';
+  view.style.top = (viewport.height < window.innerHeight && offset > 0)
+    ? Math.min(offset, window.innerHeight - viewport.height) + 'px'
+    : '0px';
   document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');
   // The keyboard changes the transcript's height, and no scroll event comes
   // with it: this is the resize #19 named as stale, and the control catches up
@@ -4041,8 +4051,8 @@ function syncVisualViewport() {
 // animates — and one read and one write per frame is all this needs. The burst
 // can end while the keyboard is still moving, so the sync runs a second time
 // after the movement has settled: a sample taken mid-animation leaves the view
-// short by whatever the keyboard had left to travel, with that much of the page
-// showing under it.
+// short or long by whatever the keyboard had left to travel, and that much of
+// the visible area shows the page beneath it.
 let visualViewportFrame = null;
 let visualViewportSettle = null;
 function scheduleVisualViewportSync() {

@@ -1448,6 +1448,7 @@ mod tests {
 
     #[test]
     fn the_pane_asks_for_the_composer_when_a_session_opens() {
+        let pane = flattened();
         assert!(
             PANE.contains(
                 "const coarsePointer = () => window.matchMedia('(pointer: coarse)').matches;"
@@ -1463,9 +1464,21 @@ mod tests {
             "function showSession(id) {",
             "function closeSession() {",
         );
+        let focus = opening
+            .find("if (!inputRow.hidden) input.focus();")
+            .expect("the open path asks for the composer");
+        let sync = opening
+            .find("scheduleVisualViewportSync();")
+            .expect("and the same path asks for a visual-viewport sync");
         assert!(
-            opening.contains("scheduleVisualViewportSync();"),
-            "and the same path schedules a visual-viewport sync with that focus: the keyboard it raises moves the numbers, and the view has to be at its height as the keyboard arrives rather than at whatever resize comes next"
+            focus < sync
+                && top_level(
+                    &pane,
+                    &squeezed("function showSession"),
+                    &squeezed("scheduleVisualViewportSync();")
+                )
+                .is_some(),
+            "the sync follows the focus it takes, and stands where the function always reaches it rather than inside a branch: the keyboard that focus raises moves the numbers, and the view has to be at its height as the keyboard arrives rather than at whatever resize comes next"
         );
         let row = segment(
             PANE,
@@ -1692,15 +1705,17 @@ mod tests {
             handler.contains(&squeezed(
                 "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
             )) && handler.contains(&squeezed(
-                "view.style.top = (viewport.height < window.innerHeight && offset > 0) ? offset + 'px' : '0px';"
+                "view.style.top = (viewport.height < window.innerHeight && offset > 0)"
             )),
             "and it takes the offset whenever the visible viewport is pushed or shortened, clamped"
         );
         assert!(
             handler.contains(&squeezed(
                 "viewport.height < window.innerHeight && offset > 0"
-            )) && handler.contains(&squeezed("? offset + 'px' : '0px';")),
-            "with the fallback a viewport at full height reaches: that is the case the offset is held back for, because on some iOS versions it stays stale after the keyboard closes, and writing it then left the whole view offset"
+            )) && handler.contains(&squeezed(
+                "? Math.min(offset, window.innerHeight - viewport.height) + 'px' : '0px';"
+            )),
+            "with the fallback a viewport at full height reaches — that is the case the offset is held back for, because on some iOS versions it stays stale after the keyboard closes, and writing it then left the whole view offset — and with the view's own top held at the keyboard, since a stale offset standing past the short viewport would put the composer under it"
         );
         assert!(
             !handler.contains(&squeezed("covered > 0 ?")),
@@ -1710,17 +1725,17 @@ mod tests {
             PANE.contains("document.addEventListener('focusout', scheduleVisualViewportSync);"),
             "and leaving a field re-syncs, because the keyboard's close does not always arrive as a resize before the next paint"
         );
+        // The retry's two lines are read from the scheduler's own block and in
+        // their own order: a set left without the clear before it passes any
+        // check that only counts the names.
+        let scheduler = block(&pane, &squeezed("function scheduleVisualViewportSync() "));
+        let cleared = scheduler.find(&squeezed("window.clearTimeout(visualViewportSettle);"));
+        let armed = scheduler.find(&squeezed(
+            "visualViewportSettle = window.setTimeout(syncVisualViewport, 300);",
+        ));
         assert!(
-            PANE.contains("document.addEventListener('focusin', scheduleVisualViewportSync);")
-                && PANE.contains("window.addEventListener('resize', scheduleVisualViewportSync);"),
-            "and taking a field re-syncs too, and the window's own resize as well: the keyboard the focus raises moves the numbers after the event that asked for it, and the numbers can miss a frame the window sees"
-        );
-        assert!(
-            pane.contains(&squeezed("window.clearTimeout(visualViewportSettle);"))
-                && pane.contains(&squeezed(
-                    "visualViewportSettle = window.setTimeout(syncVisualViewport, 300);"
-                )),
-            "and the burst schedules one more sync after it settles, dropping the retry before it: the last frame of the animation can run while the keyboard is still moving, and a sample from there leaves the view short by the rest of the travel — while without the clear, every frame of the burst would leave a retry of its own behind"
+            matches!((cleared, armed), (Some(cleared), Some(armed)) if cleared < armed),
+            "and the burst schedules one more sync after it settles, dropping the retry before it: the last frame of the animation can run while the keyboard is still moving, and a sample from there leaves the view short or long by the rest of the travel — while without the clear, every frame of the burst would leave a retry of its own behind"
         );
         assert!(
             handler.contains(&squeezed("syncStick();")),
@@ -1820,8 +1835,12 @@ mod tests {
         let attached = block(PANE, "if (window.visualViewport) ");
         assert!(
             attached.contains("addEventListener('resize', scheduleVisualViewportSync)")
-                && attached.contains("addEventListener('scroll', scheduleVisualViewportSync)"),
-            "and both listeners attach inside the guard that checks a visual viewport exists"
+                && attached.contains("addEventListener('scroll', scheduleVisualViewportSync)")
+                && attached
+                    .contains("document.addEventListener('focusin', scheduleVisualViewportSync)")
+                && attached
+                    .contains("window.addEventListener('resize', scheduleVisualViewportSync)"),
+            "and every listener attaches inside the guard that checks a visual viewport exists — the scroll as well as the resize, taking a field beside leaving one, and the window's own resize: an old browser would throw on `window.visualViewport.addEventListener`, and the guard is what keeps the pane running there"
         );
         assert!(
             PANE.contains("pointer-events: none;"),
@@ -1852,13 +1871,13 @@ mod tests {
         );
         assert!(
             handler.contains(&squeezed(
-                "view.style.top = (viewport.height < window.innerHeight && offset > 0) ? offset + 'px' : '0px';"
+                "view.style.top = (viewport.height < window.innerHeight && offset > 0) ? Math.min(offset, window.innerHeight - viewport.height) + 'px' : '0px';"
             )),
-            "so the view rides the offset on the state the pushed page is in — the viewport is short and the offset is real — and not on a strip that has gone"
+            "so the view rides the offset on the state the pushed page is in — the viewport is short and the offset is real — and not on a strip that has gone, with zero kept for a viewport at full height"
         );
         assert!(
-            handler.contains(&squeezed("? offset + 'px' : '0px';")),
-            "both branches stay: the offset while the viewport is pushed or shortened, and zero when it is the full height again, which is what still parks a stale offset after the keyboard closes"
+            !handler.contains(&squeezed("? offset + 'px' : '0px';")),
+            "and the offset is not taken whole: the same two numbers also describe a value an older keyboard left stale, and riding one that stands past the short viewport would put the composer under the keyboard, while the clamp moves the view no further than that viewport's own height in any consistent reading"
         );
         assert!(
             handler.contains(&squeezed(
