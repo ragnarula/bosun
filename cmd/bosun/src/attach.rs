@@ -120,6 +120,9 @@ pub enum LineKind {
     /// The record of a context clear: a divider like a summary, because it
     /// marks a break in the transcript rather than something anyone said.
     ContextCleared,
+    /// How full the context was when a completion finished. Centred and dim:
+    /// the session's own accounting, not something it said.
+    ContextSize,
     ChildEvent,
     ModelCall,
     Status,
@@ -374,6 +377,18 @@ fn event_lines(event: &Event) -> Vec<Line> {
                 // The marker names the reason and the fresh start. The
                 // instructions stand below it as their own row, so repeating
                 // them here would print the same thing twice.
+                Block::ContextSize {
+                    tokens,
+                    window,
+                    compact_at,
+                } => vec![Line {
+                    kind: LineKind::ContextSize,
+                    text: format!(
+                        "context: {tokens} / {window} tokens ({}%), compaction at {compact_at}",
+                        tokens * 100 / window
+                    ),
+                    at_ms,
+                }],
                 Block::ContextCleared { reason, .. } => vec![Line {
                     kind: LineKind::ContextCleared,
                     text: format!("context cleared: {reason} · continuing from a fresh prompt"),
@@ -693,7 +708,9 @@ fn prefix_for(kind: LineKind, text: &str) -> Cow<'static, str> {
         LineKind::Ask => Cow::Borrowed("  ? "),
         LineKind::Rejected => Cow::Borrowed("  ~ "),
         LineKind::Reasoning => Cow::Borrowed("  ⋮ "),
-        LineKind::Summary | LineKind::ContextCleared => Cow::Borrowed("── "),
+        LineKind::Summary | LineKind::ContextCleared | LineKind::ContextSize => {
+            Cow::Borrowed("── ")
+        }
         LineKind::ChildEvent => Cow::Borrowed("  ⤷ "),
         LineKind::ModelCall => Cow::Borrowed("  ◆ "),
         LineKind::Status => Cow::Borrowed("── "),
@@ -740,6 +757,7 @@ fn kind_color(kind: LineKind) -> Color {
         LineKind::Reasoning => Color::DarkGray,
         LineKind::Summary
         | LineKind::ContextCleared
+        | LineKind::ContextSize
         | LineKind::ChildEvent
         | LineKind::ModelCall => Color::DarkGray,
         LineKind::Status => Color::Cyan,
