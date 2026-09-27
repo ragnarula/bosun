@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::future::IntoFuture;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -426,10 +427,36 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         (None, None) => {
             info!(listen_addr = %config.listen_addr, "control plane listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .context("control plane server failed")?;
+            // The signal stops the listener and drains the connections that are
+            // open. A pane's event stream never completes on its own, so the
+            // drain is bounded: a service manager waiting for the process would
+            // otherwise run out its own timeout and kill it, and the clients
+            // reconnect from their cursors anyway.
+            let (stopping, stopped) = tokio::sync::oneshot::channel();
+            let mut serve = Box::pin(
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = stopped.await;
+                    })
+                    .into_future(),
+            );
+            let result = tokio::select! {
+                result = &mut serve => result,
+                _ = shutdown_signal() => {
+                    let _ = stopping.send(());
+                    match tokio::time::timeout(SHUTDOWN_DRAIN, &mut serve).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                secs = SHUTDOWN_DRAIN.as_secs(),
+                                "streams are still open after the shutdown drain; stopping anyway"
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+            };
+            result.context("control plane server failed")?;
             Ok(())
         }
         _ => Err(anyhow::anyhow!("tls_cert and tls_key must be set together")),
@@ -465,6 +492,12 @@ async fn serve_tls(
     }
     Ok(())
 }
+
+/// How long a stopping control plane waits for its open connections to finish.
+/// An event stream a client holds open never finishes on its own, so the wait
+/// has to end somewhere: the streams are clients that reconnect, and a service
+/// manager that waits for the process would kill it less politely.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// Resolves when the process is asked to stop: Ctrl-C in a terminal, or the
 /// SIGTERM a service manager sends when a unit is stopped or restarted. A

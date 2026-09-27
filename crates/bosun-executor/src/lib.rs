@@ -8,6 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -26,6 +27,7 @@ use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 pub mod tools;
 
@@ -45,6 +47,10 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
 /// The exit code a timed-out run reports, matching GNU `timeout`.
 const SHELL_TIMEOUT_EXIT_CODE: i32 = 124;
+/// How long a shutting-down node waits for its killed shells to be reaped and
+/// for their entries to drop, before it stops waiting and exits anyway.
+const SHELL_KILL_WAIT: Duration = Duration::from_secs(5);
+
 /// After the shell exits, keep forwarding buffered output for this long even
 /// if a backgrounded grandchild still holds the pipes open.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
@@ -56,6 +62,10 @@ pub struct ExecutorState {
     pub session_dir: PathBuf,
     pub permission: RwLock<Permission>,
     pub running: RwLock<HashMap<String, RunningShell>>,
+    /// Set when the node starts shutting down. Nothing new runs after it: the
+    /// process that would reap a shell is going away, and the control plane
+    /// re-issues the call once the node is back.
+    shutting_down: AtomicBool,
 }
 
 impl std::fmt::Debug for ExecutorState {
@@ -83,6 +93,7 @@ impl ExecutorState {
             session_dir,
             permission: RwLock::new(permission),
             running: RwLock::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -103,15 +114,42 @@ impl ExecutorState {
         }
     }
 
-    /// Kills every running shell. The node calls this when a session stops,
-    /// so in-flight shells die with the session instead of outliving it.
-    pub async fn kill_all_shells(&self) {
+    /// Kills every running shell. The node calls this when a session stops, so
+    /// in-flight shells die with the session instead of outliving it, and on
+    /// the way down, where a shell that outlived its node would have nothing
+    /// left to report its exit to.
+    ///
+    /// A shell is killed by its owner task and its entry drops when the run's
+    /// stream ends, so this waits for the map to empty: signalling and
+    /// returning would leave the process groups alive if the runtime stops
+    /// before those tasks run. The wait is bounded, because a run whose stream
+    /// nothing is consuming cannot finish its guard.
+    /// Returns the runs still in flight when the wait ran out: the caller logs
+    /// them, because a run whose stream nothing is consuming cannot finish its
+    /// guard, and an entry that is still there is a process group the node is
+    /// leaving behind.
+    pub async fn kill_all_shells(&self) -> Vec<String> {
+        self.shutting_down.store(true, Ordering::SeqCst);
         let kills: Vec<Arc<Notify>> = {
             let running = self.running.read().await;
             running.values().map(|shell| shell.kill.clone()).collect()
         };
         for kill in kills {
             kill.notify_one();
+        }
+        let deadline = Instant::now() + SHELL_KILL_WAIT;
+        loop {
+            let left: Vec<String> = {
+                let running = self.running.read().await;
+                if running.is_empty() {
+                    return Vec::new();
+                }
+                running.keys().cloned().collect()
+            };
+            if Instant::now() >= deadline {
+                return left;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -145,6 +183,8 @@ pub enum ShellEvent {
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
+    #[error("the node is shutting down")]
+    ShuttingDown,
     #[error("unknown tool {tool}")]
     UnknownTool { tool: String },
     #[error("missing or invalid argument {key}")]
@@ -179,6 +219,11 @@ pub async fn run_call(
     tool: &str,
     args: &Value,
 ) -> Result<CallOutcome, ExecutorError> {
+    // The node is going down: the process that would reap a shell is leaving,
+    // and the control plane re-issues the call once the node is back.
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return Err(ExecutorError::ShuttingDown);
+    }
     let permission = *state.permission.read().await;
     if tool == "shell" {
         if permission != Permission::ReadWrite {

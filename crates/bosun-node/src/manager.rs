@@ -298,7 +298,13 @@ impl NodeManager {
             .map(|record| record.executor.clone())
             .collect();
         for executor in executors {
-            executor.kill_all_shells().await;
+            let left = executor.kill_all_shells().await;
+            if !left.is_empty() {
+                warn!(
+                    runs = ?left,
+                    "shells are still running after the shutdown wait; their process groups may outlive the node"
+                );
+            }
         }
     }
 
@@ -962,6 +968,23 @@ mod tests {
             })
             .expect("the stream must end with a done event");
         assert_eq!(code, -1, "a killed shell ends with exit code -1");
+
+        // Nothing new runs once the shutdown has started: the process that
+        // would reap a shell is leaving, and its call is the control plane's to
+        // re-issue after the node is back. What remains wiring-only is the wait
+        // itself: a process group dying is the OS's business, and only the run
+        // map is visible in-process.
+        let refused = bosun_executor::run_call(
+            &executor,
+            "run-2",
+            "shell",
+            &serde_json::json!({ "command": "echo late" }),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(bosun_executor::ExecutorError::ShuttingDown)),
+            "a node on the way down refuses a new call"
+        );
     }
 
     #[tokio::test]

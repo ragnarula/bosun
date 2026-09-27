@@ -828,7 +828,10 @@ impl Store {
 
     /// Records the tool call row only; the agent loop emits the tool-call
     /// transcript message itself via `append_message`, so no event is written
-    /// here or in `complete_tool_call`.
+    /// here or in `complete_tool_call`. A call the thread already holds is left
+    /// as it is: a resumed session re-runs it, and an attempt that stopped
+    /// between its message and its row leaves the row missing, which the
+    /// completion below updates rather than inserts.
     pub async fn append_tool_call(
         &self,
         session_id: &str,
@@ -841,7 +844,8 @@ impl Store {
         let args = args.clone();
         self.with_session(session_id, move |conn, session_id| {
             conn.execute(
-                "INSERT INTO tool_calls (session_id, call_id, name, args) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO tool_calls (session_id, call_id, name, args) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id, call_id) DO NOTHING",
                 params![session_id, call_id, name, serde_json::to_string(&args)?],
             )
             .context("failed to insert tool call")?;

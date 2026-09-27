@@ -7005,6 +7005,25 @@ mod tests {
             })
             .await
             .unwrap();
+        state
+            .store
+            .create_session(&{
+                let mut stopped = session("stopped");
+                stopped.state = SessionState::Stopped;
+                stopped
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .create_session(&{
+                let mut interrupted = session("interrupted");
+                interrupted.state = SessionState::Interrupted;
+                interrupted.interrupt_cause = Some(InterruptCause::User);
+                interrupted
+            })
+            .await
+            .unwrap();
 
         recover(&state).await;
 
@@ -7034,6 +7053,112 @@ mod tests {
             "a running session whose model is no longer configured has nothing to run"
         );
         assert_eq!(unconfigured.interrupt_cause, Some(InterruptCause::Crash));
+        let stopped = state.store.get_session("stopped").await.unwrap().unwrap();
+        assert_eq!(
+            stopped.state,
+            SessionState::Stopped,
+            "a stopped session is left stopped"
+        );
+        let interrupted = state
+            .store
+            .get_session("interrupted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            interrupted.state,
+            SessionState::Interrupted,
+            "a session the user interrupted keeps its state and its cause"
+        );
+        assert_eq!(
+            interrupted.interrupt_cause,
+            Some(InterruptCause::User),
+            "and a deployment does not overwrite the cause the user gave it"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_resumes_a_running_root_whose_thread_ends_on_a_call() {
+        let dir = tempdir().unwrap();
+        let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
+            "the call is answered",
+        )]])));
+        let (state, requests) = recovery_state(&dir, scripts).await;
+        state
+            .store
+            .create_session(&recoverable_session("running", SessionState::Running))
+            .await
+            .unwrap();
+        // The plane wrote the call before dispatching it and stopped before the
+        // result: the thread names the work the restart cut off.
+        state
+            .store
+            .append_message(
+                "running",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .append_message(
+                "running",
+                Role::Assistant,
+                &Block::ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    args: json!({ "command": "make" }),
+                    continues_completion: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        recover(&state).await;
+
+        wait_for("the resumed turn to end", {
+            let store = state.store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("running").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        // The re-issue ran: the thread answers the call it was left holding.
+        // What that call answers with is the tool path's business, which the
+        // loop's own tests cover; here the wiring is what is checked.
+        let stored = state
+            .store
+            .messages("running", true)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|(_, message)| matches!(&message.block, Block::ToolResult { id, .. } if id == "call-1"))
+            .count();
+        assert_eq!(stored, 1, "the unanswered call now has a result");
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "and the model is asked once, after the re-issue"
+        );
+        assert_eq!(
+            state
+                .store
+                .get_session("running")
+                .await
+                .unwrap()
+                .unwrap()
+                .interrupt_cause,
+            None,
+            "nothing was marked"
+        );
     }
 
     #[tokio::test]

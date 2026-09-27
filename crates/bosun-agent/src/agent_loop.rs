@@ -1624,6 +1624,58 @@ async fn run_turn_inner(
         .expect("populated above")
         .remote
         .clone();
+    // The tool surface the session may call, and the route of every MCP tool
+    // it can reach. The dispatch reads the routes — a resumed turn reaches it
+    // without asking the model anything, and a re-issued MCP call must find
+    // its server — so both are built before the resume match.
+    let mut tools: Vec<ToolSpec> = canonical_tools(permission)
+        .into_iter()
+        .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
+        .filter(|tool| {
+            // The tree is recursive: any session may spawn children or message
+            // its own children, each level supervising its own. The machinery
+            // that starts or wakes child loops decides advertisement, not the
+            // session's depth. `todowrite` stays root-only: the user's todo
+            // list belongs to the tree owner, so children never see the tool.
+            match tool.name.as_str() {
+                "spawn" => !deps.personas.is_empty() && deps.spawner.is_some(),
+                "message_child" => deps.mailbox.is_some(),
+                "todowrite" => session.parent_id.is_none(),
+                _ => true,
+            }
+        })
+        .collect();
+    // The selected MCP servers' tools join the same list, so the provider
+    // adapters receive one finished surface. `mcp_routes` sends a call back
+    // to the server that exposed its name.
+    if let Some(mcp) = deps.mcp.as_deref() {
+        let names = parse_mcp_servers(&session.mcp_servers);
+        if !names.is_empty() {
+            let availability = mcp.servers(&names);
+            warn_unavailable_servers(deps, session_id, state, &availability).await?;
+            // Every canonical name is reserved, not only the names this
+            // session may call: the dispatch runs a canonical tool under its
+            // bare name, so an MCP tool that took one would never reach its
+            // server.
+            let reserved: Vec<String> = canonical_tools(Permission::ReadWrite)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            let exposure = expose_mcp_tools(availability.servers, &reserved);
+            for advertised in exposure.advertised {
+                mcp_routes.insert(
+                    advertised.tool.name.clone(),
+                    (advertised.server, advertised.server_name),
+                );
+                tools.push(ToolSpec {
+                    name: advertised.tool.name,
+                    description: advertised.tool.description,
+                    schema: advertised.tool.schema,
+                });
+            }
+        }
+    }
+
     // A resumed turn runs the calls the plane left unanswered instead of
     // asking the model: the thread already holds those calls, so this turn
     // records their results and ends as a tool-call turn, and the turn after
@@ -1691,53 +1743,6 @@ async fn run_turn_inner(
                         Vec::new()
                     });
                 state.repo_standards_cache = Some(present);
-            }
-            let mut tools: Vec<ToolSpec> = canonical_tools(permission)
-                .into_iter()
-                .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
-                .filter(|tool| {
-                    // The tree is recursive: any session may spawn children or message
-                    // its own children, each level supervising its own. The machinery
-                    // that starts or wakes child loops decides advertisement, not the
-                    // session's depth. `todowrite` stays root-only: the user's todo
-                    // list belongs to the tree owner, so children never see the tool.
-                    match tool.name.as_str() {
-                        "spawn" => !deps.personas.is_empty() && deps.spawner.is_some(),
-                        "message_child" => deps.mailbox.is_some(),
-                        "todowrite" => session.parent_id.is_none(),
-                        _ => true,
-                    }
-                })
-                .collect();
-            // The selected MCP servers' tools join the same list, so the provider
-            // adapters receive one finished surface. `mcp_routes` sends a call back
-            // to the server that exposed its name.
-            if let Some(mcp) = deps.mcp.as_deref() {
-                let names = parse_mcp_servers(&session.mcp_servers);
-                if !names.is_empty() {
-                    let availability = mcp.servers(&names);
-                    warn_unavailable_servers(deps, session_id, state, &availability).await?;
-                    // Every canonical name is reserved, not only the names this
-                    // session may call: the dispatch runs a canonical tool under its
-                    // bare name, so an MCP tool that took one would never reach its
-                    // server.
-                    let reserved: Vec<String> = canonical_tools(Permission::ReadWrite)
-                        .into_iter()
-                        .map(|tool| tool.name)
-                        .collect();
-                    let exposure = expose_mcp_tools(availability.servers, &reserved);
-                    for advertised in exposure.advertised {
-                        mcp_routes.insert(
-                            advertised.tool.name.clone(),
-                            (advertised.server, advertised.server_name),
-                        );
-                        tools.push(ToolSpec {
-                            name: advertised.tool.name,
-                            description: advertised.tool.description,
-                            schema: advertised.tool.schema,
-                        });
-                    }
-                }
             }
 
             let system = system_prompt(
@@ -1887,10 +1892,13 @@ async fn run_turn_inner(
                 },
             )
             .await?;
-            deps.store
-                .append_tool_call(session_id, &id, &name, &args)
-                .await?;
         }
+        // The row is registered either way: the attempt that stopped between a
+        // call's message and its row left the row missing, and the completion
+        // below updates a row rather than creating one.
+        deps.store
+            .append_tool_call(session_id, &id, &name, &args)
+            .await?;
 
         // The session's allowed-tool set is the second half of its canonical
         // surface (the executor enforces the permission); a canonical call
@@ -18906,7 +18914,13 @@ mod tests {
 
     /// A session whose thread ends on a call with nothing answering it: the
     /// plane wrote the call before dispatching it and stopped before the result.
-    async fn store_a_dangling_call(store: &Store, session_id: &str, name: &str) {
+    async fn store_a_dangling_call(
+        store: &Store,
+        session_id: &str,
+        call_id: &str,
+        name: &str,
+        args: Value,
+    ) {
         store
             .append_message(
                 session_id,
@@ -18922,9 +18936,9 @@ mod tests {
                 session_id,
                 Role::Assistant,
                 &Block::ToolCall {
-                    id: "call-1".into(),
+                    id: call_id.into(),
                     name: name.into(),
-                    args: json!({ "command": "make" }),
+                    args,
                     continues_completion: false,
                 },
             )
@@ -18937,7 +18951,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("s-resume")).await.unwrap();
-        store_a_dangling_call(&store, "s-resume", "shell").await;
+        store_a_dangling_call(
+            &store,
+            "s-resume",
+            "call-1",
+            "shell",
+            json!({ "command": "make" }),
+        )
+        .await;
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("the result is in".into()),
@@ -19089,7 +19110,14 @@ mod tests {
         // A successful ask replaces its result with the question, so its call
         // has no result: the question is live, and asking it again would ask it
         // twice.
-        store_a_dangling_call(&store, "s-ask", "ask").await;
+        store_a_dangling_call(
+            &store,
+            "s-ask",
+            "call-1",
+            "ask",
+            json!({ "message": "which branch?" }),
+        )
+        .await;
 
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             StreamEvent::TextDelta("still waiting".into()),
@@ -19186,6 +19214,409 @@ mod tests {
             provider.captured_calls().len(),
             1,
             "a deployment does not overrule the user's interrupt: the resume ran nothing"
+        );
+    }
+    #[tokio::test]
+    async fn a_resume_wake_reissues_an_mcp_call_to_its_server() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-mcp")
+            })
+            .await
+            .unwrap();
+        store_a_dangling_call(
+            &store,
+            "s-mcp",
+            "call-1",
+            "lookup",
+            json!({ "query": "the name" }),
+        )
+        .await;
+
+        let mcp = Arc::new(
+            MockMcp::new(mcp_text("the answer"))
+                .serving("srv-a", vec![mcp_tool("lookup", "looks a name up")]),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("read it".into()),
+            stop(1, 1),
+        ]]));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            instant_tools(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-mcp".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-mcp").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let calls = mcp.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "a re-issued MCP call reaches its server, not the node"
+        );
+        assert_eq!(calls[0].server, "srv-a");
+        assert_eq!(calls[0].tool, "lookup");
+        let requests = provider.captured_calls();
+        assert!(
+            requests[0].messages.iter().any(|message| matches!(
+                &message.block,
+                Block::ToolResult { id, is_error, .. } if id == "call-1" && !is_error
+            )),
+            "and its result is in the request the model reads: {:?}",
+            request_texts(&requests[0])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_wake_runs_every_unanswered_call_in_thread_order() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-two")).await.unwrap();
+        store
+            .append_message(
+                "s-two",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        for (call_id, command) in [("call-1", "first"), ("call-2", "second")] {
+            store
+                .append_message(
+                    "s-two",
+                    Role::Assistant,
+                    &Block::ToolCall {
+                        id: call_id.into(),
+                        name: "shell".into(),
+                        args: json!({ "command": command }),
+                        continues_completion: call_id == "call-2",
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("both are in".into()),
+            stop(1, 1),
+        ]]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-two".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-two").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let ran: Vec<String> = tools
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.name == "shell")
+            .map(|call| {
+                call.args["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            ran,
+            ["first", "second"],
+            "every unanswered call runs, in the order the thread holds them"
+        );
+        assert_eq!(
+            request_texts(&provider.captured_calls()[0]),
+            [
+                "start",
+                "tool call shell (id call-1): {\"command\":\"first\"}",
+                "tool result shell (id call-1, is_error false): {\"ok\":true}",
+                "tool call shell (id call-2): {\"command\":\"second\"}",
+                "tool result shell (id call-2, is_error false): {\"ok\":true}",
+            ],
+            "and each result follows its own call in the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_wake_records_a_reissued_calls_failure() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-fail")).await.unwrap();
+        store_a_dangling_call(
+            &store,
+            "s-fail",
+            "call-1",
+            "shell",
+            json!({ "command": "make" }),
+        )
+        .await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("it failed".into()),
+            stop(1, 1),
+        ]]));
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "shell",
+            ToolOutcome {
+                content: json!({ "error": "the command failed" }),
+                is_error: true,
+            },
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools,
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-fail".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-fail").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let requests = provider.captured_calls();
+        assert_eq!(
+            request_texts(&requests[0]),
+            [
+                "start",
+                "tool call shell (id call-1): {\"command\":\"make\"}",
+                "tool result shell (id call-1, is_error true): {\"error\":\"the command failed\"}",
+            ],
+            "a re-issued call that fails is recorded as any call's failure, and the model still runs"
+        );
+    }
+    #[tokio::test]
+    async fn a_resume_that_arrives_mid_turn_runs_when_the_wake_ends() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-queued")).await.unwrap();
+        store
+            .append_message(
+                "s-queued",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The first turn streams slowly, so the resume lands while it is in
+        // flight; the second script answers the resumed turn.
+        let provider = Arc::new(ScriptedProvider::with_delay(
+            vec![
+                vec![
+                    StreamEvent::TextDelta("the first answer".into()),
+                    stop(1, 1),
+                ],
+                vec![
+                    StreamEvent::TextDelta("the resumed answer".into()),
+                    stop(1, 1),
+                ],
+            ],
+            Duration::from_millis(200),
+        ));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-queued".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the queued resume to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(
+            request_texts(&calls[1]),
+            ["start", "the first answer"],
+            "the queued resume runs a turn of its own, over the thread as it stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_arrives_during_an_empty_retry_is_not_lost() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-backoff")).await.unwrap();
+        store
+            .append_message(
+                "s-backoff",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // The empty completion that starts the retry's backoff.
+            vec![stop(0, 0)],
+            vec![
+                StreamEvent::TextDelta("the retry's answer".into()),
+                stop(1, 1),
+            ],
+            vec![
+                StreamEvent::TextDelta("the resumed answer".into()),
+                stop(1, 1),
+            ],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-backoff".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        // The retry logs its attempt before it backs off, so the resume lands
+        // inside the backoff window.
+        wait_for("the empty retry's backoff", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    activities(&store, "s-backoff")
+                        .await
+                        .iter()
+                        .any(|(_, phase)| matches!(phase, ActivityPhase::EmptyRetry { .. }))
+                }
+            }
+        })
+        .await;
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the queued resume to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 3 }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            request_texts(&provider.captured_calls()[2]),
+            ["start", "the retry's answer"],
+            "the resume that landed in the backoff runs after it: the retry, then the resume"
+        );
+    }
+    #[tokio::test]
+    async fn a_reissued_call_gets_the_row_its_first_attempt_missed() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-row")).await.unwrap();
+        // The first attempt wrote the call's message and stopped before its
+        // row, so the thread names a call the store has no row for.
+        store_a_dangling_call(
+            &store,
+            "s-row",
+            "call-1",
+            "shell",
+            json!({ "command": "make" }),
+        )
+        .await;
+        assert!(
+            store.tool_calls("s-row").await.unwrap().is_empty(),
+            "the message is there and the row is not"
+        );
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("done".into()),
+            stop(1, 1),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-row".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-row").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let rows = store.tool_calls("s-row").await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the re-issued call registers the row its first attempt never wrote"
+        );
+        assert_eq!(rows[0].call_id, "call-1");
+        assert!(
+            rows[0].result.is_some(),
+            "and the completion lands on that row rather than on nothing"
         );
     }
 }
