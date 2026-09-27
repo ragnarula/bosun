@@ -1,8 +1,9 @@
 //! Spawning real child sessions from an agent loop's `spawn` tool. The child
-//! is a full session: the control plane asks the node to start its own
-//! executor on the parent's working copy, creates the child's session row,
-//! and starts its own loop. The parent's turn gets the child's id back and
-//! continues; the child runs concurrently and reports when it completes.
+//! is a full session: the control plane asks a node to start its own executor
+//! in the parent's working copy, or in a node and directory the caller named,
+//! creates the child's session row, and starts its own loop. The parent's turn
+//! gets the child's id back and continues; the child runs concurrently and
+//! reports when it completes.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -82,29 +83,33 @@ async fn spawn_child(
         persona_name,
         persona,
         instructions,
+        node,
+        dir,
     } = request;
     let parent_log_id = parent.id.clone();
     let persona_log_name = persona_name.clone();
-    if nodes.node(&parent.node, SystemTime::now()).is_none() {
-        return Err(SpawnError::Failed(format!(
-            "node {} is not up",
-            parent.node
-        )));
-    }
+    let placement = placement(
+        nodes,
+        &parent,
+        node.as_deref(),
+        dir.as_deref(),
+        SystemTime::now(),
+    )?;
 
     let child_id = uuid::Uuid::new_v4().to_string();
-    // The child runs in the parent's working copy, a directory this node
-    // already created. The start command is the internal executor-in-
-    // existing-dir command; the node confines the directory to its browse
-    // roots exactly like dev, so a clone-session parent needs a root that
-    // covers the node's work_dir.
+    // The node confines a named directory to its own browse roots exactly like
+    // dev, so an out-of-roots request is refused there and reaches the parent
+    // as a tool error; a command with no directory asks the node to pick one
+    // under its work directory. A clone-session parent lives under the node's
+    // work_dir, so a root has to cover it for the parent's own copy to be a
+    // legal placement.
     let command = NodeCommand::Start {
         id: commands.next_id(),
         session_id: child_id.clone(),
-        dir: PathBuf::from(&parent.dir),
+        dir: placement.dir.clone(),
         permission: persona.permission,
     };
-    let node_session = enqueue_and_await(commands, &parent.node, command).await?;
+    let node_session = enqueue_and_await(commands, &placement.node, command).await?;
 
     let dir = node_session
         .dir
@@ -112,14 +117,26 @@ async fn spawn_child(
         .ok_or_else(|| {
             SpawnError::Failed(format!(
                 "node {} did not report a directory for the child session",
-                parent.node
+                placement.node
             ))
         })?;
+    // The child keeps the parent's repository only when it runs in the
+    // parent's own directory; one placed elsewhere works in a directory that
+    // holds no such clone.
+    let in_parent_dir = dir == parent.dir;
     let child = Session {
         id: child_id.clone(),
-        node: parent.node,
-        repo_url: parent.repo_url,
-        git_ref: parent.git_ref,
+        node: placement.node.clone(),
+        repo_url: if in_parent_dir {
+            parent.repo_url.clone()
+        } else {
+            None
+        },
+        git_ref: if in_parent_dir {
+            parent.git_ref.clone()
+        } else {
+            None
+        },
         dir,
         model: persona.model.clone(),
         persona: Some(persona_name),
@@ -159,6 +176,59 @@ async fn spawn_child(
     Ok(child_id)
 }
 
+/// Where a spawn puts the child: the node it starts on, and the directory the
+/// caller named. `None` for the directory asks the node to choose one under
+/// its own work directory.
+#[derive(Debug)]
+struct Placement {
+    node: String,
+    dir: Option<PathBuf>,
+}
+
+/// Resolves the placement the tool asked for. With no node the child keeps the
+/// parent's place, unchanged: the parent's node and the parent's working copy.
+/// A named node must be registered and up, and a directory needs a node to
+/// confine it to that node's browse roots.
+fn placement(
+    nodes: &NodeRegistry,
+    parent: &Session,
+    node: Option<&str>,
+    dir: Option<&str>,
+    now: SystemTime,
+) -> Result<Placement, SpawnError> {
+    let Some(named) = node else {
+        if dir.is_some() {
+            return Err(SpawnError::Failed(
+                "dir needs node: without a node the child starts in the parent's directory"
+                    .to_string(),
+            ));
+        }
+        if nodes.node(&parent.node, now).is_none() {
+            return Err(SpawnError::Failed(format!(
+                "node {} is not up",
+                parent.node
+            )));
+        }
+        return Ok(Placement {
+            node: parent.node.clone(),
+            dir: Some(PathBuf::from(&parent.dir)),
+        });
+    };
+    if nodes.node(named, now).is_none() {
+        return Err(SpawnError::Failed(
+            if nodes.list(now).iter().any(|health| health.name == named) {
+                format!("node {named} is not up")
+            } else {
+                format!("unknown node {named}")
+            },
+        ));
+    }
+    Ok(Placement {
+        node: named.to_string(),
+        dir: dir.map(PathBuf::from),
+    })
+}
+
 /// A store write failure inside a spawn is an internal error: the caller can
 /// only report it.
 fn store_error(error: StoreError) -> SpawnError {
@@ -192,5 +262,153 @@ async fn enqueue_and_await(
         _ => Err(SpawnError::Failed(format!(
             "node {node} answered start with a non-session result"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bosun_common::session::Permission;
+    use bosun_common::types::UpdateStatus;
+
+    use super::*;
+
+    /// A parent session running on `node`, working in `dir`.
+    fn parent(node: &str, dir: &str) -> Session {
+        Session {
+            id: "parent-1".into(),
+            node: node.into(),
+            repo_url: Some("https://example.com/repo".into()),
+            git_ref: Some("main".into()),
+            dir: dir.into(),
+            model: "test-model".into(),
+            persona: Some("coder".into()),
+            parent_id: None,
+            owner_id: "parent-1".into(),
+            permission: Permission::ReadWrite,
+            allowed_tools: "*".into(),
+            mcp_servers: "".into(),
+            state: SessionState::Creating,
+            interrupt_cause: None,
+            created_at_secs: 1_700_000_000,
+            prompt: None,
+            summary: None,
+        }
+    }
+
+    /// A registry holding one record per node, last heard from at `seen`.
+    fn nodes(seen: &[(&str, SystemTime)]) -> NodeRegistry {
+        let registry = NodeRegistry::new(Duration::from_secs(10));
+        for (name, at) in seen {
+            registry.upsert(name, "0.9.40", UpdateStatus::UpToDate, *at);
+        }
+        registry
+    }
+
+    #[test]
+    fn a_spawn_with_no_node_keeps_the_parents_place() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now)]);
+        let placement = placement(&registry, &parent("n1", "/work/repo"), None, None, now)
+            .expect("a spawn with no node keeps today's place");
+        assert_eq!(placement.node, "n1");
+        assert_eq!(
+            placement.dir,
+            Some(PathBuf::from("/work/repo")),
+            "the child runs in the parent's working copy"
+        );
+    }
+
+    #[test]
+    fn a_named_node_takes_the_child_with_the_directory_it_was_given() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now), ("n2", now)]);
+        let placement = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("n2"),
+            Some("/work/other"),
+            now,
+        )
+        .expect("a node that is up may be named");
+        assert_eq!(placement.node, "n2");
+        assert_eq!(placement.dir, Some(PathBuf::from("/work/other")));
+    }
+
+    #[test]
+    fn a_named_node_with_no_directory_leaves_the_choice_to_that_node() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now), ("n2", now)]);
+        let placement = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("n2"),
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(placement.node, "n2");
+        assert_eq!(
+            placement.dir, None,
+            "no directory is the node's own placement to make, under its work directory"
+        );
+    }
+
+    #[test]
+    fn an_unknown_node_is_refused_by_name() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now)]);
+        let error = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("ghost"),
+            None,
+            now,
+        )
+        .expect_err("a node the registry has never seen cannot host a child");
+        assert_eq!(error.to_string(), "unknown node ghost");
+    }
+
+    #[test]
+    fn a_node_that_is_not_up_is_refused() {
+        let now = SystemTime::now();
+        let stale = now - Duration::from_secs(60);
+        let registry = nodes(&[("n1", now), ("n2", stale)]);
+        let error = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            Some("n2"),
+            None,
+            now,
+        )
+        .expect_err("a node that stopped reporting cannot host a child");
+        assert_eq!(error.to_string(), "node n2 is not up");
+    }
+
+    #[test]
+    fn a_parent_whose_own_node_is_not_up_is_refused() {
+        let now = SystemTime::now();
+        let stale = now - Duration::from_secs(60);
+        let registry = nodes(&[("n1", stale)]);
+        let error = placement(&registry, &parent("n1", "/work/repo"), None, None, now)
+            .expect_err("the unchanged path still needs the parent's node up");
+        assert_eq!(error.to_string(), "node n1 is not up");
+    }
+
+    #[test]
+    fn a_directory_without_a_node_is_refused() {
+        let now = SystemTime::now();
+        let registry = nodes(&[("n1", now)]);
+        let error = placement(
+            &registry,
+            &parent("n1", "/work/repo"),
+            None,
+            Some("/work/other"),
+            now,
+        )
+        .expect_err("a directory needs the node whose browse roots confine it");
+        assert_eq!(
+            error.to_string(),
+            "dir needs node: without a node the child starts in the parent's directory"
+        );
     }
 }

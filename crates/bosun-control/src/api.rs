@@ -3130,6 +3130,69 @@ mod tests {
         json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [tool_call] } }] })
     }
 
+    /// A fake node: it polls the control plane, records every command it is
+    /// asked to run, and answers a `Start` by reporting the session in the
+    /// directory it was given — or in a directory of its own making when the
+    /// caller named none, as a real node does under its work directory.
+    fn fake_node(
+        addr: SocketAddr,
+        node_name: &'static str,
+        seen: Arc<Mutex<Vec<NodeCommand>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = reqwest::Client::new();
+        tokio::spawn(async move {
+            let mut result: Option<CommandResult> = None;
+            loop {
+                let poll = json!({
+                    "node_name": node_name,
+                    "status": "up",
+                    "version": bosun_common::version::VERSION,
+                    "result": result,
+                });
+                let response: Value = match client
+                    .post(format!("http://{addr}/poll"))
+                    .json(&poll)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.json().await.unwrap(),
+                    Err(_) => break,
+                };
+                let Some(command) = response["command"].clone().as_object().cloned() else {
+                    result = None;
+                    continue;
+                };
+                let command: NodeCommand = serde_json::from_value(Value::Object(command)).unwrap();
+                seen.lock().unwrap().push(command.clone());
+                match command {
+                    NodeCommand::Start {
+                        ref dir,
+                        ref session_id,
+                        ..
+                    } => {
+                        let id = command.id();
+                        result = Some(CommandResult::Session {
+                            id,
+                            session: SessionInfo {
+                                id: session_id.clone(),
+                                repo_url: None,
+                                git_ref: None,
+                                dir: Some(dir.clone().unwrap_or_else(|| {
+                                    std::path::PathBuf::from("/work").join(session_id)
+                                })),
+                                status: "running".into(),
+                            },
+                        });
+                    }
+                    NodeCommand::Stop { .. } => {
+                        result = Some(CommandResult::Stop { id: command.id() });
+                    }
+                    _ => break,
+                }
+            }
+        })
+    }
+
     async fn completions(delay: Duration, requests: Arc<AtomicUsize>) -> axum::response::Response {
         requests.fetch_add(1, Ordering::Relaxed);
         let stream = futures_util::stream::unfold(0u8, move |step| async move {
@@ -3573,7 +3636,9 @@ mod tests {
                                 id: session_id.clone(),
                                 repo_url: None,
                                 git_ref: None,
-                                dir: Some(dir.clone()),
+                                dir: Some(dir.clone().unwrap_or_else(|| {
+                                    std::path::PathBuf::from("/work").join(session_id)
+                                })),
                                 status: "running".into(),
                             },
                         });
@@ -3684,7 +3749,7 @@ mod tests {
             });
         let (start_dir, start_permission) =
             start.expect("a Start command for the child's executor was queued");
-        assert_eq!(start_dir, std::path::PathBuf::from("/work/repo"));
+        assert_eq!(start_dir, Some(std::path::PathBuf::from("/work/repo")));
         assert_eq!(start_permission, Permission::ReadWrite);
 
         // The child stored its own transcript and model call; the parent's
@@ -3741,6 +3806,194 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_spawn_named_at_another_node_starts_the_child_there() {
+        // Two nodes are up: the root runs on n1, and its spawn names n2 with a
+        // directory on it. The child's executor must be requested from n2, its
+        // row must carry n2 and the directory n2 reported, and it must stay
+        // the root's child, reporting to it as any child does.
+        let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
+            vec![
+                vec![spawn_call_fragment(
+                    true,
+                    r#"{"persona":"reviewer","instructions":"review the change","node":"n2","dir":"/work/other"}"#,
+                )],
+                vec![text_chunk("acknowledged")],
+                vec![text_chunk("thanks for the review")],
+            ],
+        )));
+        let child_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> = Arc::new(Mutex::new(VecDeque::from(
+            vec![vec![text_chunk("the change looks good")]],
+        )));
+        let root_addr = scripted_provider(root_scripts).await;
+        let child_addr = scripted_provider(child_scripts).await;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let node_timeout = Duration::from_secs(4);
+        let nodes = Arc::new(NodeRegistry::new(node_timeout));
+        let commands = Arc::new(CommandQueue::new(node_timeout));
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let providers = HashMap::from([
+            (
+                "main-model".to_string(),
+                openai_provider_with_model(root_addr, "main-model"),
+            ),
+            (
+                "reviewer-model".to_string(),
+                openai_provider_with_model(child_addr, "reviewer-model"),
+            ),
+        ]);
+        let personas = HashMap::from([
+            (
+                "coder".to_string(),
+                PersonaConfig {
+                    model: "main-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Makes changes".into(),
+                    system_prompt: None,
+                },
+            ),
+            (
+                "reviewer".to_string(),
+                PersonaConfig {
+                    model: "reviewer-model".into(),
+                    permission: Permission::ReadWrite,
+                    allowed_tools: "*".into(),
+                    description: "Reviews changes".into(),
+                    system_prompt: None,
+                },
+            ),
+        ]);
+        let loops = Arc::new(AgentRegistry::new(
+            providers.clone(),
+            personas.clone(),
+            HashMap::new(),
+        ));
+        let state = Arc::new(AppState {
+            registry: nodes.clone(),
+            commands: commands.clone(),
+            tunnels: tunnels.clone(),
+            store: store.clone(),
+            github: dead_github(),
+            loops,
+            providers,
+            personas,
+            default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+        });
+        state.loops.attach_child_spawner(nodes, commands, tunnels);
+
+        let addr = serve(state.clone()).await;
+        let seen_n1: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_n2: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        fake_node(addr, "n1", seen_n1.clone());
+        fake_node(addr, "n2", seen_n2.clone());
+
+        // Both nodes are up before the root exists: the spawn tool refuses a
+        // node that is not.
+        wait_for("both fake nodes to register", {
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                async move {
+                    let now = SystemTime::now();
+                    state.registry.node("n1", now).is_some()
+                        && state.registry.node("n2", now).is_some()
+                }
+            }
+        })
+        .await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions"))
+            .json(&json!({
+                "node": "n1",
+                "dir": "/work/repo",
+                "persona": "coder",
+                "prompt": "fan this out to the other machine"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let root: Value = response.json().await.unwrap();
+        let root_id = root["id"].as_str().unwrap().to_string();
+
+        wait_for("the child report to reach the parent's thread", {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            move || {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                async move {
+                    let messages = store.messages(&root_id, false).await.unwrap();
+                    messages.iter().any(|(_, message)| {
+                        matches!(
+                            &message.block,
+                            Block::ChildEvent { text, .. } if text == "the change looks good"
+                        )
+                    })
+                }
+            }
+        })
+        .await;
+
+        let root_messages = store.messages(&root_id, false).await.unwrap();
+        let child_id = root_messages
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ToolResult { name, content, .. } if name == "spawn" => {
+                    content["child_id"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .expect("the spawn result names the child");
+
+        let child = store
+            .get_session(&child_id)
+            .await
+            .unwrap()
+            .expect("the child's row exists");
+        assert_eq!(
+            child.node, "n2",
+            "the child runs on the node its caller named"
+        );
+        assert_eq!(child.dir, "/work/other");
+        assert_eq!(
+            child.parent_id.as_deref(),
+            Some(root_id.as_str()),
+            "a child on another node is still the caller's child"
+        );
+        assert_eq!(
+            child.repo_url, None,
+            "a child placed in a directory of its own holds no clone of the parent's repository"
+        );
+
+        let n2_seen = seen_n2.lock().unwrap().clone();
+        assert!(
+            n2_seen.iter().any(|command| matches!(
+                command,
+                NodeCommand::Start { session_id, dir, .. }
+                    if session_id == &child_id
+                        && dir.as_deref() == Some(std::path::Path::new("/work/other"))
+            )),
+            "n2 was asked to start the child's executor in the directory the caller named"
+        );
+        assert!(
+            !seen_n1
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, NodeCommand::Start { .. })),
+            "the parent's own node was never asked to start anything"
+        );
     }
 
     #[tokio::test]
@@ -3957,7 +4210,7 @@ mod tests {
             });
         let (child_id, start_dir, start_permission) =
             start.expect("a Start command for the child's executor was queued");
-        assert_eq!(start_dir, std::path::PathBuf::from("/work/repo"));
+        assert_eq!(start_dir, Some(std::path::PathBuf::from("/work/repo")));
         assert_eq!(start_permission, Permission::ReadWrite);
         assert!(
             store.get_session(&child_id).await.unwrap().is_none(),

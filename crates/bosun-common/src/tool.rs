@@ -239,10 +239,12 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             description: "Load a skill's instructions into context. Skills come from the working repo and from remote packages. `name` is the short name when unique, or a full package address like `github.com/owner/repo/<path...>/skills/<name>`. A load returns the instructions plus the reference paths the body references; `reference` returns that chunk.".into(),
             schema: json!({"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}),
         },
+        // Read-only sessions drop this one with the mutating tools: a spawn
+        // places work on a machine, in a directory, which is more than reading.
         ToolSpec {
             name: "spawn".into(),
-            description: "Create a child session under a configured persona and hand it a task. Returns the child session's id; the child runs on its own executor and reports back when done.".into(),
-            schema: json!({"type":"object","properties":{"persona":{"type":"string"},"instructions":{"type":"string"}},"required":["persona","instructions"]}),
+            description: "Create a child session under a configured persona and hand it a task. Returns the child session's id; the child runs on its own executor and reports back when done. `node` names the node to start the child on, any registered node that is up; without it the child starts on your own node in your working copy. `dir` names an existing directory on that node, inside its browse roots, and needs `node`; without a directory the target node starts the child in a fresh directory it chooses under its own work directory.".into(),
+            schema: json!({"type":"object","properties":{"persona":{"type":"string"},"instructions":{"type":"string"},"node":{"type":"string"},"dir":{"type":"string"}},"required":["persona","instructions"]}),
         },
         ToolSpec {
             name: "message_child".into(),
@@ -260,9 +262,17 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
 
     match permission {
         Permission::ReadWrite => all,
+        // A spawn places new work on a machine, in a directory of the
+        // caller's or the node's choosing, so a read-only session drops it
+        // with the writing tools. The loop refuses a call too.
         Permission::ReadOnly => all
             .into_iter()
-            .filter(|tool| !matches!(tool.name.as_str(), "shell" | "file_write" | "edit"))
+            .filter(|tool| {
+                !matches!(
+                    tool.name.as_str(),
+                    "shell" | "file_write" | "edit" | "spawn"
+                )
+            })
             .collect(),
     }
 }
@@ -395,7 +405,7 @@ mod tests {
                 "history_read",
                 "webfetch",
                 "skill",
-                "spawn",
+                // `spawn` is absent: placing work on a machine is a write.
                 "message_child",
                 // `session_status` answers from the store and changes
                 // nothing, so a read-only session keeps it.
@@ -409,6 +419,32 @@ mod tests {
         let tools = canonical_tools(Permission::ReadWrite);
         let shell = tools.iter().find(|tool| tool.name == "shell").unwrap();
         assert_eq!(shell.schema["required"], json!(["command"]));
+    }
+
+    #[test]
+    fn spawn_schema_takes_a_persona_a_task_and_an_optional_placement() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let spawn = tools.iter().find(|tool| tool.name == "spawn").unwrap();
+        assert_eq!(spawn.schema["required"], json!(["persona", "instructions"]));
+        let properties = spawn.schema["properties"].as_object().unwrap();
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["dir", "instructions", "node", "persona"],
+            "the placement is optional: the persona and the task stand alone, and `node` and `dir` are the whole of the addition"
+        );
+        for field in ["node", "dir"] {
+            assert_eq!(
+                properties[field]["type"], "string",
+                "`{field}` names a node or a directory, never a structure"
+            );
+        }
+        assert!(
+            spawn.description.contains("browse roots")
+                && spawn.description.contains("work directory"),
+            "the description has to say where a named directory may lie, and what the node does when none is named"
+        );
     }
 
     #[test]

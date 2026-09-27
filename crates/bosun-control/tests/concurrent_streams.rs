@@ -166,7 +166,7 @@ async fn node_with_sessions(
         manager
             .start(&NodeStartRequest {
                 session_id: (*session_id).to_string(),
-                dir,
+                dir: Some(dir),
                 permission: Permission::ReadWrite,
             })
             .await

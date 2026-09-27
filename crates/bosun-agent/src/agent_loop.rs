@@ -247,14 +247,20 @@ pub enum ToolError {
 }
 
 /// One child session the `spawn` tool asks for: the parent session, the
-/// persona the child runs under, and the assignment that becomes the child's
-/// first user message.
+/// persona the child runs under, the assignment that becomes the child's first
+/// user message, and where it runs — a node the caller names and a directory
+/// on it, each optional.
 #[derive(Clone)]
 pub struct SpawnChild {
     pub parent: Session,
     pub persona_name: String,
     pub persona: PersonaConfig,
     pub instructions: String,
+    /// The node the child starts on; `None` is the parent's own node.
+    pub node: Option<String>,
+    /// An existing directory on that node; `None` lets the node start the
+    /// child in a fresh directory under its work directory.
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2125,10 +2131,10 @@ async fn run_turn_inner(
                 append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
             }
             // Creates a real child session: the child runs its own loop and
-            // executor on this working copy under the target persona. The
-            // call returns the child's id and the turn continues; the child's
-            // completion report arrives later as an authored event in this
-            // session's thread.
+            // executor under the target persona, in this working copy or in a
+            // node and directory the caller names. The call returns the
+            // child's id and the turn continues; the child's completion report
+            // arrives later as an authored event in this session's thread.
             "spawn" => {
                 let started = Instant::now();
                 append_activity(
@@ -2139,11 +2145,48 @@ async fn run_turn_inner(
                     },
                 )
                 .await?;
+                // A read-only session never sees the tool, so a call here is a
+                // refused fallback, not a path a model should reach: a spawn
+                // places work on a machine of its own choosing.
+                if session.permission == Permission::ReadOnly {
+                    let content =
+                        json!({ "error": "spawn is not available in a read-only session" });
+                    deps.store
+                        .complete_tool_call(session_id, &id, &content, true)
+                        .await?;
+                    record_in_wake(
+                        deps,
+                        session_id,
+                        window,
+                        Role::User,
+                        &Block::ToolResult {
+                            id,
+                            name,
+                            is_error: true,
+                            content,
+                        },
+                    )
+                    .await?;
+                    append_tool_finished(deps, session_id, &tool_name, started, false).await?;
+                    continue;
+                }
                 let persona_name = args["persona"].as_str().unwrap_or_default().to_string();
                 let instructions = args["instructions"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
+                // A placement the caller left blank is the same as one it did
+                // not send.
+                let node = args["node"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|node| !node.is_empty())
+                    .map(str::to_string);
+                let dir = args["dir"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|dir| !dir.is_empty())
+                    .map(str::to_string);
                 let outcome = async {
                     let Some(persona) = deps.personas.get(&persona_name) else {
                         anyhow::bail!("unknown persona {persona_name}");
@@ -2162,6 +2205,8 @@ async fn run_turn_inner(
                                 persona_name: persona_name.clone(),
                                 persona: persona.clone(),
                                 instructions: instructions.clone(),
+                                node: node.clone(),
+                                dir: dir.clone(),
                             },
                         )
                         .await
@@ -10704,6 +10749,206 @@ mod tests {
         assert_eq!(tool_calls[0].name, "spawn");
         assert_eq!(tool_calls[0].result, Some(json!({ "child_id": "child-4" })));
         assert!(!tool_calls[0].is_error);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_spawn_carries_the_node_and_directory_the_caller_named() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-6")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"review the diff","node":"n2","dir":"/work/other"}"#.into(),
+                },
+                stop(3, 2),
+            ],
+            vec![
+                StreamEvent::TextDelta("spawned, continuing".into()),
+                stop(1, 1),
+            ],
+        ]));
+        let spawner = Arc::new(FakeSpawner::ok("child-6"));
+        let deps = Arc::new(test_deps_with_spawner(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::from([(
+                "mock-model".to_string(),
+                provider.clone() as Arc<dyn Provider>,
+            )]),
+            spawner.clone(),
+        ));
+        let handle = spawn_loop("parent-6".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the parent's turn to continue past the spawn", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let requests = spawner.requested();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].node.as_deref(), Some("n2"));
+        assert_eq!(requests[0].dir.as_deref(), Some("/work/other"));
+        assert_eq!(
+            requests[0].parent.id, "parent-6",
+            "a child on another node is still the caller's child"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_blank_placement_argument_counts_as_absent() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-7")).await.unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"review the diff","node":"  ","dir":""}"#.into(),
+                },
+                stop(3, 2),
+            ],
+            vec![
+                StreamEvent::TextDelta("spawned, continuing".into()),
+                stop(1, 1),
+            ],
+        ]));
+        let spawner = Arc::new(FakeSpawner::ok("child-7"));
+        let deps = Arc::new(test_deps_with_spawner(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::from([(
+                "mock-model".to_string(),
+                provider.clone() as Arc<dyn Provider>,
+            )]),
+            spawner.clone(),
+        ));
+        let handle = spawn_loop("parent-7".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the parent's turn to continue past the spawn", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let requests = spawner.requested();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].node, None,
+            "a placement the caller left blank keeps the parent's node"
+        );
+        assert_eq!(requests[0].dir, None);
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_cannot_spawn_at_all() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&read_only_session("parent-ro"))
+            .await
+            .unwrap();
+
+        // The session names the tool anyway: it is not in a read-only
+        // session's surface, so the call is a refused fallback rather than a
+        // path a model reaches.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("spawn".into()),
+                    args_delta: r#"{"persona":"coder","instructions":"review the diff"}"#.into(),
+                },
+                stop(3, 2),
+            ],
+            vec![StreamEvent::TextDelta("carrying on".into()), stop(1, 1)],
+        ]));
+        let spawner = Arc::new(FakeSpawner::ok("child-ro"));
+        let deps = Arc::new(test_deps_with_spawner(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            HashMap::from([(
+                "coder".to_string(),
+                persona("mock-model", Permission::ReadWrite),
+            )]),
+            HashMap::from([(
+                "mock-model".to_string(),
+                provider.clone() as Arc<dyn Provider>,
+            )]),
+            spawner.clone(),
+        ));
+        let handle = spawn_loop("parent-ro".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the parent's turn to continue past the refused call", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        let names: Vec<&str> = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"spawn"),
+            "a read-only session's surface carries no spawn tool"
+        );
+
+        let result = recorded_result(&store, "parent-ro", "call-1").await;
+        assert_eq!(
+            result,
+            json!({ "error": "spawn is not available in a read-only session" })
+        );
+        assert!(
+            spawner.requested().is_empty(),
+            "the refusal must stand before the spawner is reached"
+        );
 
         handle.stop();
     }
