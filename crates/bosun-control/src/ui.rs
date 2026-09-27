@@ -1519,6 +1519,39 @@ mod tests {
         }
     }
 
+    // The document never scrolls, so the home column and each tab panel scroll
+    // inside it. Without that, the session list's tail -- and the tab lists' --
+    // are clipped with no way to reach them.
+
+    #[test]
+    fn the_pane_gives_every_screen_its_own_scroll() {
+        assert!(
+            PANE.contains("html, body { height: 100%; overflow: hidden; }"),
+            "the document lock is what makes this necessary"
+        );
+        assert!(
+            PANE.contains("body { display: flex; flex-direction: column; }"),
+            "the body has to be the column the screens divide"
+        );
+        let screens = segment(PANE, "main, #machines-tab, #skills-tab, #mcp-tab {", "}");
+        assert!(
+            screens.contains("flex: 1;")
+                && screens.contains("min-height: 0;")
+                && screens.contains("overflow-y: auto;"),
+            "the home column and each tab panel take the space under the chrome and scroll in it; `min-height: 0` is what lets a flex child shrink and scroll at all"
+        );
+        assert!(
+            PANE.contains(
+                "header.top, #status, #health-strip, #skills-strip, #mcp-strip { flex: 0 0 auto; }"
+            ),
+            "and the chrome above them keeps its height instead of being squashed by the column"
+        );
+        assert!(
+            PANE.contains("#session-list { padding: 0 0 8px; }"),
+            "the list itself stays unpadded, so the scroll is the column's"
+        );
+    }
+
     // The session view is a full-height box inside a locked document, not a
     // fixed layer: a fixed container is what iOS fails to reflow when the
     // keyboard opens, which is the family the focus failure comes from.
@@ -1576,6 +1609,50 @@ mod tests {
         );
     }
 
+    // The standalone notice's storage accesses are the pane's only ones, and an
+    // unguarded throw in an installed web app with cookies blocked would take
+    // the rest of the script with it.
+
+    #[test]
+    fn the_pane_survives_a_blocked_storage() {
+        let read = segment(PANE, "let dismissed = false;", "if (!dismissed) {");
+        assert!(
+            read.contains("try {")
+                && read.contains("dismissed = window.localStorage.getItem('bosun-standalone-note') === 'dismissed';")
+                && read.contains("} catch (error) {")
+                && read.contains("dismissed = false;"),
+            "the read is guarded, and an unavailable store means the notice was not dismissed"
+        );
+        let dismiss = segment(
+            PANE,
+            "btnStandaloneDismiss.addEventListener('click', () => {",
+            "});",
+        );
+        assert!(
+            dismiss.contains("try {")
+                && dismiss
+                    .contains("window.localStorage.setItem('bosun-standalone-note', 'dismissed');")
+                && dismiss.contains("} catch (error) {"),
+            "and the write is guarded too: losing the persistence costs a notice the next time, nothing else"
+        );
+    }
+
+    // The bug is iOS's and the notice names Safari, so an Android TWA or a
+    // desktop PWA is never told to open it.
+
+    #[test]
+    fn the_pane_shows_the_standalone_notice_on_ios_alone() {
+        assert!(
+            PANE.contains("/iPad|iPhone|iPod/.test(window.navigator.userAgent)")
+                && PANE.contains("window.navigator.platform === 'MacIntel' && window.navigator.maxTouchPoints > 1"),
+            "an iOS platform is what the display-mode half is gated on, iPadOS included, which reports a desktop user agent"
+        );
+        assert!(
+            PANE.contains("(ios && window.matchMedia('(display-mode: standalone)').matches)"),
+            "so a standalone display mode somewhere else shows nothing"
+        );
+    }
+
     // An installed web app can never show a keyboard for any field on some iOS
     // versions (WebKit bug 279904), and no page can work around it.
 
@@ -1596,9 +1673,10 @@ mod tests {
             "and the notice shows there, inside that check alone"
         );
         assert!(
-            PANE.contains("window.localStorage.getItem('bosun-standalone-note') !== 'dismissed'")
-                && PANE
-                    .contains("window.localStorage.setItem('bosun-standalone-note', 'dismissed');"),
+            PANE.contains(
+                "dismissed = window.localStorage.getItem('bosun-standalone-note') === 'dismissed';"
+            ) && PANE
+                .contains("window.localStorage.setItem('bosun-standalone-note', 'dismissed');"),
             "it is dismissible, and stays dismissed"
         );
         assert!(
@@ -1647,11 +1725,12 @@ mod tests {
             "the session view takes the visible height, so the composer is not left where the keyboard is drawn"
         );
         assert!(
-            !PANE.contains("view.style.top")
-                && handler.contains(&squeezed(
-                    "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
-                )),
-            "and it never takes the offset: on some iOS versions that value stays stale after the keyboard closes, which left the whole view offset — the offset is read only for the covered strip, clamped"
+            handler.contains(&squeezed(
+                "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
+            )) && handler.contains(&squeezed(
+                "view.style.top = covered > 0 ? offset + 'px' : '0px';"
+            )),
+            "and it takes the offset only while the keyboard really covers a strip, clamped: on some iOS versions that value stays stale after the keyboard closes, and writing it then left the whole view offset"
         );
         assert!(
             PANE.contains("document.addEventListener('focusout', scheduleVisualViewportSync);"),

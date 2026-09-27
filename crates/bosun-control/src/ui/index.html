@@ -30,6 +30,18 @@
      it, and Safari's reveal-scroll on focus has nothing to move. This is what
      the fixed-container family of the iOS focus failure comes down to. */
   html, body { height: 100%; overflow: hidden; }
+  /* The document never scrolls, so each screen does. The home column (the
+     strips, the panel and the session list) and each tab panel fill the space
+     under the chrome and scroll inside it; without this their tails are clipped
+     with no way to reach them. */
+  body { display: flex; flex-direction: column; }
+  header.top, #status, #health-strip, #skills-strip, #mcp-strip { flex: 0 0 auto; }
+  main, #machines-tab, #skills-tab, #mcp-tab {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
   body {
     margin: 0;
     background: var(--bg);
@@ -3950,7 +3962,8 @@ async function send() {
     btnSend.disabled = false;
     // Only where a focus is the reader's: on a touch screen iOS may treat this
     // re-focus as one it already has and withhold the keyboard, so the tap that
-    // follows asks for it instead.
+    // follows asks for it instead. This is send's own re-focus; the other gate
+    // is the `answer in your own words` button's, below.
     if (!coarsePointer()) input.focus();
   }
 }
@@ -3999,26 +4012,45 @@ btnBottom.addEventListener('click', jumpToBottom);
 // An installed web app can never show a keyboard for any field on some iOS
 // versions, and no page can work around it: say so once, and only there. A tab
 // is not affected, so a tab never sees this.
+// The bug is iOS's, and the notice names Safari: an Android TWA or a desktop
+// PWA must never be told to open Safari. `standalone` is iOS-only already, and
+// the display-mode half is gated on an iOS platform the same way.
+const ios =
+  /iPad|iPhone|iPod/.test(window.navigator.userAgent) ||
+  (window.navigator.platform === 'MacIntel' && window.navigator.maxTouchPoints > 1);
 if (
   window.navigator.standalone === true ||
-  window.matchMedia('(display-mode: standalone)').matches
+  (ios && window.matchMedia('(display-mode: standalone)').matches)
 ) {
-  if (window.localStorage.getItem('bosun-standalone-note') !== 'dismissed') {
+  // An installed web app with cookies blocked throws on storage access, and an
+  // unguarded throw here would take the rest of the script with it: the pane
+  // would load dead. An unavailable store means "not dismissed".
+  let dismissed = false;
+  try {
+    dismissed = window.localStorage.getItem('bosun-standalone-note') === 'dismissed';
+  } catch (error) {
+    dismissed = false;
+  }
+  if (!dismissed) {
     standaloneNote.hidden = false;
   }
 }
 
 btnStandaloneDismiss.addEventListener('click', () => {
   standaloneNote.hidden = true;
-  window.localStorage.setItem('bosun-standalone-note', 'dismissed');
+  try {
+    window.localStorage.setItem('bosun-standalone-note', 'dismissed');
+  } catch (error) {
+    // Losing the persistence costs a notice the next time; nothing else.
+  }
 });
 
 // iOS Safari does not shrink the layout viewport when the keyboard opens, so a
 // session view pinned to that height keeps the composer exactly where the
 // keyboard is drawn, and a tap at the very bottom edge can fall in the Home
 // indicator's strip instead of the field. The visual viewport is the part of the
-// page the reader can actually see, so the view rides it: its height, and its
-// offset when the page is pushed up.
+// page the reader can actually see, so the view rides it: its height always,
+// and its offset while the keyboard really covers a strip of the page.
 //
 // The visual viewport exists on modern desktops as well, where it is the whole
 // page and the numbers never change; this runs there harmlessly, and its only
@@ -4028,15 +4060,15 @@ function syncVisualViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
   view.style.height = viewport.height + 'px';
-  // No `top`: on some iOS versions the visual viewport's offset stays stale
-  // after the keyboard closes, and writing it left the whole view offset. The
-  // offset still says how much of the layout viewport the keyboard covers,
-  // clamped so a stale value cannot invent a negative strip.
-  // What the keyboard covers of the layout viewport's bottom, for anything that
-  // is fixed to it: the visual viewport is shorter than the layout one, and sits
-  // offset from its top, so the strip below it is what is left over.
+  // The strip the keyboard leaves is what is left of the layout viewport below
+  // the visible one; the offset says how far the page has moved under it. Both
+  // are clamped, and the offset is written into the view only while that strip
+  // is real: on some iOS versions it stays stale after the keyboard closes, and
+  // writing it then left the whole view offset, while on the others the view
+  // rides the keyboard exactly as before.
   const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);
   const covered = Math.max(0, window.innerHeight - viewport.height - offset);
+  view.style.top = covered > 0 ? offset + 'px' : '0px';
   document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');
   // The keyboard changes the transcript's height, and no scroll event comes
   // with it: this is the resize #19 named as stale, and the control catches up
