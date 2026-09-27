@@ -466,8 +466,32 @@ async fn serve_tls(
     Ok(())
 }
 
+/// Resolves when the process is asked to stop: Ctrl-C in a terminal, or the
+/// SIGTERM a service manager sends when a unit is stopped or restarted. A
+/// process that watched only for Ctrl-C is killed outright under systemd, with
+/// no chance to close what it holds: for the node, that is the shells it is
+/// running.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(terminate) => terminate,
+                Err(error) => {
+                    warn!(error = %error, "failed to watch for SIGTERM; watching Ctrl-C alone");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
@@ -515,18 +539,24 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     // as it gets. Under Type=notify the unit is not started until this.
     bosun_node::notify::ready();
 
+    let polling = manager.clone();
     tokio::select! {
         _ = bosun_node::poll::run_poll_loop(
             config.cp_url.clone(),
             config.node_name.clone(),
-            manager,
+            polling,
             tls_config,
             config.update.enabled,
             config.update.base_url.clone(),
             bosun_node::poll::UPDATE_RETRY_DELAY,
-        ) => Ok(()),
-        _ = shutdown_signal() => Ok(()),
+        ) => {}
+        _ = shutdown_signal() => {}
     }
+    // The node is going down: kill the shells it is running, so a restart
+    // cannot leave a command running with nothing left to report its exit to.
+    // The control plane re-issues the call when the session resumes.
+    manager.kill_all_shells().await;
+    Ok(())
 }
 
 async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {

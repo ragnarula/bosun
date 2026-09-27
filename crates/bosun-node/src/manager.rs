@@ -286,6 +286,22 @@ impl NodeManager {
         ));
     }
 
+    /// Kills every in-flight shell on the node. The node calls this on the way
+    /// down: a shell that outlives its node has nothing left to report its exit
+    /// to, and the control plane re-issues the call when the session resumes.
+    pub async fn kill_all_shells(&self) {
+        let executors: Vec<Arc<ExecutorState>> = self
+            .sessions
+            .read()
+            .unwrap()
+            .values()
+            .map(|record| record.executor.clone())
+            .collect();
+        for executor in executors {
+            executor.kill_all_shells().await;
+        }
+    }
+
     /// The executor state of one running session. The node's tunnel relay
     /// dispatches a logical connection addressed to the session to it.
     pub fn executor(&self, session_id: &str) -> Option<Arc<ExecutorState>> {
@@ -902,6 +918,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, NodeError::NoBrowseRoots));
+    }
+
+    /// The node's exit kills what it is running. A shell that outlived its node
+    /// has nothing left to report its exit to, and the control plane re-issues
+    /// the call when the session resumes; the rebuilt executor does nothing on
+    /// its own.
+    #[tokio::test]
+    async fn kill_all_shells_ends_every_running_shell() {
+        let work = tempdir().unwrap();
+        let manager = manager(&work);
+        let session_dir = work.path().join("repo");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        start_session(&manager, "s1", &session_dir).await;
+
+        let executor = manager.executor("s1").expect("the session's executor");
+        let outcome = bosun_executor::run_call(
+            &executor,
+            "run-1",
+            "shell",
+            &serde_json::json!({ "command": "sleep 30" }),
+        )
+        .await
+        .expect("the shell should start");
+        let bosun_executor::CallOutcome::Shell(stream) = outcome else {
+            panic!("a shell run must stream");
+        };
+        let collector = tokio::spawn(stream.collect::<Vec<_>>());
+
+        // The run is registered before its child exists, so a kill that lands
+        // while the shell is starting still finds it.
+        manager.kill_all_shells().await;
+
+        let events = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("the shell must end when the node goes down")
+            .unwrap();
+        let code = events
+            .iter()
+            .find_map(|event| match event {
+                bosun_executor::ShellEvent::Done(code) => Some(*code),
+                bosun_executor::ShellEvent::Out(_) => None,
+            })
+            .expect("the stream must end with a done event");
+        assert_eq!(code, -1, "a killed shell ends with exit code -1");
     }
 
     #[tokio::test]
