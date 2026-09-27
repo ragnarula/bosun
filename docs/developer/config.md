@@ -149,16 +149,17 @@ without that server's tools and shows a warning.
 | `cp_url` | `http://127.0.0.1:8090` | Control-plane base URL, `http` or `https` |
 | `node_name` | `node` | Name this node registers under |
 | `work_dir` | `work` | Directory session clones are created in |
-| `browse_roots` | none | Directories the interactive `bosun dev` picker may browse and spawned child-session executors may run in. Empty disables `bosun dev` and child-session spawning on this node |
+| `browse_roots` | none | Directories the interactive `bosun dev` picker may browse and a spawned child session may be placed in. Empty disables `bosun dev` and any caller-named child directory on this node |
 | `ca_cert` | none | PEM certificate the node trusts in addition to the system roots, for a control plane behind a private CA |
 | `update.enabled` | `true` | Whether the node fetches a released binary for the control plane's announced version and auto-updates to it |
 | `update.base_url` | none | Release feed the node fetches update archives from. Overrides `BOSUN_UPDATE_BASE_URL`, then GitHub Releases for this repository |
 
-`browse_roots` confines both the interactive `bosun dev` picker and spawned
-child-session executors: the control plane starts each child's executor on
-its parent's working copy, and that directory must lie within a root, exactly
-like a picked `dev` directory. Clone sessions live under `work_dir/<id>`, so
-to let children of clone sessions run, `browse_roots` must include the node's
+`browse_roots` confines every directory a caller names: the interactive
+`bosun dev` picker, and the `dir` a `spawn` tool call places a child session
+in. A child whose caller names no directory lands in a fresh one the node makes
+under `work_dir`, named after the session, exactly as a clone's does, and asks
+no root. Clone sessions live under `work_dir/<id>`, so to let children of clone
+sessions run in their parent's copy, `browse_roots` must include the node's
 `work_dir`.
 
 The node opens no inbound ports. It polls the control plane and holds one

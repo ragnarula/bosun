@@ -8,6 +8,8 @@
 > Superseded in part by `2026-09-12-layered-system-prompt.md`: the sentence below that a persona's prompt file is the session's system prompt, and that a persona without a prompt file falls back to the loop's default system text, no longer holds. The harness contract is fixed and first, and the persona file is the role layer appended after it, which cannot override the contract. The remaining persona decisions, and the permission, persona-switch, tree, and transport decisions, stand.
 >
 > Superseded in part by `2026-09-26-session-context-after-the-thread.md`: the manifest of live children no longer sits in the system prompt. It is in the session context block that follows the thread on every request. What the manifest lists, and when a child enters and leaves it, stand.
+>
+> Superseded in part by `2026-09-27-cross-node-children.md`: `spawn(persona, instructions)` starts the child on the parent's node and working copy only when the caller names no node. A caller may name any registered node that is up, and a directory on that node or none. A read-only session no longer spawns at all, so the sentence below that a read-only root may spawn a read-write child when the child's persona declares it no longer holds. The tree, persona, ask-gating, communication and transport decisions stand.
 
 ## Context
 
