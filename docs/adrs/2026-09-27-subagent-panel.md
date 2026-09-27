@@ -38,7 +38,7 @@ That is what the pane does today, and it is the cost the issue names: the parent
 
 **3. A tail of the child's transcript fetched on a timer. (rejected)**
 
-It needs a polling interval, a cursor, and a decision about how much to fetch, to reproduce what one more `EventSource` gives for free — including the resume behaviour the main stream already has. It would also lag behind a child that is mid-turn, which is the one time a reader is watching.
+It needs a polling interval, a cursor, and a decision about how much to fetch, to reproduce what one more `EventSource` gives for free — including the resume behaviour the main stream already has. The stream is not instant either: the panel draws a child's durable messages, so a frame appears when the store writes it, and its in-flight prose appears with the message that carries it. A poll would add its own interval on top of that, and the one time a reader is watching is a child mid-turn.
 
 **4. Several children at once, in tabs or a stack. (rejected)**
 
@@ -60,7 +60,7 @@ The operator left open whether the todos panel and this one share a column. This
 
 The session view holds a row, `#conversation`, with the transcript's box on the left and the panel on the right. The panel is hidden until a child is followed, so the pane opens with no panel at all, and nothing about it is stored: a reload, a new session, or leaving the session leaves no panel state behind.
 
-A child's line in the parent's transcript carries a `watch` control beside its id. The id keeps its meaning — it opens the child as the session view — and the watch control follows the child in the panel without touching the address bar. `followChild(id)` closes whatever was followed, names the child in the panel's header beside its state dot, and opens a second `EventSource` on that child's events.
+A child's line carries a `watch` control beside its id. The id keeps its meaning — it opens the child as the session view — and the watch control follows the child in the panel without touching the address bar. A line is a line wherever it is drawn, so the control also appears on a child's line inside the panel: a grandchild can be followed, and following it replaces the child that was followed. One child is followed at a time, at whatever depth it sits. `followChild(id)` closes whatever was followed, names the child in the panel's header beside its state dot, and opens a second `EventSource` on that child's events.
 
 The panel's own frame handler renders the child's durable `message` frames and ignores every other frame kind. The session-state frames — the header dot, the status label, the activity console, the ask record, the live paragraph — describe the session the pane is showing, and a child's frames never touch them. The block renderers append to a single module-level target, so a child's frame points that target at the panel's transcript and puts it back afterwards.
 
@@ -77,10 +77,11 @@ The two transcripts share one rule set: the block rules are scoped `:is(#transcr
 - Watching a child costs one more event stream and one more column, and the reader keeps the parent's place throughout: the parent's transcript does not move, its composer does not change, and the back button still leaves the session.
 - The panel made the block renderers target-agnostic. That is a small indirection — one variable the frame handlers set and restore — but it is load-bearing: a renderer that appended to the session's transcript directly would draw a child's lines into the parent.
 - A child's frames are filtered by kind rather than reusing `handleFrame`. The session-state arms of that function are the reason: they would drive the session's dot, its activity console and its ask composer from the child's stream.
-- The block stylesheet now names two containers. A rule written as `#transcript .block` after this decision would style the session's transcript and not the panel's, and the pane's checks fail such a rule by name rather than letting it pass unnoticed.
+- The block stylesheet now names two containers in every rule, heading rules included. A rule written for one container alone after this decision would style one transcript and not the other, and the pane's check fails any mention of a container followed by anything other than the shared prefix, whatever follows the id.
 - A child that has authored nothing has no line to watch from: the panel is reachable from a child's line, and a silent child has none. The reader can open such a child as the session view (the id link), or wait for its first authored event.
 - One child is watched at a time, and collapsing loses the panel's scroll position and its lines: reopening the panel starts the child's transcript from the beginning of the stream's replay.
 - The panel is not steerable. It has no composer and no banner, so watching a child is read-only in the panel; steering it is a message to the parent's model, as it always was.
+- The panel draws a child's durable lines, not its in-flight prose: a child's streamed deltas appear when the message that carries them is stored, so the panel is a moment behind the child's own view of itself. A reader who needs the child's exact live text opens it as the session view.
 - Nothing about the panel is remembered: not the child, not the collapse, not the scroll. A reload is a fresh session view with no panel.
 
 ## Revisit When

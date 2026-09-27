@@ -842,7 +842,7 @@
     min-height: 0;
     display: flex;
   }
-  :is(#transcript, #child-transcript) { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  #transcript { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
   #btn-bottom {
     position: absolute;
     right: 16px;
@@ -865,6 +865,7 @@
     flex: 1;
     min-height: 0;
     display: flex;
+    flex-direction: row;
   }
   #child-panel {
     flex: 0 0 auto;
@@ -895,8 +896,8 @@
     color: var(--muted);
   }
   #child-panel .child-panel-head button {
-    min-height: 40px;
-    min-width: 40px;
+    min-height: var(--touch-min-height);
+    min-width: var(--touch-min-height);
     background: none;
     border: none;
     font-size: 16px;
@@ -907,7 +908,7 @@
   /* The control on a child's line that follows it here: the child's id opens it
      as the session view, as it always did. */
   :is(#transcript, #child-transcript) .child-watch {
-    min-height: 26px;
+    min-height: var(--touch-min-height);
     padding: 0 8px;
     margin-left: 4px;
     font-size: 11px;
@@ -1053,7 +1054,7 @@
   :is(#transcript, #child-transcript) .ask .options { margin: 6px 0 0; padding-left: 18px; }
   :is(#transcript, #child-transcript) .ask .answer { margin-top: 6px; color: var(--ok); }
   :is(#transcript, #child-transcript) .ask .ask-to { color: var(--muted); font-size: 12px; }
-  :is(#transcript, #child-transcript) h1, #transcript h2, #transcript h3, #transcript h4, #transcript h5, #transcript h6 {
+  :is(#transcript, #child-transcript) h1, :is(#transcript, #child-transcript) h2, :is(#transcript, #child-transcript) h3, :is(#transcript, #child-transcript) h4, :is(#transcript, #child-transcript) h5, :is(#transcript, #child-transcript) h6 {
     margin: 12px 0 4px;
     font-weight: 700;
     line-height: 1.3;
@@ -1062,7 +1063,7 @@
   :is(#transcript, #child-transcript) h2 { font-size: 16px; }
   :is(#transcript, #child-transcript) h3 { font-size: 15px; }
   :is(#transcript, #child-transcript) h4 { font-size: 14px; }
-  :is(#transcript, #child-transcript) h5, #transcript h6 { font-size: 13px; color: var(--muted); }
+  :is(#transcript, #child-transcript) h5, :is(#transcript, #child-transcript) h6 { font-size: 13px; color: var(--muted); }
   :is(#transcript, #child-transcript) .msg p { margin: 0 0 6px; }
   :is(#transcript, #child-transcript) .md-bold { font-weight: 700; }
   :is(#transcript, #child-transcript) .md-italic { font-style: italic; }
@@ -1657,6 +1658,11 @@ let out = transcript;
 let childFollow = null;  // the child the panel shows, or null when it is closed
 let childEs = null;      // that child's own event stream
 let childStick = true;   // auto-scroll for the panel's transcript, its own flag
+// The ask record of the panel's transcript. The renderers keep the record of the
+// box they last drew in `openAskBox`, which belongs to the session: the panel
+// keeps its own, so a child's question and the frame that answers it are one box
+// there and neither record is lost.
+let childAskBox = null;
 let sending = false;
 let dirNode = null;   // the node the directory browser is looking at
 let dirPath = null;   // null = the node's browse roots
@@ -3776,7 +3782,14 @@ input.addEventListener('keydown', (event) => {
   }
 });
 
+// The transcript a render just drew into is the one that follows: the session's
+// own, on `stick`, or the panel's, on its own flag. A child's frame must never
+// move the session's transcript.
 function scrollToBottom() {
+  if (out === childTranscript) {
+    if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight;
+    return;
+  }
   if (stick) transcript.scrollTop = transcript.scrollHeight;
 }
 
@@ -4685,6 +4698,7 @@ function followChild(id) {
   closeChildPanel();
   childFollow = id;
   childStick = true;
+  childAskBox = null;
   childPanelTitle.textContent = id;
   updateChildPanelDot();
   childPanel.hidden = false;
@@ -4712,6 +4726,7 @@ function closeChildPanel() {
   }
   childFollow = null;
   childStick = true;
+  childAskBox = null;
   childTranscript.textContent = '';
   childPanelTitle.textContent = '';
   updateChildPanelDot();
@@ -4724,19 +4739,21 @@ function closeChildPanel() {
 // the pane is showing, so a child's frames never touch them.
 function handleChildFrame(frame) {
   if (!frame.event || frame.event.kind !== 'message') return;
-  // The renderers touch two things the session owns: where they append, and the
-  // ask record left open. A child's frame draws into the panel and puts both
-  // back.
+  // The renderers append to `out` and keep the ask record of the box they last
+  // drew. A child's frame draws into the panel and with the panel's own record,
+  // so its question and the frame that answers it stay one box there, and the
+  // session's record and transcript are untouched.
   const previousOut = out;
   const previousAsk = openAskBox;
   out = childTranscript;
+  openAskBox = childAskBox;
   try {
     renderChildMessage(frame.event.message, frame.event.at_ms);
   } finally {
     out = previousOut;
+    childAskBox = openAskBox;
     openAskBox = previousAsk;
   }
-  scrollChildToBottom();
 }
 
 // One durable message of the panel's child, drawn with the session's own block
@@ -4751,12 +4768,8 @@ function renderChildMessage(message, atMs) {
   renderBlock(message, atMs);
 }
 
-// The panel follows its own child the way the session follows its transcript:
-// it stays at the newest line until the reader scrolls the panel up.
-function scrollChildToBottom() {
-  if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight;
-}
-
+// The panel's own follow flag: it stays at the child's newest line until the
+// reader scrolls the panel up, and a render reads it through `scrollToBottom`.
 childTranscript.addEventListener('scroll', () => {
   childStick =
     childTranscript.scrollTop + childTranscript.clientHeight >=

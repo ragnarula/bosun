@@ -201,6 +201,36 @@ mod tests {
         out
     }
 
+    /// The pane's stylesheet with its comments removed, so a check reads
+    /// selectors and declarations rather than the prose beside them.
+    fn styles() -> String {
+        let css = PANE
+            .split_once("<style>")
+            .expect("the pane must carry its styles")
+            .1
+            .split_once("</style>")
+            .expect("the stylesheet must close")
+            .0;
+        let mut out = String::with_capacity(css.len());
+        let mut rest = css;
+        loop {
+            match rest.split_once("/*") {
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+                Some((before, after)) => {
+                    out.push_str(before);
+                    match after.split_once("*/") {
+                        None => break,
+                        Some((_, tail)) => rest = tail,
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `code()` with every run of whitespace outside a string literal removed,
     /// and every double quote written as a single one, so a check on a name or
     /// a spelling reads the same text however the pane respaces a call or
@@ -1334,24 +1364,62 @@ mod tests {
             "the panel is collapsed until a child is followed"
         );
         let row = squeezed(segment(PANE, "#conversation {", "}"));
-        assert!(
-            row.contains(&squeezed("flex: 1; min-height: 0; display: flex;")),
-            "the row takes the transcript's place in the view and lays the two side by side"
+        for declaration in [
+            "flex: 1;",
+            "min-height: 0;",
+            "display: flex;",
+            "flex-direction: row;",
+        ] {
+            assert!(
+                row.contains(&squeezed(declaration)),
+                "the row takes the transcript's place in the view and lays the two side by side: {declaration} keeps it doing so"
+            );
+        }
+        assert_eq!(
+            PANE.matches("id=\"child-panel\"").count(),
+            1,
+            "one element carries the panel's id"
         );
     }
 
     #[test]
     fn the_pane_styles_the_panel_transcript_with_the_session_rules() {
+        let css = styles();
         assert!(
-            BLOCKS.contains("#transcript") && BLOCKS.contains("#child-transcript"),
-            "the block rules must name both transcripts, so a child's blocks draw as the session's do"
+            css.contains(BLOCKS),
+            "the pane's stylesheet must carry the shared prefix these checks read: the session's transcript and the panel's draw the same blocks"
         );
-        for container in ["#transcript", "#child-transcript"] {
-            assert!(
-                !PANE.contains(&format!("{container} .")),
-                "no block rule is scoped to `{container}` alone: the two transcripts share one rule set, or a block would draw in one and not the other"
-            );
+        // Every selector that names a transcript is either that container itself
+        // or the shared prefix. A selector that named one container and then
+        // something under it — a class or an element — would draw a block in one
+        // transcript and not the other.
+        // `#transcript-wrap` names its own box, not the transcript: a container
+        // is named when the id stands entire, followed by no name character.
+        let names = |selector: &str, container: &str| {
+            selector.match_indices(container).any(|(at, _)| {
+                !selector[at + container.len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+        };
+        let mut read = 0;
+        for chunk in css.split('{') {
+            let selector = chunk.rsplit('}').next().unwrap_or(chunk);
+            let flat = squeezed(selector);
+            for container in ["#transcript", "#child-transcript"] {
+                if !names(selector, container) {
+                    continue;
+                }
+                read += 1;
+                assert!(
+                    flat == container || flat.starts_with(&squeezed(BLOCKS)),
+                    "the selector `{flat}` names `{container}`: a block rule names both transcripts through `{BLOCKS}`, and a container rule names its container alone"
+                );
+            }
         }
+        assert!(
+            read > 0,
+            "the check must have read the rules that name a transcript"
+        );
     }
 
     #[test]
@@ -1363,9 +1431,15 @@ mod tests {
             "two streams exist: the session's own, and the panel's child"
         );
         let follow = block(&pane, &squeezed("function followChild("));
+        let closes = follow
+            .find(&squeezed("closeChildPanel();"))
+            .expect("following a child must close whatever was followed before it");
+        let opens = follow
+            .find(&squeezed("childEs = new EventSource("))
+            .expect("following a child must open its own stream");
         assert!(
-            follow.contains(&squeezed("closeChildPanel();")),
-            "following a child closes whatever was followed before it, so one child is followed at a time"
+            closes < opens,
+            "the previous child's stream closes before the new one opens, so one child is followed at a time and no stream is left running"
         );
         assert!(
             follow.contains(&squeezed(
@@ -1454,19 +1528,36 @@ mod tests {
                 && side.contains(&squeezed("border-left: 1px solid var(--border);")),
             "on a wide screen the panel is a column beside the transcript"
         );
-        assert!(
-            PANE.contains(
-                "    #child-panel {\n      position: fixed;\n      inset: 0;\n      width: auto;\n      max-width: none;"
-            ),
-            "on a phone the column does not fit, so the panel covers the view as a full-height sheet"
-        );
+        for out_of_flow in ["position: absolute", "position: fixed", "position: sticky"] {
+            assert!(
+                !side.contains(&squeezed(out_of_flow)),
+                "the column stays in the row and takes width from the transcript, rather than covering it: {out_of_flow} would overlay instead"
+            );
+        }
+        let sheet = squeezed(segment(PANE, "    #child-panel {", "}"));
+        for declaration in [
+            "position: fixed;",
+            "inset: 0;",
+            "width: auto;",
+            "max-width: none;",
+            "z-index: 11;",
+        ] {
+            assert!(
+                sheet.contains(&squeezed(declaration)),
+                "on a phone the column does not fit, so the panel covers the view as a full-height sheet: {declaration} keeps it covering the view and keeps the header's controls above it"
+            );
+        }
         let pane = flattened();
         assert!(
             pane.contains(&squeezed("childTranscript.addEventListener('scroll'"))
-                && pane.contains(&squeezed(
-                    "if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight;"
-                )),
-            "the panel's transcript scrolls and follows on its own flag, not the session's"
+                && pane.contains(&squeezed("childStick =")),
+            "the panel's transcript carries its own follow flag, set by its own scroll"
+        );
+        assert!(
+            pane.contains(&squeezed(
+                "if (out === childTranscript) { if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight; return; }"
+            )),
+            "a render follows the transcript it drew into, so a child's frame scrolls the panel and never the session"
         );
     }
 }
