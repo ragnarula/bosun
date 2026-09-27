@@ -110,7 +110,7 @@ pub struct PendingAsk {
 #[derive(Debug, Clone)]
 pub struct ForkSource {
     pub session: Session,
-    pub window: Vec<i64>,
+    pub window: Vec<(i64, Message)>,
 }
 
 /// What routing a user's answer to a pending raised ask did.
@@ -413,16 +413,33 @@ impl Store {
                     None => return Ok(None),
                 }
             };
-            let window: Vec<i64> = {
+            let window: Vec<(i64, Message)> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT id FROM messages WHERE session_id = ?1 AND archived = 0 ORDER BY id",
+                        "SELECT id, role, block FROM messages WHERE session_id = ?1 AND archived = 0 ORDER BY id",
                     )
                     .context("failed to prepare the window query")?;
-                stmt.query_map([&session_id], |row| row.get(0))
-                    .context("failed to query the window")?
-                    .collect::<Result<Vec<i64>, _>>()
-                    .context("failed to read the window")?
+                let rows = stmt
+                    .query_map([&session_id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .context("failed to query the window")?;
+                let mut window = Vec::new();
+                for row in rows {
+                    let (id, role, block) = row.context("failed to read the window")?;
+                    window.push((
+                        id,
+                        Message {
+                            role: serde_json::from_str(&role).context("failed to parse role")?,
+                            block: serde_json::from_str(&block).context("failed to parse block")?,
+                        },
+                    ));
+                }
+                window
             };
             Ok(Some(ForkSource {
                 session,
@@ -451,7 +468,7 @@ impl Store {
         &self,
         fork: &Session,
         original_id: &str,
-        window: &[i64],
+        window: &[(i64, Message)],
     ) -> Result<usize, StoreError> {
         let fork = fork.clone();
         let original_id = original_id.to_string();
@@ -470,10 +487,11 @@ impl Store {
                     None => None,
                 }
             };
+            // A source that vanished while the clone ran is gone rather than
+            // unforkable: the caller reports it the way the first check does.
             let Some(state) = state else {
-                return Err(anyhow::Error::new(StoreError::ForkSourceChanged {
+                return Err(anyhow::Error::new(StoreError::SessionNotFound {
                     id: original_id.clone(),
-                    state: "gone".to_string(),
                 }));
             };
             let state: SessionState =
@@ -485,30 +503,7 @@ impl Store {
                 }));
             }
             insert_session(&tx, &fork)?;
-            let copied: Vec<Message> = {
-                let mut stmt = tx
-                    .prepare("SELECT role, block FROM messages WHERE session_id = ?1 AND id = ?2")
-                    .context("failed to prepare the forked thread query")?;
-                let mut messages = Vec::new();
-                for row_id in &window {
-                    let mut rows = stmt
-                        .query(params![original_id, row_id])
-                        .context("failed to query the forked thread")?;
-                    let row = rows
-                        .next()
-                        .context("failed to read the forked thread")?
-                        .with_context(|| {
-                            format!("the row {row_id} of session {original_id} is gone")
-                        })?;
-                    let role: String = row.get(0)?;
-                    let block: String = row.get(1)?;
-                    messages.push(Message {
-                        role: serde_json::from_str(&role).context("failed to parse role")?,
-                        block: serde_json::from_str(&block).context("failed to parse block")?,
-                    });
-                }
-                messages
-            };
+            let copied: Vec<Message> = window.iter().map(|(_, message)| message.clone()).collect();
             // The calls the copied thread names, so the fork's own tool-call
             // records match the thread it copied.
             let calls: Vec<String> = copied
@@ -2084,8 +2079,8 @@ fn append_event(
 
 /// Inserts a message row and its matching `Event::Message` inside the
 /// caller's transaction, so a write that spans sessions stays atomic.
-/// Writes one session row. A free function so a fork can write its row inside
-/// the transaction that copies the thread it starts from.
+/// Writes one session row, in whatever transaction the caller holds: a fork
+/// writes its row inside the transaction that copies the thread it started from.
 fn insert_session(conn: &rusqlite::Connection, session: &Session) -> Result<(), anyhow::Error> {
     let permission = serde_json::to_string(&session.permission)?;
     let state = serde_json::to_string(&session.state)?;
@@ -3135,8 +3130,6 @@ mod tests {
         let source = store.fork_source("original").await.unwrap().unwrap();
 
         // The original took a turn between the read and the copy.
-        let mut running = session("original");
-        running.state = SessionState::Running;
         store
             .set_state("original", SessionState::Running)
             .await

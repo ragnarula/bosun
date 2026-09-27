@@ -3529,12 +3529,16 @@ btnFork.addEventListener('click', async () => {
   // The clone takes seconds, and a second click would start a second fork: the
   // control is disabled until this one answers.
   btnFork.disabled = true;
+  // The clone takes seconds, and the reader may leave the session in them: the
+  // fork is theirs either way, but the pane only jumps to it if they are still
+  // here.
+  const started = current;
   try {
-    const response = await post('/sessions/' + encodeURIComponent(current) + '/fork', {});
+    const response = await post('/sessions/' + encodeURIComponent(started) + '/fork', {});
     const fork = await response.json();
     viewSheet.hidden = true;
     await refreshSessions();
-    openSession(fork.id);
+    if (current === started) openSession(fork.id);
   } catch (error) {
     viewFork.textContent = 'fork: ' + error.message;
   } finally {

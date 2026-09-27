@@ -1348,10 +1348,21 @@ mod tests {
         );
         let handler = flattened();
         assert!(
-            handler.contains(&squeezed(
-                "await post('/sessions/' + encodeURIComponent(current) + '/fork', {});"
-            )),
-            "the control posts to the session's fork endpoint"
+            handler.contains(&squeezed("const started = current;"))
+                && handler.contains(&squeezed("encodeURIComponent(started) + '/fork'")),
+            "the control posts to the session it was clicked in, not to whatever the pane shows when the clone answers"
+        );
+        assert!(
+            handler.contains(&squeezed("btnFork.disabled = true;")),
+            "the control is disabled while the clone runs, so one click makes one fork"
+        );
+        assert!(
+            handler.contains(&squeezed("} finally { btnFork.disabled = false; }")),
+            "and it comes back whether the fork was made or refused"
+        );
+        assert!(
+            handler.contains(&squeezed("if (current === started) openSession(fork.id);")),
+            "the pane opens the fork only if the reader is still in the session it was forked from"
         );
         assert!(
             handler.contains(&squeezed("openSession(fork.id);")),

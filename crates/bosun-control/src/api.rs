@@ -1023,7 +1023,23 @@ async fn fork(
         prompt: None,
         summary: None,
     };
-    let copied = state.store.fork_session(&fork, &id, &source.window).await?;
+    let copied = match state.store.fork_session(&fork, &id, &source.window).await {
+        Ok(copied) => copied,
+        Err(error) => {
+            // The clone is already on the node. Leaving it keeps a working copy,
+            // a persisted session and a boot restore for a fork that does not
+            // exist, and every retry that loses the same race leaks another.
+            state.commands.enqueue(
+                &original.node,
+                NodeCommand::Stop {
+                    id: state.commands.next_id(),
+                    session_id: fork.id.clone(),
+                },
+                None,
+            );
+            return Err(error.into());
+        }
+    };
 
     state.loops.start(
         &fork.id,
