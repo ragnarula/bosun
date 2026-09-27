@@ -29,6 +29,12 @@ pub async fn mermaid_bundle() -> impl IntoResponse {
 mod tests {
     const PANE: &str = include_str!("ui/index.html");
 
+    /// The selector prefix the transcript's block rules carry: the session's
+    /// transcript and the subagent panel's draw the same blocks, so one rule set
+    /// names both containers. A check that reads a block rule uses this prefix
+    /// rather than repeating it.
+    const BLOCKS: &str = ":is(#transcript, #child-transcript) ";
+
     // The pane ships as one embedded HTML file with no browser test harness,
     // so these are presence checks, not behaviour tests.
 
@@ -504,12 +510,12 @@ mod tests {
 
     #[test]
     fn the_pane_lays_the_stamp_out_as_a_gutter_column() {
-        let row = segment(PANE, "#transcript .stamp-row {", "}");
+        let row = segment(PANE, &format!("{BLOCKS}.stamp-row {{"), "}");
         assert!(
             row.contains("display: flex") && row.contains("align-items: baseline"),
             "the stamp row must set the time beside the entry, on the entry's first line of text"
         );
-        let entry = segment(PANE, "#transcript .stamp-row > :last-child {", "}");
+        let entry = segment(PANE, &format!("{BLOCKS}.stamp-row > :last-child {{"), "}");
         assert!(
             entry.contains("flex: 1") && entry.contains("min-width: 0"),
             "the entry must take the row's remaining width and still shrink on a phone"
@@ -585,29 +591,32 @@ mod tests {
 
     #[test]
     fn the_pane_scrolls_a_wide_table_in_its_own_holder() {
-        let holder = segment(PANE, "#transcript .md-table-wrap {", "}");
+        let holder = segment(PANE, &format!("{BLOCKS}.md-table-wrap {{"), "}");
         assert!(
             holder.contains("overflow-x: auto"),
             "a wide table scrolls inside its holder, never sideways across the page"
         );
         let cell = segment(
             PANE,
-            "#transcript .md-table th,\n  #transcript .md-table td {",
+            &format!("{BLOCKS}.md-table th,\n  {BLOCKS}.md-table td {{"),
             "}",
         );
         assert!(
             cell.contains("border: 1px solid var(--border)") && cell.contains("color: var(--text)"),
             "a cell's border and text come from the palette"
         );
-        let header = segment(PANE, "#transcript .md-table th {", "}");
+        let header = segment(PANE, &format!("{BLOCKS}.md-table th {{"), "}");
         assert!(
             header.contains("background: var(--panel-2)") && header.contains("color: var(--muted)"),
             "the header row is a panel row, not a brighter one"
         );
         // The classes the builder writes are the classes the stylesheet sets.
         assert!(
-            PANE.contains("#transcript .md-table .md-align-right { text-align: right; }")
-                && PANE.contains("#transcript .md-table .md-align-center { text-align: center; }"),
+            PANE.contains(&format!(
+                "{BLOCKS}.md-table .md-align-right {{ text-align: right; }}"
+            )) && PANE.contains(&format!(
+                "{BLOCKS}.md-table .md-align-center {{ text-align: center; }}"
+            )),
             "both alignments a delimiter row can ask for must be styled"
         );
     }
@@ -1110,7 +1119,7 @@ mod tests {
             "the marker appends as a line of its own"
         );
         assert!(
-            PANE.contains("#transcript .cleared {"),
+            PANE.contains(&format!("{BLOCKS}.cleared {{")),
             "the marker is styled as the break it draws"
         );
     }
@@ -1293,6 +1302,171 @@ mod tests {
         assert!(
             open.starts_with(&squeezed("closeSession();")),
             "every open runs the teardown first, so a reopened session starts on its newest line with the control hidden"
+        );
+    }
+
+    // The subagent panel: a second reader of a child's own stream, beside the
+    // session's transcript rather than in place of it.
+
+    #[test]
+    fn the_pane_holds_the_panel_beside_the_transcript_inside_the_session_view() {
+        let view_at = PANE
+            .find("<div id=\"session-view\"")
+            .expect("the pane must have the session view");
+        let row_at = PANE
+            .find("<div id=\"conversation\"")
+            .expect("the pane must have the row that holds the transcript and the panel");
+        let wrap_at = PANE
+            .find("<div id=\"transcript-wrap\"")
+            .expect("the pane must have the transcript's box");
+        let panel_at = PANE
+            .find("<div id=\"child-panel\"")
+            .expect("the pane must have the panel");
+        let banner_at = PANE
+            .find("<div id=\"watch-banner\"")
+            .expect("the pane must have the watch banner");
+        assert!(
+            view_at < row_at && row_at < wrap_at && wrap_at < panel_at && panel_at < banner_at,
+            "the panel stands beside the transcript inside the session view, so the view hides it and the composer stays below it"
+        );
+        assert!(
+            PANE.contains("<div id=\"child-panel\" hidden>"),
+            "the panel is collapsed until a child is followed"
+        );
+        let row = squeezed(segment(PANE, "#conversation {", "}"));
+        assert!(
+            row.contains(&squeezed("flex: 1; min-height: 0; display: flex;")),
+            "the row takes the transcript's place in the view and lays the two side by side"
+        );
+    }
+
+    #[test]
+    fn the_pane_styles_the_panel_transcript_with_the_session_rules() {
+        assert!(
+            BLOCKS.contains("#transcript") && BLOCKS.contains("#child-transcript"),
+            "the block rules must name both transcripts, so a child's blocks draw as the session's do"
+        );
+        for container in ["#transcript", "#child-transcript"] {
+            assert!(
+                !PANE.contains(&format!("{container} .")),
+                "no block rule is scoped to `{container}` alone: the two transcripts share one rule set, or a block would draw in one and not the other"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_follows_one_child_at_a_time_on_the_childs_own_stream() {
+        let pane = flattened();
+        assert_eq!(
+            pane.matches(&squeezed("new EventSource(")).count(),
+            2,
+            "two streams exist: the session's own, and the panel's child"
+        );
+        let follow = block(&pane, &squeezed("function followChild("));
+        assert!(
+            follow.contains(&squeezed("closeChildPanel();")),
+            "following a child closes whatever was followed before it, so one child is followed at a time"
+        );
+        assert!(
+            follow.contains(&squeezed(
+                "childEs = new EventSource('/sessions/' + encodeURIComponent(id) + '/events')"
+            )),
+            "the panel is driven by the child's own event stream, which reconnects with Last-Event-ID like the session's"
+        );
+        for token in [
+            "openSession(",
+            "pushSession(",
+            "history.pushState",
+            "replaceState",
+        ] {
+            assert!(
+                !follow.contains(&squeezed(token)),
+                "following a child in the panel must not call {token}: it is not opening it as the session view, and it adds no history entry"
+            );
+        }
+        let collapse = block(&pane, &squeezed("function closeChildPanel("));
+        assert!(
+            collapse.contains(&squeezed("childEs.close();"))
+                && collapse.contains(&squeezed("childFollow = null;"))
+                && collapse.contains(&squeezed("childPanel.hidden = true;")),
+            "collapsing closes the child's stream, forgets the child and hides the panel"
+        );
+        assert!(
+            !collapse.contains(&squeezed("openSession("))
+                && !collapse.contains(&squeezed("closeSession("))
+                && !collapse.contains(&squeezed("transcript.textContent")),
+            "collapsing changes the panel alone, leaving the session's view and transcript as they were"
+        );
+        let close = block(&pane, &squeezed("function closeSession("));
+        assert!(
+            close.contains(&squeezed("closeChildPanel();")),
+            "leaving the session takes the panel, its child and its stream with it"
+        );
+    }
+
+    #[test]
+    fn the_pane_keeps_a_childs_frames_out_of_the_sessions_state() {
+        let pane = flattened();
+        let handler = block(&pane, &squeezed("function handleChildFrame("));
+        assert!(
+            handler.contains(&squeezed(
+                "if (!frame.event || frame.event.kind !== 'message') return;"
+            )),
+            "the panel draws a child's durable messages and nothing else"
+        );
+        assert!(
+            handler.contains(&squeezed("out = childTranscript;"))
+                && handler.contains(&squeezed("out = previousOut;"))
+                && handler.contains(&squeezed("openAskBox = previousAsk;")),
+            "a child's frame draws into the panel and puts the session's render target and ask record back"
+        );
+        for token in [
+            "handleFrame(",
+            "handleEvent(",
+            "renderMessage(",
+            "updateStatusLabel(",
+            "activityLog.",
+            "scheduleAskSync(",
+            "viewStateDot",
+        ] {
+            assert!(
+                !handler.contains(&squeezed(token)),
+                "a child's frame must not touch the session's view through {token}: the dot, the status label, the activity console and the ask composer describe the session on screen"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_follows_a_child_from_its_line_and_shrinks_the_panel_to_a_sheet() {
+        assert!(
+            PANE.contains("watch.className = 'child-watch'")
+                && PANE
+                    .contains("watch.addEventListener('click', () => followChild(block.child_id))"),
+            "the child's line carries the control that follows it in the panel"
+        );
+        assert!(
+            PANE.contains("link.addEventListener('click', () => openSession(block.child_id))"),
+            "the child's id still opens it as the session view, as it did before the panel"
+        );
+        let side = squeezed(segment(PANE, "#child-panel {", "}"));
+        assert!(
+            side.contains(&squeezed("flex: 0 0 auto; width: 420px; max-width: 45%;"))
+                && side.contains(&squeezed("border-left: 1px solid var(--border);")),
+            "on a wide screen the panel is a column beside the transcript"
+        );
+        assert!(
+            PANE.contains(
+                "    #child-panel {\n      position: fixed;\n      inset: 0;\n      width: auto;\n      max-width: none;"
+            ),
+            "on a phone the column does not fit, so the panel covers the view as a full-height sheet"
+        );
+        let pane = flattened();
+        assert!(
+            pane.contains(&squeezed("childTranscript.addEventListener('scroll'"))
+                && pane.contains(&squeezed(
+                    "if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight;"
+                )),
+            "the panel's transcript scrolls and follows on its own flag, not the session's"
         );
     }
 }

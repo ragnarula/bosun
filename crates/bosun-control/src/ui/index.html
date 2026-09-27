@@ -842,7 +842,7 @@
     min-height: 0;
     display: flex;
   }
-  #transcript { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  :is(#transcript, #child-transcript) { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
   #btn-bottom {
     position: absolute;
     right: 16px;
@@ -858,46 +858,106 @@
   }
   #btn-bottom:active { border-color: var(--accent); }
   #btn-bottom[hidden] { display: none; }
+  /* The session's transcript and the subagent panel beside it. The panel is a
+     second reader of a child's own stream, so it carries no composer and no
+     history of its own: following a child here is not opening it. */
+  #conversation {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+  }
+  #child-panel {
+    flex: 0 0 auto;
+    width: 420px;
+    max-width: 45%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+  }
+  #child-panel[hidden] { display: none; }
+  #child-panel .child-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px 6px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  #child-panel .child-panel-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--muted);
+  }
+  #child-panel .child-panel-head button {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 16px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #child-panel .child-panel-head button:active { color: var(--accent); }
+  #child-transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; font-size: 13px; }
+  /* The control on a child's line that follows it here: the child's id opens it
+     as the session view, as it always did. */
+  :is(#transcript, #child-transcript) .child-watch {
+    min-height: 26px;
+    padding: 0 8px;
+    margin-left: 4px;
+    font-size: 11px;
+    background: none;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  :is(#transcript, #child-transcript) .child-watch:active { border-color: var(--accent); }
   /* A stamped entry is one flex row: the time holds the leading gutter and the
      entry takes the rest of the width, so a block entry's first line shares
      the row with its time and still wraps on a narrow screen. */
-  #transcript .stamp-row { display: flex; align-items: baseline; }
+  :is(#transcript, #child-transcript) .stamp-row { display: flex; align-items: baseline; }
   /* The time a durable entry landed, in the row's leading gutter. Tabular
      figures keep the times aligned down the transcript. */
-  #transcript .stamp-row .ts {
+  :is(#transcript, #child-transcript) .stamp-row .ts {
     flex: 0 0 auto;
     color: var(--muted);
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     margin-right: 6px;
   }
-  #transcript .stamp-row > :last-child { flex: 1; min-width: 0; }
-  #transcript .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  :is(#transcript, #child-transcript) .stamp-row > :last-child { flex: 1; min-width: 0; }
+  :is(#transcript, #child-transcript) .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* User and assistant messages carry a left accent gutter like opencode's
      message boxes: the user's is tinted with the user color, the assistant's
      with the plain panel border. */
-  #transcript .msg.user {
+  :is(#transcript, #child-transcript) .msg.user {
     border-left: 3px solid var(--user);
     padding: 2px 0 2px 12px;
     color: var(--user);
   }
-  #transcript .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
+  :is(#transcript, #child-transcript) .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
   /* A rejected question leaves a durable note, not a typed message: muted and
      italic, so it never reads as words the user composed. */
-  #transcript .msg.user.rejected {
+  :is(#transcript, #child-transcript) .msg.user.rejected {
     color: var(--muted);
     font-style: italic;
     border-left-color: var(--border);
   }
-  #transcript .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  :is(#transcript, #child-transcript) .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* A durable note the loop recorded, such as an unavailable MCP server: meta,
      not conversation. */
-  #transcript .line.warning { color: var(--warn); }
+  :is(#transcript, #child-transcript) .line.warning { color: var(--warn); }
   /* Tool traffic: one inline row per call, glyph + name + args, with the
      payload collapsed until clicked. The result nests under its call as a
      bordered block, so a call and its outcome read as one unit. Rows and
      clipped results are touch targets: feedback on :active, never hover. */
-  #transcript .tool {
+  :is(#transcript, #child-transcript) .tool {
     background: var(--panel-2);
     border-radius: 6px;
     padding: 8px 10px;
@@ -907,14 +967,14 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 13px;
   }
-  #transcript .tool:active { background: var(--border); }
-  #transcript .tool .glyph { color: var(--muted); margin-right: 6px; }
-  #transcript .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
-  #transcript .tool.open .toggle { color: var(--accent); }
+  :is(#transcript, #child-transcript) .tool:active { background: var(--border); }
+  :is(#transcript, #child-transcript) .tool .glyph { color: var(--muted); margin-right: 6px; }
+  :is(#transcript, #child-transcript) .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
+  :is(#transcript, #child-transcript) .tool.open .toggle { color: var(--accent); }
   /* Thinking reuses the tool strip's tap-to-open row, restyled as prose:
      muted and italic so it does not read as something the session said. */
-  #transcript .reasoning { color: var(--muted); font-style: italic; }
-  #transcript .reasoning .body {
+  :is(#transcript, #child-transcript) .reasoning { color: var(--muted); font-style: italic; }
+  :is(#transcript, #child-transcript) .reasoning .body {
     display: block;
     margin-top: 6px;
     padding-left: 10px;
@@ -923,22 +983,22 @@
     overflow-wrap: anywhere;
     font-style: normal;
   }
-  #transcript .reasoning .body[hidden] { display: none; }
-  #transcript .tool-result {
+  :is(#transcript, #child-transcript) .reasoning .body[hidden] { display: none; }
+  :is(#transcript, #child-transcript) .tool-result {
     margin: 0 0 6px 20px;
     border-left: 2px solid var(--border);
     padding: 4px 0 4px 10px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  #transcript .tool-result.clipped {
+  :is(#transcript, #child-transcript) .tool-result.clipped {
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     color: var(--muted);
     border-left: 2px solid var(--accent);
   }
-  #transcript .tool-result.clipped:active { color: var(--text); }
-  #transcript .tool-result.clipped .expand-hint {
+  :is(#transcript, #child-transcript) .tool-result.clipped:active { color: var(--text); }
+  :is(#transcript, #child-transcript) .tool-result.clipped .expand-hint {
     color: var(--accent);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px;
@@ -947,14 +1007,14 @@
   }
   /* An error result stays red even when clipped; the muted affordance must
      not hide that the tool failed. */
-  #transcript .tool-result.error { color: var(--error); }
-  #transcript .tool-result.error:active { color: var(--error); }
-  #transcript .tool-result.error .expand-hint { color: var(--error); }
-  #transcript .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
-  #transcript .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
-  #transcript .error { color: var(--error); }
-  #transcript .state { color: var(--muted); font-size: 12px; }
-  #transcript .summary {
+  :is(#transcript, #child-transcript) .tool-result.error { color: var(--error); }
+  :is(#transcript, #child-transcript) .tool-result.error:active { color: var(--error); }
+  :is(#transcript, #child-transcript) .tool-result.error .expand-hint { color: var(--error); }
+  :is(#transcript, #child-transcript) .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
+  :is(#transcript, #child-transcript) .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
+  :is(#transcript, #child-transcript) .error { color: var(--error); }
+  :is(#transcript, #child-transcript) .state { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) .summary {
     color: var(--muted);
     font-style: italic;
     text-align: center;
@@ -965,7 +1025,7 @@
   }
   /* The break a cleared context made in the thread: a divider like a summary,
      in the accent so a reader can find where the session started over. */
-  #transcript .cleared {
+  :is(#transcript, #child-transcript) .cleared {
     color: var(--accent);
     text-align: center;
     font-size: 12px;
@@ -973,15 +1033,15 @@
     padding-top: 8px;
     margin-top: 10px;
   }
-  #transcript .child-report { color: var(--muted); padding-left: 18px; }
-  #transcript .child-link {
+  :is(#transcript, #child-transcript) .child-report { color: var(--muted); padding-left: 18px; }
+  :is(#transcript, #child-transcript) .child-link {
     color: var(--accent);
     cursor: pointer;
     text-decoration: underline;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
-  #transcript .unknown { color: var(--muted); font-size: 12px; }
-  #transcript .ask {
+  :is(#transcript, #child-transcript) .unknown { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) .ask {
     margin: 6px 0;
     padding: 10px 14px;
     border: 1px solid var(--accent);
@@ -990,31 +1050,31 @@
     background: rgba(138, 169, 240, 0.10);
     overflow-wrap: anywhere;
   }
-  #transcript .ask .options { margin: 6px 0 0; padding-left: 18px; }
-  #transcript .ask .answer { margin-top: 6px; color: var(--ok); }
-  #transcript .ask .ask-to { color: var(--muted); font-size: 12px; }
-  #transcript h1, #transcript h2, #transcript h3, #transcript h4, #transcript h5, #transcript h6 {
+  :is(#transcript, #child-transcript) .ask .options { margin: 6px 0 0; padding-left: 18px; }
+  :is(#transcript, #child-transcript) .ask .answer { margin-top: 6px; color: var(--ok); }
+  :is(#transcript, #child-transcript) .ask .ask-to { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) h1, #transcript h2, #transcript h3, #transcript h4, #transcript h5, #transcript h6 {
     margin: 12px 0 4px;
     font-weight: 700;
     line-height: 1.3;
   }
-  #transcript h1 { font-size: 18px; }
-  #transcript h2 { font-size: 16px; }
-  #transcript h3 { font-size: 15px; }
-  #transcript h4 { font-size: 14px; }
-  #transcript h5, #transcript h6 { font-size: 13px; color: var(--muted); }
-  #transcript .msg p { margin: 0 0 6px; }
-  #transcript .md-bold { font-weight: 700; }
-  #transcript .md-italic { font-style: italic; }
-  #transcript .md-code {
+  :is(#transcript, #child-transcript) h1 { font-size: 18px; }
+  :is(#transcript, #child-transcript) h2 { font-size: 16px; }
+  :is(#transcript, #child-transcript) h3 { font-size: 15px; }
+  :is(#transcript, #child-transcript) h4 { font-size: 14px; }
+  :is(#transcript, #child-transcript) h5, #transcript h6 { font-size: 13px; color: var(--muted); }
+  :is(#transcript, #child-transcript) .msg p { margin: 0 0 6px; }
+  :is(#transcript, #child-transcript) .md-bold { font-weight: 700; }
+  :is(#transcript, #child-transcript) .md-italic { font-style: italic; }
+  :is(#transcript, #child-transcript) .md-code {
     padding: 0 4px;
     border-radius: 4px;
     background: var(--panel-2);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.9em;
   }
-  #transcript .md-link { color: var(--accent); text-decoration: underline; }
-  #transcript pre.md-pre {
+  :is(#transcript, #child-transcript) .md-link { color: var(--accent); text-decoration: underline; }
+  :is(#transcript, #child-transcript) pre.md-pre {
     margin: 6px 0;
     padding: 10px 12px;
     overflow-x: auto;
@@ -1027,19 +1087,19 @@
     color: var(--mono);
     white-space: pre;
   }
-  #transcript .md-mermaid { margin: 6px 0; overflow-x: auto; }
-  #transcript .md-mermaid svg { display: block; }
+  :is(#transcript, #child-transcript) .md-mermaid { margin: 6px 0; overflow-x: auto; }
+  :is(#transcript, #child-transcript) .md-mermaid svg { display: block; }
   /* A markdown table: the holder scrolls sideways, as the diagram holder
      does, so a table wider than a phone stays readable instead of squeezing
      its columns or overflowing the transcript. */
-  #transcript .md-table-wrap { margin: 6px 0; overflow-x: auto; }
-  #transcript .md-table {
+  :is(#transcript, #child-transcript) .md-table-wrap { margin: 6px 0; overflow-x: auto; }
+  :is(#transcript, #child-transcript) .md-table {
     border-collapse: collapse;
     font-size: 13px;
     line-height: 1.4;
   }
-  #transcript .md-table th,
-  #transcript .md-table td {
+  :is(#transcript, #child-transcript) .md-table th,
+  :is(#transcript, #child-transcript) .md-table td {
     padding: 5px 10px;
     border: 1px solid var(--border);
     color: var(--text);
@@ -1047,23 +1107,23 @@
     /* A cell keeps its own line: the holder scrolls for a wide table. */
     white-space: nowrap;
   }
-  #transcript .md-table th {
+  :is(#transcript, #child-transcript) .md-table th {
     background: var(--panel-2);
     color: var(--muted);
     font-weight: 600;
   }
-  #transcript .md-table .md-align-right { text-align: right; }
-  #transcript .md-table .md-align-center { text-align: center; }
-  #transcript blockquote {
+  :is(#transcript, #child-transcript) .md-table .md-align-right { text-align: right; }
+  :is(#transcript, #child-transcript) .md-table .md-align-center { text-align: center; }
+  :is(#transcript, #child-transcript) blockquote {
     margin: 4px 0 8px;
     padding: 2px 0 2px 12px;
     border-left: 3px solid var(--border);
     color: var(--muted);
   }
-  #transcript blockquote p { margin: 0; }
-  #transcript hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
-  #transcript .md-li { margin: 2px 0; }
-  #transcript .md-marker { color: var(--muted); }
+  :is(#transcript, #child-transcript) blockquote p { margin: 0; }
+  :is(#transcript, #child-transcript) hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  :is(#transcript, #child-transcript) .md-li { margin: 2px 0; }
+  :is(#transcript, #child-transcript) .md-marker { color: var(--muted); }
   .input-row {
     display: grid;
     gap: 10px;
@@ -1192,6 +1252,17 @@
     .dir-browser-head { flex-wrap: wrap; }
     #transcript { padding: 12px 14px; }
     .input-row { padding: 12px 14px; }
+    /* A side column does not fit a phone: the panel covers the view instead,
+       with the same header, which names the child and closes it. */
+    #child-panel {
+      position: fixed;
+      inset: 0;
+      width: auto;
+      max-width: none;
+      z-index: 11;
+      border-left: none;
+    }
+    #child-transcript { padding: 12px 14px; }
   }
   @media (max-width: 560px) {
     .view-header .view-title .view-dir { max-width: 40%; }
@@ -1373,9 +1444,19 @@
     <button type="button" class="btn-more" id="btn-more" title="Session actions">⋯</button>
   </header>
   <div id="activity-log" hidden></div>
-  <div id="transcript-wrap">
-    <div id="transcript"></div>
-    <button type="button" id="btn-bottom" hidden title="Back to the newest line">↓</button>
+  <div id="conversation">
+    <div id="transcript-wrap">
+      <div id="transcript"></div>
+      <button type="button" id="btn-bottom" hidden title="Back to the newest line">↓</button>
+    </div>
+    <div id="child-panel" hidden>
+      <div class="child-panel-head">
+        <span class="dot" id="child-panel-dot"></span>
+        <span class="child-panel-title" id="child-panel-title"></span>
+        <button type="button" id="btn-child-collapse" title="Collapse the panel">✕</button>
+      </div>
+      <div id="child-transcript"></div>
+    </div>
   </div>
   <div id="watch-banner" hidden>
     <div class="watch-note">watching child session — it is read-only</div>
@@ -1529,6 +1610,11 @@ const btnPersona = $('btn-persona');
 const btnStop = $('btn-stop');
 const transcript = $('transcript');
 const btnBottom = $('btn-bottom');
+const childPanel = $('child-panel');
+const childTranscript = $('child-transcript');
+const childPanelTitle = $('child-panel-title');
+const childPanelDot = $('child-panel-dot');
+const btnChildCollapse = $('btn-child-collapse');
 const input = $('input');
 const chatRow = $('chat-row');
 const btnSend = $('btn-send');
@@ -1564,6 +1650,13 @@ let statusTick = null; // the 1s header-label interval for the open session
 let es = null;        // the open EventSource
 let liveEl = null;    // the assistant paragraph live deltas stream into
 let stick = true;     // auto-scroll the transcript when true
+// Where the block renderers append: the session's own transcript, or the
+// panel's while one of a child's frames is drawn. The two share every renderer,
+// so this is the only thing that decides which transcript a block lands in.
+let out = transcript;
+let childFollow = null;  // the child the panel shows, or null when it is closed
+let childEs = null;      // that child's own event stream
+let childStick = true;   // auto-scroll for the panel's transcript, its own flag
 let sending = false;
 let dirNode = null;   // the node the directory browser is looking at
 let dirPath = null;   // null = the node's browse roots
@@ -2955,6 +3048,7 @@ async function refreshSessions() {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     sessions = await response.json();
     renderSessions();
+    updateChildPanelDot();
     // The waiting label follows the freshest list too: a child's state
     // changes without a state event for the open session, so the event
     // stream alone would leave it stale between fetches.
@@ -3299,6 +3393,9 @@ function closeSession() {
   if (askSyncTimer) window.clearTimeout(askSyncTimer);
   askSyncTimer = null;
   transcript.textContent = '';
+  // The panel belongs to the session the pane is leaving: its child, its stream
+  // and the lines it drew go with it.
+  closeChildPanel();
   // The next session opens on its newest line, so re-arm auto-follow and hide
   // the control at this teardown.
   stick = true;
@@ -3732,7 +3829,7 @@ function appendLine(kind, text, atMs) {
   const line = document.createElement('div');
   line.className = 'line ' + kind;
   line.textContent = text;
-  transcript.appendChild(stampRow(line, atMs));
+  out.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3851,7 +3948,7 @@ function appendToolStrip(name, args, atMs) {
     toggle.textContent = '▾';
     scrollToBottom();
   });
-  transcript.appendChild(stampRow(line, atMs));
+  out.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3898,7 +3995,7 @@ function appendReasoningPanel(text, atMs) {
     toggle.textContent = '\u25be';
     scrollToBottom();
   });
-  transcript.appendChild(stampRow(line, atMs));
+  out.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3938,7 +4035,7 @@ function appendToolResult(name, payload, error, atMs) {
       scrollToBottom();
     });
   }
-  transcript.appendChild(stampRow(line, atMs));
+  out.appendChild(stampRow(line, atMs));
   scrollToBottom();
 }
 
@@ -3965,7 +4062,7 @@ function appendMsg(role, text, atMs) {
   // as a muted note so it never reads as words the user composed.
   if (role === 'user' && text === USER_REJECTED_TEXT) paragraph.classList.add('rejected');
   paragraph.textContent = text;
-  transcript.appendChild(stampRow(paragraph, atMs));
+  out.appendChild(stampRow(paragraph, atMs));
   scrollToBottom();
 }
 
@@ -3976,7 +4073,7 @@ function appendAssistant(text, atMs) {
   const container = document.createElement('div');
   container.className = 'msg assistant';
   renderMarkdown(container, text);
-  transcript.appendChild(stampRow(container, atMs));
+  out.appendChild(stampRow(container, atMs));
   scrollToBottom();
 }
 
@@ -4393,7 +4490,7 @@ function appendDelta(text) {
   if (!liveEl) {
     liveEl = document.createElement('p');
     liveEl.className = 'msg assistant';
-    transcript.appendChild(liveEl);
+    out.appendChild(liveEl);
   }
   liveEl.textContent += text;
   scrollToBottom();
@@ -4451,7 +4548,7 @@ function renderAskBox(block, atMs) {
     note.textContent = 'answered: ' + block.answer;
     box.appendChild(note);
   }
-  transcript.appendChild(stampRow(box, atMs));
+  out.appendChild(stampRow(box, atMs));
   scrollToBottom();
   openAskBox = { key, el: box, answered: !!block.answer };
 }
@@ -4481,6 +4578,14 @@ function renderMessage(message, atMs) {
   // above; any other kind held tool output or reasoning, not assistant prose,
   // so the paragraph is dropped rather than left in the transcript.
   closeLive();
+  renderBlock(message, atMs);
+  scheduleAskSync();
+}
+
+// One durable message, drawn into `out`. The caller owns the state around it:
+// the session's last message, its live paragraph and its ask record.
+function renderBlock(message, atMs) {
+  const block = message.block;
   switch (block.kind) {
     case 'text':
       appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs);
@@ -4533,10 +4638,19 @@ function renderMessage(message, atMs) {
       link.title = 'expand child ' + block.child_id + ' (watch-only)';
       link.addEventListener('click', () => openSession(block.child_id));
       line.appendChild(link);
+      // Beside the id, which opens the child as the session view: this follows
+      // it in the panel, without leaving the parent's place.
+      const watch = document.createElement('button');
+      watch.type = 'button';
+      watch.className = 'child-watch';
+      watch.textContent = 'watch';
+      watch.title = 'follow child ' + block.child_id + ' in the panel';
+      watch.addEventListener('click', () => followChild(block.child_id));
+      line.appendChild(watch);
       const tail = document.createElement('span');
       tail.textContent = ' ' + (block.event_kind || 'report') + '] ' + block.text;
       line.appendChild(tail);
-      transcript.appendChild(stampRow(line, atMs));
+      out.appendChild(stampRow(line, atMs));
       scrollToBottom();
       break;
     }
@@ -4544,8 +4658,112 @@ function renderMessage(message, atMs) {
       appendLine('unknown', JSON.stringify(block), atMs);
       break;
   }
-  scheduleAskSync();
 }
+
+
+// ---- Subagent panel ----
+// One child at a time, followed on its own event stream while the session stays
+// exactly where it is. The panel writes no history entry, carries no composer
+// and adds no watch-only banner: it is a second reader of a child's own
+// transcript, not a second session view. It starts closed, and closing the
+// session takes it with it.
+
+function updateChildPanelDot() {
+  const child = sessions.find((session) => session.id === childFollow);
+  childPanelDot.className = child ? 'dot ' + child.state : 'dot';
+}
+
+// Follows `id` in the panel: the previous child's stream closes first, so one
+// child is followed at a time. Nothing here touches the address bar or the
+// history: the session on screen keeps its entry and its place.
+function followChild(id) {
+  if (!id) return;
+  if (childFollow === id) {
+    childPanel.hidden = false;
+    return;
+  }
+  closeChildPanel();
+  childFollow = id;
+  childStick = true;
+  childPanelTitle.textContent = id;
+  updateChildPanelDot();
+  childPanel.hidden = false;
+  // EventSource reconnects automatically; the child's durable frames carry
+  // their seq as the SSE id, so the browser resumes with Last-Event-ID.
+  childEs = new EventSource('/sessions/' + encodeURIComponent(id) + '/events');
+  childEs.onmessage = (event) => {
+    try {
+      handleChildFrame(JSON.parse(event.data));
+    } catch (error) {
+      showStatus('child events: ' + error.message);
+    }
+  };
+  childEs.onerror = () => {
+    showStatus('child events: stream lost, reconnecting');
+  };
+}
+
+// Collapsing leaves the session's view exactly as it was: the panel closes the
+// child's stream and drops the lines it drew, and nothing else changes.
+function closeChildPanel() {
+  if (childEs) {
+    childEs.close();
+    childEs = null;
+  }
+  childFollow = null;
+  childStick = true;
+  childTranscript.textContent = '';
+  childPanelTitle.textContent = '';
+  updateChildPanelDot();
+  childPanel.hidden = true;
+}
+
+// The panel's own frame handler: a child's durable messages render into the
+// panel and nothing else does. The session-state frames — the header dot, the
+// status label, the activity console, the ask composer — describe the session
+// the pane is showing, so a child's frames never touch them.
+function handleChildFrame(frame) {
+  if (!frame.event || frame.event.kind !== 'message') return;
+  // The renderers touch two things the session owns: where they append, and the
+  // ask record left open. A child's frame draws into the panel and puts both
+  // back.
+  const previousOut = out;
+  const previousAsk = openAskBox;
+  out = childTranscript;
+  try {
+    renderChildMessage(frame.event.message, frame.event.at_ms);
+  } finally {
+    out = previousOut;
+    openAskBox = previousAsk;
+  }
+  scrollChildToBottom();
+}
+
+// One durable message of the panel's child, drawn with the session's own block
+// renderers but without its state: the child's live paragraph, its last message
+// and its ask record are not the session's.
+function renderChildMessage(message, atMs) {
+  const block = message.block;
+  if (message.role === 'assistant' && block.kind === 'text') {
+    appendAssistant(block.text, atMs);
+    return;
+  }
+  renderBlock(message, atMs);
+}
+
+// The panel follows its own child the way the session follows its transcript:
+// it stays at the newest line until the reader scrolls the panel up.
+function scrollChildToBottom() {
+  if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight;
+}
+
+childTranscript.addEventListener('scroll', () => {
+  childStick =
+    childTranscript.scrollTop + childTranscript.clientHeight >=
+    childTranscript.scrollHeight - 40;
+});
+
+btnChildCollapse.addEventListener('click', closeChildPanel);
 
 // The transcript line for a model call. Mirrors the terminal's `event_lines`
 // in `cmd/bosun/src/attach.rs`: the model, the call kind, and only the counts
