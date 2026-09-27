@@ -1510,6 +1510,45 @@ mod tests {
         }
     }
 
+    // `renderAskBox` keeps the record of the box it last drew, so the panel has
+    // to draw with its own: with the session's record saved and put back around
+    // a frame, the record a child's own question built is dropped, and the frame
+    // that answers the question draws a second box beside it.
+
+    #[test]
+    fn the_pane_keeps_the_panels_ask_record_with_the_panel() {
+        let pane = flattened();
+        let handler = block(&pane, &squeezed("function handleChildFrame("));
+        assert!(
+            handler.contains(&squeezed(
+                "out = childTranscript; openAskBox = childAskBox;"
+            )),
+            "a child's frame draws into the panel and with the panel's ask record, or the record the child's own question built is dropped and the frame that answers it draws a second box"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "childAskBox = openAskBox; openAskBox = previousAsk;"
+            )),
+            "the record the frame left is the panel's for the next frame, and the session's record goes back with the render target"
+        );
+        for (owner, why) in [
+            (
+                "function followChild(",
+                "a child followed next starts with no ask record of its own",
+            ),
+            (
+                "function closeChildPanel(",
+                "a collapsed panel drops the record with the lines it drew",
+            ),
+        ] {
+            let body = block(&pane, &squeezed(owner));
+            assert!(
+                body.contains(&squeezed("childAskBox = null;")),
+                "`{owner}` must clear `childAskBox = null;`, so {why}"
+            );
+        }
+    }
+
     #[test]
     fn the_pane_follows_a_child_from_its_line_and_shrinks_the_panel_to_a_sheet() {
         assert!(
