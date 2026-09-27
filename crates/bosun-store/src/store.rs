@@ -748,6 +748,27 @@ impl Store {
         .await
     }
 
+    /// Shows one archived message to the model's window again. A context clear
+    /// archives everything up to its boundary, and a message another writer
+    /// appended during the turn the clear ran in sits inside that range: the
+    /// clear restores those, so a message the session has not read never leaves
+    /// the window.
+    pub async fn unarchive_message(
+        &self,
+        session_id: &str,
+        message_id: i64,
+    ) -> Result<(), StoreError> {
+        self.with_session(session_id, move |conn, session_id| {
+            conn.execute(
+                "UPDATE messages SET archived = 0 WHERE session_id = ?1 AND id = ?2",
+                params![session_id, message_id],
+            )
+            .context("failed to unarchive a message")?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Records the tool call row only; the agent loop emits the tool-call
     /// transcript message itself via `append_message`, so no event is written
     /// here or in `complete_tool_call`.
@@ -2679,6 +2700,66 @@ mod tests {
         let all = store.messages("a", true).await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!((all[0].0, all[1].0), (old, old + 1));
+    }
+
+    #[tokio::test]
+    async fn unarchive_message_shows_one_row_again_and_leaves_the_rest() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        let first = store
+            .append_message(
+                "a",
+                Role::User,
+                &Block::Text {
+                    text: "first".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let second = store
+            .append_message(
+                "a",
+                Role::User,
+                &Block::Text {
+                    text: "second".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let third = store
+            .append_message(
+                "a",
+                Role::Assistant,
+                &Block::Text {
+                    text: "third".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store.mark_archived("a", third).await.unwrap();
+        assert!(store.messages("a", false).await.unwrap().is_empty());
+
+        // The row another writer appended during the turn the clear ran in
+        // comes back, and the history above it stays out of the window.
+        store.unarchive_message("a", second).await.unwrap();
+        let active = store.messages("a", false).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, second);
+        assert!(matches!(&active[0].1.block, Block::Text { text } if text == "second"));
+
+        let all = store.messages("a", true).await.unwrap();
+        assert_eq!(
+            all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first, second, third]
+        );
+
+        // A row that is already active, or an id that names nothing, changes
+        // nothing rather than failing the clear that asked for it.
+        store.unarchive_message("a", second).await.unwrap();
+        store.unarchive_message("a", 9999).await.unwrap();
+        assert_eq!(store.messages("a", false).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

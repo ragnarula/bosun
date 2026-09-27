@@ -118,6 +118,9 @@ pub enum LineKind {
     /// something the session said.
     Reasoning,
     Summary,
+    /// The record of a context clear: a divider like a summary, because it
+    /// marks a break in the transcript rather than something anyone said.
+    ContextCleared,
     ChildEvent,
     ModelCall,
     Status,
@@ -367,6 +370,14 @@ fn event_lines(event: &Event) -> Vec<Line> {
                 Block::Summary { text } => vec![Line {
                     kind: LineKind::Summary,
                     text: text.clone(),
+                    at_ms,
+                }],
+                Block::ContextCleared {
+                    reason,
+                    instructions,
+                } => vec![Line {
+                    kind: LineKind::ContextCleared,
+                    text: format!("context cleared: {reason} · fresh instructions: {instructions}"),
                     at_ms,
                 }],
                 Block::ChildEvent {
@@ -683,7 +694,7 @@ fn prefix_for(kind: LineKind, text: &str) -> Cow<'static, str> {
         LineKind::Ask => Cow::Borrowed("  ? "),
         LineKind::Rejected => Cow::Borrowed("  ~ "),
         LineKind::Reasoning => Cow::Borrowed("  ⋮ "),
-        LineKind::Summary => Cow::Borrowed("── "),
+        LineKind::Summary | LineKind::ContextCleared => Cow::Borrowed("── "),
         LineKind::ChildEvent => Cow::Borrowed("  ⤷ "),
         LineKind::ModelCall => Cow::Borrowed("  ◆ "),
         LineKind::Status => Cow::Borrowed("── "),
@@ -728,7 +739,10 @@ fn kind_color(kind: LineKind) -> Color {
         LineKind::Ask => Color::Yellow,
         LineKind::Rejected => Color::DarkGray,
         LineKind::Reasoning => Color::DarkGray,
-        LineKind::Summary | LineKind::ChildEvent | LineKind::ModelCall => Color::DarkGray,
+        LineKind::Summary
+        | LineKind::ContextCleared
+        | LineKind::ChildEvent
+        | LineKind::ModelCall => Color::DarkGray,
         LineKind::Status => Color::Cyan,
     }
 }

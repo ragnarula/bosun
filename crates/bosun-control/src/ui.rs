@@ -1089,6 +1089,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_pane_renders_a_cleared_context_as_a_break() {
+        let pane = flattened();
+        assert!(
+            pane.contains(&squeezed("case 'context_cleared':")),
+            "a cleared context must render as itself, not fall through to the raw block"
+        );
+        assert!(
+            PANE.contains("block.reason") && PANE.contains("block.instructions"),
+            "the marker line names the reason and what the session continues from"
+        );
+        assert!(
+            pane.contains(&squeezed("appendLine('cleared',")),
+            "the marker appends as a line of its own"
+        );
+        assert!(
+            PANE.contains("#transcript .cleared {"),
+            "the marker is styled as the break it draws"
+        );
+    }
+
     // The control that brings a reader who scrolled up back to the newest line.
     // It lives in the transcript's box, so the session view hides it, and its
     // two states are the two states of `stick`.

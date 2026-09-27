@@ -963,6 +963,16 @@
     padding-top: 8px;
     margin-top: 10px;
   }
+  /* The break a cleared context made in the thread: a divider like a summary,
+     in the accent so a reader can find where the session started over. */
+  #transcript .cleared {
+    color: var(--accent);
+    text-align: center;
+    font-size: 12px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+    margin-top: 10px;
+  }
   #transcript .child-report { color: var(--muted); padding-left: 18px; }
   #transcript .child-link {
     color: var(--accent);
@@ -4497,6 +4507,15 @@ function renderMessage(message, atMs) {
       break;
     case 'summary':
       appendLine('summary', block.text, atMs);
+      break;
+    case 'context_cleared':
+      // The break the session made in its own thread: a divider naming why it
+      // cleared and what it continues from, not something anyone said.
+      appendLine(
+        'cleared',
+        'context cleared: ' + block.reason + ' · fresh instructions: ' + block.instructions,
+        atMs
+      );
       break;
     case 'child_event': {
       // Child activity renders as one line whose child id expands into that
