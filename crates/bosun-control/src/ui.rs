@@ -1361,7 +1361,8 @@ mod tests {
             "and it comes back whether the fork was made or refused"
         );
         assert!(
-            handler.contains(&squeezed("if (current === started) openSession(fork.id);")),
+            handler.contains(&squeezed("openSession(fork.id);"))
+                && PANE.contains("if (current !== started) return;"),
             "the pane opens the fork only if the reader is still in the session it was forked from"
         );
         assert!(
@@ -1369,8 +1370,14 @@ mod tests {
             "and the pane opens the fork, which is a session like any other"
         );
         assert!(
-            PANE.contains("viewFork.textContent = 'fork: ' + error.message;"),
-            "a refusal is shown where the control is, in the sheet"
+            PANE.contains(
+                "if (current === started) viewFork.textContent = 'fork: ' + error.message;"
+            ),
+            "a refusal is shown where the control is, in the sheet, and only while the reader is still in that session"
+        );
+        assert!(
+            PANE.contains("if (current !== started) return;"),
+            "and the sheet closes over a session the reader has left only after they are back in it"
         );
         for token in ["rowFork.hidden = false;", "rowFork.hidden = watchOnly;"] {
             assert!(

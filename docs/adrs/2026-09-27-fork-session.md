@@ -49,7 +49,7 @@ A dev session runs in a directory the user chose, with no recorded repository, a
 
 `POST /sessions/<id>/fork` returns the new session's JSON, and the pane's session actions sheet carries a `Fork session` control that opens it.
 
-The refusals come before the node sees a command: an unknown id is 404; a child is 400, "fork a root session instead"; a session whose state is not `waiting_for_input` is 409, naming the state; a session with no recorded repository is 400, because a fork clones one. The fork's model must have a provider, and the node must be up, before the clone starts.
+The first refusals come before the node sees a command: an unknown id is 404; a child is 400, "fork a root session instead"; a session whose state is not `waiting_for_input` is 409, naming the state; a session with no recorded repository is 400, because a fork clones one. The fork's model must have a provider, and the node must be up, before the clone starts.
 
 `Store::fork_source` reads the original's row and its window's messages in one call, and that read decides what the fork copies: the state checks and the copy point are the same moment, not three. `Store::fork_session` then writes the fork's row and copies exactly those messages in one transaction, each inserted as the fork's own message with its own event, plus the tool-call rows those messages name. Nothing is written to the original.
 

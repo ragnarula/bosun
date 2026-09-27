@@ -7357,10 +7357,6 @@ mod tests {
         );
     }
 
-    /// The resume waits for the session's node: the nodes dial back in after a
-    /// restart, and the listener that accepts them binds after recovery, so a
-    /// wake sent at boot would re-issue the call against a plane that cannot
-    /// reach the node and record that failure as the call's result.
     /// A fork copies what it can and refuses the rest, saying why: nothing is
     /// started for a session it cannot copy.
     #[tokio::test]

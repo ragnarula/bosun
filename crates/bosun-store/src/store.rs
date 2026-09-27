@@ -106,7 +106,7 @@ pub struct PendingAsk {
     pub ask_message_id: i64,
 }
 
-/// A session and the row ids of its window, read together: what a fork copies.
+/// A session and its window's messages, read together: what a fork copies.
 #[derive(Debug, Clone)]
 pub struct ForkSource {
     pub session: Session,
@@ -391,10 +391,11 @@ impl Store {
         .await
     }
 
-    /// The two answers a fork needs, from one moment: the session's row and the
-    /// row ids of its window. The caller holds the ids and copies exactly those,
-    /// so what the fork carries is what the state check saw and not whatever the
-    /// original appended while the clone ran.
+    /// The two answers a fork needs, from one moment: the session's row and its
+    /// window's messages. The caller holds those and copies exactly them, so what
+    /// the fork carries is what the state check saw — not whatever the original
+    /// appended while the clone ran, and not a row another writer rewrote in
+    /// place in the meantime.
     pub async fn fork_source(&self, session_id: &str) -> Result<Option<ForkSource>, StoreError> {
         let session_id = session_id.to_string();
         self.with_conn(move |conn| {
@@ -2073,8 +2074,6 @@ fn append_event(
     Ok(conn.last_insert_rowid())
 }
 
-/// Inserts a message row and its matching `Event::Message` inside the
-/// caller's transaction, so a write that spans sessions stays atomic.
 /// A session's columns, in the order `session_from_row` reads them: one place
 /// names them, so a query cannot drift from the row it builds.
 const SESSION_COLUMNS: &str = "id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary";
@@ -3239,6 +3238,74 @@ mod tests {
             fork_thread,
             ["first", "second"],
             "including the row the original has since retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_the_ask_an_answer_rewrote_after_the_read() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("original")).await.unwrap();
+        store.create_session(&session("child-1")).await.unwrap();
+        // A question the session raised, with no answer yet.
+        let ask = store
+            .append_message(
+                "original",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "which branch?".into(),
+                    options: vec!["main".into(), "pane".into()],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_pending_ask("original", "child-1", "original", "which branch?", ask)
+            .await
+            .unwrap();
+        store
+            .set_state("original", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let source = store.fork_source("original").await.unwrap().unwrap();
+
+        // The answer lands while the fork's clone runs, and the store rewrites
+        // the block in place: the fork must carry the block the read saw, not
+        // the row as it stands at copy time.
+        store.route_answer("original", "main").await.unwrap();
+
+        let copied = store
+            .fork_session(&session("fork"), "original", &source.window)
+            .await
+            .unwrap();
+        assert_eq!(copied, 1);
+        let answer_in = |session: &str| {
+            let store = store.clone();
+            let session = session.to_string();
+            async move {
+                store
+                    .messages(&session, true)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|(_, message)| match message.block {
+                        Block::Ask { answer, .. } => Some(answer),
+                        _ => None,
+                    })
+                    .expect("the session holds the question")
+            }
+        };
+        assert_eq!(
+            answer_in("fork").await,
+            None,
+            "the fork's question carries no answer: its copy is the read's snapshot"
+        );
+        assert_eq!(
+            answer_in("original").await.as_deref(),
+            Some("main"),
+            "and the original carries the answer that landed after the read"
         );
     }
 

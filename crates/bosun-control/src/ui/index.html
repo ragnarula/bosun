@@ -3536,11 +3536,14 @@ btnFork.addEventListener('click', async () => {
   try {
     const response = await post('/sessions/' + encodeURIComponent(started) + '/fork', {});
     const fork = await response.json();
-    viewSheet.hidden = true;
     await refreshSessions();
-    if (current === started) openSession(fork.id);
+    // The reader may have left while the clone ran: the fork is in the list
+    // either way, and the pane only acts on a session it is still showing.
+    if (current !== started) return;
+    viewSheet.hidden = true;
+    openSession(fork.id);
   } catch (error) {
-    viewFork.textContent = 'fork: ' + error.message;
+    if (current === started) viewFork.textContent = 'fork: ' + error.message;
   } finally {
     btnFork.disabled = false;
   }
