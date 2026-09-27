@@ -305,7 +305,8 @@ impl NodeManager {
 
     /// Kills every in-flight shell on the node. The node calls this on the way
     /// down: a shell that outlives its node has nothing left to report its exit
-    /// to, and the control plane re-issues the call when the session resumes.
+    /// to. Nothing re-runs that call on its own: the control plane records the
+    /// failure, and a boot that resumes the session is what runs it again.
     pub async fn kill_all_shells(&self) {
         let executors: Vec<Arc<ExecutorState>> = self
             .sessions
@@ -321,23 +322,19 @@ impl NodeManager {
         for executor in &executors {
             executor.begin_shutdown().await;
         }
+        // The bound is the node's, spent across its sessions: each executor is
+        // given what is left of it, so the whole shutdown waits once.
         let deadline = Instant::now() + SHUTDOWN_WAIT;
-        loop {
-            let mut left = Vec::new();
-            for executor in &executors {
-                left.extend(executor.shells_in_flight().await);
-            }
-            if left.is_empty() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                warn!(
-                    runs = ?left,
-                    "shells are still running after the shutdown wait; their process groups may outlive the node"
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut left = Vec::new();
+        for executor in &executors {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            left.extend(executor.wait_for_shells(remaining).await);
+        }
+        if !left.is_empty() {
+            warn!(
+                runs = ?left,
+                "shells are still running after the shutdown wait; their process groups may outlive the node"
+            );
         }
     }
 

@@ -63,8 +63,10 @@ pub struct ExecutorState {
     pub permission: RwLock<Permission>,
     pub running: RwLock<HashMap<String, RunningShell>>,
     /// Set when the node starts shutting down. Nothing new runs after it: the
-    /// process that would reap a shell is going away, and the control plane
-    /// re-issues the call once the node is back.
+    /// process that would reap a shell is going away. Its call is not re-issued
+    /// by the node coming back — the control plane records the failure it never
+    /// saw an answer to, and only a boot that resumes the session runs the call
+    /// again.
     shutting_down: AtomicBool,
 }
 
@@ -136,6 +138,21 @@ impl ExecutorState {
         self.running.read().await.keys().cloned().collect()
     }
 
+    /// Waits, up to `bound`, for the runs to be reaped, and returns the runs
+    /// still in flight when it runs out. The caller owns the bound: the node
+    /// gives all of its sessions one between them, and a single session stop
+    /// gives this one session its own.
+    pub async fn wait_for_shells(&self, bound: Duration) -> Vec<String> {
+        let deadline = Instant::now() + bound;
+        loop {
+            let left = self.shells_in_flight().await;
+            if left.is_empty() || Instant::now() >= deadline {
+                return left;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Kills every running shell. The node calls this when a session stops, so
     /// in-flight shells die with the session instead of outliving it, and on
     /// the way down, where a shell that outlived its node would have nothing
@@ -150,17 +167,7 @@ impl ExecutorState {
     /// is still there is a process group the node is leaving behind.
     pub async fn kill_all_shells(&self) -> Vec<String> {
         self.begin_shutdown().await;
-        let deadline = Instant::now() + SHELL_KILL_WAIT;
-        loop {
-            let left = self.shells_in_flight().await;
-            if left.is_empty() {
-                return left;
-            }
-            if Instant::now() >= deadline {
-                return left;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        self.wait_for_shells(SHELL_KILL_WAIT).await
     }
 }
 
@@ -229,8 +236,9 @@ pub async fn run_call(
     tool: &str,
     args: &Value,
 ) -> Result<CallOutcome, ExecutorError> {
-    // The node is going down: the process that would reap a shell is leaving,
-    // and the control plane re-issues the call once the node is back.
+    // The node is going down: the process that would reap a shell is leaving.
+    // The call is refused rather than started and orphaned; the control plane
+    // records the failure, and only a boot that resumes the session re-runs it.
     if state.shutting_down.load(Ordering::SeqCst) {
         return Err(ExecutorError::ShuttingDown);
     }
@@ -597,14 +605,25 @@ async fn start_shell(
     // and leave an orphaned shell behind. The placeholder pid is 0, which the
     // owner task replaces once the child exists; kill_group refuses pids at or
     // below 1, so nothing can ever signal the placeholder.
+    // The registration re-checks the shutdown flag under the lock the
+    // shutdown's snapshot takes. A call that passed the check at the top of
+    // `run_call` and then lost the race to a shutdown would otherwise register
+    // after that snapshot, and nothing would ever signal it: its shell would
+    // outlive the node.
     let kill_signal = Arc::new(Notify::new());
-    state.running.write().await.insert(
-        run_id.to_string(),
-        RunningShell {
-            pid: 0,
-            kill: kill_signal.clone(),
-        },
-    );
+    {
+        let mut running = state.running.write().await;
+        if state.shutting_down.load(Ordering::SeqCst) {
+            return Err(ExecutorError::ShuttingDown);
+        }
+        running.insert(
+            run_id.to_string(),
+            RunningShell {
+                pid: 0,
+                kill: kill_signal.clone(),
+            },
+        );
+    }
 
     let mut child = match shell.spawn() {
         Ok(child) => child,
@@ -1321,6 +1340,41 @@ mod tests {
             child.kill().await.unwrap();
             child.wait().await.unwrap();
         }
+    }
+
+    /// The shutdown flag is checked again under the registration lock: a call
+    /// that passed the first check and then lost the race to a shutdown is
+    /// refused, rather than registering after the shutdown's snapshot, where
+    /// nothing would ever signal it and its shell would outlive the node.
+    ///
+    /// The window is held open deliberately: the test holds the permission write
+    /// lock, so the call parks between its flag check and its registration while
+    /// the shutdown runs.
+    #[tokio::test]
+    async fn a_call_that_races_the_shutdown_is_refused_not_orphaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), Permission::ReadWrite);
+        let held = state.permission.write().await;
+        let calling = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                run_call(&state, "run-1", "shell", &json!({ "command": "sleep 30" })).await
+            })
+        };
+        // The call has passed the flag check and is parked on the permission.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.begin_shutdown().await;
+        drop(held);
+
+        let outcome = calling.await.unwrap();
+        assert!(
+            matches!(outcome, Err(ExecutorError::ShuttingDown)),
+            "a call that lost the race is refused rather than started: {outcome:?}"
+        );
+        assert!(
+            state.shells_in_flight().await.is_empty(),
+            "and nothing registers after the shutdown's snapshot"
+        );
     }
 
     #[tokio::test]

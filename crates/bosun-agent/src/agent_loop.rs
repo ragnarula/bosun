@@ -1373,35 +1373,24 @@ async fn clear_context(
     Ok(())
 }
 
-/// The session's two skill sources, read at the first turn and cached: the
-/// working copy's skills through the executor and the store's advertised
-/// remote packages. A failed source degrades to an empty list, so a session
-/// runs with whatever reached it.
-async fn fetch_session_skills(deps: &LoopDeps, session_id: &str) -> SessionSkills {
+/// The session's two skill sources, read at the first turn that can reach them
+/// and cached: the working copy's skills through the executor and the store's
+/// advertised remote packages. A failure is returned rather than degraded to an
+/// empty list, because the caller caches the answer: after a restart the node
+/// has not come back yet, and caching that emptiness would hide every
+/// working-copy skill for the rest of the boot.
+async fn fetch_session_skills(deps: &LoopDeps, session_id: &str) -> anyhow::Result<SessionSkills> {
     let working = fetch_working_skills(&*deps.tools, session_id)
         .await
-        .unwrap_or_else(|error| {
-            warn!(
-                msg = "failed to fetch skills from the node",
-                session_id = %session_id,
-                error = %error.display_chain()
-            );
-            Vec::new()
-        });
+        .with_context(|| format!("failed to fetch skills from the node for {session_id}"))?;
     let remote = deps
         .store
         .advertised_skill_packages()
-        .await
-        .map(|ads| ads.into_iter().map(Skill::from).collect())
-        .unwrap_or_else(|error| {
-            warn!(
-                msg = "failed to fetch remote skill packages from the store",
-                session_id = %session_id,
-                error = %error.display_chain()
-            );
-            Vec::new()
-        });
-    SessionSkills { working, remote }
+        .await?
+        .into_iter()
+        .map(Skill::from)
+        .collect();
+    Ok(SessionSkills { working, remote })
 }
 
 /// One remote `skill` tool answer: reads one reference chunk when the call
@@ -1610,20 +1599,19 @@ async fn run_turn_inner(
     // the dispatch, and a resumed turn reaches the dispatch without asking the
     // model anything, so they are fetched before the resume match.
     if state.skills_cache.is_none() {
-        state.skills_cache = Some(fetch_session_skills(deps, session_id).await);
+        match fetch_session_skills(deps, session_id).await {
+            Ok(skills) => state.skills_cache = Some(skills),
+            Err(error) => warn!(
+                msg = "failed to fetch the session's skills; trying again on the next turn",
+                session_id = %session_id,
+                error = %error.display_chain()
+            ),
+        }
     }
-    let working_skills: Vec<Skill> = state
-        .skills_cache
-        .as_ref()
-        .expect("populated above")
-        .working
-        .clone();
-    let remote_skills: Vec<Skill> = state
-        .skills_cache
-        .as_ref()
-        .expect("populated above")
-        .remote
-        .clone();
+    let (working_skills, remote_skills) = match state.skills_cache.as_ref() {
+        Some(skills) => (skills.working.clone(), skills.remote.clone()),
+        None => (Vec::new(), Vec::new()),
+    };
     // The tool surface the session may call, and the route of every MCP tool
     // it can reach. The dispatch reads the routes — a resumed turn reaches it
     // without asking the model anything, and a re-issued MCP call must find
@@ -2584,6 +2572,7 @@ async fn run_turn_inner(
                 let Some(outcome) =
                     run_mcp_call(deps, mcp, session_id, &server, &tool, args, signal).await
                 else {
+                    record_interrupted_call(deps, session_id, window, &id, &name, None).await?;
                     return Ok(TurnOutcome::Interrupted);
                 };
                 deps.store
@@ -2623,6 +2612,8 @@ async fn run_turn_inner(
                 let Some(outcome) =
                     run_tool_call(deps, session_id, &run_id, &name, args, signal).await?
                 else {
+                    record_interrupted_call(deps, session_id, window, &id, &name, Some(started))
+                        .await?;
                     return Ok(TurnOutcome::Interrupted);
                 };
                 deps.store
@@ -3145,6 +3136,15 @@ fn order_tool_exchange(messages: Vec<Message>) -> Vec<Message> {
     ordered
 }
 
+/// What a tool result says about a call that was dispatched and never finished:
+/// the control plane was replaced under it, or the user interrupted its turn.
+/// The model cannot see that a command was cut off, and left to guess it may
+/// assume the work was done.
+const INTERRUPTED_CALL_TEXT: &str = "This call was interrupted and produced no result. \
+                                    Whether it ran, partly ran, or never started is unknown. \
+                                    Check the state it would have changed before relying on it, \
+                                    and call the tool again if you still need the result.";
+
 /// Gives every tool call left without a result a synthetic error result, so a
 /// window that ends mid-call is still a valid request.
 ///
@@ -3184,17 +3184,50 @@ fn answer_interrupted_tool_calls(messages: Vec<Message>) -> Vec<Message> {
                     id,
                     name,
                     is_error: true,
-                    content: json!({
-                        "error": "This call was interrupted and produced no result. \
-                                  Whether it ran, partly ran, or never started is unknown. \
-                                  Check the state it would have changed before relying on it, \
-                                  and call the tool again if you still need the result."
-                    }),
+                    content: json!({ "error": INTERRUPTED_CALL_TEXT }),
                 },
             });
         }
     }
     out
+}
+
+/// Records the result of a call an interrupt cancelled after it was dispatched.
+///
+/// The call's message is in the thread and its result never arrives, so without
+/// this the thread ends on a dangling call: the provider would reject the next
+/// request, and a resume would re-run work the user stopped. The result says
+/// what the synthetic answer says, so the model reads the same thing whether
+/// the interrupt landed while the call ran or after a restart.
+async fn record_interrupted_call(
+    deps: &LoopDeps,
+    session_id: &str,
+    window: &mut Vec<(i64, Message)>,
+    id: &str,
+    name: &str,
+    started: Option<Instant>,
+) -> anyhow::Result<()> {
+    let content = json!({ "error": INTERRUPTED_CALL_TEXT });
+    deps.store
+        .complete_tool_call(session_id, id, &content, true)
+        .await?;
+    record_in_wake(
+        deps,
+        session_id,
+        window,
+        Role::User,
+        &Block::ToolResult {
+            id: id.to_string(),
+            name: name.to_string(),
+            is_error: true,
+            content,
+        },
+    )
+    .await?;
+    if let Some(started) = started {
+        append_tool_finished(deps, session_id, name, started, false).await?;
+    }
+    Ok(())
 }
 
 /// The origin leaf of the question `named` last raised into this session's
@@ -17859,7 +17892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_interrupt_drops_an_mcp_call_that_cannot_be_cancelled() {
+    async fn an_interrupt_records_an_mcp_call_it_cannot_cancel() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
@@ -17910,20 +17943,28 @@ mod tests {
         })
         .await;
 
-        // The call cannot be cancelled, so it is dropped and the turn records
-        // no result for it.
+        // The call cannot be cancelled — the server keeps working on it — so
+        // its result says what the synthetic answer says: the effect is unknown,
+        // and the model has to check before it relies on it.
         let tool_calls = store.tool_calls("s-drop").await.unwrap();
         assert_eq!(tool_calls.len(), 1);
+        let recorded = tool_calls[0]
+            .result
+            .as_ref()
+            .expect("an interrupted MCP call records its result");
         assert!(
-            tool_calls[0].result.is_none(),
-            "an interrupted MCP call records no result"
+            recorded["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("interrupted"),
+            "and says the call was interrupted: {recorded}"
         );
 
         handle.stop();
     }
 
     #[tokio::test]
-    async fn a_resumed_turn_answers_the_tool_call_an_interrupt_left_unanswered() {
+    async fn a_resumed_turn_carries_the_result_an_interrupt_recorded() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store
@@ -17974,18 +18015,17 @@ mod tests {
         })
         .await;
 
-        // The interrupt cut the call short, so the thread holds its call with
-        // no result: exactly the pair the resumed turn's window must repair.
+        // The interrupt recorded the call's result, so the thread holds no
+        // dangling call: the next window carries the pair as any answered call's.
         let tool_calls = store.tool_calls("s-dangle").await.unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert!(
-            tool_calls[0].result.is_none(),
-            "the interrupted call records no result"
+            tool_calls[0].result.is_some(),
+            "the interrupted call records the result the interrupt gave it"
         );
 
-        // The resumed turn rebuilds its window from the thread the interrupt
-        // left behind, so the recorded call with no result is in front of the
-        // provider again.
+        // The next turn rebuilds its window from the thread the interrupt left
+        // behind, so the answered call is in front of the provider again.
         store
             .append_message(
                 "s-dangle",
@@ -19703,6 +19743,95 @@ mod tests {
             )),
             "the call is recorded as a failure the model reads, not left dangling: {:?}",
             request_texts(&requests[0])
+        );
+    }
+    #[tokio::test]
+    async fn an_interrupt_records_the_call_it_cancelled() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-cancel")).await.unwrap();
+        store
+            .append_message(
+                "s-cancel",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn("call-1", "shell", json!({ "command": "make" })),
+            vec![StreamEvent::TextDelta("after".into()), stop(1, 1)],
+        ]));
+        // The tool never finishes on its own, so the interrupt lands while the
+        // call is in flight.
+        let tools = Arc::new(MockTools::new(default_outcome()).blocking());
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-cancel".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the blocking call to be dispatched", {
+            let tools = tools.clone();
+            move || {
+                let tools = tools.clone();
+                async move {
+                    tools
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|call| call.name == "shell")
+                }
+            }
+        })
+        .await;
+        handle.send(LoopEvent::Interrupt);
+        wait_for("the interrupted turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-cancel").await.unwrap().unwrap().state
+                        == SessionState::Interrupted
+                }
+            }
+        })
+        .await;
+
+        // The cancelled call's result is durable, the way a restart's synthetic
+        // answer is: the thread holds no dangling call, and the model reads what
+        // happened to it.
+        let thread = store.messages("s-cancel", false).await.unwrap();
+        let (is_error, content) = thread
+            .iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ToolResult {
+                    id,
+                    is_error,
+                    content,
+                    ..
+                } if id == "call-1" => Some((*is_error, content.clone())),
+                _ => None,
+            })
+            .expect("the cancelled call's result is recorded");
+        assert!(is_error, "a cancelled call is an error result");
+        assert!(
+            content["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("interrupted"),
+            "and says the call was interrupted: {content:?}"
+        );
+        assert!(
+            unanswered_calls(&thread).is_empty(),
+            "so a resume has nothing to re-issue: the call the user stopped is answered"
         );
     }
 }

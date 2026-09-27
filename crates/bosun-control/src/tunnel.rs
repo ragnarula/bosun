@@ -54,6 +54,14 @@ impl TunnelRegistry {
     /// Opens a logical connection for one session on its node's tunnel. The
     /// connection names the session, so the node relay dispatches it to the
     /// session's in-process executor.
+    /// Whether the node has a live tunnel: the control plane's view of whether a
+    /// call to one of its sessions can reach it. The tree registers a tunnel when
+    /// the node dials in and drops it when the connection closes, so this is what
+    /// a caller waits on after a restart, when the nodes are re-dialling.
+    pub fn has_tunnel(&self, node: &str) -> bool {
+        self.tunnels.read().unwrap().contains_key(node)
+    }
+
     pub async fn open(&self, node: &str, session_id: &str) -> Result<LogicalStream, TunnelError> {
         let tunnel = self
             .tunnels

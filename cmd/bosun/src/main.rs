@@ -622,7 +622,8 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     }
     // The node is going down: kill the shells it is running, so a restart
     // cannot leave a command running with nothing left to report its exit to.
-    // The control plane re-issues the call when the session resumes.
+    // Nothing re-runs that call by itself: the control plane records the
+    // failure, and a boot that resumes the session is what re-issues it.
     manager.kill_all_shells().await;
     Ok(())
 }

@@ -3,6 +3,8 @@
 **Date:** 2026-09-05
 **Author:** Raghav
 
+> Superseded in part by `2026-09-27-deploy-resume.md`: the node now kills the shells it is running when it is asked to stop, so a shell does not outlive the process that would reap it, and the control plane re-runs a call only when a boot resumes the session that holds it.
+
 ## Context
 
 Sprint 002 made each session's executor one `bosun executor` process on the node, started as `bosun executor --session-dir <dir> --port <n> --permission <mode>`, serving its tool API on its own loopback port, with port and pid kept in the node's `state.json` and restored at boot. That arrangement is recorded in `2026-08-30-executor-per-session.md`. Tool calls ride the node tunnel as HTTP/1.1 over a logical connection that the node relay splices to the executor's loopback port; that protocol is recorded in `2026-08-30-tool-protocol-over-tunnel.md` and re-addressed per session by `2026-09-03-one-tunnel-per-node.md`. Sprint 005 (`2026-09-03-agent-tree.md`) makes a tree of sessions share one node and records the consequences of a live tree holding one executor process per running or stopped-but-resumable session.

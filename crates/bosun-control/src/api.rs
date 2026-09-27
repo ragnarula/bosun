@@ -303,17 +303,49 @@ impl AppState {
     }
 }
 
-/// Control-plane boot recovery. Sessions that were mid-flight when the
-/// process died become `Interrupted` with a crash cause; every surviving
-/// session's loop is re-spawned so it rehydrates from the store; and each
-/// crash-interrupted child authors a failure event to its parent, so the
-/// parent's loop — whether it was itself crashed or merely waiting — wakes
-/// and re-decides the child: resume it with `message_child`, or abandon it.
-/// A child the user interrupted authors nothing: its cause is `User`, and it
-/// stays stopped until the user acts. The failures are authored only after
-/// every loop is running, so the wakes that carry them are never lost to a
-/// loop that has not started yet.
-pub async fn recover(state: &AppState) {
+/// Control-plane boot recovery. A session that was running keeps running: it is
+/// woken once, after its node has reconnected, and the work the restart cut off
+/// is re-run rather than left for the user to notice. Every surviving session's
+/// loop is re-spawned so it rehydrates from the store. A child that was running
+/// does not continue on its own: it is parked in `waiting_for_input` and reports
+/// the restart to its parent, whose loop wakes and re-decides it with
+/// `message_child` or abandons it. A `creating` session ran nothing, and a
+/// running session whose model is no longer configured has no loop to run, so
+/// both keep the crash rule: marked `interrupted` with a crash cause, and a child
+/// among them authors a failure event for its parent to re-decide. A child the
+/// user interrupted authors nothing: its cause is `User`, and it stays stopped
+/// until the user acts. The events are authored only after every loop is
+/// running, so the wakes that carry them are never lost to a loop that has not
+/// started yet.
+/// The node a session's work runs on, for a waiter that has to know whether the
+/// node is reachable again before it resumes the session.
+async fn session_node(store: &Store, session_id: &str) -> Option<String> {
+    match store.get_session(session_id).await {
+        Ok(Some(session)) => Some(session.node),
+        Ok(None) => {
+            warn!(
+                session_id = %session_id,
+                "the session is gone before its resume"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                session_id = %session_id,
+                error = %error.display_chain(),
+                "failed to read the session for its resume"
+            );
+            None
+        }
+    }
+}
+
+/// How long a resumed session waits for its node to reconnect before the resume
+/// is given up for this boot. The nodes re-dial within about a second of the
+/// plane listening; the bound covers one that is slow, and one that is gone.
+const RESUME_TUNNEL_WAIT: Duration = Duration::from_secs(30);
+
+pub async fn recover(state: &Arc<AppState>) {
     let sessions = match state.store.list_sessions().await {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -410,8 +442,38 @@ pub async fn recover(state: &AppState) {
     }
     // One wake per session per boot: a session that keeps crashing the plane
     // re-runs on each boot, and nothing else bounds the resume.
+    //
+    // The resume waits for the session's node. The nodes dial back in after a
+    // restart, and the listener that accepts them binds after recovery, so
+    // waking a session now would re-issue its call against a control plane that
+    // has not heard from the node yet, and record that failure as the call's
+    // result. Each wait is its own task, so the boot waits for no node; a node
+    // that never comes back leaves its session to the next boot, or to a user
+    // message, rather than spending the wake on a call that cannot reach it.
     for session_id in &resuming {
-        state.loops.resume(session_id);
+        let state = state.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            let Some(node) = session_node(&state.store, &session_id).await else {
+                return;
+            };
+            // The tunnel registry holds a node's tunnel only while it is
+            // connected, so this is the same reachability the tool path needs.
+            let deadline = tokio::time::Instant::now() + RESUME_TUNNEL_WAIT;
+            while !state.tunnels.has_tunnel(&node) {
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        session_id = %session_id,
+                        node = %node,
+                        secs = RESUME_TUNNEL_WAIT.as_secs(),
+                        "the node has not reconnected; the session resumes on the next boot or on a user message"
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            state.loops.resume(&session_id);
+        });
     }
     for child_id in &restarted_children {
         let _ = author_child_event(
@@ -6952,6 +7014,10 @@ mod tests {
             .unwrap();
 
         recover(&state).await;
+        // The resume waits for the session's node to reconnect, which its own
+        // test covers; the wake is sent here directly, so this test is about
+        // what the resumed turn does.
+        state.loops.resume("running");
 
         // The resume is the turn re-sent from the durable thread: the model is
         // asked once, and the session is never marked.
@@ -7077,6 +7143,88 @@ mod tests {
         );
     }
 
+    /// The resume waits for the session's node: the nodes dial back in after a
+    /// restart, and the listener that accepts them binds after recovery, so a
+    /// wake sent at boot would re-issue the call against a plane that cannot
+    /// reach the node and record that failure as the call's result.
+    #[tokio::test]
+    async fn recover_holds_a_resume_until_the_node_reconnects() {
+        let dir = tempdir().unwrap();
+        let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
+            "the call is answered",
+        )]])));
+        let (state, requests) = recovery_state(&dir, scripts).await;
+        state
+            .store
+            .create_session(&recoverable_session("running", SessionState::Running))
+            .await
+            .unwrap();
+        state
+            .store
+            .append_message(
+                "running",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .append_message(
+                "running",
+                Role::Assistant,
+                &Block::ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    args: json!({ "command": "make" }),
+                    continues_completion: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        recover(&state).await;
+
+        // The node has not dialled back yet, so nothing has run: the call has no
+        // result, no turn has been attempted, and no node call went out. The
+        // window is generous because the test has to outlast a turn that should
+        // not happen: a resume that fired would spend over a second reaching the
+        // node and failing, and the call would carry that failure.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let answered = state
+            .store
+            .messages("running", true)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, message)| matches!(&message.block, Block::ToolResult { id, .. } if id == "call-1"));
+        assert!(
+            !answered,
+            "the resume is held until the session's node is reachable: the call it would re-issue is untouched"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 0, "and no turn has run");
+
+        // The node dials back, and the resume fires: the first thing it does is
+        // reach the node.
+        let (cp_side, node_side) = tokio::io::duplex(1 << 20);
+        let (cp_tunnel, _) = bosun_common::tunnel::Tunnel::new(cp_side);
+        // The receiver is the peer's: a connection the control plane opens
+        // arrives on the node's side.
+        let (node_tunnel, mut opens) = bosun_common::tunnel::Tunnel::new(node_side);
+        state.tunnels.register("n1", cp_tunnel);
+
+        let opened = tokio::time::timeout(Duration::from_secs(10), opens.recv())
+            .await
+            .expect("the resume must fire once the node is back");
+        assert!(
+            opened.is_some(),
+            "the resumed turn opens a connection on the node's tunnel"
+        );
+        let _ = node_tunnel;
+    }
+
     #[tokio::test]
     async fn recover_resumes_a_running_root_whose_thread_ends_on_a_call() {
         let dir = tempdir().unwrap();
@@ -7118,6 +7266,8 @@ mod tests {
             .unwrap();
 
         recover(&state).await;
+        // The wait for the node is its own test; the wake is sent here directly.
+        state.loops.resume("running");
 
         wait_for("the resumed turn to end", {
             let store = state.store.clone();
