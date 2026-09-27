@@ -142,14 +142,9 @@
     font-weight: 600;
     color: var(--text);
   }
-  #machines-list {
-    flex: 1;
-    background: var(--bg);
-    /* It scrolls like the other lists, and its last rows keep clear of the Home
-       indicator now that the page reaches under it. */
-    overflow-y: auto;
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-  }
+  /* Scrolling like the other two keeps every tab's head pinned the same way,
+     and leaves the tab's own overflow inert. */
+  #machines-list { flex: 1; background: var(--bg); overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
   #machines-list .machine-row {
     display: flex;
     align-items: center;
@@ -3963,7 +3958,7 @@ async function send() {
     // Only where a focus is the reader's: on a touch screen iOS may treat this
     // re-focus as one it already has and withhold the keyboard, so the tap that
     // follows asks for it instead. This is send's own re-focus; the other gate
-    // is the `answer in your own words` button's, below.
+    // is the `answer in your own words` button's, above.
     if (!coarsePointer()) input.focus();
   }
 }

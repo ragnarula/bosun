@@ -1550,6 +1550,15 @@ mod tests {
             PANE.contains("#session-list { padding: 0 0 8px; }"),
             "the list itself stays unpadded, so the scroll is the column's"
         );
+        // All three tabs scroll the same way, so each keeps its head pinned and
+        // the tab's own overflow never engages.
+        for list in [
+            "#machines-list { flex: 1; background: var(--bg); overflow-y: auto;",
+            "#skills-list { flex: 1; background: var(--bg); overflow-y: auto;",
+            "#mcp-list { flex: 1; background: var(--bg); overflow-y: auto;",
+        ] {
+            assert!(PANE.contains(list), "`{list}` must scroll like the others");
+        }
     }
 
     // The session view is a full-height box inside a locked document, not a
