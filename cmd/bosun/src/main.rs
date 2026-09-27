@@ -26,7 +26,6 @@ use bosun_common::config::save_cli_config;
 #[cfg(windows)]
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Session;
-use bosun_common::session::SessionState;
 use bosun_common::telemetry::setup_logging;
 use bosun_common::types::CloneRequest;
 use bosun_common::types::DevRequest;
@@ -732,7 +731,7 @@ async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
         "cloned session {} on node {} (status {})",
         session.id,
         session.node,
-        state_name(session.state)
+        session.state.as_str()
     );
     println!("open with: bosun open {}", session.id);
     Ok(())
@@ -884,7 +883,7 @@ async fn spawn_dev(
         "started dev session {} on node {} (status {})",
         session.id,
         session.node,
-        state_name(session.state)
+        session.state.as_str()
     );
     println!("open with: bosun open {}", session.id);
     Ok(())
@@ -966,7 +965,7 @@ fn session_rows(sessions: &[Session]) -> Vec<String> {
             source,
             session.git_ref.as_deref().unwrap_or("-"),
             session.persona.as_deref().unwrap_or("-"),
-            state_name(session.state)
+            session.state.as_str()
         )
     };
     let mut lines = vec![format!(
@@ -996,16 +995,6 @@ fn session_rows(sessions: &[Session]) -> Vec<String> {
     lines
 }
 
-fn state_name(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Creating => "creating",
-        SessionState::Running => "running",
-        SessionState::WaitingForInput => "waiting_for_input",
-        SessionState::Interrupted => "interrupted",
-        SessionState::Stopped => "stopped",
-    }
-}
-
 async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
     let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
     let session_id = match args.session_id {
@@ -1033,7 +1022,7 @@ async fn pick_session(cp_url: &str) -> anyhow::Result<Option<String>> {
     }
     let items: Vec<String> = sessions
         .iter()
-        .map(|s| format!("{}  {}  {}", s.id, s.node, state_name(s.state)))
+        .map(|s| format!("{}  {}  {}", s.id, s.node, s.state.as_str()))
         .collect();
     let selected = match FuzzySelect::new()
         .with_prompt("session")
@@ -1171,6 +1160,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use bosun_common::session::Permission;
+    use bosun_common::session::SessionState;
     use bosun_common::types::UpdateStatus;
 
     use super::*;

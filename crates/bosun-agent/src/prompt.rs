@@ -39,16 +39,6 @@ fn skill_ad_line(skill: &Skill) -> String {
 
 /// A session state as the manifest renders it: the wire-format names the
 /// store uses.
-fn state_name(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Creating => "creating",
-        SessionState::Running => "running",
-        SessionState::WaitingForInput => "waiting_for_input",
-        SessionState::Interrupted => "interrupted",
-        SessionState::Stopped => "stopped",
-    }
-}
-
 /// Builds the system prompt in layers: the fixed harness contract first, then
 /// the persona's role text when it has one, then the parts of the session's
 /// context that hold for the whole session — the repo-standard files present
@@ -129,7 +119,7 @@ pub(crate) fn session_context(todos: &[Value], live: &[LiveChild]) -> Option<Str
             context.push_str(&format!(
                 "\n- {} (persona: {persona}, state: {}, last message: {last})",
                 child.id,
-                state_name(child.state)
+                child.state.as_str()
             ));
         }
     }

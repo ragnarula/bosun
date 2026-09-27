@@ -375,37 +375,81 @@ impl Store {
     pub async fn create_session(&self, session: &Session) -> Result<(), StoreError> {
         let session = session.clone();
         self.with_conn(move |conn| {
-            let permission = serde_json::to_string(&session.permission)?;
-            let state = serde_json::to_string(&session.state)?;
-            let interrupt_cause = session
-                .interrupt_cause
-                .map(|cause| serde_json::to_string(&cause))
-                .transpose()?;
-            conn.execute(
-                "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                params![
-                    session.id,
-                    session.node,
-                    session.repo_url,
-                    session.git_ref,
-                    session.dir,
-                    session.model,
-                    session.persona,
-                    permission,
-                    session.allowed_tools,
-                    session.mcp_servers,
-                    state,
-                    session.created_at_secs,
-                    session.prompt,
-                    session.parent_id,
-                    session.owner_id,
-                    interrupt_cause,
-                    session.summary,
-                ],
-            )
-            .context("failed to insert session")?;
+            insert_session(conn, &session)?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Forks a session's thread into `fork`, in one transaction: the fork's own
+    /// row, the original's active messages up to and including `through`, and
+    /// the tool-call rows those messages name. The original is not written to —
+    /// it keeps its thread, its events and no note that it was forked — so the
+    /// two sessions are independent from here on.
+    ///
+    /// The copied messages land as the fork's own message events, so the fork's
+    /// readers replay the thread it started from. What is copied is the original's
+    /// *active* thread, so a fork of a compacted session starts where that
+    /// session's window starts, from its summary, and not from the rows the
+    /// summary replaced. Returns how many messages were copied.
+    pub async fn fork_session(
+        &self,
+        fork: &Session,
+        original_id: &str,
+        through: i64,
+    ) -> Result<usize, StoreError> {
+        let fork = fork.clone();
+        let original_id = original_id.to_string();
+        self.with_conn(move |conn| {
+            let tx = transaction(conn)?;
+            insert_session(&tx, &fork)?;
+            let copied: Vec<Message> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT role, block FROM messages
+                         WHERE session_id = ?1 AND archived = 0 AND id <= ?2
+                         ORDER BY id",
+                    )
+                    .context("failed to prepare the forked thread query")?;
+                let rows = stmt
+                    .query_map(params![original_id, through], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .context("failed to query the forked thread")?;
+                let mut messages = Vec::new();
+                for row in rows {
+                    let (role, block) = row.context("failed to read the forked thread")?;
+                    messages.push(Message {
+                        role: serde_json::from_str(&role).context("failed to parse role")?,
+                        block: serde_json::from_str(&block).context("failed to parse block")?,
+                    });
+                }
+                messages
+            };
+            // The calls the copied thread names, so the fork's own tool-call
+            // records match the thread it copied.
+            let calls: Vec<String> = copied
+                .iter()
+                .filter_map(|message| match &message.block {
+                    Block::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            for message in &copied {
+                insert_message(&tx, &fork.id, message)?;
+            }
+            for call_id in calls {
+                tx.execute(
+                    "INSERT INTO tool_calls (session_id, call_id, name, args, result, is_error)
+                     SELECT ?1, call_id, name, args, result, is_error FROM tool_calls
+                     WHERE session_id = ?2 AND call_id = ?3
+                     ON CONFLICT(session_id, call_id) DO NOTHING",
+                    params![fork.id, original_id, call_id],
+                )
+                .context("failed to copy a tool call row")?;
+            }
+            tx.commit().context("failed to commit the fork")?;
+            Ok(copied.len())
         })
         .await
     }
@@ -1957,6 +2001,42 @@ fn append_event(
 
 /// Inserts a message row and its matching `Event::Message` inside the
 /// caller's transaction, so a write that spans sessions stays atomic.
+/// Writes one session row. Free function so the fork can write its own row
+/// inside the transaction that copies the thread it starts from.
+fn insert_session(conn: &rusqlite::Connection, session: &Session) -> Result<(), anyhow::Error> {
+    let permission = serde_json::to_string(&session.permission)?;
+    let state = serde_json::to_string(&session.state)?;
+    let interrupt_cause = session
+        .interrupt_cause
+        .map(|cause| serde_json::to_string(&cause))
+        .transpose()?;
+    conn.execute(
+        "INSERT INTO sessions (id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            session.id,
+            session.node,
+            session.repo_url,
+            session.git_ref,
+            session.dir,
+            session.model,
+            session.persona,
+            permission,
+            session.allowed_tools,
+            session.mcp_servers,
+            state,
+            session.created_at_secs,
+            session.prompt,
+            session.parent_id,
+            session.owner_id,
+            interrupt_cause,
+            session.summary,
+        ],
+    )
+    .context("failed to insert session")?;
+    Ok(())
+}
+
 fn insert_message(
     tx: &rusqlite::Transaction,
     session_id: &str,
@@ -2733,6 +2813,143 @@ mod tests {
         assert!(
             persona <= permission,
             "one write stamped its events {persona} and {permission} out of order"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_the_thread_and_leaves_the_original_alone() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("original")).await.unwrap();
+
+        // A thread with a tool call and its result, then a fork point, then rows
+        // the fork must not carry.
+        store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::Text {
+                    text: "first".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "original",
+                Role::Assistant,
+                &Block::Text {
+                    text: "second".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "original",
+                Role::Assistant,
+                &Block::ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    args: json!({ "command": "make" }),
+                    continues_completion: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::ToolResult {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    is_error: false,
+                    content: json!("built"),
+                },
+            )
+            .await
+            .unwrap();
+        let through = store
+            .messages("original", true)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .0;
+        store
+            .append_tool_call("original", "call-1", "shell", &json!({ "command": "make" }))
+            .await
+            .unwrap();
+        store
+            .complete_tool_call("original", "call-1", &json!("built"), false)
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "original",
+                Role::Assistant,
+                &Block::Text {
+                    text: "after the fork".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let original_events = store.events_after("original", 0).await.unwrap().len();
+
+        let mut fork = session("fork");
+        fork.repo_url = Some("https://example.com/repo".into());
+        let copied = store
+            .fork_session(&fork, "original", through)
+            .await
+            .unwrap();
+
+        assert_eq!(copied, 4, "the fork copies the thread up to the fork point");
+        let label = |(_, message): (i64, Message)| serde_json::to_string(&message.block).unwrap();
+        let original_thread: Vec<String> = store
+            .messages("original", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(label)
+            .collect();
+        let fork_thread: Vec<String> = store
+            .messages("fork", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(label)
+            .collect();
+        assert_eq!(
+            fork_thread,
+            original_thread[..4].to_vec(),
+            "the fork's thread is the original's prefix"
+        );
+        assert_eq!(
+            store.tool_calls("fork").await.unwrap().len(),
+            1,
+            "and the call rows it names came with it"
+        );
+        let forked = store.get_session("fork").await.unwrap().unwrap();
+        assert_eq!(
+            forked.repo_url.as_deref(),
+            Some("https://example.com/repo"),
+            "the fork's own row is written in the same transaction"
+        );
+        assert_eq!(forked.parent_id, None, "and it is a root of its own");
+
+        // The original is untouched: its rows, its events, and no note of the
+        // fork anywhere in it.
+        assert_eq!(store.messages("original", true).await.unwrap().len(), 5);
+        assert_eq!(
+            store.events_after("original", 0).await.unwrap().len(),
+            original_events,
+            "the original's stream gains nothing"
+        );
+        assert_eq!(
+            store.events_after("fork", 0).await.unwrap().len(),
+            4,
+            "and the fork's own stream carries the thread it started from"
         );
     }
 

@@ -1506,6 +1506,10 @@
     <span class="view-sheet-copy" id="view-id-copy" title="Session id"></span>
     <button type="button" id="btn-copy-id">Copy session id</button>
   </div>
+  <div class="view-sheet-row" id="row-fork">
+    <button type="button" id="btn-fork">Fork session</button>
+    <span class="view-sheet-note" id="view-fork"></span>
+  </div>
   <div class="view-sheet-row" id="row-interrupt">
     <button type="button" id="btn-interrupt">Interrupt</button>
   </div>
@@ -1601,6 +1605,9 @@ const viewPermission = $('view-permission');
 const viewSheetMeta = $('view-sheet-meta');
 const rowPermission = $('row-permission');
 const rowPersona = $('row-persona');
+const rowFork = $('row-fork');
+const btnFork = $('btn-fork');
+const viewFork = $('view-fork');
 const rowInterrupt = $('row-interrupt');
 const rowStop = $('row-stop');
 const inputRow = $('input-row');
@@ -3438,8 +3445,10 @@ function clearHeader() {
   watchBanner.hidden = true;
   rowPermission.hidden = false;
   rowPersona.hidden = false;
+  rowFork.hidden = false;
   rowInterrupt.hidden = false;
   rowStop.hidden = false;
+  viewFork.textContent = '';
 }
 
 async function fetchSession(id) {
@@ -3500,6 +3509,7 @@ function updateHeader(session) {
   watchBanner.hidden = !watchOnly;
   rowPermission.hidden = watchOnly;
   rowPersona.hidden = watchOnly;
+  rowFork.hidden = watchOnly;
   rowInterrupt.hidden = watchOnly;
   rowStop.hidden = watchOnly;
 }
@@ -3509,6 +3519,25 @@ function updatePermissionBadge(permission) {
   btnPermission.textContent =
     permission === 'read_only' ? 'Switch to read-write' : 'Switch to read-only';
 }
+
+// Forking copies the session's conversation into a new root session with its
+// own working copy, and the pane opens the fork: it is a session like any other
+// from here on. A refusal — no recorded repository, a child, a session that is
+// not waiting for input — is shown in the sheet, which is where the control is.
+btnFork.addEventListener('click', async () => {
+  viewFork.textContent = '';
+  try {
+    const response = await post('/sessions/' + encodeURIComponent(current) + '/fork', {});
+    const fork = await response.json();
+    viewSheet.hidden = true;
+    // The fork's row has to be in the list before the pane opens it, or the
+    // view has no header to show until the next poll.
+    await refreshSessions();
+    openSession(fork.id);
+  } catch (error) {
+    viewFork.textContent = 'fork: ' + error.message;
+  }
+});
 
 btnInterrupt.addEventListener('click', async () => {
   try {

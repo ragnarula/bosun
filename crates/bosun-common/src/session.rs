@@ -93,6 +93,20 @@ pub enum Role {
     Assistant,
 }
 
+impl SessionState {
+    /// The state's wire-format name: what the store holds, what the events
+    /// carry, and what both clients show.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionState::Creating => "creating",
+            SessionState::Running => "running",
+            SessionState::WaitingForInput => "waiting_for_input",
+            SessionState::Interrupted => "interrupted",
+            SessionState::Stopped => "stopped",
+        }
+    }
+}
+
 impl Role {
     /// The role's wire-format name.
     pub fn as_str(&self) -> &'static str {

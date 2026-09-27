@@ -1335,6 +1335,40 @@ mod tests {
         );
     }
 
+    // The fork control: a session's conversation copies into a new session from
+    // the actions sheet, and the pane opens the copy.
+
+    #[test]
+    fn the_pane_forks_from_the_actions_sheet_and_opens_the_fork() {
+        assert!(
+            PANE.contains(
+                "<div class=\"view-sheet-row\" id=\"row-fork\">\n    <button type=\"button\" id=\"btn-fork\">Fork session</button>"
+            ),
+            "the fork control lives in the session actions sheet, with its own row"
+        );
+        let handler = flattened();
+        assert!(
+            handler.contains(&squeezed(
+                "await post('/sessions/' + encodeURIComponent(current) + '/fork', {});"
+            )),
+            "the control posts to the session's fork endpoint"
+        );
+        assert!(
+            handler.contains(&squeezed("openSession(fork.id);")),
+            "and the pane opens the fork, which is a session like any other"
+        );
+        assert!(
+            PANE.contains("viewFork.textContent = 'fork: ' + error.message;"),
+            "a refusal is shown where the control is, in the sheet"
+        );
+        for token in ["rowFork.hidden = false;", "rowFork.hidden = watchOnly;"] {
+            assert!(
+                handler.contains(&squeezed(token)),
+                "{token} keeps the control off a watch-only child, like the sheet's other controls"
+            );
+        }
+    }
+
     // The subagent panel: a second reader of a child's own stream, beside the
     // session's transcript rather than in place of it.
 

@@ -66,7 +66,6 @@ use tokio::sync::mpsc;
 
 use crate::markdown::DiagramCache;
 use crate::markdown::markdown_rows;
-use crate::state_name;
 
 /// How long to wait before reconnecting after the event stream ends.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -394,7 +393,7 @@ fn event_lines(event: &Event) -> Vec<Line> {
         }
         Event::State { state, .. } => vec![Line {
             kind: LineKind::Status,
-            text: format!("state: {}", state_name(*state)),
+            text: format!("state: {}", state.as_str()),
             at_ms,
         }],
         Event::Permission { permission, .. } => vec![Line {
@@ -1178,11 +1177,11 @@ fn state_label(
 ) -> String {
     match session_state {
         SessionState::Running => activity_status(phase, elapsed_secs)
-            .unwrap_or_else(|| state_name(session_state).to_string()),
+            .unwrap_or_else(|| session_state.as_str().to_string()),
         SessionState::WaitingForInput if live_children > 0 => {
             format!("waiting for children ({live_children})")
         }
-        state => state_name(state).to_string(),
+        state => state.as_str().to_string(),
     }
 }
 

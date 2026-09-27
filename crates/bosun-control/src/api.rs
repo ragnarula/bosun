@@ -117,6 +117,19 @@ pub enum ApiError {
     )]
     ChildIsWatchOnly { id: String },
 
+    #[error("session {id} is a child session; fork a root session instead")]
+    ChildNotForkable { id: String },
+
+    #[error(
+        "session {id} cannot be forked: a fork starts from a session waiting for input, and this one is {state}"
+    )]
+    NotForkable { id: String, state: String },
+
+    #[error(
+        "session {id} has no recorded repository to clone; a fork clones one, and this session works in a directory of its own"
+    )]
+    NoRepositoryToFork { id: String },
+
     #[error("no persona configured")]
     NoPersona,
 
@@ -199,6 +212,12 @@ impl IntoResponse for ApiError {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
             ApiError::ChildIsWatchOnly { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
+            ApiError::ChildNotForkable { .. } | ApiError::NoRepositoryToFork { .. } => {
+                (StatusCode::BAD_REQUEST, Some(self.to_string()))
+            }
+            // The session is real and the request is well formed; its state is
+            // what refuses a fork.
+            ApiError::NotForkable { .. } => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::SessionNotFound { .. }
             | ApiError::RepoNotFound { .. }
@@ -589,6 +608,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}", get(session_detail))
         .route("/sessions/{id}/messages", post(add_message))
         .route("/sessions/{id}/reject", post(reject_ask))
+        .route("/sessions/{id}/fork", post(fork))
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/permission", post(set_permission))
         .route("/sessions/{id}/persona", post(switch_persona))
@@ -892,6 +912,145 @@ async fn clone(
         .expect("the session was just created");
     info!(session_id = %session.id, node = %req.node, "session cloned");
     Ok(Json(session))
+}
+
+/// Forks a session's conversation into a new root session: a fresh clone of the
+/// original's recorded repository and ref on the same node, the original's
+/// persona, model, MCP selection and permission, and a copy of its active
+/// thread up to now as the fork's own. The original is not written to and keeps
+/// no note of it; the fork waits for the user, like any session created without
+/// a prompt.
+#[instrument(skip(state))]
+async fn fork(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Session>, ApiError> {
+    let original = state
+        .store
+        .get_session(&id)
+        .await?
+        .ok_or_else(|| ApiError::SessionNotFound { id: id.clone() })?;
+    if original.parent_id.is_some() {
+        return Err(ApiError::ChildNotForkable { id });
+    }
+    if original.state != SessionState::WaitingForInput {
+        return Err(ApiError::NotForkable {
+            id,
+            state: original.state.as_str().to_string(),
+        });
+    }
+    let Some(repo_url) = original.repo_url.clone() else {
+        return Err(ApiError::NoRepositoryToFork { id });
+    };
+    let provider = state
+        .providers
+        .get(&original.model)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "no provider for model {}, so a fork of session {id} cannot run",
+                original.model
+            ))
+        })?;
+    if state
+        .registry
+        .node(&original.node, SystemTime::now())
+        .is_none()
+    {
+        return Err(ApiError::NodeNotUp {
+            node: original.node.clone(),
+        });
+    }
+
+    let fork_id = uuid::Uuid::new_v4().to_string();
+    // The fork gets its own working copy: a clone of what the original recorded,
+    // on the node the original runs on. Two sessions editing one directory would
+    // collide, and a clone is what every other session starts from.
+    let command = NodeCommand::Clone {
+        id: state.commands.next_id(),
+        session_id: fork_id.clone(),
+        repo_url,
+        git_ref: original.git_ref.clone(),
+        permission: original.permission,
+    };
+    let node_session = enqueue_and_await(&state, &original.node, command)
+        .await
+        .and_then(|result| match result {
+            CommandResult::Session { session, .. } => Ok(session),
+            CommandResult::Error { message, .. } => Err(ApiError::NodeRejected {
+                node: original.node.clone(),
+                detail: message,
+            }),
+            _ => Err(ApiError::Internal(anyhow::anyhow!(
+                "node answered clone with a non-session result"
+            ))),
+        })?;
+    let dir = node_session
+        .dir
+        .map(|dir| dir.display().to_string())
+        .ok_or_else(|| {
+            ApiError::Internal(anyhow::anyhow!(
+                "node did not report a directory for the forked session"
+            ))
+        })?;
+
+    let fork = Session {
+        id: fork_id.clone(),
+        node: original.node.clone(),
+        repo_url: node_session.repo_url.clone(),
+        git_ref: node_session.git_ref.clone(),
+        dir,
+        model: original.model.clone(),
+        persona: original.persona.clone(),
+        parent_id: None,
+        owner_id: fork_id.clone(),
+        permission: original.permission,
+        allowed_tools: original.allowed_tools.clone(),
+        mcp_servers: original.mcp_servers.clone(),
+        state: SessionState::Creating,
+        interrupt_cause: None,
+        created_at_secs: now_secs(),
+        prompt: None,
+        summary: None,
+    };
+    // The fork point is the newest row in the original's window: what its model
+    // would read next is what the fork's model starts from.
+    let through = state
+        .store
+        .messages(&id, false)
+        .await?
+        .last()
+        .map(|(row, _)| *row)
+        .unwrap_or(0);
+    let copied = state.store.fork_session(&fork, &id, through).await?;
+
+    state.loops.start(
+        &fork.id,
+        state.store.clone(),
+        provider,
+        state.tunnels.clone(),
+        &fork.model,
+    );
+    // A fork carries no prompt: it waits for the user to take it somewhere,
+    // exactly as a session created without one does.
+    state
+        .store
+        .set_state(&fork.id, SessionState::WaitingForInput)
+        .await?;
+
+    let stored = state
+        .store
+        .get_session(&fork.id)
+        .await?
+        .expect("the fork was just created");
+    info!(
+        session_id = %fork.id,
+        original = %id,
+        messages = copied,
+        node = %fork.node,
+        "session forked"
+    );
+    Ok(Json(stored))
 }
 
 #[instrument(skip(state))]
@@ -3109,17 +3268,23 @@ mod tests {
     async fn delayed_scripted_provider(
         scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
         delay: Duration,
-    ) -> (SocketAddr, Arc<AtomicUsize>) {
+    ) -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
         use axum::routing::post;
 
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_server = requests.clone();
+        // The bodies, so a test can read what a turn asked for: the counter
+        // alone says a request happened, not what it carried.
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_for_server = bodies.clone();
         let app = axum::Router::new().route(
             "/v1/chat/completions",
-            post(move || {
+            post(move |axum::Json(body): axum::Json<Value>| {
                 let scripts = scripts.clone();
                 let requests = requests_for_server.clone();
+                let bodies = bodies_for_server.clone();
                 async move {
+                    bodies.lock().unwrap().push(body);
                     let request_number = requests.fetch_add(1, Ordering::Relaxed);
                     let chunks = scripts
                         .lock()
@@ -3149,7 +3314,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (addr, requests)
+        (addr, requests, bodies)
     }
 
     /// One OpenAI text chunk.
@@ -3232,6 +3397,26 @@ mod tests {
                                 dir: Some(dir.clone().unwrap_or_else(|| {
                                     std::path::PathBuf::from("/work").join(session_id)
                                 })),
+                                status: "running".into(),
+                            },
+                        });
+                    }
+                    NodeCommand::Clone {
+                        ref repo_url,
+                        ref git_ref,
+                        ref session_id,
+                        ..
+                    } => {
+                        // A clone lands under the node's work directory, and the
+                        // node reports the repository it actually cloned.
+                        let id = command.id();
+                        result = Some(CommandResult::Session {
+                            id,
+                            session: SessionInfo {
+                                id: session_id.clone(),
+                                repo_url: Some(repo_url.clone()),
+                                git_ref: git_ref.clone(),
+                                dir: Some(std::path::PathBuf::from("/work").join(session_id)),
                                 status: "running".into(),
                             },
                         });
@@ -6625,8 +6810,8 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
-        let (root_addr, root_requests) = delayed_scripted_provider(root_scripts, delay).await;
-        let (child_addr, child_requests) = delayed_scripted_provider(child_scripts, delay).await;
+        let (root_addr, root_requests, _) = delayed_scripted_provider(root_scripts, delay).await;
+        let (child_addr, child_requests, _) = delayed_scripted_provider(child_scripts, delay).await;
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         let mut root = session("root-s8l");
         root.model = "root-model".into();
@@ -6931,15 +7116,27 @@ mod tests {
         assert_eq!(root.state, SessionState::WaitingForInput);
     }
 
-    /// A control-plane state for recovery tests: a scripted provider that counts
-    /// its requests, the persona its sessions need, and the store. A session
-    /// whose model is one of these has a loop `recover` can start, which is what
-    /// makes it resumable.
-    async fn recovery_state(
+    /// What a stored thread holds as plain text, in order: the rows a test
+    /// cares about, without the blocks around them.
+    fn thread_texts(thread: &[(i64, bosun_common::session::Message)]) -> Vec<String> {
+        thread
+            .iter()
+            .filter_map(|(_, message)| match &message.block {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A control-plane state with one scripted provider that counts its
+    /// requests, and the persona its sessions need. A session on this state's
+    /// model is one the control plane can run, which is what makes it
+    /// resumable after a restart and forkable.
+    async fn state_with_provider(
         dir: &tempfile::TempDir,
         scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
-    ) -> (Arc<AppState>, Arc<AtomicUsize>) {
-        let (addr, requests) = delayed_scripted_provider(scripts, Duration::ZERO).await;
+    ) -> (Arc<AppState>, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let (addr, requests, bodies) = delayed_scripted_provider(scripts, Duration::ZERO).await;
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         let node_timeout = Duration::from_secs(4);
         let nodes = Arc::new(NodeRegistry::new(node_timeout));
@@ -6978,7 +7175,7 @@ mod tests {
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
         });
-        (state, requests)
+        (state, requests, bodies)
     }
 
     /// A session on the recovery state's model, in `state`\'s state.\n
@@ -6995,7 +7192,7 @@ mod tests {
         let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
             "carried on",
         )]])));
-        let (state, requests) = recovery_state(&dir, scripts).await;
+        let (state, requests, _) = state_with_provider(&dir, scripts).await;
         state
             .store
             .create_session(&recoverable_session("running", SessionState::Running))
@@ -7147,13 +7344,240 @@ mod tests {
     /// restart, and the listener that accepts them binds after recovery, so a
     /// wake sent at boot would re-issue the call against a plane that cannot
     /// reach the node and record that failure as the call's result.
+    /// A fork copies what it can and refuses the rest, saying why: nothing is
+    /// started for a session it cannot copy.
+    #[tokio::test]
+    async fn fork_refuses_a_session_it_cannot_copy() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
+        // A dev session: it waits for input, and records no repository.
+        let mut dev = session("dev-1");
+        dev.state = SessionState::WaitingForInput;
+        dev.repo_url = None;
+        state.store.create_session(&dev).await.unwrap();
+        // A session with a repository that is not waiting for input.
+        let mut running = session("running-1");
+        running.state = SessionState::Running;
+        running.repo_url = Some("https://example.com/repo".into());
+        state.store.create_session(&running).await.unwrap();
+        // A child, which waits for input and has a repository.
+        state
+            .store
+            .create_session(&session("root-1"))
+            .await
+            .unwrap();
+        let mut child = child_session("child-1", "root-1");
+        child.state = SessionState::WaitingForInput;
+        child.repo_url = Some("https://example.com/repo".into());
+        state.store.create_session(&child).await.unwrap();
+
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let fork = |id: &str| {
+            client
+                .post(format!("http://{addr}/sessions/{id}/fork"))
+                .send()
+        };
+
+        let response = fork("ghost").await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.text().await.unwrap().contains("was not found"));
+
+        let response = fork("dev-1").await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("no recorded repository"),
+            "a session with no repository says so"
+        );
+
+        let response = fork("running-1").await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "a session that is not waiting for input is a conflict, not a bad request"
+        );
+        let text = response.text().await.unwrap();
+        assert!(
+            text.contains("waiting for input") && text.contains("running"),
+            "{text}"
+        );
+
+        let response = fork("child-1").await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("fork a root session")
+        );
+
+        assert!(!state.commands.pending("n1"), "no node saw a command");
+        assert_eq!(
+            state.store.list_sessions().await.unwrap().len(),
+            4,
+            "and no fork was created"
+        );
+    }
+
+    /// The fork: its own working copy, the original's settings, the original's
+    /// thread as its own, and a first request that carries that thread.
+    #[tokio::test]
+    async fn fork_copies_the_thread_and_opens_the_fork() {
+        let dir = tempdir().unwrap();
+        let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
+            "the fork's first answer",
+        )]])));
+        let (state, requests, bodies) = state_with_provider(&dir, scripts).await;
+        state
+            .registry
+            .upsert("n1", "0.5.5", UpdateStatus::default(), SystemTime::now());
+        let addr = serve(state.clone()).await;
+        let seen: Arc<Mutex<Vec<NodeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let node = fake_node(addr, "n1", seen.clone());
+
+        let mut original = session("original-1");
+        original.model = "main-model".into();
+        original.state = SessionState::WaitingForInput;
+        original.repo_url = Some("https://example.com/repo".into());
+        original.git_ref = Some("main".into());
+        state.store.create_session(&original).await.unwrap();
+        state
+            .store
+            .append_message(
+                "original-1",
+                Role::User,
+                &Block::Text {
+                    text: "the task".into(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .append_message(
+                "original-1",
+                Role::Assistant,
+                &Block::Text {
+                    text: "the reply".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/sessions/original-1/fork"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap_or_default()
+        );
+        let fork: Session = response.json().await.unwrap();
+        assert_eq!(fork.parent_id, None, "a fork is a root of its own");
+        assert_eq!(fork.owner_id, fork.id, "and owns itself");
+        assert_eq!(fork.model, original.model);
+        assert_eq!(fork.persona, original.persona);
+        assert_eq!(fork.mcp_servers, original.mcp_servers);
+        assert_eq!(fork.permission, original.permission);
+        assert_eq!(fork.node, original.node);
+        assert_ne!(fork.dir, original.dir, "the fork gets its own working copy");
+        assert_eq!(
+            fork.state,
+            SessionState::WaitingForInput,
+            "a fork carries no prompt, so it waits for the user"
+        );
+
+        let cloned = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|command| match command {
+                NodeCommand::Clone {
+                    session_id,
+                    repo_url,
+                    git_ref,
+                    ..
+                } if session_id == &fork.id => Some((repo_url.clone(), git_ref.clone())),
+                _ => None,
+            })
+            .expect("the node was asked to clone the original's repository");
+        assert_eq!(cloned.0, "https://example.com/repo");
+        assert_eq!(cloned.1, Some("main".into()));
+        node.abort();
+
+        let fork_thread = state.store.messages(&fork.id, true).await.unwrap();
+        assert_eq!(
+            thread_texts(&fork_thread),
+            ["the task", "the reply"],
+            "the fork's thread is the original's"
+        );
+        let original_thread = state.store.messages("original-1", true).await.unwrap();
+        assert_eq!(
+            thread_texts(&original_thread),
+            ["the task", "the reply"],
+            "and the original is untouched"
+        );
+        assert_eq!(
+            state.store.list_sessions().await.unwrap().len(),
+            2,
+            "the fork is a session of its own"
+        );
+
+        // The fork's first turn carries the copied thread: the user takes it
+        // somewhere, and its model reads what the original's had read.
+        let response = client
+            .post(format!("http://{addr}/sessions/{}/messages", fork.id))
+            .json(&json!({ "content": "take it further" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        wait_for("the fork's turn to run", {
+            let requests = requests.clone();
+            move || {
+                let requests = requests.clone();
+                async move { requests.load(Ordering::Relaxed) == 1 }
+            }
+        })
+        .await;
+
+        let request = bodies.lock().unwrap().first().cloned().unwrap_or_default();
+        let carried = request["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            carried.iter().any(|text| text == "the task")
+                && carried.iter().any(|text| text == "the reply")
+                && carried.iter().any(|text| text == "take it further"),
+            "the fork's first request carries the copied thread and the new message: {carried:?}"
+        );
+    }
+
     #[tokio::test]
     async fn recover_holds_a_resume_until_the_node_reconnects() {
         let dir = tempdir().unwrap();
         let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
             "the call is answered",
         )]])));
-        let (state, requests) = recovery_state(&dir, scripts).await;
+        let (state, requests, _) = state_with_provider(&dir, scripts).await;
         state
             .store
             .create_session(&recoverable_session("running", SessionState::Running))
@@ -7231,7 +7655,7 @@ mod tests {
         let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
             "the call is answered",
         )]])));
-        let (state, requests) = recovery_state(&dir, scripts).await;
+        let (state, requests, _) = state_with_provider(&dir, scripts).await;
         state
             .store
             .create_session(&recoverable_session("running", SessionState::Running))
@@ -7324,7 +7748,7 @@ mod tests {
             )],
             vec![text_chunk("carrying on")],
         ])));
-        let (state, requests) = recovery_state(&dir, scripts).await;
+        let (state, requests, _) = state_with_provider(&dir, scripts).await;
         state
             .store
             .create_session(&recoverable_session(
