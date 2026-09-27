@@ -1096,9 +1096,14 @@ mod tests {
             pane.contains(&squeezed("case 'context_cleared':")),
             "a cleared context must render as itself, not fall through to the raw block"
         );
+        let line = segment(PANE, "case 'context_cleared':", "break;");
         assert!(
-            PANE.contains("block.reason") && PANE.contains("block.instructions"),
-            "the marker line names the reason and what the session continues from"
+            line.contains("block.reason"),
+            "the marker line names the reason"
+        );
+        assert!(
+            !line.contains("block.instructions"),
+            "the line does not repeat the fresh instructions: they stand below it as the row the session continues from"
         );
         assert!(
             pane.contains(&squeezed("appendLine('cleared',")),

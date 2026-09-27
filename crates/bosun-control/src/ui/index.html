@@ -4510,10 +4510,12 @@ function renderMessage(message, atMs) {
       break;
     case 'context_cleared':
       // The break the session made in its own thread: a divider naming why it
-      // cleared and what it continues from, not something anyone said.
+      // cleared, not something anyone said. The fresh instructions stand below
+      // it as the message the session continues from, so this line does not
+      // repeat them.
       appendLine(
         'cleared',
-        'context cleared: ' + block.reason + ' · fresh instructions: ' + block.instructions,
+        'context cleared: ' + block.reason + ' · continuing from a fresh prompt',
         atMs
       );
       break;

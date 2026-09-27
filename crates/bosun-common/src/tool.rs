@@ -228,7 +228,7 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         // context and nothing else, not a file, a machine or another session.
         ToolSpec {
             name: "clear_context".into(),
-            description: "Start over from a fresh prompt: the thread you read is discarded and your next request begins with `instructions`. The transcript the reader sees keeps everything and records the break, so `reason` is required — say what the clear is for, because clearing a thread is not a way around a hard problem. Work that arrives while you are running is not lost: it lands after the clear. The working copy is untouched.".into(),
+            description: "Start over from a fresh prompt: the thread you read is discarded, and your next request holds `instructions` as its task, after whatever arrived while you were running. The transcript the reader sees keeps everything and marks the break with your `reason`, so `reason` is required — say what the clear is for, because clearing a thread is not a way around a hard problem. The working copy is untouched.".into(),
             schema: json!({"type":"object","properties":{"instructions":{"type":"string"},"reason":{"type":"string"}},"required":["instructions","reason"]}),
         },
         ToolSpec {

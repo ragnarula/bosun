@@ -1300,50 +1300,28 @@ async fn clear_context(
     reason: &str,
     instructions: &str,
 ) -> anyhow::Result<()> {
-    // Rows another writer appended during this turn — a user message, a
-    // child's event — are in the store but not in the turn's window, and the
-    // boundary below would swallow them with the history. The session has not
-    // read them, so the clear puts them back in the window.
-    let own: HashSet<i64> = window.iter().map(|(id, _)| *id).collect();
-    let arrived: Vec<i64> = deps
+    // The store writes the marker, the boundary cut, the rows another writer
+    // appended during this turn, and the instructions, in one transaction and
+    // one lock hold: no row can land between the steps and be lost with the
+    // history, and a restart mid-clear leaves the thread as it was rather than
+    // half-cut. The rows the turn itself wrote go with the history; a row the
+    // session has not read stays in the window.
+    let own: Vec<i64> = window.iter().map(|(id, _)| *id).collect();
+    let (marker_id, instructions_id) = deps
         .store
-        .messages(session_id, false)
-        .await?
-        .into_iter()
-        .map(|(id, _)| id)
-        .filter(|id| !own.contains(id))
-        .collect();
-
-    let marker_id = deps
-        .store
-        .append_message(
-            session_id,
-            Role::Assistant,
-            &Block::ContextCleared {
-                reason: reason.to_string(),
-                instructions: instructions.to_string(),
-            },
-        )
+        .clear_context(session_id, &own, reason, instructions)
         .await?;
-    // Everything at or below the marker, the marker included, leaves the
-    // window. The clear's own tool call and result sit below it, so the next
-    // window holds no result without its call.
-    deps.store.mark_archived(session_id, marker_id).await?;
-    // The instructions go through the wake's own recording, so the boundary a
-    // wake advances over covers them.
-    record_in_wake(
-        deps,
-        session_id,
-        window,
-        Role::User,
-        &Block::Text {
-            text: instructions.to_string(),
+    // The instructions are stored already, so the wake's own window takes them
+    // here: the boundary a wake advances over has to cover them.
+    window.push((
+        instructions_id,
+        Message {
+            role: Role::User,
+            block: Block::Text {
+                text: instructions.to_string(),
+            },
         },
-    )
-    .await?;
-    for id in arrived {
-        deps.store.unarchive_message(session_id, id).await?;
-    }
+    ));
     info!(
         session_id = %session_id,
         boundary = marker_id,
@@ -2141,6 +2119,21 @@ async fn run_turn_inner(
                     if instructions.is_empty() {
                         anyhow::bail!(
                             "clear_context needs instructions: say what to do after the clear"
+                        );
+                    }
+                    // A clear would take the question out of the window while
+                    // the pending binding keeps the next ask refused, leaving
+                    // the session waiting on a question it can no longer read.
+                    // Resolve it first.
+                    if let Some(pending) = deps.store.get_pending_ask(session_id).await? {
+                        anyhow::bail!(
+                            "a question is pending {}: answer it, or send child {} a message to cancel it, before clearing the context",
+                            if session.parent_id.is_none() {
+                                "with the user"
+                            } else {
+                                "with your parent"
+                            },
+                            pending.child_id
                         );
                     }
                     Ok::<(), anyhow::Error>(())
@@ -3480,10 +3473,7 @@ fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
             )
         }
         Block::Summary { text } => format!("summary: {text}"),
-        Block::ContextCleared {
-            reason,
-            instructions,
-        } => format!("context cleared: {reason} · fresh instructions: {instructions}"),
+        Block::ContextCleared { reason, .. } => crate::serialize::cleared_text(reason),
         Block::ChildEvent {
             child_id,
             kind,
@@ -18158,11 +18148,14 @@ mod tests {
 
         handle.send(LoopEvent::Wake);
 
-        wait_for("the turn after the clear to run", {
-            let provider = provider.clone();
+        wait_for("the wake to end", {
+            let store = store.clone();
             move || {
-                let provider = provider.clone();
-                async move { provider.captured_calls().len() == 2 }
+                let store = store.clone();
+                async move {
+                    store.get_session("s1").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
             }
         })
         .await;
@@ -18197,8 +18190,8 @@ mod tests {
         assert_eq!(all[0], "the old task");
         assert_eq!(
             all[3],
-            "context cleared: the thread is full of dead ends · fresh instructions: start from the failing test",
-            "the marker stands at the break, after the call it answers: {all:?}"
+            "context cleared: the thread is full of dead ends · continuing from a fresh prompt",
+            "the marker stands at the break, after the call it answers, and does not repeat the instructions below it: {all:?}"
         );
         assert_eq!(all[4], "start from the failing test");
         assert_eq!(
@@ -18563,11 +18556,25 @@ mod tests {
 
         handle.send(LoopEvent::Wake);
 
-        wait_for("the turn after the child's clear to run", {
-            let provider = provider.clone();
+        // The child's report reaching its parent means the child's wake ended,
+        // so every row its clear wrote is stored.
+        wait_for("the child's report to reach its parent", {
+            let store = store.clone();
             move || {
-                let provider = provider.clone();
-                async move { provider.captured_calls().len() == 2 }
+                let store = store.clone();
+                async move {
+                    store
+                        .messages("parent-1", true)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|(_, message)| {
+                            matches!(
+                                &message.block,
+                                Block::ChildEvent { child_id, .. } if child_id == "child-1"
+                            )
+                        })
+                }
             }
         })
         .await;
@@ -18597,27 +18604,182 @@ mod tests {
             "and none of the child's discarded history reaches it: {parent_thread:?}"
         );
 
-        // The child still reports to its parent when its wake ends.
-        wait_for("the child's report to reach its parent", {
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_clear_without_instructions_is_refused_and_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_message(
+                "s1",
+                Role::User,
+                &Block::Text {
+                    text: "the old task".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({ "reason": "the thread is stale", "instructions": "   " }),
+            ),
+            vec![StreamEvent::TextDelta("carrying on".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the wake to end", {
             let store = store.clone();
             move || {
                 let store = store.clone();
                 async move {
-                    store
-                        .messages("parent-1", true)
-                        .await
-                        .unwrap()
-                        .iter()
-                        .any(|(_, message)| {
-                            matches!(
-                                &message.block,
-                                Block::ChildEvent { child_id, .. } if child_id == "child-1"
-                            )
-                        })
+                    store.get_session("s1").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
                 }
             }
         })
         .await;
+
+        assert_eq!(
+            recorded_result(&store, "s1", "call-1").await,
+            json!({ "error": "clear_context needs instructions: say what to do after the clear" }),
+            "blank instructions are a tool error"
+        );
+        let active = stored_texts(&store, "s1", false).await;
+        assert!(
+            active.iter().any(|text| text == "the old task")
+                && active.iter().any(|text| text == "carrying on"),
+            "a refused clear leaves the window alone: {active:?}"
+        );
+        assert_eq!(
+            store.messages("s1", true).await.unwrap().len(),
+            active.len(),
+            "nothing was archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clear_is_refused_while_a_question_is_pending() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-ask")).await.unwrap();
+        store
+            .append_message(
+                "s-ask",
+                Role::User,
+                &Block::Text {
+                    text: "the question's context".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // The session asked and waits on the answer: its own question is the
+        // one thing a clear must not take out of the window.
+        store
+            .set_pending_ask("s-ask", "child-9", "s-ask", "which branch?", 1)
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({ "reason": "start over", "instructions": "carry on" }),
+            ),
+            vec![StreamEvent::TextDelta("waiting".into()), stop(1, 1)],
+            tool_turn(
+                "call-2",
+                "clear_context",
+                json!({ "reason": "start over", "instructions": "carry on" }),
+            ),
+            vec![StreamEvent::TextDelta("cleared".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-ask".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the refused turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-ask").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            recorded_result(&store, "s-ask", "call-1").await,
+            json!({ "error": "a question is pending with the user: answer it, or send child child-9 a message to cancel it, before clearing the context" }),
+            "a clear is refused while the session waits on a question"
+        );
+        let active = stored_texts(&store, "s-ask", false).await;
+        assert!(
+            active.iter().any(|text| text == "the question's context"),
+            "the question's own window survives the refused clear: {active:?}"
+        );
+        assert!(
+            !stored_texts(&store, "s-ask", true)
+                .await
+                .iter()
+                .any(|text| text.starts_with("context cleared")),
+            "and no marker is written"
+        );
+        assert!(
+            store.get_pending_ask("s-ask").await.unwrap().is_some(),
+            "the binding survives too, so the published question is still reachable"
+        );
+
+        // With the question resolved, the same call clears.
+        store.clear_pending_ask("s-ask").await.unwrap();
+        handle.send(LoopEvent::UserMessage);
+
+        wait_for("the second clear to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 4 }
+            }
+        })
+        .await;
+
+        let active = stored_texts(&store, "s-ask", false).await;
+        assert!(
+            active.iter().any(|text| text == "carry on"),
+            "the fresh prompt is the window once the question is resolved: {active:?}"
+        );
+        assert!(
+            !active.iter().any(|text| text == "the question's context"),
+            "and the window the question lived in is retired: {active:?}"
+        );
+        assert!(
+            stored_texts(&store, "s-ask", true)
+                .await
+                .iter()
+                .any(|text| text.starts_with("context cleared")),
+            "the break is recorded"
+        );
 
         handle.stop();
     }

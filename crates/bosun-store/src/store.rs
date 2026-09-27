@@ -748,23 +748,80 @@ impl Store {
         .await
     }
 
-    /// Shows one archived message to the model's window again. A context clear
-    /// archives everything up to its boundary, and a message another writer
-    /// appended during the turn the clear ran in sits inside that range: the
-    /// clear restores those, so a message the session has not read never leaves
-    /// the window.
-    pub async fn unarchive_message(
+    /// Clears a session's context: the marker row, the archive cut at it, the
+    /// rows another writer appended while the turn that cleared was running
+    /// (which the cut would otherwise swallow), and the fresh instructions —
+    /// all in one transaction and one lock hold. No row can land between the
+    /// steps and be lost, and a restart mid-clear leaves the thread as it was
+    /// rather than half-cut.
+    ///
+    /// `own` names the rows the turn itself wrote, which the boundary retires
+    /// with the history. Every other row that was in the model's window goes
+    /// back into it: the session has not read those, and a clear is the
+    /// session's own act, not theirs. A row that was already archived before
+    /// the clear stays archived, so a clear never resurrects history.
+    ///
+    /// Returns the marker's id and the instructions row's id.
+    pub async fn clear_context(
         &self,
         session_id: &str,
-        message_id: i64,
-    ) -> Result<(), StoreError> {
+        own: &[i64],
+        reason: &str,
+        instructions: &str,
+    ) -> Result<(i64, i64), StoreError> {
+        let own: Vec<i64> = own.to_vec();
+        let reason = reason.to_string();
+        let instructions = instructions.to_string();
         self.with_session(session_id, move |conn, session_id| {
-            conn.execute(
-                "UPDATE messages SET archived = 0 WHERE session_id = ?1 AND id = ?2",
-                params![session_id, message_id],
+            let tx = transaction(conn)?;
+            // The window as it stands inside the transaction: what the model
+            // could read, which is what the boundary is about.
+            let active: Vec<i64> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id FROM messages WHERE session_id = ?1 AND archived = 0 ORDER BY id",
+                    )
+                    .context("failed to prepare the window query")?;
+                stmt.query_map(params![session_id], |row| row.get(0))?
+                    .collect::<Result<Vec<i64>, _>>()
+                    .context("failed to read the window")?
+            };
+            let marker_id = insert_message(
+                &tx,
+                session_id,
+                &Message {
+                    role: Role::Assistant,
+                    block: Block::ContextCleared {
+                        reason,
+                        instructions: instructions.clone(),
+                    },
+                },
+            )?;
+            tx.execute(
+                "UPDATE messages SET archived = 1 WHERE session_id = ?1 AND id <= ?2",
+                params![session_id, marker_id],
             )
-            .context("failed to unarchive a message")?;
-            Ok(())
+            .context("failed to archive the cleared history")?;
+            for id in active {
+                if own.contains(&id) {
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE messages SET archived = 0 WHERE session_id = ?1 AND id = ?2",
+                    params![session_id, id],
+                )
+                .context("failed to keep an unread message in the window")?;
+            }
+            let instructions_id = insert_message(
+                &tx,
+                session_id,
+                &Message {
+                    role: Role::User,
+                    block: Block::Text { text: instructions },
+                },
+            )?;
+            tx.commit().context("failed to commit the clear")?;
+            Ok((marker_id, instructions_id))
         })
         .await
     }
@@ -2703,63 +2760,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unarchive_message_shows_one_row_again_and_leaves_the_rest() {
+    async fn clear_context_cuts_the_window_and_keeps_rows_the_turn_never_read() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         store.create_session(&session("a")).await.unwrap();
 
         let first = store
-            .append_message(
-                "a",
-                Role::User,
-                &Block::Text {
-                    text: "first".into(),
-                },
-            )
+            .append_message("a", Role::User, &Block::Text { text: "old".into() })
             .await
             .unwrap();
         let second = store
             .append_message(
                 "a",
-                Role::User,
-                &Block::Text {
-                    text: "second".into(),
-                },
-            )
-            .await
-            .unwrap();
-        let third = store
-            .append_message(
-                "a",
                 Role::Assistant,
                 &Block::Text {
-                    text: "third".into(),
+                    text: "older".into(),
                 },
             )
             .await
             .unwrap();
-        store.mark_archived("a", third).await.unwrap();
-        assert!(store.messages("a", false).await.unwrap().is_empty());
+        // A row another writer lands after the turn read its window.
+        let unread = store
+            .append_message(
+                "a",
+                Role::User,
+                &Block::Text {
+                    text: "wait".into(),
+                },
+            )
+            .await
+            .unwrap();
 
-        // The row another writer appended during the turn the clear ran in
-        // comes back, and the history above it stays out of the window.
-        store.unarchive_message("a", second).await.unwrap();
+        let (marker, instructions) = store
+            .clear_context("a", &[first, second], "a fresh start", "carry on")
+            .await
+            .unwrap();
+
         let active = store.messages("a", false).await.unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].0, second);
-        assert!(matches!(&active[0].1.block, Block::Text { text } if text == "second"));
-
-        let all = store.messages("a", true).await.unwrap();
         assert_eq!(
-            all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [first, second, third]
+            active.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [unread, instructions],
+            "the unread row and the fresh prompt are the window: nothing the boundary retired is"
+        );
+        assert!(
+            matches!(&active[0].1.block, Block::Text { text } if text == "wait"),
+            "a row the session has not read stays in the window"
+        );
+        assert!(
+            instructions > marker,
+            "the fresh prompt comes after the marker"
         );
 
-        // A row that is already active, or an id that names nothing, changes
-        // nothing rather than failing the clear that asked for it.
-        store.unarchive_message("a", second).await.unwrap();
-        store.unarchive_message("a", 9999).await.unwrap();
-        assert_eq!(store.messages("a", false).await.unwrap().len(), 1);
+        let all = store.messages("a", true).await.unwrap();
+        assert!(
+            all.iter().any(|(id, message)| *id == marker
+                && matches!(&message.block, Block::ContextCleared { reason, instructions }
+                    if reason == "a fresh start" && instructions == "carry on")),
+            "the marker is stored with the reason and the prompt it continued from"
+        );
+        assert!(
+            !active.iter().any(|(id, _)| [first, second].contains(id)),
+            "the rows the turn itself wrote are retired with the history, the marker above them"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_context_never_resurrects_rows_archived_before_it() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        let retired = store
+            .append_message("a", Role::User, &Block::Text { text: "old".into() })
+            .await
+            .unwrap();
+        let read = store
+            .append_message(
+                "a",
+                Role::User,
+                &Block::Text {
+                    text: "read".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // A compaction retired the first row before the clear ran.
+        store.mark_archived("a", retired).await.unwrap();
+
+        let (_, instructions) = store
+            .clear_context("a", &[read], "a fresh start", "carry on")
+            .await
+            .unwrap();
+
+        let active = store.messages("a", false).await.unwrap();
+        assert_eq!(
+            active.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [instructions],
+            "only the fresh prompt is left: the retired row stays retired"
+        );
     }
 
     #[tokio::test]

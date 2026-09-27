@@ -290,15 +290,9 @@ fn anthropic_message(message: &Message, ask_recipient: AskRecipient) -> Value {
             "text": ask_text(ask_recipient, child_id.as_deref(), ask, answer.as_deref())
         }),
         (_, Block::Summary { text }) => json!({ "type": "text", "text": text }),
-        (
-            _,
-            Block::ContextCleared {
-                reason,
-                instructions,
-            },
-        ) => json!({
+        (_, Block::ContextCleared { reason, .. }) => json!({
             "type": "text",
-            "text": cleared_text(reason, instructions)
+            "text": cleared_text(reason)
         }),
         (
             _,
@@ -361,14 +355,8 @@ fn openai_message(message: &Message, ask_recipient: AskRecipient) -> Value {
         (_, Block::Summary { text }) => {
             json!({ "role": message.role.as_str(), "content": text })
         }
-        (
-            _,
-            Block::ContextCleared {
-                reason,
-                instructions,
-            },
-        ) => {
-            json!({ "role": message.role.as_str(), "content": cleared_text(reason, instructions) })
+        (_, Block::ContextCleared { reason, .. }) => {
+            json!({ "role": message.role.as_str(), "content": cleared_text(reason) })
         }
         (
             _,
@@ -431,12 +419,14 @@ fn authored_event_text(child_id: &str, kind: ChildEventKind, text: &str) -> Stri
 /// question it carries, so the session reading it knows which child it can
 /// message to answer, deny, or cancel the question; a recorded answer is
 /// included, so a later wake sees the question was resolved.
-/// The text a cleared-context marker carries. The marker is archived with the
-/// history it closes, so a request holds one only if something put it back in
-/// the window; this keeps it readable either way, and the clients word the
-/// reader's line the same.
-fn cleared_text(reason: &str, instructions: &str) -> String {
-    format!("context cleared: {reason} · fresh instructions: {instructions}")
+/// The text a cleared-context marker carries. It names the reason and the
+/// fresh start, and not the instructions: those stand in the transcript as the
+/// row the session continues from, and repeating them would say the same thing
+/// twice. The marker is archived with the history it closes, so a request holds
+/// one only if something put it back in the window; this keeps it readable
+/// either way, and the clients word the reader's line the same.
+pub(crate) fn cleared_text(reason: &str) -> String {
+    format!("context cleared: {reason} · continuing from a fresh prompt")
 }
 
 fn ask_text(

@@ -372,12 +372,12 @@ fn event_lines(event: &Event) -> Vec<Line> {
                     text: text.clone(),
                     at_ms,
                 }],
-                Block::ContextCleared {
-                    reason,
-                    instructions,
-                } => vec![Line {
+                // The marker names the reason and the fresh start. The
+                // instructions stand below it as their own row, so repeating
+                // them here would print the same thing twice.
+                Block::ContextCleared { reason, .. } => vec![Line {
                     kind: LineKind::ContextCleared,
-                    text: format!("context cleared: {reason} · fresh instructions: {instructions}"),
+                    text: format!("context cleared: {reason} · continuing from a fresh prompt"),
                     at_ms,
                 }],
                 Block::ChildEvent {
