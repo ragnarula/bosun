@@ -1716,10 +1716,11 @@ mod tests {
             "and taking a field re-syncs too, and the window's own resize as well: the keyboard the focus raises moves the numbers after the event that asked for it, and the numbers can miss a frame the window sees"
         );
         assert!(
-            pane.contains(&squeezed(
-                "visualViewportSettle = window.setTimeout(syncVisualViewport, 300);"
-            )),
-            "and the burst schedules one more sync after it settles: the last frame of the animation can run while the keyboard is still moving, and a sample from there leaves the view short by the rest of the travel, with that much of the page under it"
+            pane.contains(&squeezed("window.clearTimeout(visualViewportSettle);"))
+                && pane.contains(&squeezed(
+                    "visualViewportSettle = window.setTimeout(syncVisualViewport, 300);"
+                )),
+            "and the burst schedules one more sync after it settles, dropping the retry before it: the last frame of the animation can run while the keyboard is still moving, and a sample from there leaves the view short by the rest of the travel — while without the clear, every frame of the burst would leave a retry of its own behind"
         );
         assert!(
             handler.contains(&squeezed("syncStick();")),
@@ -1864,6 +1865,11 @@ mod tests {
                 "document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');"
             )),
             "and the strip is still the inset's source for the elements fixed to the layout viewport's bottom, whatever the view's own top does"
+        );
+        assert_eq!(
+            handler.matches("view.style.top=").count(),
+            1,
+            "and this is the sync's only write to the view's top: a second write further down would put the view back at the document's top with every string above it still in place"
         );
     }
 

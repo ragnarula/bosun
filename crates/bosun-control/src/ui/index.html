@@ -4001,12 +4001,15 @@ btnBottom.addEventListener('click', jumpToBottom);
 // keyboard is drawn, and a tap at the very bottom edge can fall in the Home
 // indicator's strip instead of the field. The visual viewport is the part of the
 // page the reader can actually see, so the view rides it: its height always,
-// and its offset whenever the keyboard has pushed or shortened it.
+// and its offset whenever the visible viewport is pushed or shortened. Those
+// two numbers do not say what moved it — the keyboard, or a pinch zoom — and
+// both leave the visible window somewhere below the document's top.
 //
 // The visual viewport exists on modern desktops as well, where it is the whole
-// page and the numbers never change; this runs there harmlessly, and its only
-// cost on a window resize is one read of the transcript's geometry. A browser
-// without one attaches no listeners at all.
+// page and the numbers never change; this runs there harmlessly, and a window
+// resize costs one read of the transcript's geometry on the frame it asks for
+// and one more when the numbers settle. A browser without a visual viewport
+// attaches no listeners at all.
 function syncVisualViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
