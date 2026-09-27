@@ -1549,32 +1549,55 @@ mod tests {
             )),
             "and the scroll as well as the resize: iOS moves the page under the keyboard, which arrives as a scroll"
         );
-        // Every rule that writes a bottom row's padding, the narrow-screen ones
-        // included: a shorthand in a media query is what dropped the inset where
-        // it matters most, which the browser harness caught on the composer and
-        // this loop then found a rule later on the panel's transcript.
-        for rule in [
-            ".input-row {",
-            "#child-transcript {",
-            ".sheet-actions {",
-            "#skills-list {",
-            "#mcp-list {",
-        ] {
-            let mut rest = PANE;
-            let mut read = 0;
-            while let Some((_, after)) = rest.split_once(rule) {
-                let Some((body, tail)) = after.split_once('}') else {
-                    break;
-                };
-                rest = tail;
-                read += 1;
-                assert!(
-                    body.contains("env(safe-area-inset-bottom"),
-                    "`{rule}` must keep clear of the Home indicator in every rule that writes its padding"
-                );
+        // Every rule whose selector names one of these rows, wherever it sits and
+        // however it is written: the walk reads the stylesheet's own rules, so a
+        // grouped selector, a class-qualified one, and a comment that happens to
+        // hold a rule's name are all read as they are. A shorthand in a media
+        // query is what dropped the inset where it matters most, which the
+        // browser harness caught on the composer and this loop then found a rule
+        // later on the panel's transcript.
+        let css = styles();
+        let mut rest = css.as_str();
+        let mut read = 0;
+        while let Some((before, after)) = rest.split_once('{') {
+            // The raw selector keeps the descendant spaces that tell a container
+            // from a row inside it; the squeezed form is only for the message.
+            let raw = before.rsplit('}').next().unwrap_or(before);
+            let selector = squeezed(raw);
+            let Some((body, tail)) = after.split_once('}') else {
+                break;
+            };
+            rest = tail;
+            // Each comma-separated group's subject — its last compound — is
+            // what the rule styles. `#skills-list .repo-row` is a row inside the
+            // container, not the container, and the container's own padding is
+            // what keeps the last of them clear.
+            let names_row = raw.split(',').any(|group| {
+                let subject = group.split_whitespace().last().unwrap_or_default();
+                [
+                    ".input-row",
+                    "#child-transcript",
+                    ".sheet-actions",
+                    "#skills-list",
+                    "#mcp-list",
+                    "#machines-list",
+                ]
+                .iter()
+                .any(|row| subject.contains(row))
+            });
+            if !names_row || !body.contains("padding") {
+                continue;
             }
-            assert!(read > 0, "`{rule}` must be styled at all");
+            read += 1;
+            assert!(
+                body.contains("env(safe-area-inset-bottom"),
+                "`{selector}` writes a bottom row's padding without the Home indicator's inset"
+            );
         }
+        assert!(
+            read >= 7,
+            "the walk must read every rule that pads one of the six rows, the narrow-screen ones included: read {read}"
+        );
         assert!(
             segment(PANE, "#view-sheet {", "}").contains("env(safe-area-inset-bottom"),
             "the sheet that anchors to the bottom keeps clear of the Home indicator; the desktop variant is a side sheet and needs no inset"
@@ -1600,10 +1623,22 @@ mod tests {
                 ),
             "and the listeners attach only where a visual viewport exists: an old browser would throw on `window.visualViewport.addEventListener`, and the guard is what keeps the pane running there"
         );
+        // The coalescing, read structurally: the guard is what makes the sync
+        // wait for the frame it asked for, and the listeners are what ask.
         assert!(
-            PANE.contains("let visualViewportFrame = null;")
-                && PANE.contains("window.requestAnimationFrame(() => {"),
-            "a resize arrives in bursts while the keyboard animates, so one sync per frame is the most this asks for"
+            pane.contains(&squeezed("function scheduleVisualViewportSync() {"))
+                && pane.contains(&squeezed("if (visualViewportFrame !== null) return;"))
+                && pane.contains(&squeezed("window.requestAnimationFrame(() => {"))
+                && pane.contains(&squeezed("visualViewportFrame = null;")),
+            "a resize arrives in bursts while the keyboard animates, so the sync must schedule one frame and ignore the rest until it runs"
+        );
+        // The start omits the brace: `block` counts from it, so handing it in
+        // would close a block that was never opened.
+        let attached = block(PANE, "if (window.visualViewport) ");
+        assert!(
+            attached.contains("addEventListener('resize', scheduleVisualViewportSync)")
+                && attached.contains("addEventListener('scroll', scheduleVisualViewportSync)"),
+            "and both listeners attach inside the guard that checks a visual viewport exists"
         );
         assert!(
             PANE.contains("pointer-events: none;"),

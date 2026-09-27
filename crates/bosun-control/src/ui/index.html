@@ -126,7 +126,14 @@
     font-weight: 600;
     color: var(--text);
   }
-  #machines-list { flex: 1; background: var(--bg); }
+  #machines-list {
+    flex: 1;
+    background: var(--bg);
+    /* It scrolls like the other lists, and its last rows keep clear of the Home
+       indicator now that the page reaches under it. */
+    overflow-y: auto;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
   #machines-list .machine-row {
     display: flex;
     align-items: center;
