@@ -66,14 +66,12 @@ use crate::skills::referenced_paths;
 use crate::skills::resolve_remote;
 use crate::standards::fetch_repo_standards;
 
-/// The session's skills, discovered once and reused across turns: the working
-/// copy's through the executor and the store's advertised remote packages.
-/// The system prompt advertises both; the `skill` tool resolves its name
-/// against the working copy first and the remote packages second.
-struct SessionSkills {
-    working: Vec<Skill>,
-    remote: Vec<Skill>,
-}
+// The session's skills, discovered once and reused across turns: the working
+// copy's through the executor and the store's advertised remote packages. The
+// system prompt advertises both; the `skill` tool resolves its name against the
+// working copy first and the remote packages second. The two sources are cached
+// apart, because they are read apart and fail apart: a node that is down must
+// not take the advertised packages down with it.
 
 /// Caps the summarizer output so a compaction stays cheap.
 const MAX_TOKENS: u32 = 2048;
@@ -345,7 +343,13 @@ pub struct LoopDeps {
 #[derive(Default)]
 struct LoopState {
     todos: Vec<Value>,
-    skills_cache: Option<SessionSkills>,
+    /// The working copy's skills, read through the node. None until a fetch
+    /// answers: after a restart the node is not back yet, and caching that
+    /// emptiness would hide every working-copy skill for the rest of the boot.
+    working_skills: Option<Vec<Skill>>,
+    /// The store's advertised remote packages, read once. A node that is down
+    /// must not take them down with it.
+    remote_skills: Option<Vec<Skill>>,
     /// The repo-standard files present at the working-copy root, fetched once
     /// per session like the skills list. None until the first turn has
     /// fetched; a fetch that fails caches an empty list.
@@ -1373,26 +1377,6 @@ async fn clear_context(
     Ok(())
 }
 
-/// The session's two skill sources, read at the first turn that can reach them
-/// and cached: the working copy's skills through the executor and the store's
-/// advertised remote packages. A failure is returned rather than degraded to an
-/// empty list, because the caller caches the answer: after a restart the node
-/// has not come back yet, and caching that emptiness would hide every
-/// working-copy skill for the rest of the boot.
-async fn fetch_session_skills(deps: &LoopDeps, session_id: &str) -> anyhow::Result<SessionSkills> {
-    let working = fetch_working_skills(&*deps.tools, session_id)
-        .await
-        .with_context(|| format!("failed to fetch skills from the node for {session_id}"))?;
-    let remote = deps
-        .store
-        .advertised_skill_packages()
-        .await?
-        .into_iter()
-        .map(Skill::from)
-        .collect();
-    Ok(SessionSkills { working, remote })
-}
-
 /// One remote `skill` tool answer: reads one reference chunk when the call
 /// names one, otherwise loads the package's instructions and the reference
 /// paths its body mentions.
@@ -1598,20 +1582,33 @@ async fn run_turn_inner(
     // executor when the model asks for a working-copy skill. They are read by
     // the dispatch, and a resumed turn reaches the dispatch without asking the
     // model anything, so they are fetched before the resume match.
-    if state.skills_cache.is_none() {
-        match fetch_session_skills(deps, session_id).await {
-            Ok(skills) => state.skills_cache = Some(skills),
+    // Each source is cached on its own, and only when it answers: a node that
+    // has not come back yet fails the working-copy fetch alone, and the session
+    // keeps advertising the packages the store knows about.
+    if state.remote_skills.is_none() {
+        match deps.store.advertised_skill_packages().await {
+            Ok(packages) => {
+                state.remote_skills = Some(packages.into_iter().map(Skill::from).collect());
+            }
             Err(error) => warn!(
-                msg = "failed to fetch the session's skills; trying again on the next turn",
+                msg = "failed to fetch the advertised skill packages; trying again on the next turn",
                 session_id = %session_id,
                 error = %error.display_chain()
             ),
         }
     }
-    let (working_skills, remote_skills) = match state.skills_cache.as_ref() {
-        Some(skills) => (skills.working.clone(), skills.remote.clone()),
-        None => (Vec::new(), Vec::new()),
-    };
+    if state.working_skills.is_none() {
+        match fetch_working_skills(&*deps.tools, session_id).await {
+            Ok(skills) => state.working_skills = Some(skills),
+            Err(error) => warn!(
+                msg = "failed to fetch the session's working-copy skills; trying again on the next turn",
+                session_id = %session_id,
+                error = %error.display_chain()
+            ),
+        }
+    }
+    let working_skills: Vec<Skill> = state.working_skills.clone().unwrap_or_default();
+    let remote_skills: Vec<Skill> = state.remote_skills.clone().unwrap_or_default();
     // The tool surface the session may call, and the route of every MCP tool
     // it can reach. The dispatch reads the routes — a resumed turn reaches it
     // without asking the model anything, and a re-issued MCP call must find
@@ -19832,6 +19829,64 @@ mod tests {
         assert!(
             unanswered_calls(&thread).is_empty(),
             "so a resume has nothing to re-issue: the call the user stopped is answered"
+        );
+    }
+    #[tokio::test]
+    async fn a_node_that_is_down_leaves_the_advertised_skill_packages_in_place() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-skills")).await.unwrap();
+        seed_remote_skill_packages(&store).await;
+        store
+            .append_message(
+                "s-skills",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The node that holds the working copy does not answer its fetch, so
+        // only that source fails.
+        let tools = Arc::new(MockTools::new(default_outcome()).serving(
+            "skills",
+            ToolOutcome {
+                content: json!({ "error": "the node is down" }),
+                is_error: true,
+            },
+        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            stop(1, 1),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools,
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-skills".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-skills").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let system = provider.captured_calls()[0].system.clone();
+        assert!(
+            system.contains("checkout (github.com/owner/acme/tools/skills/checkout)"),
+            "the store's advertised packages survive a node that cannot answer: {system}"
         );
     }
 }
