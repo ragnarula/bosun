@@ -35,6 +35,9 @@ pub enum StoreError {
     Internal(#[from] anyhow::Error),
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
+
+    #[error("session {id} is no longer forkable: it is {state}")]
+    ForkSourceChanged { id: String, state: String },
     #[error("skill repo {repo} already exists")]
     RepoAlreadyExists { repo: String },
     #[error("skill repo {repo} was not found")]
@@ -101,6 +104,13 @@ pub struct PendingAsk {
     pub origin_leaf: String,
     pub question: String,
     pub ask_message_id: i64,
+}
+
+/// A session and the row ids of its window, read together: what a fork copies.
+#[derive(Debug, Clone)]
+pub struct ForkSource {
+    pub session: Session,
+    pub window: Vec<i64>,
 }
 
 /// What routing a user's answer to a pending raised ask did.
@@ -381,44 +391,117 @@ impl Store {
         .await
     }
 
+    /// The two answers a fork needs, from one moment: the session's row and the
+    /// row ids of its window. The caller holds the ids and copies exactly those,
+    /// so what the fork carries is what the state check saw and not whatever the
+    /// original appended while the clone ran.
+    pub async fn fork_source(&self, session_id: &str) -> Result<Option<ForkSource>, StoreError> {
+        let session_id = session_id.to_string();
+        self.with_conn(move |conn| {
+            let session = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, node, repo_url, git_ref, dir, model, persona, permission, allowed_tools, mcp_servers, state, created_at_secs, prompt, parent_id, owner_id, interrupt_cause, summary
+                         FROM sessions WHERE id = ?1",
+                    )
+                    .context("failed to prepare session query")?;
+                let mut rows = stmt
+                    .query([&session_id])
+                    .context("failed to query session")?;
+                match rows.next().context("failed to read session row")? {
+                    Some(row) => session_from_row(row)?,
+                    None => return Ok(None),
+                }
+            };
+            let window: Vec<i64> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id FROM messages WHERE session_id = ?1 AND archived = 0 ORDER BY id",
+                    )
+                    .context("failed to prepare the window query")?;
+                stmt.query_map([&session_id], |row| row.get(0))
+                    .context("failed to query the window")?
+                    .collect::<Result<Vec<i64>, _>>()
+                    .context("failed to read the window")?
+            };
+            Ok(Some(ForkSource {
+                session,
+                window,
+            }))
+        })
+        .await
+    }
+
     /// Forks a session's thread into `fork`, in one transaction: the fork's own
-    /// row, the original's active messages up to and including `through`, and
-    /// the tool-call rows those messages name. The original is not written to —
-    /// it keeps its thread, its events and no note that it was forked — so the
-    /// two sessions are independent from here on.
+    /// row, the rows `window` names, and the tool-call rows those messages carry.
+    /// The original is not written to — it keeps its thread, its events and no
+    /// note that it was forked — so the two sessions are independent from here
+    /// on.
     ///
-    /// The copied messages land as the fork's own message events, so the fork's
-    /// readers replay the thread it started from. What is copied is the original's
-    /// *active* thread, so a fork of a compacted session starts where that
-    /// session's window starts, from its summary, and not from the rows the
-    /// summary replaced. Returns how many messages were copied.
+    /// The rows are the caller's, taken from a [`Store::fork_source`] read: the
+    /// copy is that snapshot and nothing newer. The transaction re-checks that
+    /// the session is still waiting for input, because a session that stopped,
+    /// or was interrupted, while the fork's clone ran is no longer forkable and
+    /// must not be copied silently. The copied messages land as the fork's own
+    /// message events, so the fork's readers replay the thread it started from:
+    /// the original's active thread, which for a compacted session is its kept
+    /// rows with the summary that closed them. Returns how many messages were
+    /// copied.
     pub async fn fork_session(
         &self,
         fork: &Session,
         original_id: &str,
-        through: i64,
+        window: &[i64],
     ) -> Result<usize, StoreError> {
         let fork = fork.clone();
         let original_id = original_id.to_string();
+        let window = window.to_vec();
         self.with_conn(move |conn| {
             let tx = transaction(conn)?;
+            let state: Option<String> = {
+                let mut stmt = tx
+                    .prepare("SELECT state FROM sessions WHERE id = ?1")
+                    .context("failed to prepare the source state query")?;
+                let mut rows = stmt
+                    .query([&original_id])
+                    .context("failed to query the source state")?;
+                match rows.next().context("failed to read the source state")? {
+                    Some(row) => Some(row.get(0).context("failed to read the source state")?),
+                    None => None,
+                }
+            };
+            let Some(state) = state else {
+                return Err(anyhow::Error::new(StoreError::ForkSourceChanged {
+                    id: original_id.clone(),
+                    state: "gone".to_string(),
+                }));
+            };
+            let state: SessionState =
+                serde_json::from_str(&state).context("failed to parse the source state")?;
+            if state != SessionState::WaitingForInput {
+                return Err(anyhow::Error::new(StoreError::ForkSourceChanged {
+                    id: original_id.clone(),
+                    state: state.as_str().to_string(),
+                }));
+            }
             insert_session(&tx, &fork)?;
             let copied: Vec<Message> = {
                 let mut stmt = tx
-                    .prepare(
-                        "SELECT role, block FROM messages
-                         WHERE session_id = ?1 AND archived = 0 AND id <= ?2
-                         ORDER BY id",
-                    )
+                    .prepare("SELECT role, block FROM messages WHERE session_id = ?1 AND id = ?2")
                     .context("failed to prepare the forked thread query")?;
-                let rows = stmt
-                    .query_map(params![original_id, through], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .context("failed to query the forked thread")?;
                 let mut messages = Vec::new();
-                for row in rows {
-                    let (role, block) = row.context("failed to read the forked thread")?;
+                for row_id in &window {
+                    let mut rows = stmt
+                        .query(params![original_id, row_id])
+                        .context("failed to query the forked thread")?;
+                    let row = rows
+                        .next()
+                        .context("failed to read the forked thread")?
+                        .with_context(|| {
+                            format!("the row {row_id} of session {original_id} is gone")
+                        })?;
+                    let role: String = row.get(0)?;
+                    let block: String = row.get(1)?;
                     messages.push(Message {
                         role: serde_json::from_str(&role).context("failed to parse role")?,
                         block: serde_json::from_str(&block).context("failed to parse block")?,
@@ -2001,8 +2084,8 @@ fn append_event(
 
 /// Inserts a message row and its matching `Event::Message` inside the
 /// caller's transaction, so a write that spans sessions stays atomic.
-/// Writes one session row. Free function so the fork can write its own row
-/// inside the transaction that copies the thread it starts from.
+/// Writes one session row. A free function so a fork can write its row inside
+/// the transaction that copies the thread it starts from.
 fn insert_session(conn: &rusqlite::Connection, session: &Session) -> Result<(), anyhow::Error> {
     let permission = serde_json::to_string(&session.permission)?;
     let state = serde_json::to_string(&session.state)?;
@@ -2037,6 +2120,9 @@ fn insert_session(conn: &rusqlite::Connection, session: &Session) -> Result<(), 
     Ok(())
 }
 
+/// Appends one message row for a session, and the `message` event that carries
+/// it to the session's readers, so a stored line and a replayed one are the same
+/// line. Returns the row's id.
 fn insert_message(
     tx: &rusqlite::Transaction,
     session_id: &str,
@@ -2870,13 +2956,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let through = store
-            .messages("original", true)
-            .await
-            .unwrap()
-            .last()
-            .unwrap()
-            .0;
         store
             .append_tool_call("original", "call-1", "shell", &json!({ "command": "make" }))
             .await
@@ -2885,22 +2964,34 @@ mod tests {
             .complete_tool_call("original", "call-1", &json!("built"), false)
             .await
             .unwrap();
+        // The source waits for input, which is when a fork is allowed.
+        store
+            .set_state("original", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let source = store.fork_source("original").await.unwrap().unwrap();
+        assert_eq!(
+            source.window.len(),
+            4,
+            "the source read carries the window the state check saw"
+        );
+        // A turn the original takes after the source read is not the fork's: the
+        // copy is the rows that read named.
         store
             .append_message(
                 "original",
-                Role::Assistant,
+                Role::User,
                 &Block::Text {
-                    text: "after the fork".into(),
+                    text: "a newer turn".into(),
                 },
             )
             .await
             .unwrap();
         let original_events = store.events_after("original", 0).await.unwrap().len();
-
         let mut fork = session("fork");
         fork.repo_url = Some("https://example.com/repo".into());
         let copied = store
-            .fork_session(&fork, "original", through)
+            .fork_session(&fork, "original", &source.window)
             .await
             .unwrap();
 
@@ -2913,6 +3004,11 @@ mod tests {
             .into_iter()
             .map(label)
             .collect();
+        assert_eq!(
+            original_thread.len(),
+            5,
+            "the original ran on after the read"
+        );
         let fork_thread: Vec<String> = store
             .messages("fork", true)
             .await
@@ -2950,6 +3046,112 @@ mod tests {
             store.events_after("fork", 0).await.unwrap().len(),
             4,
             "and the fork's own stream carries the thread it started from"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_the_active_thread_of_a_compacted_source() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("original")).await.unwrap();
+        let old = store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::Text {
+                    text: "before the compaction".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // A compaction retired that row and closed the window with its summary.
+        store.mark_archived("original", old).await.unwrap();
+        store
+            .append_message(
+                "original",
+                Role::Assistant,
+                &Block::Summary {
+                    text: "the thread so far".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::Text {
+                    text: "after the compaction".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .set_state("original", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let source = store.fork_source("original").await.unwrap().unwrap();
+        let fork = session("fork");
+        let copied = store
+            .fork_session(&fork, "original", &source.window)
+            .await
+            .unwrap();
+
+        assert_eq!(copied, 2, "the retired row is not copied");
+        let fork_thread: Vec<String> = store
+            .messages("fork", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, message)| match &message.block {
+                Block::Summary { text } => text.clone(),
+                Block::Text { text } => text.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            fork_thread,
+            ["the thread so far", "after the compaction"],
+            "the fork's window is the original's: the summary and what followed it"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_refuses_a_source_that_is_no_longer_forkable() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("original")).await.unwrap();
+        store
+            .append_message(
+                "original",
+                Role::User,
+                &Block::Text {
+                    text: "the task".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let source = store.fork_source("original").await.unwrap().unwrap();
+
+        // The original took a turn between the read and the copy.
+        let mut running = session("original");
+        running.state = SessionState::Running;
+        store
+            .set_state("original", SessionState::Running)
+            .await
+            .unwrap();
+        let error = store
+            .fork_session(&session("fork"), "original", &source.window)
+            .await
+            .expect_err("a source that moved on is refused");
+        assert!(
+            matches!(&error, StoreError::ForkSourceChanged { id, state } if id == "original" && state == "running"),
+            "{error:?}"
+        );
+        assert!(
+            store.get_session("fork").await.unwrap().is_none(),
+            "and no fork row is written"
         );
     }
 

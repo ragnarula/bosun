@@ -39,7 +39,7 @@ It would be truthful — an original's thread could say it was forked — and th
 
 **5. Copy every row, archived ones included. (rejected)**
 
-The original may have compacted: its old rows are archived, and its window starts from a summary. Copying the archived rows would give the fork a longer thread than the original's model has, with a summary in the middle of it, so the fork's window would not be the original's. What a fork copies is what the original would read next.
+The original may have compacted: its old rows are archived, and its window is the rows that survived, closed by the summary the compaction wrote. Copying the archived rows would give the fork a longer thread than the original's model has, with a summary in the middle of it, so the fork's window would not be the original's. What a fork copies is what the original would read next.
 
 **6. Copy a dev session's directory. (rejected)**
 
@@ -59,7 +59,7 @@ The fork's row carries the original's node, repository, ref, model, persona, per
 
 - A fork is a faithful copy of what the original could read, and the two are independent from the moment it exists: the original's rows, events and state are untouched, and it does not learn that it was forked.
 - The copy's stamps are the copy's, not the original's. A message row in the store carries no timestamp — the events do — so the fork's replay shows every copied line at the time of the fork. A reader can tell the fork's own lines from the copied ones by the time only loosely; the tests compare bodies.
-- A fork of a compacted session starts from its summary, because that is where its window starts. That is faithful to the original's model and surprising to a reader who scrolls the original and sees rows the fork does not have.
+- A fork of a compacted session carries the rows that survived its compaction and the summary that closed the retired tail, because that is the original's window. It is faithful to the original's model and surprising to a reader who scrolls the original and sees rows the fork does not have.
 - Children and dev sessions are not forkable, and nothing links a fork to its original: no parent, no note, no id on either row. Finding the fork is the session list, which is where every session is found.
 - The copy is a transaction, so a fork either exists whole or not at all: no half-copied thread, and no fork row pointing at a clone that was never made.
 - The node work is the clone every session does, so a fork costs one clone and one loop, and the fork's first turn is the user's own message.

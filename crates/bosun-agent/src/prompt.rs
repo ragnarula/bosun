@@ -37,8 +37,6 @@ fn skill_ad_line(skill: &Skill) -> String {
     format!("- {} ({}): {}", skill.name, provenance, description)
 }
 
-/// A session state as the manifest renders it: the wire-format names the
-/// store uses.
 /// Builds the system prompt in layers: the fixed harness contract first, then
 /// the persona's role text when it has one, then the parts of the session's
 /// context that hold for the whole session — the repo-standard files present

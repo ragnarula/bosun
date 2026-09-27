@@ -121,6 +121,11 @@ pub enum ApiError {
     ChildNotForkable { id: String },
 
     #[error(
+        "model {model} is not configured, so session {id} cannot be forked; configure the model and try again"
+    )]
+    ForkModelNotConfigured { id: String, model: String },
+
+    #[error(
         "session {id} cannot be forked: a fork starts from a session waiting for input, and this one is {state}"
     )]
     NotForkable { id: String, state: String },
@@ -177,6 +182,7 @@ impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::SessionNotFound { id } => ApiError::SessionNotFound { id },
+            StoreError::ForkSourceChanged { id, state } => ApiError::NotForkable { id, state },
             StoreError::RepoAlreadyExists { repo } => ApiError::RepoAlreadyExists { repo },
             StoreError::RepoNotFound { repo } => ApiError::RepoNotFound { repo },
             StoreError::McpServerAlreadyExists { name } => {
@@ -212,7 +218,9 @@ impl IntoResponse for ApiError {
                 (StatusCode::BAD_GATEWAY, Some(self.to_string()))
             }
             ApiError::ChildIsWatchOnly { .. } => (StatusCode::BAD_REQUEST, Some(self.to_string())),
-            ApiError::ChildNotForkable { .. } | ApiError::NoRepositoryToFork { .. } => {
+            ApiError::ChildNotForkable { .. }
+            | ApiError::NoRepositoryToFork { .. }
+            | ApiError::ForkModelNotConfigured { .. } => {
                 (StatusCode::BAD_REQUEST, Some(self.to_string()))
             }
             // The session is real and the request is well formed; its state is
@@ -925,11 +933,15 @@ async fn fork(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Session>, ApiError> {
-    let original = state
+    // The row and the window come from one read, and the fork copies exactly
+    // those rows: the clone below can take seconds, and the original can run a
+    // turn in them.
+    let source = state
         .store
-        .get_session(&id)
+        .fork_source(&id)
         .await?
         .ok_or_else(|| ApiError::SessionNotFound { id: id.clone() })?;
+    let original = source.session;
     if original.parent_id.is_some() {
         return Err(ApiError::ChildNotForkable { id });
     }
@@ -946,11 +958,9 @@ async fn fork(
         .providers
         .get(&original.model)
         .cloned()
-        .ok_or_else(|| {
-            ApiError::Conflict(format!(
-                "no provider for model {}, so a fork of session {id} cannot run",
-                original.model
-            ))
+        .ok_or_else(|| ApiError::ForkModelNotConfigured {
+            id: id.clone(),
+            model: original.model.clone(),
         })?;
     if state
         .registry
@@ -1013,16 +1023,7 @@ async fn fork(
         prompt: None,
         summary: None,
     };
-    // The fork point is the newest row in the original's window: what its model
-    // would read next is what the fork's model starts from.
-    let through = state
-        .store
-        .messages(&id, false)
-        .await?
-        .last()
-        .map(|(row, _)| *row)
-        .unwrap_or(0);
-    let copied = state.store.fork_session(&fork, &id, through).await?;
+    let copied = state.store.fork_session(&fork, &id, &source.window).await?;
 
     state.loops.start(
         &fork.id,
@@ -7382,20 +7383,13 @@ mod tests {
                 .send()
         };
 
+        // The statuses are the check. The wording is presentation, and the
+        // variants' statuses have their own test below.
         let response = fork("ghost").await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(response.text().await.unwrap().contains("was not found"));
 
         let response = fork("dev-1").await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            response
-                .text()
-                .await
-                .unwrap()
-                .contains("no recorded repository"),
-            "a session with no repository says so"
-        );
 
         let response = fork("running-1").await.unwrap();
         assert_eq!(
@@ -7403,26 +7397,90 @@ mod tests {
             StatusCode::CONFLICT,
             "a session that is not waiting for input is a conflict, not a bad request"
         );
-        let text = response.text().await.unwrap();
-        assert!(
-            text.contains("waiting for input") && text.contains("running"),
-            "{text}"
-        );
 
         let response = fork("child-1").await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            response
-                .text()
-                .await
-                .unwrap()
-                .contains("fork a root session")
-        );
+
+        // A session whose model has no provider is a configuration gap.
+        let mut unconfigured = session("unconfigured-1");
+        unconfigured.state = SessionState::WaitingForInput;
+        unconfigured.repo_url = Some("https://example.com/repo".into());
+        state.store.create_session(&unconfigured).await.unwrap();
+        let response = fork("unconfigured-1").await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         assert!(!state.commands.pending("n1"), "no node saw a command");
         assert_eq!(
             state.store.list_sessions().await.unwrap().len(),
-            4,
+            5,
+            "and no fork was created"
+        );
+    }
+
+    /// The fork refusals are variants, and each one is a status: the mapping is
+    /// checked here, rather than in the wording of a response body.
+    #[test]
+    fn fork_refusals_map_to_their_statuses() {
+        for (error, expected) in [
+            (
+                ApiError::SessionNotFound { id: "x".into() },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ApiError::ChildNotForkable { id: "x".into() },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ApiError::NoRepositoryToFork { id: "x".into() },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ApiError::ForkModelNotConfigured {
+                    id: "x".into(),
+                    model: "m".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ApiError::NotForkable {
+                    id: "x".into(),
+                    state: "running".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                ApiError::NodeNotUp { node: "n".into() },
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let described = error.to_string();
+            assert_eq!(error.into_response().status(), expected, "{described}");
+        }
+    }
+
+    /// A fork starts on the original's node, so a node that is not up refuses it
+    /// before anything is cloned.
+    #[tokio::test]
+    async fn fork_refuses_a_session_whose_node_is_not_up() {
+        let dir = tempdir().unwrap();
+        let (state, _, _) = state_with_provider(&dir, Arc::new(Mutex::new(VecDeque::new()))).await;
+        let mut original = session("original-1");
+        original.model = "main-model".into();
+        original.state = SessionState::WaitingForInput;
+        original.repo_url = Some("https://example.com/repo".into());
+        state.store.create_session(&original).await.unwrap();
+
+        let addr = serve(state.clone()).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/sessions/original-1/fork"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!state.commands.pending("n1"), "no node saw a command");
+        assert_eq!(
+            state.store.list_sessions().await.unwrap().len(),
+            1,
             "and no fork was created"
         );
     }
@@ -7492,6 +7550,11 @@ mod tests {
         assert_eq!(fork.mcp_servers, original.mcp_servers);
         assert_eq!(fork.permission, original.permission);
         assert_eq!(fork.node, original.node);
+        assert_eq!(fork.repo_url, original.repo_url);
+        assert_eq!(fork.git_ref, original.git_ref);
+        assert_eq!(fork.allowed_tools, original.allowed_tools);
+        assert_eq!(fork.prompt, None, "a fork carries no prompt of its own");
+        assert_eq!(fork.summary, None, "and no summary of its own yet");
         assert_ne!(fork.dir, original.dir, "the fork gets its own working copy");
         assert_eq!(
             fork.state,
@@ -7571,6 +7634,10 @@ mod tests {
         );
     }
 
+    /// The resume waits for the session's node: the nodes dial back in after a
+    /// restart, and the listener that accepts them binds after recovery, so a
+    /// wake sent at boot would re-issue the call against a plane that cannot
+    /// reach the node and record that failure as the call's result.
     #[tokio::test]
     async fn recover_holds_a_resume_until_the_node_reconnects() {
         let dir = tempdir().unwrap();

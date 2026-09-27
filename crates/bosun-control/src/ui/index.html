@@ -3526,16 +3526,19 @@ function updatePermissionBadge(permission) {
 // not waiting for input — is shown in the sheet, which is where the control is.
 btnFork.addEventListener('click', async () => {
   viewFork.textContent = '';
+  // The clone takes seconds, and a second click would start a second fork: the
+  // control is disabled until this one answers.
+  btnFork.disabled = true;
   try {
     const response = await post('/sessions/' + encodeURIComponent(current) + '/fork', {});
     const fork = await response.json();
     viewSheet.hidden = true;
-    // The fork's row has to be in the list before the pane opens it, or the
-    // view has no header to show until the next poll.
     await refreshSessions();
     openSession(fork.id);
   } catch (error) {
     viewFork.textContent = 'fork: ' + error.message;
+  } finally {
+    btnFork.disabled = false;
   }
 });
 

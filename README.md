@@ -38,7 +38,11 @@ and the planned roadmap are tracked in [docs/sprints](docs/sprints/).
   repository, `bosun dev` starts one in an existing directory on a node,
   `bosun list` shows sessions, and `bosun open` attaches to a live session.
 - **🧠 Sessions** hold their own transcript, store, and model calls. Tool
-  output streams back to the client live; assistant text renders as markdown.
+  output streams back to the client live; assistant text renders as markdown. A
+  session's conversation forks into a new one from the pane's actions sheet: the
+  fork keeps the same model, persona, permission and MCP servers, carries the
+  same thread, and gets a clone of the same repository, while the original is
+  left exactly as it was.
 - **Skills** are packages fetched from GitHub repositories the operator adds
   in the web pane, stored in the session store, and loaded on demand through
   the `skill` tool beside the working copy's own skills. Versions are commit
