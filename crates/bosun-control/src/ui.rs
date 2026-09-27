@@ -1458,6 +1458,15 @@ mod tests {
             PANE.contains("if (!inputRow.hidden) input.focus();"),
             "opening a session asks for the composer on every device, which is the path a phone had before: the keyboard comes up with the session"
         );
+        let opening = segment(
+            PANE,
+            "function showSession(id) {",
+            "function closeSession() {",
+        );
+        assert!(
+            opening.contains("scheduleVisualViewportSync();"),
+            "and the same path schedules a visual-viewport sync with that focus: the keyboard it raises moves the numbers, and the view has to be at its height as the keyboard arrives rather than at whatever resize comes next"
+        );
         let row = segment(
             PANE,
             "inputRow.addEventListener('click', (event) => {",
@@ -1586,6 +1595,10 @@ mod tests {
             view_rule.contains("position: absolute;") && view_rule.contains("inset: 0;"),
             "and the session view fills it absolutely"
         );
+        assert!(
+            view_rule.contains("z-index: 10;") && view_rule.contains("background: var(--bg);"),
+            "and it is opaque and above the list: the view is offset down the page while the keyboard is up, and any strip of its own height it does not paint shows the home column's session list through it — an uncovered area, not a paint order for the fixed layers to settle"
+        );
         // The layers left alone, and why they are not the same case: a fixed
         // element's containing block is the viewport, not the session view, so
         // the other overlays are unaffected by this change.
@@ -1679,13 +1692,34 @@ mod tests {
             handler.contains(&squeezed(
                 "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
             )) && handler.contains(&squeezed(
-                "view.style.top = covered > 0 ? offset + 'px' : '0px';"
+                "view.style.top = (viewport.height < window.innerHeight && offset > 0) ? offset + 'px' : '0px';"
             )),
-            "and it takes the offset only while the keyboard really covers a strip, clamped: on some iOS versions that value stays stale after the keyboard closes, and writing it then left the whole view offset"
+            "and it takes the offset whenever the visible viewport is pushed or shortened, clamped"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "viewport.height < window.innerHeight && offset > 0"
+            )) && handler.contains(&squeezed("? offset + 'px' : '0px';")),
+            "with the fallback a viewport at full height reaches: that is the case the offset is held back for, because on some iOS versions it stays stale after the keyboard closes, and writing it then left the whole view offset"
+        );
+        assert!(
+            !handler.contains(&squeezed("covered > 0 ?")),
+            "the strip the keyboard leaves must not decide this: Safari can push the page to the layout viewport's bottom, where the strip is zero with the keyboard still up, and `covered > 0` then pinned the view at the document's top — a keyboard-height short of the keyboard, with the home column's session list showing in the gap"
         );
         assert!(
             PANE.contains("document.addEventListener('focusout', scheduleVisualViewportSync);"),
             "and leaving a field re-syncs, because the keyboard's close does not always arrive as a resize before the next paint"
+        );
+        assert!(
+            PANE.contains("document.addEventListener('focusin', scheduleVisualViewportSync);")
+                && PANE.contains("window.addEventListener('resize', scheduleVisualViewportSync);"),
+            "and taking a field re-syncs too, and the window's own resize as well: the keyboard the focus raises moves the numbers after the event that asked for it, and the numbers can miss a frame the window sees"
+        );
+        assert!(
+            pane.contains(&squeezed(
+                "visualViewportSettle = window.setTimeout(syncVisualViewport, 300);"
+            )),
+            "and the burst schedules one more sync after it settles: the last frame of the animation can run while the keyboard is still moving, and a sample from there leaves the view short by the rest of the travel, with that much of the page under it"
         );
         assert!(
             handler.contains(&squeezed("syncStick();")),
@@ -1791,6 +1825,45 @@ mod tests {
         assert!(
             PANE.contains("pointer-events: none;"),
             "a toast reports and never takes a tap: it used to cover the composer and swallow taps there"
+        );
+    }
+
+    // The case v0.9.50 got wrong: the keyboard is up and Safari has pushed the
+    // page so the visible viewport reaches the layout viewport's bottom. The
+    // strip the keyboard leaves is then zero, and the offset is still the whole
+    // story — reading that strip as "no keyboard" pinned the view at the
+    // document's top, a keyboard-height short of the keyboard, with the home
+    // column's session list showing in the gap.
+
+    #[test]
+    fn the_pane_keeps_the_offset_while_the_keyboard_covers_the_layout_bottom() {
+        let pane = flattened();
+        let handler = block(&pane, &squeezed("function syncVisualViewport("));
+        // The state itself: a visible viewport shorter than the window with a
+        // real offset, and nothing left of the layout viewport below it.
+        assert!(
+            handler.contains(&squeezed(
+                "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
+            )) && handler.contains(&squeezed(
+                "const covered = Math.max(0, window.innerHeight - viewport.height - offset);"
+            )),
+            "the offset is clamped to the layout viewport's height, and what that leaves uncovered is the strip, which is zero here"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "view.style.top = (viewport.height < window.innerHeight && offset > 0) ? offset + 'px' : '0px';"
+            )),
+            "so the view rides the offset on the state the pushed page is in — the viewport is short and the offset is real — and not on a strip that has gone"
+        );
+        assert!(
+            handler.contains(&squeezed("? offset + 'px' : '0px';")),
+            "both branches stay: the offset while the viewport is pushed or shortened, and zero when it is the full height again, which is what still parks a stale offset after the keyboard closes"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');"
+            )),
+            "and the strip is still the inset's source for the elements fixed to the layout viewport's bottom, whatever the view's own top does"
         );
     }
 

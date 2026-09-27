@@ -3503,6 +3503,10 @@ function showSession(id) {
   // Opening a session asks for the composer whatever the pointer: this is the
   // path a phone had before, and the keyboard comes up with the session.
   if (!inputRow.hidden) input.focus();
+  // The keyboard that focus raises moves the visual viewport, and the numbers
+  // settle after this turn: ask for a sync here rather than wait for the next
+  // resize, so the view is at its height as the keyboard arrives.
+  scheduleVisualViewportSync();
 }
 
 function closeSession() {
@@ -3997,7 +4001,7 @@ btnBottom.addEventListener('click', jumpToBottom);
 // keyboard is drawn, and a tap at the very bottom edge can fall in the Home
 // indicator's strip instead of the field. The visual viewport is the part of the
 // page the reader can actually see, so the view rides it: its height always,
-// and its offset while the keyboard really covers a strip of the page.
+// and its offset whenever the keyboard has pushed or shortened it.
 //
 // The visual viewport exists on modern desktops as well, where it is the whole
 // page and the numbers never change; this runs there harmlessly, and its only
@@ -4007,15 +4011,22 @@ function syncVisualViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
   view.style.height = viewport.height + 'px';
-  // The strip the keyboard leaves is what is left of the layout viewport below
-  // the visible one; the offset says how far the page has moved under it. Both
-  // are clamped, and the offset is written into the view only while that strip
-  // is real: on some iOS versions it stays stale after the keyboard closes, and
-  // writing it then left the whole view offset, while on the others the view
-  // rides the keyboard exactly as before.
+  // The offset says how far the page has moved under the visible part, and the
+  // strip below it is what the keyboard leaves of the layout viewport; both are
+  // clamped. The offset is written whenever the visible viewport is pushed or
+  // shortened, and parks at zero only when it is the full height again: on some
+  // iOS versions the offset stays stale after the keyboard closes, and writing
+  // it then left the whole view offset.
+  //
+  // The strip is not what tells this code a keyboard is up. Safari can push the
+  // page far enough that the visible viewport reaches the layout viewport's
+  // bottom, and the strip is then zero with the keyboard still up; reading that
+  // as "no keyboard" wrote `top: 0`, which put the view's bottom edge a
+  // keyboard-height above the keyboard, and the home column's session list
+  // showed in the gap.
   const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);
   const covered = Math.max(0, window.innerHeight - viewport.height - offset);
-  view.style.top = covered > 0 ? offset + 'px' : '0px';
+  view.style.top = (viewport.height < window.innerHeight && offset > 0) ? offset + 'px' : '0px';
   document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');
   // The keyboard changes the transcript's height, and no scroll event comes
   // with it: this is the resize #19 named as stale, and the control catches up
@@ -4024,22 +4035,34 @@ function syncVisualViewport() {
 }
 
 // A resize arrives in bursts — iOS sends one per frame while the keyboard
-// animates — and one read and one write per frame is all this needs.
+// animates — and one read and one write per frame is all this needs. The burst
+// can end while the keyboard is still moving, so the sync runs a second time
+// after the movement has settled: a sample taken mid-animation leaves the view
+// short by whatever the keyboard had left to travel, with that much of the page
+// showing under it.
 let visualViewportFrame = null;
+let visualViewportSettle = null;
 function scheduleVisualViewportSync() {
   if (visualViewportFrame !== null) return;
   visualViewportFrame = window.requestAnimationFrame(() => {
     visualViewportFrame = null;
     syncVisualViewport();
   });
+  window.clearTimeout(visualViewportSettle);
+  visualViewportSettle = window.setTimeout(syncVisualViewport, 300);
 }
 
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', scheduleVisualViewportSync);
   window.visualViewport.addEventListener('scroll', scheduleVisualViewportSync);
   // Leaving a field is when the numbers settle: the keyboard's close arrives as
-  // a resize, but not always before the next paint.
+  // a resize, but not always before the next paint. Taking a field asks for the
+  // same sync, because the keyboard it raises is what moves the numbers; the
+  // window's own resize covers the frames the visual viewport's numbers miss;
+  // and `showSession` asks too, for a session opened with the keyboard up.
   document.addEventListener('focusout', scheduleVisualViewportSync);
+  document.addEventListener('focusin', scheduleVisualViewportSync);
+  window.addEventListener('resize', scheduleVisualViewportSync);
 }
 
 // Whether the transcript is at its end, and the control that shows when it is
