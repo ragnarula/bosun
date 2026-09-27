@@ -114,6 +114,28 @@ impl ExecutorState {
         }
     }
 
+    /// Stops the executor taking new calls and signals every running shell.
+    /// The kills are answered by each shell's owner task, so this returns
+    /// before the process groups are gone: a caller that is going down waits
+    /// with [`ExecutorState::wait_for_shells`], and a caller that stops one
+    /// session uses [`ExecutorState::kill_all_shells`], which does both.
+    pub async fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let kills: Vec<Arc<Notify>> = {
+            let running = self.running.read().await;
+            running.values().map(|shell| shell.kill.clone()).collect()
+        };
+        for kill in kills {
+            kill.notify_one();
+        }
+    }
+
+    /// The runs still in flight: what a caller waiting for the killed shells to
+    /// be reaped has left to look at.
+    pub async fn shells_in_flight(&self) -> Vec<String> {
+        self.running.read().await.keys().cloned().collect()
+    }
+
     /// Kills every running shell. The node calls this when a session stops, so
     /// in-flight shells die with the session instead of outliving it, and on
     /// the way down, where a shell that outlived its node would have nothing
@@ -123,29 +145,17 @@ impl ExecutorState {
     /// stream ends, so this waits for the map to empty: signalling and
     /// returning would leave the process groups alive if the runtime stops
     /// before those tasks run. The wait is bounded, because a run whose stream
-    /// nothing is consuming cannot finish its guard.
-    /// Returns the runs still in flight when the wait ran out: the caller logs
-    /// them, because a run whose stream nothing is consuming cannot finish its
-    /// guard, and an entry that is still there is a process group the node is
-    /// leaving behind.
+    /// nothing is consuming cannot finish its guard. Returns the runs still in
+    /// flight when the wait ran out, so the caller can log them: an entry that
+    /// is still there is a process group the node is leaving behind.
     pub async fn kill_all_shells(&self) -> Vec<String> {
-        self.shutting_down.store(true, Ordering::SeqCst);
-        let kills: Vec<Arc<Notify>> = {
-            let running = self.running.read().await;
-            running.values().map(|shell| shell.kill.clone()).collect()
-        };
-        for kill in kills {
-            kill.notify_one();
-        }
+        self.begin_shutdown().await;
         let deadline = Instant::now() + SHELL_KILL_WAIT;
         loop {
-            let left: Vec<String> = {
-                let running = self.running.read().await;
-                if running.is_empty() {
-                    return Vec::new();
-                }
-                running.keys().cloned().collect()
-            };
+            let left = self.shells_in_flight().await;
+            if left.is_empty() {
+                return left;
+            }
             if Instant::now() >= deadline {
                 return left;
             }

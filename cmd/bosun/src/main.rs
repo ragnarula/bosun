@@ -423,41 +423,29 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             let server_config = bosun_common::tls::load_server_config(cert, key)
                 .context("failed to load the control-plane TLS certificate")?;
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-            serve_tls(listener, app, acceptor, &config.listen_addr).await
+            serve_until_stopped(
+                |stopped| async move {
+                    serve_tls(listener, app, acceptor, &config.listen_addr, stopped).await
+                },
+                shutdown_signal(),
+            )
+            .await
         }
         (None, None) => {
             info!(listen_addr = %config.listen_addr, "control plane listening");
-            // The signal stops the listener and drains the connections that are
-            // open. A pane's event stream never completes on its own, so the
-            // drain is bounded: a service manager waiting for the process would
-            // otherwise run out its own timeout and kill it, and the clients
-            // reconnect from their cursors anyway.
-            let (stopping, stopped) = tokio::sync::oneshot::channel();
-            let mut serve = Box::pin(
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        let _ = stopped.await;
-                    })
-                    .into_future(),
-            );
-            let result = tokio::select! {
-                result = &mut serve => result,
-                _ = shutdown_signal() => {
-                    let _ = stopping.send(());
-                    match tokio::time::timeout(SHUTDOWN_DRAIN, &mut serve).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(
-                                secs = SHUTDOWN_DRAIN.as_secs(),
-                                "streams are still open after the shutdown drain; stopping anyway"
-                            );
-                            Ok(())
-                        }
-                    }
-                }
-            };
-            result.context("control plane server failed")?;
-            Ok(())
+            serve_until_stopped(
+                |stopped| async move {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            let _ = stopped.await;
+                        })
+                        .into_future()
+                        .await
+                        .context("control plane server failed")
+                },
+                shutdown_signal(),
+            )
+            .await
         }
         _ => Err(anyhow::anyhow!("tls_cert and tls_key must be set together")),
     }
@@ -468,16 +456,22 @@ async fn serve_tls(
     app: axum::Router,
     acceptor: tokio_rustls::TlsAcceptor,
     listen_addr: &str,
+    stopped: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     info!(listen_addr = %listen_addr, "control plane listening (TLS)");
+    let mut stopped = stopped;
+    // The connections are kept, not detached: the caller bounds how long they
+    // are waited for, and a client that holds a stream open is why that bound
+    // exists.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => accepted.context("control plane accept failed")?,
-            _ = shutdown_signal() => break,
+            _ = &mut stopped => break,
         };
         let acceptor = acceptor.clone();
         let service = hyper_util::service::TowerToHyperService::new(app.clone().into_service());
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let stream = acceptor
                 .accept(stream)
                 .await
@@ -490,7 +484,48 @@ async fn serve_tls(
             Ok::<(), anyhow::Error>(())
         });
     }
+    // The listener is closed. Every connection that is still open is a client
+    // that has not finished, and the caller gives them the drain before it
+    // stops the process.
+    while connections.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Serves until the process is asked to stop, then waits for the connections the
+/// stop leaves open. A pane's event stream never completes on its own, so the
+/// wait is bounded: the clients reconnect from their cursors, and a service
+/// manager that waited for the process would run out its own timeout and kill it
+/// less politely.
+///
+/// `serve` receives the future that fires when the wait begins: the plain path
+/// hands it to axum's graceful shutdown, the TLS path stops accepting and joins
+/// the connections it opened, so both paths drain the same way.
+async fn serve_until_stopped<S, F>(
+    serve: S,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()>
+where
+    S: FnOnce(tokio::sync::oneshot::Receiver<()>) -> F,
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let (stopping, stopped) = tokio::sync::oneshot::channel();
+    let mut serving = Box::pin(serve(stopped));
+    tokio::select! {
+        result = &mut serving => result,
+        _ = stop => {
+            let _ = stopping.send(());
+            match tokio::time::timeout(SHUTDOWN_DRAIN, &mut serving).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        secs = SHUTDOWN_DRAIN.as_secs(),
+                        "streams are still open after the shutdown drain; stopping anyway"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 /// How long a stopping control plane waits for its open connections to finish.
@@ -1138,6 +1173,123 @@ mod tests {
     use bosun_common::types::UpdateStatus;
 
     use super::*;
+
+    /// The TLS path drains like the plain one: a connection that is open when
+    /// the stop begins is waited for, not cut. This is the path a deployed
+    /// control plane runs, and it had no drain before `serve_until_stopped`
+    /// owned one. The test drives the helper with its own stop, which is why
+    /// the helper takes that future rather than the process signal.
+    #[tokio::test]
+    async fn a_tls_stop_waits_for_an_open_connection() {
+        use std::io::Write as _;
+
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let mut cert_file = std::fs::File::create(&cert_path).unwrap();
+        cert_file
+            .write_all(certified.cert.pem().as_bytes())
+            .unwrap();
+        let mut key_file = std::fs::File::create(&key_path).unwrap();
+        key_file
+            .write_all(certified.key_pair.serialize_pem().as_bytes())
+            .unwrap();
+
+        let server_config = bosun_common::tls::load_server_config(&cert_path, &key_path).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        // A route that never answers, the way an event stream never completes.
+        let app = axum::Router::new().route(
+            "/hang",
+            axum::routing::get(|| async { std::future::pending::<()>().await }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (stopping, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(serve_until_stopped(
+            move |stopped| async move { serve_tls(listener, app, acceptor, "tls", stopped).await },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        // One connection, with a request that will not finish.
+        let client_config = bosun_common::tls::load_client_config(Some(&cert_path))
+            .unwrap()
+            .expect("a CA file builds a client config");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, stream).await.unwrap();
+        tls.write_all(b"GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        // The stop begins: the connection that is open is waited for, and the
+        // drain ends it at the bound rather than cutting it at once.
+        let started = std::time::Instant::now();
+        let _ = stopping.send(());
+        let result = tokio::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(5), serving)
+            .await
+            .expect("the drain must end at its bound")
+            .unwrap();
+        assert!(result.is_ok(), "the server stopped cleanly");
+        assert!(
+            started.elapsed() >= SHUTDOWN_DRAIN,
+            "the stop waits for the open connection rather than cutting it: {:?}",
+            started.elapsed()
+        );
+        drop(tls);
+    }
+
+    /// The drain that both serve paths share. A serving future that never
+    /// finishes — an open pane's event stream — is abandoned once the wait runs
+    /// out, and the process stops anyway. It costs the bound, because the bound
+    /// is what the test is about.
+    #[tokio::test]
+    async fn a_serving_future_that_never_finishes_is_abandoned_at_the_drain() {
+        let started = std::time::Instant::now();
+        let result = serve_until_stopped(
+            |stopped| async move {
+                let _ = stopped.await;
+                std::future::pending::<()>().await;
+                anyhow::Ok(())
+            },
+            std::future::ready(()),
+        )
+        .await;
+        assert!(result.is_ok(), "the process stops anyway");
+        let waited = started.elapsed();
+        assert!(
+            waited >= SHUTDOWN_DRAIN,
+            "the drain is given its full bound, not skipped: {waited:?}"
+        );
+        assert!(
+            waited < SHUTDOWN_DRAIN + Duration::from_secs(2),
+            "and the bound ends it, rather than the future: {waited:?}"
+        );
+    }
+
+    /// A serving future that finishes inside the drain is the one whose result
+    /// the caller sees: a stop does not swallow a server failure.
+    #[tokio::test]
+    async fn a_serving_future_that_finishes_inside_the_drain_returns_its_result() {
+        let result = serve_until_stopped(
+            |stopped| async move {
+                let _ = stopped.await;
+                anyhow::bail!("the server failed on the way out");
+            },
+            std::future::ready(()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the serving future's failure reaches the caller"
+        );
+    }
 
     #[test]
     fn format_ago_reports_seconds_then_minutes_then_hours() {

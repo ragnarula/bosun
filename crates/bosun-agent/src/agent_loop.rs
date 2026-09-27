@@ -19619,4 +19619,90 @@ mod tests {
             "and the completion lands on that row rather than on nothing"
         );
     }
+    #[tokio::test]
+    async fn a_resume_wake_records_a_call_whose_mcp_server_is_gone() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&Session {
+                mcp_servers: "srv-a".to_string(),
+                ..session("s-mcp-down")
+            })
+            .await
+            .unwrap();
+        store_a_dangling_call(
+            &store,
+            "s-mcp-down",
+            "call-1",
+            "lookup",
+            json!({ "query": "the name" }),
+        )
+        .await;
+
+        // The server the session selected is not reachable this boot, so its
+        // tools are not advertised and the re-issued call has no route.
+        let mcp = Arc::new(MockMcp::new(mcp_text("the answer")));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("it failed".into()),
+            stop(1, 1),
+        ]]));
+        // With no route, the dispatch falls to the node, which does not know
+        // the tool: this is the answer a real node gives.
+        let node = Arc::new(MockTools::new(default_outcome()).serving(
+            "lookup",
+            ToolOutcome {
+                content: json!({ "error": "unknown tool lookup" }),
+                is_error: true,
+            },
+        ));
+        let deps = Arc::new(test_deps_with_mcp(
+            &store,
+            provider.clone(),
+            node.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            mcp.clone(),
+        ));
+        let handle = spawn_loop("s-mcp-down".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store
+                        .get_session("s-mcp-down")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            mcp.calls().is_empty(),
+            "a server that is not reachable is not called"
+        );
+        assert!(
+            node.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.name == "lookup"),
+            "the call falls to the node path, which has no such tool"
+        );
+        let requests = provider.captured_calls();
+        assert!(
+            requests[0].messages.iter().any(|message| matches!(
+                &message.block,
+                Block::ToolResult { id, is_error, .. } if id == "call-1" && *is_error
+            )),
+            "the call is recorded as a failure the model reads, not left dangling: {:?}",
+            request_texts(&requests[0])
+        );
+    }
 }

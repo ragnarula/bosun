@@ -3,6 +3,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::Context;
 use bosun_common::error::ErrorExt;
@@ -15,6 +16,7 @@ use bosun_common::types::NodeStartRequest;
 use bosun_common::types::SessionInfo;
 use bosun_executor::ExecutorState;
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -69,6 +71,11 @@ pub enum NodeError {
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
+
+/// How long the node waits, once, for every session's killed shells to be
+/// reaped before it stops waiting and exits. It bounds the whole shutdown, not
+/// each session: the shells die in parallel.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 pub struct NodeManager {
     work_dir: PathBuf,
@@ -243,8 +250,18 @@ impl NodeManager {
                 return Ok(());
             }
         };
-        // In-flight shells die with the session instead of outliving it.
-        record.executor.kill_all_shells().await;
+        // In-flight shells die with the session instead of outliving it. A run
+        // whose stream nothing is consuming cannot be reaped inside the wait,
+        // and it is a process group the node is leaving behind, so it is
+        // logged rather than dropped.
+        let left = record.executor.kill_all_shells().await;
+        if !left.is_empty() {
+            warn!(
+                session_id = %session_id,
+                runs = ?left,
+                "shells are still running after the stop wait; their process groups may outlive the session"
+            );
+        }
         if record.reapable {
             cleanup(&record.dir).await;
         }
@@ -297,14 +314,30 @@ impl NodeManager {
             .values()
             .map(|record| record.executor.clone())
             .collect();
-        for executor in executors {
-            let left = executor.kill_all_shells().await;
-            if !left.is_empty() {
+        // Every session is signalled before anything waits: the wait is the
+        // same for all of them, and waiting session by session would make a
+        // node with stragglers in each one take their sum, which is how a
+        // service manager's own timeout is reached and the process killed.
+        for executor in &executors {
+            executor.begin_shutdown().await;
+        }
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        loop {
+            let mut left = Vec::new();
+            for executor in &executors {
+                left.extend(executor.shells_in_flight().await);
+            }
+            if left.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
                 warn!(
                     runs = ?left,
                     "shells are still running after the shutdown wait; their process groups may outlive the node"
                 );
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -930,6 +963,53 @@ mod tests {
     /// has nothing left to report its exit to, and the control plane re-issues
     /// the call when the session resumes; the rebuilt executor does nothing on
     /// its own.
+    /// The shutdown wait is one bound for the whole node, not one per session:
+    /// stragglers left in every session are waited for together, so a node with
+    /// many of them does not add their waits up and reach a service manager's
+    /// own timeout, which ends in the kill the wait exists to avoid.
+    #[tokio::test]
+    async fn kill_all_shells_waits_once_for_every_session() {
+        let work = tempdir().unwrap();
+        let manager = manager(&work);
+        let mut held = Vec::new();
+        for index in 0..3 {
+            let session_dir = work.path().join(format!("repo-{index}"));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let session_id = format!("s{index}");
+            start_session(&manager, &session_id, &session_dir).await;
+            let executor = manager
+                .executor(&session_id)
+                .expect("the session's executor");
+            let outcome = bosun_executor::run_call(
+                &executor,
+                "run-1",
+                "shell",
+                &serde_json::json!({ "command": "sleep 30" }),
+            )
+            .await
+            .expect("the shell should start");
+            let bosun_executor::CallOutcome::Shell(stream) = outcome else {
+                panic!("a shell run must stream");
+            };
+            // Held, not consumed: a run nothing is reading cannot be reaped, so
+            // every session leaves the wait a straggler to give up on.
+            held.push(stream);
+        }
+
+        let started = std::time::Instant::now();
+        manager.kill_all_shells().await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= SHUTDOWN_WAIT,
+            "the stragglers are waited for: {waited:?}"
+        );
+        assert!(
+            waited < SHUTDOWN_WAIT + Duration::from_secs(3),
+            "and they are waited for together rather than one session after another: {waited:?}"
+        );
+        drop(held);
+    }
+
     #[tokio::test]
     async fn kill_all_shells_ends_every_running_shell() {
         let work = tempdir().unwrap();
