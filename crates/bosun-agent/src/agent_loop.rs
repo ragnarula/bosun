@@ -151,6 +151,11 @@ pub enum LoopEvent {
     /// appended to this session's thread. Starts a turn even when the session
     /// is stopped or interrupted, which is how a child resumes.
     ParentMessage,
+    /// The control plane was replaced while this session was running: the loop
+    /// runs the calls its thread left unanswered before it asks the model
+    /// again. The control plane sends this once per session per boot; nothing
+    /// else re-runs a call, and a node never does.
+    Resume,
     Interrupt,
 }
 
@@ -160,6 +165,10 @@ pub enum LoopEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WakeKind {
     Turn,
+    /// A deployment resumed the session's in-flight work: the first turn runs
+    /// the calls the plane left unanswered, and the ones after it are ordinary
+    /// turns.
+    Resume,
     UserMessage,
     ParentMessage,
 }
@@ -580,6 +589,7 @@ fn wake_of(session_id: &str, event: LoopEvent) -> Option<WakeKind> {
         LoopEvent::Wake => Some(WakeKind::Turn),
         LoopEvent::UserMessage => Some(WakeKind::UserMessage),
         LoopEvent::ParentMessage => Some(WakeKind::ParentMessage),
+        LoopEvent::Resume => Some(WakeKind::Resume),
         LoopEvent::Interrupt => {
             debug!(
                 msg = "ignoring interrupt: no turn is in flight",
@@ -679,10 +689,12 @@ async fn handle_wake(
     // children's failure reports wake it so it can re-decide them after a
     // crash. A user message or a parent's message_child is always let through
     // — those are the resume paths for an interrupted owner and an
-    // interrupted or stopped child.
+    // interrupted or stopped child. A deployment's resume is let through on the
+    // session it was sent for, and dropped if the session stopped or the user
+    // interrupted it first: a stop the user asked for outranks a restart.
     let stored = deps.store.get_session(session_id).await?;
     let blocked = stored.as_ref().is_some_and(|session| match wake {
-        WakeKind::Turn => {
+        WakeKind::Turn | WakeKind::Resume => {
             session.state == SessionState::Stopped
                 || (session.state == SessionState::Interrupted
                     && session.interrupt_cause != Some(InterruptCause::Crash))
@@ -748,6 +760,10 @@ async fn handle_wake(
     let mut window: Vec<(i64, Message)>;
     let mut live: Vec<LiveChild>;
     let mut refresh_newest: i64;
+    // A deployment's resume belongs to the wake's first turn: it runs the calls
+    // the plane left unanswered before the model is asked anything. Every turn
+    // after it is an ordinary one.
+    let mut resuming = wake == WakeKind::Resume;
     loop {
         // Each turn refreshes the window and the manifest from the store, so
         // an event or message that landed mid-wake is visible to the next
@@ -760,6 +776,8 @@ async fn handle_wake(
         let messages = deps.store.messages(session_id, true).await?;
         live = live_children(deps, session_id, state.handled_through, &messages).await?;
 
+        let resume = resuming.then(|| unanswered_calls(&window));
+        resuming = false;
         let signal = Arc::new(InterruptSignal::new());
         let outcome = {
             let mut turn = Box::pin(run_turn(
@@ -771,6 +789,7 @@ async fn handle_wake(
                 &signal,
                 wake_boundary,
                 consecutive_empty + 1,
+                resume,
             ));
             loop {
                 tokio::select! {
@@ -804,6 +823,13 @@ async fn handle_wake(
                                 session_id = %session_id
                             );
                             pending.push_back(WakeKind::UserMessage);
+                        }
+                        Some(LoopEvent::Resume) => {
+                            debug!(
+                                msg = "queuing a resume that arrived mid-turn",
+                                session_id = %session_id
+                            );
+                            pending.push_back(WakeKind::Resume);
                         }
                         None => return Ok(()),
                     },
@@ -902,6 +928,13 @@ async fn handle_wake(
                                     session_id = %session_id
                                 );
                                 pending.push_back(WakeKind::UserMessage);
+                            }
+                            Some(LoopEvent::Resume) => {
+                                debug!(
+                                    msg = "queuing a resume that arrived during the retry backoff",
+                                    session_id = %session_id
+                                );
+                                pending.push_back(WakeKind::Resume);
                             }
                             None => return Ok(()),
                         },
@@ -1072,6 +1105,14 @@ async fn handle_wake(
 pub const CRASH_FAILURE_TEXT: &str =
     "a crash stopped my turn and I am stopped; resume me or abandon me";
 
+/// The text a running child authors to its parent when a deployment replaced
+/// the control plane under it. Nothing failed, so it is a report and not a
+/// failure: a child does not continue on its own, and its interruption is its
+/// parent's to decide. The parent's re-decision resumes it with
+/// `message_child`, or abandons it, as it does for a crash.
+pub const RESTART_REPORT_TEXT: &str =
+    "the control plane was replaced while I was running, and I stopped; resume me or abandon me";
+
 /// Authors a child's event into its parent's thread — a completion report, a
 /// question to the parent, or a failure notice — and wakes the parent's loop.
 /// `origin` is the origin leaf an ask event carries (None for reports and
@@ -1241,6 +1282,7 @@ async fn run_turn(
     signal: &Arc<InterruptSignal>,
     wake_boundary: i64,
     empty_attempt: u32,
+    resume: Option<Vec<Call>>,
 ) -> TurnOutcome {
     match run_turn_inner(
         deps,
@@ -1251,6 +1293,7 @@ async fn run_turn(
         signal,
         wake_boundary,
         empty_attempt,
+        resume,
     )
     .await
     {
@@ -1533,6 +1576,7 @@ async fn run_turn_inner(
     signal: &Arc<InterruptSignal>,
     wake_boundary: i64,
     empty_attempt: u32,
+    resume: Option<Vec<Call>>,
 ) -> anyhow::Result<TurnOutcome> {
     let session = deps
         .store
@@ -1557,43 +1601,14 @@ async fn run_turn_inner(
     // plus the turn's own appends. `wake_boundary` is the wake's fixed
     // boundary: compaction may retire everything at or below it, but nothing
     // a mid-wake writer appended above it.
-    let messages: Vec<Message> = maybe_compact(
-        deps,
-        &turn,
-        session_id,
-        signal,
-        window,
-        wake_boundary,
-        ask_recipient,
-        state,
-    )
-    .await?;
-    // A successful ask's tool call has no tool result in the transcript — its
-    // Ask block replaced the result — so it is dropped from the window or the
-    // provider would reject the dangling tool_use on the next turn. A refused
-    // ask records an error tool result and its turn continues, so its tool
-    // call stays: the result needs its matching use or the provider rejects
-    // the dangling tool_result instead.
-    let ask_result_ids: Vec<String> = messages
-        .iter()
-        .filter_map(|message| match &message.block {
-            Block::ToolResult { id, name, .. } if name == "ask" => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    let messages: Vec<Message> = messages
-        .into_iter()
-        .filter(|message| {
-            !matches!(&message.block, Block::ToolCall { id, name, .. }
-                if name == "ask" && !ask_result_ids.contains(id))
-        })
-        .collect();
-    let messages = order_tool_exchange(messages);
-    let messages = answer_interrupted_tool_calls(messages);
-
-    // The two skill sources are fetched once per session and cached, so a
-    // turn does not round-trip for them. The on-demand `skill` read still
-    // goes to the executor when the model asks for a working-copy skill.
+    // The route of every advertised MCP tool, filled below and read by the
+    // dispatch to send a call back to the server that exposed it.
+    let mut mcp_routes: HashMap<String, (String, String)> = HashMap::new();
+    // The two skill sources are fetched once per session and cached, so a turn
+    // does not round-trip for them. The on-demand `skill` read still goes to the
+    // executor when the model asks for a working-copy skill. They are read by
+    // the dispatch, and a resumed turn reaches the dispatch without asking the
+    // model anything, so they are fetched before the resume match.
     if state.skills_cache.is_none() {
         state.skills_cache = Some(fetch_session_skills(deps, session_id).await);
     }
@@ -1609,218 +1624,273 @@ async fn run_turn_inner(
         .expect("populated above")
         .remote
         .clone();
-    // The system prompt advertises the union of both skill sources, never
-    // deduplicated by short name: a remote package whose name collides with a
-    // working-copy skill must stay discoverable under its full address.
-    let skills: Vec<Skill> = working_skills
-        .iter()
-        .chain(remote_skills.iter())
-        .cloned()
-        .collect();
-    // The repo-standard presence list is fetched once per session and cached,
-    // like the skills list: the working copy does not change mid-session, and
-    // the files' contents are read on demand with the file tools, so only the
-    // presence notice enters the system prompt.
-    if state.repo_standards_cache.is_none() {
-        let present = fetch_repo_standards(&*deps.tools, session_id)
-            .await
-            .unwrap_or_else(|error| {
-                warn!(
-                    msg = "failed to fetch repo standards from the node",
-                    session_id = %session_id,
-                    error = %error.display_chain()
-                );
-                Vec::new()
-            });
-        state.repo_standards_cache = Some(present);
-    }
-    let mut tools: Vec<ToolSpec> = canonical_tools(permission)
-        .into_iter()
-        .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
-        .filter(|tool| {
-            // The tree is recursive: any session may spawn children or message
-            // its own children, each level supervising its own. The machinery
-            // that starts or wakes child loops decides advertisement, not the
-            // session's depth. `todowrite` stays root-only: the user's todo
-            // list belongs to the tree owner, so children never see the tool.
-            match tool.name.as_str() {
-                "spawn" => !deps.personas.is_empty() && deps.spawner.is_some(),
-                "message_child" => deps.mailbox.is_some(),
-                "todowrite" => session.parent_id.is_none(),
-                _ => true,
-            }
-        })
-        .collect();
-    // The selected MCP servers' tools join the same list, so the provider
-    // adapters receive one finished surface. `mcp_routes` sends a call back
-    // to the server that exposed its name.
-    let mut mcp_routes: HashMap<String, (String, String)> = HashMap::new();
-    if let Some(mcp) = deps.mcp.as_deref() {
-        let names = parse_mcp_servers(&session.mcp_servers);
-        if !names.is_empty() {
-            let availability = mcp.servers(&names);
-            warn_unavailable_servers(deps, session_id, state, &availability).await?;
-            // Every canonical name is reserved, not only the names this
-            // session may call: the dispatch runs a canonical tool under its
-            // bare name, so an MCP tool that took one would never reach its
-            // server.
-            let reserved: Vec<String> = canonical_tools(Permission::ReadWrite)
-                .into_iter()
-                .map(|tool| tool.name)
+    // A resumed turn runs the calls the plane left unanswered instead of
+    // asking the model: the thread already holds those calls, so this turn
+    // records their results and ends as a tool-call turn, and the turn after
+    // it asks the model with the results in its window. With nothing
+    // unanswered it does nothing and the model turn follows at once: the work
+    // of a restart is the turn re-sent from the durable thread.
+    let calls: Vec<Call> = match resume {
+        Some(calls) => calls,
+        None => {
+            let messages: Vec<Message> = maybe_compact(
+                deps,
+                &turn,
+                session_id,
+                signal,
+                window,
+                wake_boundary,
+                ask_recipient,
+                state,
+            )
+            .await?;
+            // A successful ask's tool call has no tool result in the transcript — its
+            // Ask block replaced the result — so it is dropped from the window or the
+            // provider would reject the dangling tool_use on the next turn. A refused
+            // ask records an error tool result and its turn continues, so its tool
+            // call stays: the result needs its matching use or the provider rejects
+            // the dangling tool_result instead.
+            let ask_result_ids: Vec<String> = messages
+                .iter()
+                .filter_map(|message| match &message.block {
+                    Block::ToolResult { id, name, .. } if name == "ask" => Some(id.clone()),
+                    _ => None,
+                })
                 .collect();
-            let exposure = expose_mcp_tools(availability.servers, &reserved);
-            for advertised in exposure.advertised {
-                mcp_routes.insert(
-                    advertised.tool.name.clone(),
-                    (advertised.server, advertised.server_name),
-                );
-                tools.push(ToolSpec {
-                    name: advertised.tool.name,
-                    description: advertised.tool.description,
-                    schema: advertised.tool.schema,
-                });
+            let messages: Vec<Message> = messages
+                .into_iter()
+                .filter(|message| {
+                    !matches!(&message.block, Block::ToolCall { id, name, .. }
+                    if name == "ask" && !ask_result_ids.contains(id))
+                })
+                .collect();
+            let messages = order_tool_exchange(messages);
+            let messages = answer_interrupted_tool_calls(messages);
+
+            // The system prompt advertises the union of both skill sources, never
+            // deduplicated by short name: a remote package whose name collides with a
+            // working-copy skill must stay discoverable under its full address.
+            let skills: Vec<Skill> = working_skills
+                .iter()
+                .chain(remote_skills.iter())
+                .cloned()
+                .collect();
+            // The repo-standard presence list is fetched once per session and cached,
+            // like the skills list: the working copy does not change mid-session, and
+            // the files' contents are read on demand with the file tools, so only the
+            // presence notice enters the system prompt.
+            if state.repo_standards_cache.is_none() {
+                let present = fetch_repo_standards(&*deps.tools, session_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            msg = "failed to fetch repo standards from the node",
+                            session_id = %session_id,
+                            error = %error.display_chain()
+                        );
+                        Vec::new()
+                    });
+                state.repo_standards_cache = Some(present);
             }
-        }
-    }
+            let mut tools: Vec<ToolSpec> = canonical_tools(permission)
+                .into_iter()
+                .filter(|tool| tool_allowed(&allowed_tools, &tool.name))
+                .filter(|tool| {
+                    // The tree is recursive: any session may spawn children or message
+                    // its own children, each level supervising its own. The machinery
+                    // that starts or wakes child loops decides advertisement, not the
+                    // session's depth. `todowrite` stays root-only: the user's todo
+                    // list belongs to the tree owner, so children never see the tool.
+                    match tool.name.as_str() {
+                        "spawn" => !deps.personas.is_empty() && deps.spawner.is_some(),
+                        "message_child" => deps.mailbox.is_some(),
+                        "todowrite" => session.parent_id.is_none(),
+                        _ => true,
+                    }
+                })
+                .collect();
+            // The selected MCP servers' tools join the same list, so the provider
+            // adapters receive one finished surface. `mcp_routes` sends a call back
+            // to the server that exposed its name.
+            if let Some(mcp) = deps.mcp.as_deref() {
+                let names = parse_mcp_servers(&session.mcp_servers);
+                if !names.is_empty() {
+                    let availability = mcp.servers(&names);
+                    warn_unavailable_servers(deps, session_id, state, &availability).await?;
+                    // Every canonical name is reserved, not only the names this
+                    // session may call: the dispatch runs a canonical tool under its
+                    // bare name, so an MCP tool that took one would never reach its
+                    // server.
+                    let reserved: Vec<String> = canonical_tools(Permission::ReadWrite)
+                        .into_iter()
+                        .map(|tool| tool.name)
+                        .collect();
+                    let exposure = expose_mcp_tools(availability.servers, &reserved);
+                    for advertised in exposure.advertised {
+                        mcp_routes.insert(
+                            advertised.tool.name.clone(),
+                            (advertised.server, advertised.server_name),
+                        );
+                        tools.push(ToolSpec {
+                            name: advertised.tool.name,
+                            description: advertised.tool.description,
+                            schema: advertised.tool.schema,
+                        });
+                    }
+                }
+            }
 
-    let system = system_prompt(
-        persona_system_prompt(deps, &session),
-        state
-            .repo_standards_cache
-            .as_ref()
-            .expect("populated above"),
-        &skills,
-        // The persona catalog is advertised only to sessions whose surface
-        // includes `spawn`: it is the list of personas they may spawn.
-        tools
-            .iter()
-            .any(|tool| tool.name == "spawn")
-            .then(|| persona_catalog(deps)),
-    );
-    let context = session_context(&state.todos, live);
-    append_activity(
-        deps,
-        session_id,
-        ActivityPhase::RequestSent {
-            model: turn.provider.model().to_string(),
-            provider: turn.provider.name().to_string(),
-        },
-    )
-    .await?;
-    let request_started = Instant::now();
-    let mut stream = turn.provider.chat_stream(ProviderCall {
-        model: turn.provider.model(),
-        max_tokens: turn.provider.max_output_tokens(),
-        system: &system,
-        messages,
-        session_context: context.as_deref(),
-        tools,
-        ask_recipient,
-    })?;
-
-    let (text, reasoning, tool_calls, stopped, stop_reason) = match collect_stream(
-        &mut stream,
-        deps,
-        session_id,
-        signal,
-        &turn,
-        state,
-        request_started,
-    )
-    .await?
-    {
-        StreamEnd::Collected {
-            text,
-            reasoning,
-            tool_calls,
-            stopped,
-            stop_reason,
-        } => (text, reasoning, tool_calls, stopped, stop_reason),
-        StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
-        StreamEnd::Failed(error) => {
-            error!(
-                msg = "provider stream failed",
-                session_id = %session_id,
-                provider = %turn.provider.name(),
-                error = %error.display_chain()
+            let system = system_prompt(
+                persona_system_prompt(deps, &session),
+                state
+                    .repo_standards_cache
+                    .as_ref()
+                    .expect("populated above"),
+                &skills,
+                // The persona catalog is advertised only to sessions whose surface
+                // includes `spawn`: it is the list of personas they may spawn.
+                tools
+                    .iter()
+                    .any(|tool| tool.name == "spawn")
+                    .then(|| persona_catalog(deps)),
             );
-            return Ok(TurnOutcome::Failed);
+            let context = session_context(&state.todos, live);
+            append_activity(
+                deps,
+                session_id,
+                ActivityPhase::RequestSent {
+                    model: turn.provider.model().to_string(),
+                    provider: turn.provider.name().to_string(),
+                },
+            )
+            .await?;
+            let request_started = Instant::now();
+            let mut stream = turn.provider.chat_stream(ProviderCall {
+                model: turn.provider.model(),
+                max_tokens: turn.provider.max_output_tokens(),
+                system: &system,
+                messages,
+                session_context: context.as_deref(),
+                tools,
+                ask_recipient,
+            })?;
+
+            let (text, reasoning, tool_calls, stopped, stop_reason) = match collect_stream(
+                &mut stream,
+                deps,
+                session_id,
+                signal,
+                &turn,
+                state,
+                request_started,
+            )
+            .await?
+            {
+                StreamEnd::Collected {
+                    text,
+                    reasoning,
+                    tool_calls,
+                    stopped,
+                    stop_reason,
+                } => (text, reasoning, tool_calls, stopped, stop_reason),
+                StreamEnd::Interrupted => return Ok(TurnOutcome::Interrupted),
+                StreamEnd::Failed(error) => {
+                    error!(
+                        msg = "provider stream failed",
+                        session_id = %session_id,
+                        provider = %turn.provider.name(),
+                        error = %error.display_chain()
+                    );
+                    return Ok(TurnOutcome::Failed);
+                }
+            };
+
+            if !stopped {
+                error!(
+                    msg = "provider stream ended without a stop event",
+                    session_id = %session_id,
+                    provider = %turn.provider.name()
+                );
+                return Ok(TurnOutcome::Failed);
+            }
+
+            // Recorded before the reply and the tool calls, so serialization can
+            // replay it onto every assistant message this completion produced.
+            if !reasoning.is_empty() {
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::Assistant,
+                    &Block::Reasoning { text: reasoning },
+                )
+                .await?;
+            }
+
+            if !text.is_empty() {
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::Assistant,
+                    &Block::Text { text: text.clone() },
+                )
+                .await?;
+            }
+
+            let calls: Vec<Call> = parse_tool_calls(tool_calls, session_id);
+
+            if calls.is_empty() {
+                if text.is_empty() {
+                    warn!(
+                        msg = empty_outcome_message(stop_reason),
+                        session_id = %session_id,
+                        provider = %turn.provider.name(),
+                        model = %turn.provider.model(),
+                        empty_attempt = empty_attempt,
+                    );
+                    return Ok(TurnOutcome::Empty {
+                        reason: stop_reason,
+                    });
+                }
+                return Ok(TurnOutcome::Finished { text });
+            }
+            calls
         }
     };
 
-    if !stopped {
-        error!(
-            msg = "provider stream ended without a stop event",
-            session_id = %session_id,
-            provider = %turn.provider.name()
-        );
-        return Ok(TurnOutcome::Failed);
-    }
-
-    // Recorded before the reply and the tool calls, so serialization can
-    // replay it onto every assistant message this completion produced.
-    if !reasoning.is_empty() {
-        record_in_wake(
-            deps,
-            session_id,
-            window,
-            Role::Assistant,
-            &Block::Reasoning { text: reasoning },
-        )
-        .await?;
-    }
-
-    if !text.is_empty() {
-        record_in_wake(
-            deps,
-            session_id,
-            window,
-            Role::Assistant,
-            &Block::Text { text: text.clone() },
-        )
-        .await?;
-    }
-
-    let calls: Vec<(String, String, Value)> = parse_tool_calls(tool_calls, session_id);
-
-    if calls.is_empty() {
-        if text.is_empty() {
-            warn!(
-                msg = empty_outcome_message(stop_reason),
-                session_id = %session_id,
-                provider = %turn.provider.name(),
-                model = %turn.provider.model(),
-                empty_attempt = empty_attempt,
-            );
-            return Ok(TurnOutcome::Empty {
-                reason: stop_reason,
-            });
-        }
-        return Ok(TurnOutcome::Finished { text });
-    }
-
-    for (index, (id, name, args)) in calls.into_iter().enumerate() {
+    for (index, call) in calls.into_iter().enumerate() {
+        let Call {
+            id,
+            name,
+            args,
+            recorded,
+        } = call;
         // Commit each tool call to the transcript just before dispatching it,
         // so calls after an ask or a mid-turn interrupt never leave a phantom
         // tool_use without a result. Every call after the first is marked as
         // part of this completion, so serialization can send the completion
-        // back as one assistant message.
-        record_in_wake(
-            deps,
-            session_id,
-            window,
-            Role::Assistant,
-            &Block::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                args: args.clone(),
-                continues_completion: index > 0,
-            },
-        )
-        .await?;
-        deps.store
-            .append_tool_call(session_id, &id, &name, &args)
+        // back as one assistant message. A re-issued call is in the transcript
+        // already: it was committed before it was first dispatched, and only
+        // its result is new.
+        if !recorded {
+            record_in_wake(
+                deps,
+                session_id,
+                window,
+                Role::Assistant,
+                &Block::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    continues_completion: index > 0,
+                },
+            )
             .await?;
+            deps.store
+                .append_tool_call(session_id, &id, &name, &args)
+                .await?;
+        }
 
         // The session's allowed-tool set is the second half of its canonical
         // surface (the executor enforces the permission); a canonical call
@@ -2924,7 +2994,7 @@ fn truncate_mcp_text(text: &str) -> String {
 fn parse_tool_calls(
     tool_calls: BTreeMap<usize, AccumulatedToolCall>,
     session_id: &str,
-) -> Vec<(String, String, Value)> {
+) -> Vec<Call> {
     tool_calls
         .into_iter()
         .map(|(index, call)| {
@@ -2947,7 +3017,53 @@ fn parse_tool_calls(
                     has_name = !name.is_empty(),
                 );
             }
-            (id, name, args)
+            Call {
+                id,
+                name,
+                args,
+                recorded: false,
+            }
+        })
+        .collect()
+}
+
+/// One tool call a turn runs: the id the provider gave it, the tool's name, its
+/// arguments, and whether the thread already holds the call. A call a resumed
+/// turn re-issues is recorded already — the plane wrote it before dispatching it
+/// and stopped before the result — so that turn adds only the result.
+struct Call {
+    id: String,
+    name: String,
+    args: Value,
+    recorded: bool,
+}
+
+/// The calls a resumed turn runs again: every tool call the thread holds without
+/// a result, in the order it holds them. A call whose `ask` became a question is
+/// not one of them — the question is live, not interrupted — and a call whose
+/// result is stored is not either: the plane wrote the result before it stopped.
+fn unanswered_calls(window: &[(i64, Message)]) -> Vec<Call> {
+    let answered: HashSet<&str> = window
+        .iter()
+        .filter_map(|(_, message)| match &message.block {
+            Block::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    window
+        .iter()
+        .filter_map(|(_, message)| match &message.block {
+            Block::ToolCall { id, name, args, .. }
+                if name != "ask" && !answered.contains(id.as_str()) =>
+            {
+                Some(Call {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    recorded: true,
+                })
+            }
+            _ => None,
         })
         .collect()
 }
@@ -18782,5 +18898,294 @@ mod tests {
         );
 
         handle.stop();
+    }
+    // A deployment resumes the work its restart cut off. The control plane wakes
+    // the session once; the loop runs the calls the thread left unanswered
+    // before it asks the model anything, and re-sends the turn when there are
+    // none.
+
+    /// A session whose thread ends on a call with nothing answering it: the
+    /// plane wrote the call before dispatching it and stopped before the result.
+    async fn store_a_dangling_call(store: &Store, session_id: &str, name: &str) {
+        store
+            .append_message(
+                session_id,
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                Role::Assistant,
+                &Block::ToolCall {
+                    id: "call-1".into(),
+                    name: name.into(),
+                    args: json!({ "command": "make" }),
+                    continues_completion: false,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resume_wake_reissues_the_unanswered_call_before_the_completion() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-resume")).await.unwrap();
+        store_a_dangling_call(&store, "s-resume", "shell").await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("the result is in".into()),
+            stop(1, 1),
+        ]]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-resume".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-resume").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let reissued: Vec<String> = tools
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.name == "shell")
+            .map(|call| {
+                call.args["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            reissued,
+            ["make"],
+            "the unanswered call is dispatched again, with the arguments the thread holds"
+        );
+        let calls = provider.captured_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the model is asked once, after the re-issue"
+        );
+        assert!(
+            calls[0].messages.iter().any(|message| matches!(
+                &message.block,
+                Block::ToolResult { id, is_error, .. } if id == "call-1" && !is_error
+            )),
+            "the result is in the request, so the model reads it: {:?}",
+            request_texts(&calls[0])
+        );
+        assert_eq!(
+            store
+                .messages("s-resume", true)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|(_, message)| matches!(&message.block, Block::ToolCall { .. }))
+                .count(),
+            1,
+            "the re-issued call is the one the thread already held, not a second call"
+        );
+        assert_eq!(
+            request_texts(&calls[0]),
+            [
+                "start",
+                "tool call shell (id call-1): {\"command\":\"make\"}",
+                "tool result shell (id call-1, is_error false): {\"ok\":true}",
+            ],
+            "the request holds the call and its result, in that order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_wake_with_nothing_unanswered_resends_the_turn() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-resume")).await.unwrap();
+        store
+            .append_message(
+                "s-resume",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("carrying on".into()),
+            stop(1, 1),
+        ]]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-resume".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-resume").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            !tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.name == "shell"),
+            "nothing was unanswered, so no tool runs again"
+        );
+        let calls = provider.captured_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            request_texts(&calls[0]),
+            ["start"],
+            "the work of a restart with nothing unanswered is the turn re-sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_wake_does_not_reissue_a_live_question() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-ask")).await.unwrap();
+        // A successful ask replaces its result with the question, so its call
+        // has no result: the question is live, and asking it again would ask it
+        // twice.
+        store_a_dangling_call(&store, "s-ask", "ask").await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("still waiting".into()),
+            stop(1, 1),
+        ]]));
+        let tools = Arc::new(MockTools::new(default_outcome()));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            tools.clone(),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-ask".into(), deps);
+
+        handle.send(LoopEvent::Resume);
+
+        wait_for("the resumed wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s-ask").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            !tools
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.name == "ask"),
+            "a live question is not re-issued: it is still the question the session waits on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_wake_does_not_start_an_interrupted_session() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let mut interrupted = session("s-interrupted");
+        interrupted.state = SessionState::Interrupted;
+        interrupted.interrupt_cause = Some(InterruptCause::User);
+        store.create_session(&interrupted).await.unwrap();
+        store
+            .append_message(
+                "s-interrupted",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("resumed by the user".into()),
+            stop(1, 1),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-interrupted".into(), deps);
+
+        // The resume is queued first and must be dropped; the user's own
+        // message is the one that runs a turn.
+        handle.send(LoopEvent::Resume);
+        handle.send(LoopEvent::UserMessage);
+
+        wait_for("the user's turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store
+                        .get_session("s-interrupted")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            provider.captured_calls().len(),
+            1,
+            "a deployment does not overrule the user's interrupt: the resume ran nothing"
+        );
     }
 }

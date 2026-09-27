@@ -156,6 +156,17 @@ impl AgentRegistry {
         }
     }
 
+    /// Resumes a session whose work a control-plane restart cut off: its loop
+    /// runs the calls its thread left unanswered before it asks the model
+    /// again. The control plane sends this once per session per boot — a
+    /// session that crashes the plane is resumed again by the next one — and a
+    /// node never sends it: a node waits for the re-issue.
+    pub fn resume(&self, session_id: &str) {
+        if let Some(handle) = self.loops.read().unwrap().get(session_id) {
+            handle.send(LoopEvent::Resume);
+        }
+    }
+
     pub fn subscribe(&self, session_id: &str) -> Option<broadcast::Receiver<String>> {
         self.live
             .read()

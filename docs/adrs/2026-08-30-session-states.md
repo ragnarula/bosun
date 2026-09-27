@@ -4,6 +4,8 @@
 **Author:** Raghav
 
 > Relaxed by sprint 005 (S8, `../sprints/005-agent-tree.md`) for the crash cause: a crash-interrupted session may run a re-decision turn after boot recovery, woken by its children's failure reports, where this ADR says no turn starts until the user sends a message. User-interrupted sessions still hold until the user acts. The final ADR for sprint 005 records this.
+>
+> Superseded in part by `2026-09-27-deploy-resume.md`: a deployment does not mark a session that was running. It keeps `running`, is woken once, and re-runs the work its thread names, so the sentence below that on boot the control plane marks every `running` or `creating` session interrupted, and the consequence that an interrupted turn is never replayed, now hold for a `creating` session, for a running session whose model is no longer configured, for an operator's interrupt and for a real crash. A `waiting_for_input` session is untouched by a deployment, and a user-interrupted session still holds until the user acts.
 
 ## Context
 

@@ -9,6 +9,8 @@
 >
 > Superseded in part by `2026-09-26-session-context-after-the-thread.md`: the manifest of live children no longer sits in the system prompt. It is in the session context block that follows the thread on every request. What the manifest lists, and when a child enters and leaves it, stand.
 >
+> Superseded in part by `2026-09-27-deploy-resume.md`: a child that was running when a deployment replaced the control plane reports the restart to its parent as a report, not a failure, and waits for the parent's re-decision, where this ADR's crash rule has a restart authoring a failure. A crash-interrupted child authors the failure event as before, and the parent's re-decision is the same flow for both.
+>
 > Superseded in part by `2026-09-27-cross-node-children.md`: `spawn(persona, instructions)` starts the child on the parent's node and working copy only when the caller names no node. A caller may name any registered node that is up, and a directory on that node or none. A read-only session no longer spawns at all, so the sentence below that a read-only root may spawn a read-write child when the child's persona declares it no longer holds. The tree, persona, ask-gating, communication and transport decisions stand.
 
 ## Context

@@ -29,6 +29,7 @@ use axum::routing::post;
 use bosun_agent::agent_loop::CRASH_FAILURE_TEXT;
 use bosun_agent::agent_loop::LoopEvent;
 use bosun_agent::agent_loop::LoopMailbox;
+use bosun_agent::agent_loop::RESTART_REPORT_TEXT;
 use bosun_agent::agent_loop::author_child_event;
 use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
@@ -323,32 +324,71 @@ pub async fn recover(state: &AppState) {
             return;
         }
     };
+    // A session that was running when the plane stopped keeps running: nothing
+    // is marked, and it is woken once below to re-run what the restart cut off —
+    // the calls its thread left unanswered, or the turn itself. A deployment is
+    // not an interruption the session has to be told about.
+    //
+    // A running child does not continue on its own: its interruption is its
+    // parent's to decide, so it reports the restart and waits, and the parent's
+    // re-decision resumes it or abandons it. A `creating` session ran nothing,
+    // and a running session whose model is no longer configured has no loop to
+    // run: both keep the crash rule.
+    let mut resuming = Vec::new();
+    let mut restarted_children = Vec::new();
     let mut crashed_children = Vec::new();
     for session in &sessions {
-        if matches!(
-            session.state,
-            SessionState::Running | SessionState::Creating
-        ) {
-            if let Err(error) = state
-                .store
-                .mark_interrupted(&session.id, InterruptCause::Crash)
-                .await
-            {
-                warn!(
+        let runnable = state.providers.contains_key(&session.model);
+        match session.state {
+            SessionState::Running if runnable && session.parent_id.is_none() => {
+                info!(
                     session_id = %session.id,
-                    error = %error.display_chain(),
-                    "failed to mark the session interrupted"
+                    "resuming the session a restart interrupted"
                 );
-                continue;
+                resuming.push(session.id.clone());
             }
-            info!(
-                session_id = %session.id,
-                from = ?session.state,
-                "session interrupted by control-plane restart"
-            );
-            if session.parent_id.is_some() {
-                crashed_children.push(session.id.clone());
+            SessionState::Running if runnable => {
+                if let Err(error) = state
+                    .store
+                    .set_state(&session.id, SessionState::WaitingForInput)
+                    .await
+                {
+                    warn!(
+                        session_id = %session.id,
+                        error = %error.display_chain(),
+                        "failed to park the child after a restart"
+                    );
+                    continue;
+                }
+                info!(
+                    session_id = %session.id,
+                    "child reports the restart to its parent"
+                );
+                restarted_children.push(session.id.clone());
             }
+            SessionState::Running | SessionState::Creating => {
+                if let Err(error) = state
+                    .store
+                    .mark_interrupted(&session.id, InterruptCause::Crash)
+                    .await
+                {
+                    warn!(
+                        session_id = %session.id,
+                        error = %error.display_chain(),
+                        "failed to mark the session interrupted"
+                    );
+                    continue;
+                }
+                info!(
+                    session_id = %session.id,
+                    from = ?session.state,
+                    "session interrupted by control-plane restart"
+                );
+                if session.parent_id.is_some() {
+                    crashed_children.push(session.id.clone());
+                }
+            }
+            _ => {}
         }
     }
     for session in &sessions {
@@ -368,6 +408,22 @@ pub async fn recover(state: &AppState) {
             );
         }
     }
+    // One wake per session per boot: a session that keeps crashing the plane
+    // re-runs on each boot, and nothing else bounds the resume.
+    for session_id in &resuming {
+        state.loops.resume(session_id);
+    }
+    for child_id in &restarted_children {
+        let _ = author_child_event(
+            &state.store,
+            Some(&*state.loops as &dyn LoopMailbox),
+            child_id,
+            ChildEventKind::Report,
+            RESTART_REPORT_TEXT.to_string(),
+            None,
+        )
+        .await;
+    }
     for child_id in &crashed_children {
         // A missing parent and a refused append are handled inside
         // `author_child_event`, which returns Ok for both, so nothing is left
@@ -382,7 +438,11 @@ pub async fn recover(state: &AppState) {
         )
         .await;
     }
-    info!(count = sessions.len(), "recovered sessions");
+    info!(
+        count = sessions.len(),
+        resuming = resuming.len(),
+        "recovered sessions"
+    );
 }
 
 /// The paths the router serves at a fixed location. The OAuth callback must
@@ -2301,76 +2361,6 @@ mod tests {
             Err(ApiError::PersonaModelNotFound { persona, model })
                 if persona == "coder" && model == "ghost"
         ));
-    }
-
-    #[tokio::test]
-    async fn recover_marks_running_and_creating_interrupted() {
-        let dir = tempdir().unwrap();
-        let state = test_state(&dir);
-        let mut running = session("running");
-        running.state = SessionState::Running;
-        let mut creating = session("creating");
-        creating.state = SessionState::Creating;
-        let mut waiting = session("waiting");
-        waiting.state = SessionState::WaitingForInput;
-        state.store.create_session(&running).await.unwrap();
-        state.store.create_session(&creating).await.unwrap();
-        state.store.create_session(&waiting).await.unwrap();
-
-        recover(&state).await;
-
-        assert_eq!(
-            state
-                .store
-                .get_session("running")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            SessionState::Interrupted
-        );
-        assert_eq!(
-            state
-                .store
-                .get_session("running")
-                .await
-                .unwrap()
-                .unwrap()
-                .interrupt_cause,
-            Some(InterruptCause::Crash),
-            "a boot-time interruption is recorded as a crash"
-        );
-        assert_eq!(
-            state
-                .store
-                .get_session("creating")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            SessionState::Interrupted
-        );
-        assert_eq!(
-            state
-                .store
-                .get_session("waiting")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            SessionState::WaitingForInput
-        );
-        assert_eq!(
-            state
-                .store
-                .get_session("waiting")
-                .await
-                .unwrap()
-                .unwrap()
-                .interrupt_cause,
-            None,
-            "a session that was not mid-flight is not interrupted"
-        );
     }
 
     #[tokio::test]
@@ -6879,11 +6869,266 @@ mod tests {
         assert_eq!(root.state, SessionState::WaitingForInput);
     }
 
+    /// A control-plane state for recovery tests: a scripted provider that counts
+    /// its requests, the persona its sessions need, and the store. A session
+    /// whose model is one of these has a loop `recover` can start, which is what
+    /// makes it resumable.
+    async fn recovery_state(
+        dir: &tempfile::TempDir,
+        scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
+    ) -> (Arc<AppState>, Arc<AtomicUsize>) {
+        let (addr, requests) = delayed_scripted_provider(scripts, Duration::ZERO).await;
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let node_timeout = Duration::from_secs(4);
+        let nodes = Arc::new(NodeRegistry::new(node_timeout));
+        let commands = Arc::new(CommandQueue::new(node_timeout));
+        let tunnels = Arc::new(TunnelRegistry::new());
+        let providers = HashMap::from([(
+            "main-model".to_string(),
+            openai_provider_with_model(addr, "main-model"),
+        )]);
+        let personas = HashMap::from([(
+            "coder".to_string(),
+            PersonaConfig {
+                model: "main-model".into(),
+                permission: Permission::ReadWrite,
+                allowed_tools: "*".into(),
+                description: "Makes changes".into(),
+                system_prompt: None,
+            },
+        )]);
+        let loops = Arc::new(AgentRegistry::new(
+            providers.clone(),
+            personas.clone(),
+            HashMap::new(),
+        ));
+        let state = Arc::new(AppState {
+            registry: nodes.clone(),
+            commands: commands.clone(),
+            tunnels: tunnels.clone(),
+            store: store.clone(),
+            github: dead_github(),
+            loops,
+            providers,
+            personas,
+            default_persona: Some("coder".into()),
+            oauth_redirect_uri: None,
+            mcp: idle_mcp(&store),
+            mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+        });
+        (state, requests)
+    }
+
+    /// A session on the recovery state's model, in `state`\'s state.\n
+    fn recoverable_session(id: &str, state: SessionState) -> Session {
+        let mut session = session(id);
+        session.model = "main-model".into();
+        session.state = state;
+        session
+    }
+
+    #[tokio::test]
+    async fn recover_resumes_a_running_session_without_marking_it() {
+        let dir = tempdir().unwrap();
+        let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![text_chunk(
+            "carried on",
+        )]])));
+        let (state, requests) = recovery_state(&dir, scripts).await;
+        state
+            .store
+            .create_session(&recoverable_session("running", SessionState::Running))
+            .await
+            .unwrap();
+        state
+            .store
+            .append_message(
+                "running",
+                Role::User,
+                &Block::Text {
+                    text: "carry on".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        recover(&state).await;
+
+        // The resume is the turn re-sent from the durable thread: the model is
+        // asked once, and the session is never marked.
+        wait_for("the resumed turn to end", {
+            let store = state.store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("running").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "one wake per session per boot: the resumed session asks the model once"
+        );
+        let stored = state.store.get_session("running").await.unwrap().unwrap();
+        assert_eq!(
+            stored.interrupt_cause, None,
+            "a deployment records no cause, because nothing was interrupted"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_marks_only_what_has_no_work_to_resume() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        // This state has no providers, so a running session has no loop to
+        // resume: the crash rule is what is left for it.
+        let mut unconfigured = session("unconfigured");
+        unconfigured.state = SessionState::Running;
+        state.store.create_session(&unconfigured).await.unwrap();
+        state
+            .store
+            .create_session(&{
+                let mut creating = session("creating");
+                creating.state = SessionState::Creating;
+                creating
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .create_session(&{
+                let mut waiting = session("waiting");
+                waiting.state = SessionState::WaitingForInput;
+                waiting
+            })
+            .await
+            .unwrap();
+
+        recover(&state).await;
+
+        let creating = state.store.get_session("creating").await.unwrap().unwrap();
+        assert_eq!(
+            creating.state,
+            SessionState::Interrupted,
+            "a creating session ran nothing, so it keeps today\'s crash rule"
+        );
+        assert_eq!(creating.interrupt_cause, Some(InterruptCause::Crash));
+        let waiting = state.store.get_session("waiting").await.unwrap().unwrap();
+        assert_eq!(
+            waiting.state,
+            SessionState::WaitingForInput,
+            "a waiting session is untouched by a deployment"
+        );
+        assert_eq!(waiting.interrupt_cause, None);
+        let unconfigured = state
+            .store
+            .get_session("unconfigured")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unconfigured.state,
+            SessionState::Interrupted,
+            "a running session whose model is no longer configured has nothing to run"
+        );
+        assert_eq!(unconfigured.interrupt_cause, Some(InterruptCause::Crash));
+    }
+
+    #[tokio::test]
+    async fn recover_parks_a_running_child_and_its_parent_decides() {
+        let dir = tempdir().unwrap();
+        // The parent's own turn, and then the child's resumption: the parent
+        // decides over the restart by messaging the child back.
+        let scripts = Arc::new(Mutex::new(VecDeque::from(vec![
+            vec![tool_call_fragment(
+                "call-1",
+                "message_child",
+                r#"{"id":"child-1","text":"carry on"}"#,
+            )],
+            vec![text_chunk("carrying on")],
+        ])));
+        let (state, requests) = recovery_state(&dir, scripts).await;
+        state
+            .store
+            .create_session(&recoverable_session(
+                "parent-1",
+                SessionState::WaitingForInput,
+            ))
+            .await
+            .unwrap();
+        let mut child = recoverable_session("child-1", SessionState::Running);
+        child.parent_id = Some("parent-1".into());
+        child.owner_id = "parent-1".into();
+        state.store.create_session(&child).await.unwrap();
+
+        recover(&state).await;
+
+        let stored = state.store.get_session("child-1").await.unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::WaitingForInput,
+            "a running child does not continue on its own: it waits for its parent"
+        );
+        assert_eq!(stored.interrupt_cause, None, "and nothing is marked");
+        let report = state
+            .store
+            .messages("parent-1", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|(_, message)| match &message.block {
+                Block::ChildEvent {
+                    child_id,
+                    kind,
+                    text,
+                    ..
+                } if child_id == "child-1" => Some((*kind, text.clone())),
+                _ => None,
+            })
+            .expect("the child reports the restart to its parent");
+        assert_eq!(
+            report.0,
+            ChildEventKind::Report,
+            "the restart reads as a report, not a failure: nothing failed"
+        );
+        assert_eq!(report.1, RESTART_REPORT_TEXT);
+
+        // The parent decides: its turn messages the child back, which resumes it.
+        wait_for("the parent's decision to resume the child", {
+            let store = state.store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store
+                        .messages("child-1", true)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|(_, message)| matches!(&message.block, Block::Text { text } if text == "carry on"))
+                }
+            }
+        })
+        .await;
+        wait_for("the child's resumed turn", {
+            let requests = requests.clone();
+            move || {
+                let requests = requests.clone();
+                async move { requests.load(Ordering::Relaxed) == 2 }
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn recover_reports_crash_interrupted_children_and_the_parent_rededicides_each() {
-        // Pre-boot rows: the whole tree was mid-flight when the control plane
-        // died — root, child-a, and child-b running; child-c had already been
-        // stopped by the user and must author nothing on recovery.
+        // Pre-boot rows. The root waits for input, so the deployment leaves it
+        // alone and its children's events wake it. child-a and child-b were
+        // still being created when the plane died, so they ran nothing and keep
+        // the crash rule; child-c had already been stopped by the user and must
+        // author nothing on recovery. A child that was *running* is a different
+        // case, tested below: it reports the restart rather than failing.
         let root_scripts: Arc<Mutex<VecDeque<Vec<Value>>>> =
             Arc::new(Mutex::new(VecDeque::from(vec![
                 // The root's re-decision wake surfaces both failure events,
@@ -6908,15 +7153,15 @@ mod tests {
         let mut root = session("root-s8c");
         root.model = "root-model".into();
         root.persona = None;
-        root.state = SessionState::Running;
+        root.state = SessionState::WaitingForInput;
         let mut a = child_session("child-s8c-a", "root-s8c");
         a.model = "a-model".into();
         a.persona = None;
-        a.state = SessionState::Running;
+        a.state = SessionState::Creating;
         let mut b = child_session("child-s8c-b", "root-s8c");
         b.model = "b-model".into();
         b.persona = None;
-        b.state = SessionState::Running;
+        b.state = SessionState::Creating;
         let mut c = child_session("child-s8c-c", "root-s8c");
         c.model = "c-model".into();
         c.persona = None;
