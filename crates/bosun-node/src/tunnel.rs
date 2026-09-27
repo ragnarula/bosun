@@ -515,7 +515,7 @@ mod tests {
             manager
                 .start(&NodeStartRequest {
                     session_id: (*session_id).into(),
-                    dir,
+                    dir: Some(dir),
                     permission: Permission::ReadWrite,
                 })
                 .await

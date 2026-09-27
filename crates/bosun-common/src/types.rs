@@ -97,14 +97,16 @@ pub enum NodeCommand {
         permission: Permission,
     },
     /// Start a session executor in a directory that already exists on the
-    /// node. Only the control plane's child-session spawner sends this: the
-    /// directory is the parent session's working copy. The node confines the
-    /// directory to its browse roots exactly like `Dev`, because a spawned
-    /// child's executor holds the same shell and file access as any session's.
+    /// node, or in a fresh directory under the node's work directory when the
+    /// caller names none. Only the control plane's child-session spawner
+    /// sends this. A named directory is confined to the node's browse roots
+    /// exactly like `Dev`, because a spawned child's executor holds the same
+    /// shell and file access as any session's; a fresh one is the node's own
+    /// choice and needs no root, like `Clone`.
     Start {
         id: u64,
         session_id: String,
-        dir: PathBuf,
+        dir: Option<PathBuf>,
         permission: Permission,
     },
     Dirs {
@@ -238,7 +240,9 @@ pub struct NodeDevRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeStartRequest {
     pub session_id: String,
-    pub dir: PathBuf,
+    /// The directory the caller named, or `None` for the node to choose one
+    /// under its own work directory.
+    pub dir: Option<PathBuf>,
     pub permission: Permission,
 }
 
@@ -475,7 +479,7 @@ mod tests {
         let command = NodeCommand::Start {
             id: 9,
             session_id: "child-1".into(),
-            dir: "/work/repo".into(),
+            dir: Some("/work/repo".into()),
             permission: Permission::ReadOnly,
         };
         let json = serde_json::to_value(&command).unwrap();
@@ -495,8 +499,25 @@ mod tests {
             panic!("the command must stay a start");
         };
         assert_eq!(session_id, "child-1");
-        assert_eq!(dir, PathBuf::from("/work/repo"));
+        assert_eq!(dir, Some(PathBuf::from("/work/repo")));
         assert_eq!(permission, Permission::ReadOnly);
+    }
+
+    #[test]
+    fn start_command_without_a_dir_asks_the_node_to_choose_one() {
+        let command = NodeCommand::Start {
+            id: 10,
+            session_id: "child-2".into(),
+            dir: None,
+            permission: Permission::ReadWrite,
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert!(json["dir"].is_null());
+        let decoded: NodeCommand = serde_json::from_value(json).unwrap();
+        let NodeCommand::Start { dir, .. } = decoded else {
+            panic!("the command must stay a start");
+        };
+        assert_eq!(dir, None, "a null dir is the node's own placement to make");
     }
 
     #[test]

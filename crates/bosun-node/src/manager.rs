@@ -160,20 +160,34 @@ impl NodeManager {
     }
 
     /// Starts a session executor in a directory that already exists on the
-    /// node. Only the control plane's child-session spawner calls this: the
-    /// directory is the parent session's working copy. A spawned child's
-    /// executor holds the same shell and file access as any session's, so the
-    /// directory is confined to the configured browse roots exactly like a
-    /// `dev` session's directory; clone-session parents live under
-    /// `work_dir/<session_id>`, so a root must cover the node's `work_dir`
-    /// for their children to start.
+    /// node, or in a fresh directory under the node's work directory when the
+    /// caller names none. Only the control plane's child-session spawner calls
+    /// this. A named directory is confined to the configured browse roots
+    /// exactly like a `dev` session's directory, because a spawned child's
+    /// executor holds the same shell and file access as any session's; the
+    /// node's own work directory needs no root, exactly as a clone's does.
     pub async fn start(&self, req: &NodeStartRequest) -> Result<SessionRecord, NodeError> {
-        let dir = resolve_within_roots(&self.browse_roots, &req.dir)?;
+        let (dir, reapable) = match &req.dir {
+            Some(dir) => (resolve_within_roots(&self.browse_roots, dir)?, false),
+            None => (self.fresh_work_dir(&req.session_id).await?, true),
+        };
         let record = self
-            .start_in_dir(&req.session_id, &dir, false, None, None, req.permission)
+            .start_in_dir(&req.session_id, &dir, reapable, None, None, req.permission)
             .await?;
-        info!(session_id = %req.session_id, dir = %record.dir.display(), "session started in existing dir");
+        info!(session_id = %req.session_id, dir = %record.dir.display(), reapable, "session started");
         Ok(record)
+    }
+
+    /// A directory the node picks for a session the caller did not place: its
+    /// own work directory, named after the session. The node owns it, so it
+    /// goes when the session stops, and boot restore finds it the same way it
+    /// finds a clone's.
+    async fn fresh_work_dir(&self, session_id: &str) -> Result<PathBuf, NodeError> {
+        let dir = self.work_dir.join(session_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("failed to create session dir {}", dir.display()))?;
+        Ok(dir)
     }
 
     async fn start_in_dir(
@@ -523,7 +537,7 @@ mod tests {
         manager
             .start(&NodeStartRequest {
                 session_id: session_id.into(),
-                dir: dir.to_path_buf(),
+                dir: Some(dir.to_path_buf()),
                 permission: Permission::ReadWrite,
             })
             .await
@@ -830,7 +844,7 @@ mod tests {
         let missing = manager
             .start(&NodeStartRequest {
                 session_id: "s1".into(),
-                dir: work.path().join("missing"),
+                dir: Some(work.path().join("missing")),
                 permission: Permission::ReadWrite,
             })
             .await
@@ -843,7 +857,7 @@ mod tests {
         let err = manager
             .start(&NodeStartRequest {
                 session_id: "s2".into(),
-                dir: outside.path().to_path_buf(),
+                dir: Some(outside.path().to_path_buf()),
                 permission: Permission::ReadWrite,
             })
             .await
@@ -855,7 +869,7 @@ mod tests {
         let err = manager
             .start(&NodeStartRequest {
                 session_id: "s3".into(),
-                dir: file,
+                dir: Some(file),
                 permission: Permission::ReadWrite,
             })
             .await
@@ -865,9 +879,10 @@ mod tests {
 
     #[tokio::test]
     async fn start_without_browse_roots_refuses_an_existing_dir() {
-        // A spawned child's executor has full shell and file access, so a node
-        // without browse roots refuses to run one anywhere: the roots gate
-        // applies to `start` exactly as it does to `dev`.
+        // A directory the caller names is the caller's, and a spawned child's
+        // executor holds full shell and file access, so a node without browse
+        // roots refuses a named directory exactly as `dev` does. The directory
+        // the node chooses for itself needs no root.
         let work = tempdir().unwrap();
         let session_dir = work.path().join("repo");
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -881,12 +896,64 @@ mod tests {
         let err = manager
             .start(&NodeStartRequest {
                 session_id: "s1".into(),
-                dir: session_dir,
+                dir: Some(session_dir),
                 permission: Permission::ReadWrite,
             })
             .await
             .unwrap_err();
         assert!(matches!(err, NodeError::NoBrowseRoots));
+    }
+
+    #[tokio::test]
+    async fn start_without_a_directory_makes_one_under_the_work_dir() {
+        let work = tempdir().unwrap();
+        let manager = manager(&work);
+
+        let record = manager
+            .start(&NodeStartRequest {
+                session_id: "child-1".into(),
+                dir: None,
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .expect("the node chooses a directory when the caller names none");
+
+        let chosen = work.path().join("child-1");
+        assert_eq!(
+            record.dir, chosen,
+            "the node names the directory after the session, as a clone's is named"
+        );
+        assert!(chosen.is_dir(), "the node creates the directory it chose");
+        assert!(
+            record.reapable,
+            "a directory the node made for a session is the node's to remove when the session stops"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_without_browse_roots_still_makes_a_work_dir() {
+        // Roots confine the directories a caller names: the interactive
+        // picker, `dev`, and a spawned child placed in an existing directory.
+        // The directory the node picks for a session sits under its work
+        // directory, exactly as a clone's does, and asks no root.
+        let work = tempdir().unwrap();
+        let manager = NodeManager::new(
+            work.path().to_path_buf(),
+            Vec::new(),
+            "http://127.0.0.1:8090".into(),
+            None,
+        );
+
+        let record = manager
+            .start(&NodeStartRequest {
+                session_id: "child-1".into(),
+                dir: None,
+                permission: Permission::ReadWrite,
+            })
+            .await
+            .expect("the node's own work directory needs no root");
+
+        assert_eq!(record.dir, work.path().join("child-1"));
     }
 
     #[tokio::test]

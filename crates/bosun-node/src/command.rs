@@ -451,7 +451,7 @@ mod tests {
             NodeCommand::Start {
                 id: 7,
                 session_id: "child-1".into(),
-                dir: session_dir,
+                dir: Some(session_dir),
                 permission: bosun_common::session::Permission::ReadOnly,
             },
         )
@@ -514,7 +514,7 @@ mod tests {
             NodeCommand::Start {
                 id: 7,
                 session_id: "child-1".into(),
-                dir: outside.path().to_path_buf(),
+                dir: Some(outside.path().to_path_buf()),
                 permission: bosun_common::session::Permission::ReadOnly,
             },
         )
@@ -551,7 +551,7 @@ mod tests {
             NodeCommand::Start {
                 id: 7,
                 session_id: "child-1".into(),
-                dir: work.path().join("missing"),
+                dir: Some(work.path().join("missing")),
                 permission: bosun_common::session::Permission::ReadOnly,
             },
         )
@@ -587,7 +587,7 @@ mod tests {
             NodeCommand::Start {
                 id: 7,
                 session_id: "child-1".into(),
-                dir: file.clone(),
+                dir: Some(file.clone()),
                 permission: bosun_common::session::Permission::ReadOnly,
             },
         )
