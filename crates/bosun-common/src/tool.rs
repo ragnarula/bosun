@@ -224,6 +224,13 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
             description: "Replace the session todo list.".into(),
             schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["todo","in_progress","done"]}},"required":["id","content","status"]}}},"required":["items"]}),
         },
+        // A read-only session keeps this one: it changes the session's own
+        // context and nothing else, not a file, a machine or another session.
+        ToolSpec {
+            name: "clear_context".into(),
+            description: "Start over from a fresh prompt: the thread you read is discarded and your next request begins with `instructions`. The transcript the reader sees keeps everything and records the break, so `reason` is required — say what the clear is for, because clearing a thread is not a way around a hard problem. Work that arrives while you are running is not lost: it lands after the clear. The working copy is untouched.".into(),
+            schema: json!({"type":"object","properties":{"instructions":{"type":"string"},"reason":{"type":"string"}},"required":["instructions","reason"]}),
+        },
         ToolSpec {
             name: "history_read".into(),
             description: "Read this repository's history. `op` is one of: `diff` (what changed; `ref` compares against a commit or branch, `summary` gives a per-file stat instead of the full patch), `status` (what is uncommitted, in porcelain form), `log` (recent commits, newest first; `limit` defaults to 20 and caps at 200, and `grep` and `author` filter them), or `show` (one commit, named by a required `ref`; `summary` gives its stat). `paths` narrows diff, status and log to those files. To read a file as it stood at a commit, use `file_read` with its `ref` instead. This tool never writes: use `shell` to commit, tag, or push.".into(),
@@ -376,6 +383,7 @@ mod tests {
                 "glob",
                 "ask",
                 "todowrite",
+                "clear_context",
                 "history_read",
                 "webfetch",
                 "skill",
@@ -402,6 +410,9 @@ mod tests {
                 "glob",
                 "ask",
                 "todowrite",
+                // `clear_context` stays: it changes the session's own context
+                // and nothing outside it.
+                "clear_context",
                 "history_read",
                 "webfetch",
                 "skill",
@@ -444,6 +455,24 @@ mod tests {
             spawn.description.contains("browse roots")
                 && spawn.description.contains("work directory"),
             "the description has to say where a named directory may lie, and what the node does when none is named"
+        );
+    }
+
+    #[test]
+    fn clear_context_schema_requires_instructions_and_a_reason() {
+        let tools = canonical_tools(Permission::ReadWrite);
+        let clear = tools
+            .iter()
+            .find(|tool| tool.name == "clear_context")
+            .unwrap();
+        assert_eq!(
+            clear.schema["required"],
+            json!(["instructions", "reason"]),
+            "a clear says what to do next and why it is being cleared"
+        );
+        assert!(
+            clear.description.contains("`reason` is required"),
+            "the description has to say the reason is not optional"
         );
     }
 

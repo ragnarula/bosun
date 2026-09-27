@@ -838,6 +838,14 @@ async fn handle_wake(
                 if *id <= refresh_newest {
                     continue;
                 }
+                // An own append the active thread no longer holds was retired
+                // by compaction, or by a context clear, which archives the
+                // turn's own call and result with the history it closes. It is
+                // not a foreign row, so step over it instead of stopping the
+                // boundary on it.
+                while own_index < own_appends.len() && own_appends[own_index] < *id {
+                    own_index += 1;
+                }
                 if own_index == own_appends.len() || *id != own_appends[own_index] {
                     break;
                 }
@@ -1278,6 +1286,70 @@ async fn record_in_wake(
         },
     ));
     Ok(id)
+}
+
+/// Clears a session's context: the marker the reader sees, the history above
+/// it, and the call that asked for the clear all leave the model's window, and
+/// the instructions become the first row of the next one. Nothing is deleted —
+/// the rows stay stored, so the transcript keeps everything — and the boundary
+/// is the marker's own row.
+async fn clear_context(
+    deps: &LoopDeps,
+    session_id: &str,
+    window: &mut Vec<(i64, Message)>,
+    reason: &str,
+    instructions: &str,
+) -> anyhow::Result<()> {
+    // Rows another writer appended during this turn — a user message, a
+    // child's event — are in the store but not in the turn's window, and the
+    // boundary below would swallow them with the history. The session has not
+    // read them, so the clear puts them back in the window.
+    let own: HashSet<i64> = window.iter().map(|(id, _)| *id).collect();
+    let arrived: Vec<i64> = deps
+        .store
+        .messages(session_id, false)
+        .await?
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| !own.contains(id))
+        .collect();
+
+    let marker_id = deps
+        .store
+        .append_message(
+            session_id,
+            Role::Assistant,
+            &Block::ContextCleared {
+                reason: reason.to_string(),
+                instructions: instructions.to_string(),
+            },
+        )
+        .await?;
+    // Everything at or below the marker, the marker included, leaves the
+    // window. The clear's own tool call and result sit below it, so the next
+    // window holds no result without its call.
+    deps.store.mark_archived(session_id, marker_id).await?;
+    // The instructions go through the wake's own recording, so the boundary a
+    // wake advances over covers them.
+    record_in_wake(
+        deps,
+        session_id,
+        window,
+        Role::User,
+        &Block::Text {
+            text: instructions.to_string(),
+        },
+    )
+    .await?;
+    for id in arrived {
+        deps.store.unarchive_message(session_id, id).await?;
+    }
+    info!(
+        session_id = %session_id,
+        boundary = marker_id,
+        "cleared the session's context"
+    );
+    Ok(())
 }
 
 /// The session's two skill sources, read at the first turn and cached: the
@@ -2034,6 +2106,74 @@ async fn run_turn_inner(
                 )
                 .await?;
                 append_tool_finished(deps, session_id, &tool_name, started, true).await?;
+            }
+            // Discards the thread above this point and continues from the
+            // caller's fresh instructions. The marker records the break for the
+            // reader, the instructions become the first row of the model's next
+            // window, and the stored history stays: only the window starts
+            // after it. The turn ends normally, so the clear takes effect for
+            // the next request, and anything queued meanwhile lands after the
+            // boundary.
+            "clear_context" => {
+                let started = Instant::now();
+                append_activity(
+                    deps,
+                    session_id,
+                    ActivityPhase::ToolStarted {
+                        name: tool_name.clone(),
+                    },
+                )
+                .await?;
+                let instructions = args["instructions"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let reason = args["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let outcome = async {
+                    if reason.is_empty() {
+                        anyhow::bail!("clear_context needs a reason: say what the clear is for");
+                    }
+                    if instructions.is_empty() {
+                        anyhow::bail!(
+                            "clear_context needs instructions: say what to do after the clear"
+                        );
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                let (content, is_error) = match outcome {
+                    Ok(()) => (json!({ "cleared": true }), false),
+                    Err(error) => (json!({ "error": error.to_string() }), true),
+                };
+                deps.store
+                    .complete_tool_call(session_id, &id, &content, is_error)
+                    .await?;
+                record_in_wake(
+                    deps,
+                    session_id,
+                    window,
+                    Role::User,
+                    &Block::ToolResult {
+                        id,
+                        name,
+                        is_error,
+                        content,
+                    },
+                )
+                .await?;
+                append_tool_finished(deps, session_id, &tool_name, started, !is_error).await?;
+                // The clear runs after the result is recorded, so the call, its
+                // result and the whole history above them leave the window
+                // together: a window holding a result without its call is a
+                // request a provider refuses.
+                if !is_error {
+                    clear_context(deps, session_id, window, &reason, &instructions).await?;
+                }
             }
             "skill" => {
                 let started = Instant::now();
@@ -3340,6 +3480,10 @@ fn render_block(block: &Block, ask_recipient: AskRecipient) -> String {
             )
         }
         Block::Summary { text } => format!("summary: {text}"),
+        Block::ContextCleared {
+            reason,
+            instructions,
+        } => format!("context cleared: {reason} · fresh instructions: {instructions}"),
         Block::ChildEvent {
             child_id,
             kind,
@@ -17875,6 +18019,605 @@ mod tests {
             2,
             "an outage after a recovery warns again"
         );
+
+        handle.stop();
+    }
+    /// One completion that calls `name` with `args`, then stops: the shape the
+    /// scripted provider answers a turn with.
+    fn tool_turn(id: &str, name: &str, args: Value) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some(id.into()),
+                name: Some(name.into()),
+                args_delta: args.to_string(),
+            },
+            stop(3, 2),
+        ]
+    }
+
+    /// The plain text of each message a request carried.
+    fn request_texts(call: &CapturedCall) -> Vec<String> {
+        call.messages
+            .iter()
+            .map(|message| render_block(&message.block, call.ask_recipient))
+            .collect()
+    }
+
+    /// The plain text of each message a session's stored thread holds.
+    async fn stored_texts(store: &Store, session_id: &str, include_archived: bool) -> Vec<String> {
+        store
+            .messages(session_id, include_archived)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, message)| render_block(&message.block, AskRecipient::User))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_clear_starts_the_next_request_from_the_fresh_instructions() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_message(
+                "s1",
+                Role::User,
+                &Block::Text {
+                    text: "the old task".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({
+                    "reason": "the thread is full of dead ends",
+                    "instructions": "start from the failing test"
+                }),
+            ),
+            vec![StreamEvent::TextDelta("starting over".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn after the clear to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert_eq!(
+            request_texts(&calls[0]),
+            ["the old task"],
+            "the clear's own request holds the thread it is about to discard"
+        );
+        assert_eq!(
+            request_texts(&calls[1]),
+            ["start from the failing test"],
+            "the next request begins with the fresh instructions and nothing else"
+        );
+        assert_eq!(
+            calls[1].messages[0].role,
+            Role::User,
+            "the instructions reach the model as its user turn"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_clear_keeps_the_transcript_and_marks_the_break() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_message(
+                "s1",
+                Role::User,
+                &Block::Text {
+                    text: "the old task".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({
+                    "reason": "the thread is full of dead ends",
+                    "instructions": "start from the failing test"
+                }),
+            ),
+            vec![StreamEvent::TextDelta("starting over".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn after the clear to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let marker = store
+            .messages("s1", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|(_, message)| match message.block {
+                Block::ContextCleared {
+                    reason,
+                    instructions,
+                } => Some((reason, instructions)),
+                _ => None,
+            })
+            .expect("the marker is stored");
+        assert_eq!(
+            marker,
+            (
+                "the thread is full of dead ends".to_string(),
+                "start from the failing test".to_string()
+            ),
+            "the marker carries the reason and the instructions"
+        );
+        let all = stored_texts(&store, "s1", true).await;
+        assert_eq!(
+            all.len(),
+            6,
+            "the history, the clear's call and result, the marker, the instructions and the reply: {all:?}"
+        );
+        assert_eq!(all[0], "the old task");
+        assert_eq!(
+            all[3],
+            "context cleared: the thread is full of dead ends · fresh instructions: start from the failing test",
+            "the marker stands at the break, after the call it answers: {all:?}"
+        );
+        assert_eq!(all[4], "start from the failing test");
+        assert_eq!(
+            stored_texts(&store, "s1", false).await,
+            ["start from the failing test", "starting over"],
+            "the model's window holds only what came after the boundary"
+        );
+
+        // The reader's transcript is the event stream, so the marker has to be
+        // there as an event of its own.
+        let events = store.events_after("s1", 0).await.unwrap();
+        assert!(
+            events.iter().any(|(_, event)| matches!(
+                event,
+                Event::Message { message, .. }
+                    if matches!(&message.block, Block::ContextCleared { .. })
+            )),
+            "the marker reaches the reader's transcript"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_clear_without_a_reason_is_refused_and_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_message(
+                "s1",
+                Role::User,
+                &Block::Text {
+                    text: "the old task".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({ "reason": "   ", "instructions": "start from the failing test" }),
+            ),
+            vec![StreamEvent::TextDelta("carrying on".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        // The refused turn keeps going like any other: the session runs the
+        // turn after it and then waits, with the thread it already had.
+        wait_for("the wake to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store.get_session("s1").await.unwrap().unwrap().state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            recorded_result(&store, "s1", "call-1").await,
+            json!({ "error": "clear_context needs a reason: say what the clear is for" }),
+            "a blank reason is a tool error"
+        );
+        let active = stored_texts(&store, "s1", false).await;
+        assert!(
+            active.iter().any(|text| text == "the old task")
+                && active.iter().any(|text| text == "carrying on"),
+            "a refused clear leaves the window alone: {active:?}"
+        );
+        assert_eq!(
+            store.messages("s1", true).await.unwrap().len(),
+            active.len(),
+            "nothing was archived"
+        );
+        assert!(
+            !stored_texts(&store, "s1", true)
+                .await
+                .iter()
+                .any(|text| text.starts_with("context cleared")),
+            "a refused clear leaves no marker"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_can_clear_its_context() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store
+            .create_session(&read_only_session("s-ro"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "s-ro",
+                Role::User,
+                &Block::Text {
+                    text: "read this repo".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({ "reason": "the listing is stale", "instructions": "read the changelog instead" }),
+            ),
+            vec![StreamEvent::TextDelta("reading it".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-ro".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn after the clear to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+
+        let calls = provider.captured_calls();
+        assert!(
+            calls[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "clear_context"),
+            "a read-only session is offered the tool"
+        );
+        assert_eq!(
+            request_texts(&calls[1]),
+            ["read the changelog instead"],
+            "and its clear takes effect like any other session's"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_message_that_arrives_during_the_clear_turn_stays_in_the_window() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        let read = store
+            .append_message(
+                "s1",
+                Role::User,
+                &Block::Text {
+                    text: "the thread the turn read".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // A message another writer lands after the turn read its window: the
+        // model has not seen it, and the boundary must not swallow it.
+        let arrived = store
+            .append_message(
+                "s1",
+                Role::User,
+                &Block::Text {
+                    text: "wait, check the other file".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider,
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let mut window = vec![(
+            read,
+            Message {
+                role: Role::User,
+                block: Block::Text {
+                    text: "the thread the turn read".into(),
+                },
+            },
+        )];
+
+        clear_context(&deps, "s1", &mut window, "a fresh start", "carry on")
+            .await
+            .unwrap();
+
+        let active = store.messages("s1", false).await.unwrap();
+        let ids: Vec<i64> = active.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&arrived),
+            "a message the turn never read stays in the window: {active:?}"
+        );
+        assert!(
+            !ids.contains(&read),
+            "the history the clear closed leaves the window"
+        );
+        assert_eq!(
+            stored_texts(&store, "s1", false).await,
+            ["wait, check the other file", "carry on"],
+            "the message and the fresh instructions are what the next window holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_after_a_clear_retires_from_the_fresh_window() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-cc")).await.unwrap();
+        fill_transcript(&store, "s-cc").await;
+
+        // Turn one clears, and its completion fills the context; the turn after
+        // it runs on the fresh window and fills the context again; the wake a
+        // user message starts then compacts that fresh window.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("clear_context".into()),
+                    args_delta: r#"{"reason":"start over","instructions":"carry on"}"#.into(),
+                },
+                stop(1000, 20),
+            ],
+            vec![StreamEvent::TextDelta("carrying on".into()), stop(1000, 20)],
+            vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
+            vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
+        ]));
+        let deps = Arc::new(test_deps_with_compact_at(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            500,
+        ));
+        let handle = spawn_loop("s-cc".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the post-clear turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+        assert_eq!(
+            request_texts(&provider.captured_calls()[1]),
+            ["carry on"],
+            "the fresh window is what the post-clear turn sees"
+        );
+
+        // A user message starts the next wake, whose snapshot is the fresh
+        // window: compaction retires from that window, not from the history the
+        // clear closed.
+        store
+            .append_message(
+                "s-cc",
+                Role::User,
+                &Block::Text {
+                    text: "keep going".into(),
+                },
+            )
+            .await
+            .unwrap();
+        handle.send(LoopEvent::UserMessage);
+
+        wait_for("the compacted turn to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 4 }
+            }
+        })
+        .await;
+
+        let active = stored_texts(&store, "s-cc", false).await;
+        assert!(
+            active.iter().any(|text| text == "summary: compacted"),
+            "the summary stands in the fresh window: {active:?}"
+        );
+        assert!(
+            !active.iter().any(|text| text == "carry on"),
+            "the instructions it retired were from the fresh window, not the old history: {active:?}"
+        );
+        assert!(
+            active.iter().any(|text| text == "keep going"),
+            "the message that started the wake stays in it: {active:?}"
+        );
+        assert!(
+            !active.iter().any(|text| text.starts_with("user ")),
+            "nothing from before the clear comes back into the window: {active:?}"
+        );
+        let all = stored_texts(&store, "s-cc", true).await;
+        assert!(
+            all.iter().any(|text| text == "user 0"),
+            "the history the clear closed is still stored"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn a_child_session_can_clear_its_own_context() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("parent-1")).await.unwrap();
+        store
+            .create_session(&child_session_of("child-1", "parent-1"))
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "child-1",
+                Role::User,
+                &Block::Text {
+                    text: "the child's old task".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(
+                "call-1",
+                "clear_context",
+                json!({ "reason": "the child's thread went stale", "instructions": "finish the check" }),
+            ),
+            vec![StreamEvent::TextDelta("checking".into()), stop(1, 1)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("child-1".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the turn after the child's clear to run", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { provider.captured_calls().len() == 2 }
+            }
+        })
+        .await;
+        assert_eq!(
+            request_texts(&provider.captured_calls()[1]),
+            ["finish the check"],
+            "a child's own window restarts the same way"
+        );
+        assert!(
+            stored_texts(&store, "child-1", true)
+                .await
+                .iter()
+                .any(|text| text.starts_with("context cleared")),
+            "the child's transcript carries its own marker"
+        );
+        let parent_thread = stored_texts(&store, "parent-1", true).await;
+        assert!(
+            !parent_thread
+                .iter()
+                .any(|text| text.starts_with("context cleared")),
+            "the clear is the child's own: no marker lands on the parent: {parent_thread:?}"
+        );
+        assert!(
+            !parent_thread
+                .iter()
+                .any(|text| text == "the child's old task"),
+            "and none of the child's discarded history reaches it: {parent_thread:?}"
+        );
+
+        // The child still reports to its parent when its wake ends.
+        wait_for("the child's report to reach its parent", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store
+                        .messages("parent-1", true)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|(_, message)| {
+                            matches!(
+                                &message.block,
+                                Block::ChildEvent { child_id, .. } if child_id == "child-1"
+                            )
+                        })
+                }
+            }
+        })
+        .await;
 
         handle.stop();
     }
