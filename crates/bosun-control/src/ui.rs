@@ -1341,21 +1341,60 @@ mod tests {
 
     #[test]
     fn the_pane_keeps_its_text_fields_at_sixteen_pixels() {
-        for rule in [".chat-row textarea {", ".ask-free textarea {"] {
-            let body = segment(PANE, rule, "}");
-            assert!(
-                body.contains("font-size: 16px;"),
-                "`{rule}` must carry the size that keeps a phone from zooming on focus"
-            );
+        // Every rule that names a text field, wherever it sits — the sheet, a
+        // narrow-screen block, a later rule — must set at least 16px: one rule
+        // that lowered it would put the zoom back, and a landscape phone is
+        // wider than the breakpoint the guard used to live in.
+        let css = styles();
+        let mut rest = css.as_str();
+        let mut read = 0;
+        while let Some((before, after)) = rest.split_once('{') {
+            let selector = squeezed(before.rsplit('}').next().unwrap_or(before));
+            let Some((body, tail)) = after.split_once('}') else {
+                break;
+            };
+            rest = tail;
+            let names_a_field = [
+                "#input",
+                "#ask-input",
+                ".chat-rowtextarea",
+                ".ask-freetextarea",
+                ".composerselect",
+            ]
+            .iter()
+            .any(|field| selector.contains(field));
+            if !names_a_field {
+                continue;
+            }
+            read += 1;
+            for (at, _) in body.match_indices("font-size:") {
+                let size: u32 = body[at + "font-size:".len()..]
+                    .trim_start()
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_default();
+                assert!(
+                    size >= 16,
+                    "`{selector}` sets {size}px on a text field: under 16px a phone zooms the page when it is focused"
+                );
+            }
         }
         assert!(
-            !PANE.contains(".input-row textarea, .ask-free textarea { font-size: 16px; }"),
-            "and the size must not come from the narrow-screen override, which a landscape phone is wider than"
+            read >= 3,
+            "the walk must have read the composer, the ask field and the picker's rules: read {read}"
         );
-        assert!(
-            PANE.contains(".composer select { font-size: 16px; }"),
-            "a picker keeps its phone size where the thumb opens it"
-        );
+        for rule in [
+            ".chat-row textarea {",
+            ".ask-free textarea {",
+            ".composer select {",
+        ] {
+            assert!(
+                PANE.contains(rule),
+                "`{rule}` must be in the sheet, not only inside a media query"
+            );
+        }
     }
 
     #[test]
@@ -1372,7 +1411,7 @@ mod tests {
         );
         assert!(
             PANE.contains("if (!coarsePointer()) askInput.focus();"),
-            "and an arriving question must not take the ask field's either"
+            "and the free-answer branch `renderAskComposer` opens for an arriving question must not take the ask field's focus either"
         );
         assert_eq!(
             PANE.matches("askInput.focus();").count(),
@@ -1380,8 +1419,18 @@ mod tests {
             "the ask field has two focuses: the arriving one, gated, and the one the `answer in your own words` button takes"
         );
         assert!(
-            PANE.contains("input.focus();"),
-            "and the composer keeps the focus send takes after a tap"
+            segment(PANE, "btnAskType.addEventListener('click', () => {", "});")
+                .contains("askInput.focus();"),
+            "the `answer in your own words` button still focuses the free-answer field, where the tap is the gesture"
+        );
+        assert!(
+            segment(
+                PANE,
+                "function send(",
+                "btnSend.addEventListener('click', send);"
+            )
+            .contains("input.focus();"),
+            "and send still re-focuses the composer in its `finally`, where the tap is the gesture"
         );
     }
 
