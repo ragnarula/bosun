@@ -1529,11 +1529,19 @@ mod tests {
             )) && named.contains(&squeezed("if (error) return undefined;")),
             "and only a `message_child` that succeeded is asked for the child its call named"
         );
+        assert!(
+            PANE.contains(
+                "return args && typeof args.id === 'string' && args.id ? args.id : undefined;"
+            ),
+            "and only a string argument counts: an `id` of another shape names no child"
+        );
         let result = block(&pane, &squeezed("function appendToolResult("));
         assert!(
             result.contains(&squeezed(
                 "const named = namedChild(content, name, error, id);"
-            )) && result.contains(&squeezed("callArgs.delete(id);")),
+            )) && result.contains(&squeezed(
+                "if (id && name === 'message_child') callArgs.delete(id);"
+            )),
             "the result asks it about the content it was given, and drops the call's arguments once it has them"
         );
         assert!(

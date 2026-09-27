@@ -4128,8 +4128,9 @@ function namedChild(content, name, error, id) {
 function appendToolResult(name, payload, error, atMs, id, content) {
   const text = payload == null ? '' : String(payload);
   const named = namedChild(content, name, error, id);
-  // The arguments a result has just consumed are dropped: their child is known
-  // now, and the map holds one object per call otherwise.
+  // Only a `message_child` call's arguments are kept, and they go as its result
+  // renders: their child is known now. The session's teardown clears whatever
+  // never got an answer.
   if (id && name === 'message_child') callArgs.delete(id);
   if (!error && text === '') return;
   const line = document.createElement('div');
