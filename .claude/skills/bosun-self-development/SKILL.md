@@ -61,8 +61,9 @@ Release from `main`, never from a branch.
 4. Commit it: `Bump version to X.Y.Z`.
 5. `git tag vX.Y.Z` (lightweight, matching the existing tags).
 6. Push `main`, then the tag: `git push origin main && git push origin vX.Y.Z`. If either push is rejected, another session released first: pull again and bump to the next free version rather than reusing the number.
+7. Write the release notes. The release flow generates an asset table as the body; the notes lead it. Read the generated body (`gh release view vX.Y.Z --repo ragnarula/bosun --json body`), write a file that holds the issue's name and number and the shipped paragraph from its close comment, followed by that generated body, and `gh release edit vX.Y.Z --repo ragnarula/bosun --notes-file <file>`. Never replace the asset table.
 
-Done when the tag's workflow finished green: `curl -s "https://api.github.com/repos/ragnarula/bosun/actions/runs?per_page=3"` shows the run for your commit `completed success`, and the release at `releases/tags/vX.Y.Z` carries its assets.
+Done when the tag's workflow finished green — `curl -s "https://api.github.com/repos/ragnarula/bosun/actions/runs?per_page=3"` shows the run for your commit `completed success` — the release at `releases/tags/vX.Y.Z` carries its assets, and its body leads with the release notes for that issue.
 
 ### 6. Deploy, close, repeat
 
