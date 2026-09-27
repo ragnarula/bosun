@@ -8,6 +8,8 @@ This guide covers running Bosun locally for development.
 cargo run -p bosun -- serve --config cmd/bosun/settings/serve.toml
 ```
 
+The sample configs take the shared password from `BOSUN_PASSWORD`, so export it before starting the control plane or the node.
+
 The control plane reads its config from `--config`. See [config.md](../config.md) for the fields. A control plane needs at least one configured model and one persona; set `[models.default]`, `[personas.coder]`, and `default_persona` in the config and export the key the model references, for example:
 
 ```toml

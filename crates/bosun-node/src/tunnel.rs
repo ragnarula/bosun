@@ -57,9 +57,10 @@ pub async fn run_node_tunnel(
     node_name: String,
     manager: Arc<NodeManager>,
     tls_config: Option<Arc<ClientConfig>>,
+    password: String,
 ) {
     loop {
-        match connect_tunnel(&cp_url, &node_name, tls_config.clone()).await {
+        match connect_tunnel(&cp_url, &node_name, tls_config.clone(), &password).await {
             Ok(stream) => {
                 let (tunnel, opens) = Tunnel::new(stream);
                 relay_tunnel(tunnel, opens, manager.clone()).await;
@@ -407,6 +408,7 @@ async fn connect_tunnel(
     cp_url: &str,
     node_name: &str,
     tls_config: Option<Arc<ClientConfig>>,
+    password: &str,
 ) -> anyhow::Result<TokioIo<Upgraded>> {
     let mut connector = match tls_config {
         Some(config) => HttpsConnectorBuilder::new()
@@ -447,6 +449,10 @@ async fn connect_tunnel(
         .header(header::HOST, authority.as_str())
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, "bosun-tunnel")
+        .header(
+            header::AUTHORIZATION,
+            bosun_common::auth::authorization(password),
+        )
         .body(Empty::<Bytes>::new())
         .context("failed to build the tunnel request")?;
     let response = sender
@@ -499,6 +505,9 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// The password every node under test presents on the tunnel handshake.
+    const TUNNEL_PASSWORD: &str = "hunter2";
 
     /// A manager running one in-process session per id, each with its own
     /// directory under `root`.
@@ -1086,6 +1095,15 @@ mod tests {
         connections: Arc<AtomicUsize>,
         latest: Arc<Mutex<Option<Tunnel>>>,
         first: FirstTunnelAction,
+        authorizations: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl FakeCpState {
+        /// The `Authorization` header of every tunnel request received, in
+        /// arrival order.
+        fn authorizations(&self) -> Vec<Option<String>> {
+            self.authorizations.lock().unwrap().clone()
+        }
     }
 
     /// A control plane that upgrades one tunnel per node connection, kills
@@ -1097,6 +1115,12 @@ mod tests {
             AxumPath(_node): AxumPath<String>,
             mut req: Request<Body>,
         ) -> Response {
+            state.authorizations.lock().unwrap().push(
+                req.headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+            );
             if !wants_tunnel_upgrade(&req) {
                 return StatusCode::BAD_REQUEST.into_response();
             }
@@ -1141,6 +1165,7 @@ mod tests {
             connections: Arc::new(AtomicUsize::new(0)),
             latest: Arc::new(Mutex::new(None)),
             first,
+            authorizations: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
             .route("/tunnel/node/{node}", get(serve_tunnel))
@@ -1182,7 +1207,13 @@ mod tests {
             .unwrap();
         let (state, addr) = fake_control_plane(FirstTunnelAction::Drop).await;
         let base = format!("http://127.0.0.1:{}", addr.port());
-        let task = tokio::spawn(run_node_tunnel(base, "node-1".into(), manager, None));
+        let task = tokio::spawn(run_node_tunnel(
+            base,
+            "node-1".into(),
+            manager,
+            None,
+            TUNNEL_PASSWORD.into(),
+        ));
 
         wait_until("the node to reconnect after the drop", || {
             state.connections.load(Ordering::SeqCst) >= 2 && state.latest.lock().unwrap().is_some()
@@ -1222,7 +1253,13 @@ mod tests {
             .unwrap();
         let (state, addr) = fake_control_plane(FirstTunnelAction::Violate).await;
         let base = format!("http://127.0.0.1:{}", addr.port());
-        let task = tokio::spawn(run_node_tunnel(base, "node-1".into(), manager, None));
+        let task = tokio::spawn(run_node_tunnel(
+            base,
+            "node-1".into(),
+            manager,
+            None,
+            TUNNEL_PASSWORD.into(),
+        ));
 
         wait_until("the node to reconnect after the violation", || {
             state.connections.load(Ordering::SeqCst) >= 2 && state.latest.lock().unwrap().is_some()
@@ -1247,6 +1284,38 @@ mod tests {
             panic!("the call after the reconnect must return a result");
         };
         assert_eq!(content["content"], "SRV1");
+
+        task.abort();
+    }
+
+    /// The tunnel handshake presents the node's password: the control plane
+    /// guards this route with the same credential as every other.
+    #[tokio::test]
+    async fn the_tunnel_handshake_presents_the_password() {
+        let root = tempdir().unwrap();
+        let manager = manager_with(root.path(), &["s1"]).await;
+        let (state, addr) = fake_control_plane(FirstTunnelAction::Drop).await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let task = tokio::spawn(run_node_tunnel(
+            base,
+            "node-1".into(),
+            manager,
+            None,
+            TUNNEL_PASSWORD.into(),
+        ));
+
+        wait_until("the node tunnel to handshake", || {
+            !state.authorizations().is_empty()
+        })
+        .await;
+        let presented = bosun_common::auth::authorization(TUNNEL_PASSWORD);
+        let authorizations = state.authorizations();
+        assert!(
+            authorizations
+                .iter()
+                .all(|authorization| authorization.as_deref() == Some(presented.as_str())),
+            "every tunnel handshake must present the node's password: {authorizations:?}"
+        );
 
         task.abort();
     }

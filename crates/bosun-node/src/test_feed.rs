@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -34,6 +36,7 @@ pub(crate) enum ArchiveBehavior {
 pub(crate) struct FeedStub {
     addr: SocketAddr,
     requests: Arc<AtomicUsize>,
+    authorizations: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl FeedStub {
@@ -43,6 +46,13 @@ impl FeedStub {
 
     pub(crate) fn requests(&self) -> usize {
         self.requests.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The `Authorization` header of every request the feed has served, in
+    /// arrival order. A node's control-plane credential must never appear
+    /// here: the feed is a third party.
+    pub(crate) fn authorizations(&self) -> Vec<Option<String>> {
+        self.authorizations.lock().unwrap().clone()
     }
 }
 
@@ -55,6 +65,7 @@ pub(crate) async fn serve(version: &str, behavior: ArchiveBehavior) -> FeedStub 
         ArchiveBehavior::Mismatch => format!("{} *{}\n", "0".repeat(64), archive_name()),
     };
     let requests = Arc::new(AtomicUsize::new(0));
+    let authorizations = Arc::new(Mutex::new(Vec::new()));
 
     #[derive(Clone)]
     struct ServerState {
@@ -64,10 +75,21 @@ pub(crate) async fn serve(version: &str, behavior: ArchiveBehavior) -> FeedStub 
         content: Arc<Vec<u8>>,
         behavior: ArchiveBehavior,
         requests: Arc<AtomicUsize>,
+        authorizations: Arc<Mutex<Vec<Option<String>>>>,
     }
 
-    async fn serve_feed(State(state): State<ServerState>, Path(path): Path<String>) -> Response {
+    async fn serve_feed(
+        State(state): State<ServerState>,
+        Path(path): Path<String>,
+        headers: HeaderMap,
+    ) -> Response {
         state.requests.fetch_add(1, AtomicOrdering::Relaxed);
+        state.authorizations.lock().unwrap().push(
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        );
         if path == state.checksum_path {
             return state.checksum_file.into_response();
         }
@@ -90,6 +112,7 @@ pub(crate) async fn serve(version: &str, behavior: ArchiveBehavior) -> FeedStub 
             content,
             behavior,
             requests: requests.clone(),
+            authorizations: authorizations.clone(),
         });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -97,7 +120,11 @@ pub(crate) async fn serve(version: &str, behavior: ArchiveBehavior) -> FeedStub 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    FeedStub { addr, requests }
+    FeedStub {
+        addr,
+        requests,
+        authorizations,
+    }
 }
 
 /// cargo-dist ships every Windows target as a `.zip` and every other target

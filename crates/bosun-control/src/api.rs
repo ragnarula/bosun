@@ -18,6 +18,7 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware::Next;
 use axum::middleware::from_fn;
+use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::sse::Event as SseEvent;
@@ -70,6 +71,7 @@ use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::oneshot;
+use tracing::debug;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
@@ -292,6 +294,10 @@ pub struct AppState {
     pub personas: HashMap<String, PersonaConfig>,
     /// The persona sessions use when a request names none.
     pub default_persona: Option<String>,
+    /// The resolved password every request must present. `None` leaves the
+    /// whole surface open, which only the tests do: boot refuses to start the
+    /// control plane without one.
+    pub password: Option<String>,
     /// The configured MCP OAuth callback URL, served as the callback route.
     pub oauth_redirect_uri: Option<String>,
     /// The OAuth flow context the authorize and callback routes use.
@@ -652,7 +658,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         }
     }
 
-    app = app.fallback(not_found).layer(from_fn(add_version_header));
+    app = app
+        .fallback(not_found)
+        .layer(from_fn_with_state(state.clone(), require_password));
+    // The password check sits inside the version-header layer, so a refusal
+    // still tells an outdated client the control plane's version.
+    app = app.layer(from_fn(add_version_header));
     app.with_state(state)
 }
 
@@ -663,6 +674,38 @@ async fn add_version_header(request: Request<Body>, next: Next) -> Response {
     response.headers_mut().insert(
         bosun_common::types::X_BOSUN_VERSION,
         HeaderValue::from_static(bosun_common::version::VERSION),
+    );
+    response
+}
+
+/// Refuses every request that does not present the control-plane password,
+/// with the Basic challenge that makes a browser show its own prompt. A
+/// request carrying no credential logs at `debug` — a browser's first request
+/// is unauthenticated — and one whose credential does not match logs at
+/// `warn`. Neither logs the value.
+async fn require_password(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(password) = state.password.as_deref() else {
+        return next.run(request).await;
+    };
+    let credential = request.headers().get(header::AUTHORIZATION);
+    let presented = credential.and_then(|value| value.to_str().ok());
+    if bosun_common::auth::authorized(presented, password) {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    if credential.is_none() {
+        debug!(path = %path, "request refused: no credential");
+    } else {
+        warn!(path = %path, "request refused: the credential does not match");
+    }
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"bosun\""),
     );
     response
 }
@@ -1913,7 +1956,8 @@ struct EventsQuery {
 /// live text deltas from the loop's broadcast channel. While the stream is
 /// open the store is polled for new durable events, so a client that joined
 /// mid-turn still sees the terminal state.
-#[instrument(skip(state))]
+// `headers` is skipped: the Authorization header holds the shared password.
+#[instrument(skip(state, headers))]
 async fn events(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -2260,6 +2304,20 @@ mod tests {
         dir: &tempfile::TempDir,
         redirect_uri: Option<&str>,
     ) -> Arc<AppState> {
+        test_state_with(dir, redirect_uri, None)
+    }
+
+    /// The same state as [`test_state`], guarding every request with
+    /// `password`.
+    fn test_state_with_password(dir: &tempfile::TempDir, password: &str) -> Arc<AppState> {
+        test_state_with(dir, None, Some(password))
+    }
+
+    fn test_state_with(
+        dir: &tempfile::TempDir,
+        redirect_uri: Option<&str>,
+        password: Option<&str>,
+    ) -> Arc<AppState> {
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
         let oauth = McpOAuthContext::new(
             reqwest::Client::new(),
@@ -2280,6 +2338,7 @@ mod tests {
             providers: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
+            password: password.map(str::to_string),
             oauth_redirect_uri: redirect_uri.map(str::to_string),
             mcp: Arc::new(McpManager::new(
                 store.clone(),
@@ -2474,6 +2533,7 @@ mod tests {
                 })
                 .collect(),
             default_persona: default_persona.map(ToString::to_string),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
@@ -2526,6 +2586,7 @@ mod tests {
             providers,
             personas,
             default_persona: default_persona.map(ToString::to_string),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
@@ -3090,6 +3151,192 @@ mod tests {
         assert_eq!(body["version"], bosun_common::version::VERSION);
     }
 
+    /// Every route the control-plane password guards, plus an unmatched path
+    /// that lands on the fallback route, as its method, path and JSON body.
+    /// Each one is reachable with the right credential, so a 401 from any of
+    /// them means the middleware refused the request.
+    fn guarded_routes() -> Vec<(&'static str, &'static str, Option<Value>)> {
+        vec![
+            ("GET", "/", None),
+            ("GET", "/ui", None),
+            ("GET", "/sessions", None),
+            ("GET", "/sessions/s1", None),
+            ("GET", "/sessions/s1/events", None),
+            (
+                "POST",
+                "/poll",
+                Some(json!({
+                    "node_name": "node-1",
+                    "status": "up",
+                    "version": "0.9.0",
+                    "result": null
+                })),
+            ),
+            ("GET", "/tunnel/node/node-1", None),
+            ("GET", "/no-such-route", None),
+        ]
+    }
+
+    /// Sends one guarded route, presenting `credential` as the Authorization
+    /// value or, when it is `None`, presenting no credential at all.
+    async fn send_guarded(
+        client: &reqwest::Client,
+        addr: SocketAddr,
+        route: &(&'static str, &'static str, Option<Value>),
+        credential: Option<&str>,
+    ) -> reqwest::Response {
+        let (method, path, body) = route;
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = client.request(method, format!("http://{addr}{path}"));
+        if let Some(credential) = credential {
+            request = request.header(reqwest::header::AUTHORIZATION, credential);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        request.send().await.unwrap()
+    }
+
+    /// Queues one Stop command for `node-1`, so a granted `/poll` answers at
+    /// once instead of holding for the queue's timeout. The returned receiver
+    /// keeps the command's reply channel open for the test's lifetime.
+    fn queue_stop(state: &Arc<AppState>) -> oneshot::Receiver<CommandResult> {
+        let (reply, reply_rx) = oneshot::channel();
+        state.commands.enqueue(
+            "node-1",
+            NodeCommand::Stop {
+                id: 1,
+                session_id: "s1".into(),
+            },
+            Some(reply),
+        );
+        reply_rx
+    }
+
+    #[tokio::test]
+    async fn every_guarded_route_refuses_a_request_with_no_credential() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state_with_password(&dir, "s3cret")).await;
+        let client = reqwest::Client::new();
+
+        for route in guarded_routes() {
+            let response = send_guarded(&client, addr, &route, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} {} was not refused",
+                route.0,
+                route.1
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Basic realm=\"bosun\""),
+                "{} {} carries no Basic challenge",
+                route.0,
+                route.1
+            );
+            // The refusal comes from inside the version-header layer, so an
+            // outdated client still learns the control plane's version.
+            assert_eq!(
+                response
+                    .headers()
+                    .get(bosun_common::types::X_BOSUN_VERSION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(bosun_common::version::VERSION),
+                "{} {} carries no version header",
+                route.0,
+                route.1
+            );
+            let body = response.text().await.unwrap();
+            assert!(
+                !body.contains("s3cret"),
+                "the refusal body carries the password"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_guarded_route_refuses_a_wrong_password() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state_with_password(&dir, "s3cret")).await;
+        let client = reqwest::Client::new();
+        let wrong = bosun_common::auth::authorization("s3cret-but-not-quite");
+
+        for route in guarded_routes() {
+            let response = send_guarded(&client, addr, &route, Some(&wrong)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} {} was not refused",
+                route.0,
+                route.1
+            );
+            let body = response.text().await.unwrap();
+            assert!(
+                !body.contains("s3cret"),
+                "the refusal body carries the password"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_guarded_route_answers_the_right_password() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_password(&dir, "s3cret");
+        let _reply_rx = queue_stop(&state);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let credential = bosun_common::auth::authorization("s3cret");
+
+        for route in guarded_routes() {
+            let response = send_guarded(&client, addr, &route, Some(&credential)).await;
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} {} was refused the right password",
+                route.0,
+                route.1
+            );
+            let body = response.text().await.unwrap();
+            assert!(
+                !body.contains("s3cret"),
+                "{} {} returned the password",
+                route.0,
+                route.1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_without_a_password_checks_nothing() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let wrong = bosun_common::auth::authorization("wrong");
+
+        for route in guarded_routes() {
+            // With no configured password there is nothing to check a
+            // credential against, so even a wrong one is served.
+            for credential in [Some(wrong.as_str()), None] {
+                // A queued command keeps a granted `/poll` from holding for
+                // the queue's timeout.
+                let _reply_rx = queue_stop(&state);
+                let response = send_guarded(&client, addr, &route, credential).await;
+                assert_ne!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{} {} was refused without a configured password",
+                    route.0,
+                    route.1
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn poll_records_the_node_version_in_the_registry() {
         let dir = tempdir().unwrap();
@@ -3520,6 +3767,7 @@ mod tests {
                 },
             )]),
             default_persona: Some("test".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -3706,6 +3954,7 @@ mod tests {
                 },
             )]),
             default_persona: Some("reviewer".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -3838,6 +4087,7 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -4137,6 +4387,10 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            // The tests run the routes without a password: `serve` still
+            // mounts the middleware, and `None` is the open state the field
+            // documents.
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -4323,6 +4577,10 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            // The tests run the routes without a password: `serve` still
+            // mounts the middleware, and `None` is the open state the field
+            // documents.
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -4497,6 +4755,7 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -4721,6 +4980,7 @@ mod tests {
             providers,
             personas: HashMap::new(),
             default_persona: None,
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -5234,6 +5494,7 @@ mod tests {
             providers,
             personas: HashMap::new(),
             default_persona: None,
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -5535,6 +5796,7 @@ mod tests {
             providers: HashMap::from([("test".to_string(), provider)]),
             personas,
             default_persona: Some("coder".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -6008,6 +6270,7 @@ mod tests {
                 ),
             ]),
             default_persona: Some("coder".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -6263,6 +6526,7 @@ mod tests {
                 },
             )]),
             default_persona: Some("test".into()),
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -6893,6 +7157,7 @@ mod tests {
             providers,
             personas: HashMap::new(),
             default_persona: None,
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -7188,6 +7453,10 @@ mod tests {
             providers,
             personas,
             default_persona: Some("coder".into()),
+            // The tests run the routes without a password: `serve` still
+            // mounts the middleware, and `None` is the open state the field
+            // documents.
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
@@ -8388,6 +8657,7 @@ mod tests {
             providers: HashMap::new(),
             personas: HashMap::new(),
             default_persona: None,
+            password: None,
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),

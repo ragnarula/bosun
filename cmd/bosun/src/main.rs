@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::future::IntoFuture;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,6 +117,10 @@ struct NodeArgs {
     /// when no --config is given.
     #[arg(long)]
     rollback: bool,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -123,6 +128,10 @@ struct NodesArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -146,6 +155,10 @@ struct CloneArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -165,6 +178,10 @@ struct DevArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -172,6 +189,10 @@ struct ListArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -181,6 +202,10 @@ struct OpenArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -191,20 +216,27 @@ struct ConfigArgs {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Store the control-plane base URL in the CLI config file.
+    /// Store a control-plane URL or password in the CLI config file.
     Set(ConfigSetArgs),
-    /// Print the stored control-plane base URL and the config file path.
+    /// Print the stored control-plane URL, whether a password is set, and the
+    /// config file path.
     Get,
-    /// Reset the stored control-plane base URL to the default.
-    Unset,
+    /// Forget a stored key: reset cp-url to the default, or drop the password.
+    Unset(ConfigUnsetArgs),
 }
 
 #[derive(Args)]
 struct ConfigSetArgs {
-    /// Config key. Only cp-url is supported.
+    /// Config key: cp-url or password.
     key: String,
-    /// Value to store.
+    /// Value to store. A password is a literal or an env:VAR reference.
     value: String,
+}
+
+#[derive(Args)]
+struct ConfigUnsetArgs {
+    /// Config key: cp-url or password.
+    key: String,
 }
 
 #[derive(Args)]
@@ -214,6 +246,10 @@ struct StopArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -226,6 +262,10 @@ struct UpdateArgs {
     /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
     #[arg(long)]
     cp_url: Option<String>,
+    /// Allow sending the password in cleartext over http to a host that is
+    /// neither loopback nor localhost.
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[tokio::main]
@@ -256,13 +296,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn resolve_cp_url(flag: Option<&str>) -> anyhow::Result<String> {
+fn resolve_cp_url(flag: Option<&str>, insecure: bool) -> anyhow::Result<String> {
     let stored = load_cli_config()?.cp_url;
-    Ok(resolve_cp_url_from(
-        flag,
-        env::var("BOSUN_CP_URL").ok(),
-        stored,
-    ))
+    let cp_url = resolve_cp_url_from(flag, env::var("BOSUN_CP_URL").ok(), stored);
+    check_cp_url(&cp_url, insecure)?;
+    Ok(cp_url)
 }
 
 fn resolve_cp_url_from(flag: Option<&str>, env_url: Option<String>, stored: String) -> String {
@@ -282,15 +320,178 @@ fn resolve_github_token(github_token: &Option<String>) -> Result<Option<String>,
         .filter(|token| !token.is_empty()))
 }
 
-/// Builds the HTTP client the CLI uses to reach the control plane. When
-/// `BOSUN_CA_CERT` names a PEM file, the client trusts it, so a control plane
-/// behind a private CA (or self-signed certificate) can be reached.
-fn cp_client() -> anyhow::Result<reqwest::Client> {
-    let ca_cert = std::env::var("BOSUN_CA_CERT")
+/// The control plane's shared password, resolved at boot by the same rule as
+/// `github_token`: `env:VAR` reads the environment and any other value is a
+/// literal. The password is required, so an unset, empty, or unresolvable
+/// value fails boot rather than leaving every route open. The resolved value
+/// is never logged or returned.
+fn resolve_password(password: &Option<String>) -> anyhow::Result<String> {
+    const EXAMPLE: &str = r#"password = "env:BOSUN_PASSWORD""#;
+    let Some(configured) = password.as_deref() else {
+        return Err(anyhow::anyhow!(
+            "password is not set; set {EXAMPLE} in the control-plane config"
+        ));
+    };
+    let resolved = resolve_api_key(configured).with_context(|| {
+        format!("password could not be resolved; set {EXAMPLE} in the control-plane config")
+    })?;
+    if resolved.is_empty() {
+        return Err(anyhow::anyhow!(
+            "password is empty; set {EXAMPLE} to the value the clients present"
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The node's shared password, resolved at boot by the same rule as
+/// `github_token`: `env:VAR` reads the environment and any other value is a
+/// literal. The node refuses to start without one, so an unset, empty, or
+/// unresolvable value fails boot rather than leaving every poll and tunnel
+/// refused. The resolved value is never logged.
+fn resolve_node_password(config_path: &Path, password: &Option<String>) -> anyhow::Result<String> {
+    const EXAMPLE: &str = r#"password = "env:BOSUN_PASSWORD""#;
+    let path = config_path.display();
+    let Some(configured) = password.as_deref() else {
+        return Err(anyhow::anyhow!(
+            "password is not set; set {EXAMPLE} in the node config {path}"
+        ));
+    };
+    let resolved = resolve_api_key(configured).with_context(|| {
+        format!("password could not be resolved; set {EXAMPLE} in the node config {path}")
+    })?;
+    if resolved.is_empty() {
+        return Err(anyhow::anyhow!(
+            "password is empty; set {EXAMPLE} in the node config {path} to the value the control plane requires"
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The password the CLI presents, resolved from the stored value (a literal,
+/// or `env:VAR` read from the environment like `github_token`) and then from
+/// `BOSUN_PASSWORD`. Neither set means the client sends no credential, and
+/// the control plane's 401 names the password it wants.
+fn resolve_cli_password() -> anyhow::Result<Option<String>> {
+    let stored = load_cli_config()?.password;
+    resolve_cli_password_from(stored, env::var("BOSUN_PASSWORD").ok())
+}
+
+fn resolve_cli_password_from(
+    stored: Option<String>,
+    env_password: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(stored) = stored else {
+        return Ok(env_password.filter(|password| !password.is_empty()));
+    };
+    // The stored value is authoritative: a reference that resolves to nothing
+    // is an error, not a fallback to the environment.
+    let path = cli_config_path();
+    let password = resolve_api_key(&stored).with_context(|| {
+        format!(
+            "failed to resolve the stored password in {}",
+            path.display()
+        )
+    })?;
+    if password.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the stored password in {} is empty; set one with \"bosun config set password <value>\", or unset it",
+            path.display()
+        ));
+    }
+    Ok(Some(password))
+}
+
+/// Whether `listen_addr` binds a loopback address: a loopback IP such as
+/// `127.0.0.1` or `[::1]`, or a hostname that resolves to one, such as
+/// `localhost`. A hostname that does not resolve counts as non-loopback, so
+/// the cleartext warning errs toward firing.
+fn is_loopback_bind(listen_addr: &str) -> bool {
+    match listen_addr.to_socket_addrs() {
+        Ok(mut addrs) => addrs.all(|addr| addr.ip().is_loopback()),
+        Err(_) => false,
+    }
+}
+
+/// Whether `cp_url` is `http` to a host that is not loopback. The URL is
+/// parsed the way the client parses it, so a spelling such as `HTTP://` is
+/// judged by the scheme it actually uses; a URL that does not parse is left to
+/// fail as a request.
+fn is_cleartext_remote(cp_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(cp_url) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    !is_loopback_bind(&format!("{host}:0"))
+}
+
+/// Refuses a control-plane URL that would carry the password over cleartext
+/// to a host that is not loopback. `https` encrypts the credential, and a
+/// loopback host never leaves the machine; any other `http` host is refused
+/// unless the operator passed `--insecure`.
+fn check_cp_url(cp_url: &str, insecure: bool) -> anyhow::Result<()> {
+    if insecure || !is_cleartext_remote(cp_url) {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "refusing to send the control-plane password over cleartext http to {cp_url}; use https, or pass --insecure to accept it"
+    ))
+}
+
+/// The control plane refused the request's credential: it requires a
+/// password. Every command reports it as that rather than as a bare 401,
+/// because the operator fixes it by setting the password, not by retrying.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the control plane requires a password; set one with \"bosun config set password <value>\" or the BOSUN_PASSWORD environment variable"
+)]
+pub(crate) struct RequiresPassword;
+
+/// Returns the response when the control plane accepted the call. A 401 means
+/// it requires a password; any other refusal is reported as `what` with the
+/// control plane's own message.
+pub(crate) async fn check_response(
+    response: reqwest::Response,
+    what: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // A refusal carries the version header like any other response, so an
+        // outdated client still learns it is behind.
+        maybe_print_update_notice(response.headers());
+        return Err(RequiresPassword.into());
+    }
+    if status.is_success() {
+        return Ok(response);
+    }
+    let text = response
+        .text()
+        .await
+        .context("failed to read the control plane's response")?;
+    Err(anyhow::anyhow!("{what}: {text}"))
+}
+
+/// The PEM file `BOSUN_CA_CERT` names, when set: a trust anchor the CLI adds
+/// for a control plane behind a private CA.
+fn resolve_ca_cert() -> Option<PathBuf> {
+    std::env::var("BOSUN_CA_CERT")
         .ok()
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    bosun_common::tls::reqwest_client(ca_cert.as_deref())
+        .map(PathBuf::from)
+}
+
+/// Builds the HTTP client the CLI uses to reach the control plane, presenting
+/// the resolved password on every request. When `BOSUN_CA_CERT` names a PEM
+/// file, the client trusts it, so a control plane behind a private CA (or
+/// self-signed certificate) can be reached.
+fn cp_client() -> anyhow::Result<reqwest::Client> {
+    let password = resolve_cli_password()?;
+    let headers = bosun_common::auth::client_headers(password.as_deref());
+    bosun_common::tls::reqwest_client(resolve_ca_cert().as_deref(), headers)
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -299,6 +500,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         load_config(&args.config).context("failed to load control-plane config")?;
     // The error's Display lists every problem on its own line.
     config.validate_personas()?;
+    let password = resolve_password(&config.password)?;
+    if config.tls_cert.is_none() && !is_loopback_bind(&config.listen_addr) {
+        warn!(
+            listen_addr = %config.listen_addr,
+            "the control plane serves cleartext HTTP on a non-loopback address; set tls_cert and tls_key to keep the password and the sessions it guards off the wire"
+        );
+    }
     if let Some(redirect_uri) = config.oauth_redirect_uri.as_deref() {
         // The callback route registers here; a path the router cannot serve
         // or already serves would leave the callback unreachable, so the
@@ -399,6 +607,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         providers,
         personas: config.personas,
         default_persona: config.default_persona,
+        password: Some(password),
         oauth_redirect_uri: config.oauth_redirect_uri,
         mcp_oauth,
         mcp,
@@ -584,6 +793,8 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         .as_deref()
         .context("node boot requires --config")?;
     let config: NodeConfig = load_config(config_path).context("failed to load node config")?;
+    let password = resolve_node_password(config_path, &config.password)?;
+    check_cp_url(&config.cp_url, args.insecure)?;
     info!(
         cp_url = %config.cp_url,
         node_name = %config.node_name,
@@ -600,7 +811,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     ));
     // The one outbound tunnel starts at boot and reconnects on its own, so
     // every session's tool calls reach the control plane as soon as it is up.
-    manager.start_node_tunnel(&config.node_name);
+    manager.start_node_tunnel(&config.node_name, &password);
     manager.restore().await;
     // Sessions are restored and the tunnel is up, so the node is as ready
     // as it gets. Under Type=notify the unit is not started until this.
@@ -613,6 +824,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             config.node_name.clone(),
             polling,
             tls_config,
+            password,
             config.update.enabled,
             config.update.base_url.clone(),
             bosun_node::poll::UPDATE_RETRY_DELAY,
@@ -628,7 +840,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 }
 
 async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
 
     let client = cp_client()?;
     let response = client
@@ -636,9 +848,8 @@ async fn run_nodes(args: NodesArgs) -> anyhow::Result<()> {
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("control plane at {cp_url} returned an error"))?;
+    let what = format!("control plane at {cp_url} returned an error");
+    let response = check_response(response, &what).await?;
     maybe_print_update_notice(response.headers());
     let health: Vec<NodeHealth> = response.json().await.context("failed to parse node list")?;
 
@@ -696,7 +907,7 @@ fn node_rows(now: SystemTime, health: &[NodeHealth]) -> Vec<String> {
 }
 
 async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
 
     let client = cp_client()?;
     let request = CloneRequest {
@@ -713,14 +924,7 @@ async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response
-            .text()
-            .await
-            .with_context(|| format!("failed to read response from {cp_url}"))?;
-        return Err(anyhow::anyhow!("clone failed: {text}"));
-    }
+    let response = check_response(response, "clone failed").await?;
     maybe_print_update_notice(response.headers());
     let text = response
         .text()
@@ -758,7 +962,7 @@ impl fmt::Display for Choice {
 }
 
 async fn run_dev(args: DevArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
     let client = cp_client()?;
     let mut current: Option<PathBuf> = None;
 
@@ -823,16 +1027,8 @@ async fn fetch_dirs(
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response
-            .text()
-            .await
-            .with_context(|| format!("failed to read response from {cp_url}"))?;
-        return Err(anyhow::anyhow!(
-            "failed to list directories on node {node}: {text}"
-        ));
-    }
+    let what = format!("failed to list directories on node {node}");
+    let response = check_response(response, &what).await?;
     maybe_print_update_notice(response.headers());
     let text = response
         .text()
@@ -865,14 +1061,7 @@ async fn spawn_dev(
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response
-            .text()
-            .await
-            .with_context(|| format!("failed to read response from {cp_url}"))?;
-        return Err(anyhow::anyhow!("dev failed: {text}"));
-    }
+    let response = check_response(response, "dev failed").await?;
     maybe_print_update_notice(response.headers());
     let text = response
         .text()
@@ -896,9 +1085,8 @@ async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<Session>> {
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("control plane at {cp_url} returned an error"))?;
+    let what = format!("control plane at {cp_url} returned an error");
+    let response = check_response(response, &what).await?;
     maybe_print_update_notice(response.headers());
     response
         .json()
@@ -907,7 +1095,7 @@ async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<Session>> {
 }
 
 async fn run_list(args: ListArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
     let sessions = fetch_sessions(&cp_url).await?;
 
     if sessions.is_empty() {
@@ -996,7 +1184,7 @@ fn session_rows(sessions: &[Session]) -> Vec<String> {
 }
 
 async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
     let session_id = match args.session_id {
         Some(id) => {
             let sessions = fetch_sessions(&cp_url).await?;
@@ -1036,43 +1224,75 @@ async fn pick_session(cp_url: &str) -> anyhow::Result<Option<String>> {
     };
     Ok(Some(sessions[selected].id.clone()))
 }
+
+/// The lines `bosun config get` prints: the stored control-plane URL, whether
+/// a password is set, and the config file path. The password appears only as
+/// set or not set, never as its value.
+fn config_lines(config: &CliConfig, path: &Path) -> Vec<String> {
+    let password = if config.password.is_some() {
+        "set"
+    } else {
+        "not set"
+    };
+    vec![
+        format!("cp-url {} (in {})", config.cp_url, path.display()),
+        format!("password {password}"),
+    ]
+}
+
 fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
     match args.command {
         ConfigCommand::Set(args) => {
-            if args.key != "cp-url" {
-                return Err(anyhow::anyhow!("unknown config key: {}", args.key));
-            }
             let mut config = load_cli_config()?;
-            config.cp_url = args.value;
-            save_cli_config(&config)?;
-            println!(
-                "stored cp-url {} in {}",
-                config.cp_url,
-                cli_config_path().display()
-            );
+            match args.key.as_str() {
+                "cp-url" => {
+                    config.cp_url = args.value;
+                    save_cli_config(&config)?;
+                    println!(
+                        "stored cp-url {} in {}",
+                        config.cp_url,
+                        cli_config_path().display()
+                    );
+                }
+                "password" => {
+                    config.password = Some(args.value);
+                    save_cli_config(&config)?;
+                    // The value is never echoed back: only that one is stored.
+                    println!("stored password in {}", cli_config_path().display());
+                }
+                key => return Err(anyhow::anyhow!("unknown config key: {key}")),
+            }
             Ok(())
         }
         ConfigCommand::Get => {
             let config = load_cli_config()?;
-            println!(
-                "cp-url {} (in {})",
-                config.cp_url,
-                cli_config_path().display()
-            );
+            for line in config_lines(&config, &cli_config_path()) {
+                println!("{line}");
+            }
             Ok(())
         }
-        ConfigCommand::Unset => {
+        ConfigCommand::Unset(args) => {
             let mut config = load_cli_config()?;
-            config.cp_url = CliConfig::default().cp_url;
-            save_cli_config(&config)?;
-            println!("reset cp-url to {}", config.cp_url);
+            match args.key.as_str() {
+                "cp-url" => {
+                    config.cp_url = CliConfig::default().cp_url;
+                    save_cli_config(&config)?;
+                    println!("reset cp-url to {}", config.cp_url);
+                }
+                "password" => {
+                    config.password = None;
+                    save_cli_config(&config)?;
+                    println!("forgot the stored password");
+                }
+                key => return Err(anyhow::anyhow!("unknown config key: {key}")),
+            }
             Ok(())
         }
     }
 }
 
 async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
 
     let client = cp_client()?;
     let request = StopRequest {
@@ -1084,24 +1304,17 @@ async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response
-            .text()
-            .await
-            .with_context(|| format!("failed to read response from {cp_url}"))?;
-        return Err(anyhow::anyhow!("stop failed: {text}"));
-    }
+    let response = check_response(response, "stop failed").await?;
     maybe_print_update_notice(response.headers());
     println!("stopped session {}", args.session_id);
     Ok(())
 }
 
 async fn run_update_cmd(args: UpdateArgs) -> anyhow::Result<()> {
-    let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+    let cp_url = resolve_cp_url(args.cp_url.as_deref(), args.insecure)?;
     let client = cp_client()?;
     if args.nodes.is_empty() {
-        update::run_update(&client, &cp_url, args.force)
+        update::run_update(&client, &cp_url, resolve_ca_cert().as_deref(), args.force)
             .await
             .map_err(anyhow::Error::from)
     } else {
@@ -1159,6 +1372,7 @@ fn format_ago(now: SystemTime, unix_secs: u64) -> String {
 mod tests {
     use std::time::UNIX_EPOCH;
 
+    use axum::response::IntoResponse;
     use bosun_common::session::Permission;
     use bosun_common::session::SessionState;
     use bosun_common::types::UpdateStatus;
@@ -1316,6 +1530,260 @@ mod tests {
         assert_eq!(
             resolve_github_token(&Some("a-secret-token".to_string())).unwrap(),
             Some("a-secret-token".to_string())
+        );
+    }
+
+    #[test]
+    fn a_literal_password_and_an_env_reference_both_resolve() {
+        assert_eq!(
+            resolve_password(&Some("hunter2".to_string())).unwrap(),
+            "hunter2"
+        );
+        let var = "BOSUN_TEST_CONTROL_PASSWORD";
+        unsafe {
+            std::env::set_var(var, "hunter2");
+        }
+        assert_eq!(
+            resolve_password(&Some(format!("env:{var}"))).unwrap(),
+            "hunter2"
+        );
+    }
+
+    #[test]
+    fn an_unset_empty_or_unresolvable_password_fails_boot() {
+        assert!(resolve_password(&None).is_err());
+        assert!(resolve_password(&Some(String::new())).is_err());
+        let var = "BOSUN_TEST_MISSING_CONTROL_PASSWORD";
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert!(resolve_password(&Some(format!("env:{var}"))).is_err());
+        let var = "BOSUN_TEST_EMPTY_CONTROL_PASSWORD";
+        unsafe {
+            std::env::set_var(var, "");
+        }
+        assert!(resolve_password(&Some(format!("env:{var}"))).is_err());
+    }
+
+    #[test]
+    fn a_node_password_literal_and_an_env_reference_both_resolve() {
+        let path = Path::new("/etc/bosun/node.toml");
+        assert_eq!(
+            resolve_node_password(path, &Some("hunter2".to_string())).unwrap(),
+            "hunter2"
+        );
+        let var = "BOSUN_TEST_NODE_PASSWORD";
+        unsafe {
+            std::env::set_var(var, "hunter2");
+        }
+        assert_eq!(
+            resolve_node_password(path, &Some(format!("env:{var}"))).unwrap(),
+            "hunter2"
+        );
+    }
+
+    #[test]
+    fn an_unset_empty_or_unresolvable_node_password_fails_boot() {
+        let path = Path::new("/etc/bosun/node.toml");
+        assert!(resolve_node_password(path, &None).is_err());
+        assert!(resolve_node_password(path, &Some(String::new())).is_err());
+        let var = "BOSUN_TEST_MISSING_NODE_PASSWORD";
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert!(resolve_node_password(path, &Some(format!("env:{var}"))).is_err());
+        let var = "BOSUN_TEST_EMPTY_NODE_PASSWORD";
+        unsafe {
+            std::env::set_var(var, "");
+        }
+        assert!(resolve_node_password(path, &Some(format!("env:{var}"))).is_err());
+    }
+
+    #[test]
+    fn only_a_loopback_bind_is_recognised() {
+        assert!(is_loopback_bind("127.0.0.1:8090"));
+        assert!(is_loopback_bind("127.0.0.5:8090"));
+        assert!(is_loopback_bind("[::1]:8090"));
+        assert!(is_loopback_bind("localhost:8090"));
+        assert!(!is_loopback_bind("0.0.0.0:8090"));
+        assert!(!is_loopback_bind("192.0.2.1:8090"));
+        assert!(!is_loopback_bind("not-a-bind-address"));
+    }
+
+    #[test]
+    fn the_cli_password_prefers_the_stored_value_then_bosun_password() {
+        let stored = Some("the-stored-value".to_string());
+        let from_environment = Some("the-environment-value".to_string());
+        assert_eq!(
+            resolve_cli_password_from(stored, from_environment.clone())
+                .unwrap()
+                .as_deref(),
+            Some("the-stored-value")
+        );
+        assert_eq!(
+            resolve_cli_password_from(None, from_environment)
+                .unwrap()
+                .as_deref(),
+            Some("the-environment-value")
+        );
+        assert_eq!(resolve_cli_password_from(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_cli_password_from(None, Some(String::new())).unwrap(),
+            None,
+            "an empty BOSUN_PASSWORD is no password at all"
+        );
+    }
+
+    #[test]
+    fn a_stored_env_reference_resolves_from_the_environment_or_fails() {
+        // PATH is set wherever the tests run, so this case needs no write to
+        // the process environment.
+        let resolved = resolve_cli_password_from(Some("env:PATH".to_string()), None)
+            .unwrap()
+            .expect("PATH resolves");
+        assert_eq!(Some(resolved), std::env::var("PATH").ok());
+
+        // The stored value is authoritative: a reference that resolves to
+        // nothing is an error rather than a fallback to BOSUN_PASSWORD, and an
+        // empty stored value is no credential at all.
+        let missing = "env:BOSUN_TEST_UNSET_PASSWORD_VARIABLE";
+        assert!(
+            resolve_cli_password_from(
+                Some(missing.to_string()),
+                Some("the-environment-value".to_string())
+            )
+            .is_err()
+        );
+        assert!(resolve_cli_password_from(Some(String::new()), None).is_err());
+    }
+
+    #[test]
+    fn config_get_reports_whether_a_password_is_set_without_printing_it() {
+        let path = Path::new("/home/dev/.config/bosun/config.toml");
+        let stored = config_lines(
+            &CliConfig {
+                cp_url: "http://10.0.0.5:8090".into(),
+                password: Some("hunter2".into()),
+            },
+            path,
+        );
+        let absent = config_lines(
+            &CliConfig {
+                cp_url: "http://10.0.0.5:8090".into(),
+                password: None,
+            },
+            path,
+        );
+        assert!(
+            stored.iter().all(|line| !line.contains("hunter2")),
+            "the password value must never be printed: {stored:?}"
+        );
+        assert_ne!(
+            stored[1], absent[1],
+            "the report must say whether a password is set: {stored:?}"
+        );
+    }
+
+    #[test]
+    fn https_and_a_loopback_host_need_no_insecure_flag() {
+        for cp_url in [
+            "https://10.0.0.5:8090",
+            "http://127.0.0.1:8090",
+            "http://127.0.0.5:8090",
+            "http://[::1]:8090",
+            "http://localhost:8090",
+            " http://127.0.0.1:8090",
+        ] {
+            assert!(
+                check_cp_url(cp_url, false).is_ok(),
+                "{cp_url} must be accepted without --insecure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleartext_url_to_a_remote_host_needs_the_insecure_flag() {
+        for cp_url in [
+            "http://10.0.0.5:8090",
+            "http://10.0.0.5",
+            "http://192.0.2.1:8090/ui",
+            "http://[2001:db8::1]:8090",
+            "http://not-a-host",
+            "HTTP://10.0.0.5:8090",
+            " http://10.0.0.5:8090",
+        ] {
+            assert!(
+                check_cp_url(cp_url, false).is_err(),
+                "{cp_url} must be refused without --insecure"
+            );
+            assert!(
+                check_cp_url(cp_url, true).is_ok(),
+                "{cp_url} must be accepted with --insecure"
+            );
+        }
+    }
+
+    /// A control plane that answers every request with `status`, announcing
+    /// `version` in the version header when one is given.
+    async fn stub_control_plane(status: reqwest::StatusCode, version: Option<&str>) -> String {
+        let version = version.map(str::to_string);
+        let app = axum::Router::new().fallback(move || {
+            let version = version.clone();
+            async move {
+                let mut response = status.into_response();
+                if let Some(version) = version {
+                    response.headers_mut().insert(
+                        X_BOSUN_VERSION,
+                        reqwest::header::HeaderValue::from_str(&version).unwrap(),
+                    );
+                }
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    #[tokio::test]
+    async fn only_a_401_is_reported_as_the_control_plane_requiring_a_password() {
+        let cp_url = stub_control_plane(reqwest::StatusCode::UNAUTHORIZED, None).await;
+        let response = reqwest::Client::new().get(&cp_url).send().await.unwrap();
+        let error = check_response(response, "nodes failed").await.unwrap_err();
+        assert!(
+            error.downcast_ref::<RequiresPassword>().is_some(),
+            "a 401 is the control plane asking for a password: {error:#}"
+        );
+
+        let cp_url = stub_control_plane(reqwest::StatusCode::OK, None).await;
+        let response = reqwest::Client::new().get(&cp_url).send().await.unwrap();
+        check_response(response, "nodes failed")
+            .await
+            .expect("an accepted response passes through");
+
+        let cp_url = stub_control_plane(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None).await;
+        let response = reqwest::Client::new().get(&cp_url).send().await.unwrap();
+        let error = check_response(response, "nodes failed").await.unwrap_err();
+        assert!(
+            error.downcast_ref::<RequiresPassword>().is_none(),
+            "another refusal is the command's own failure: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_still_announces_a_newer_control_plane() {
+        let newer = "999.0.0";
+        let cp_url = stub_control_plane(reqwest::StatusCode::UNAUTHORIZED, Some(newer)).await;
+        let response = reqwest::Client::new().get(&cp_url).send().await.unwrap();
+        let error = check_response(response, "nodes failed").await.unwrap_err();
+
+        assert!(error.downcast_ref::<RequiresPassword>().is_some());
+        assert!(
+            UPDATE_NOTICE_PRINTED.load(AtomicOrdering::Relaxed),
+            "the version header survives a refusal, so an outdated client still learns its version"
         );
     }
 

@@ -24,6 +24,12 @@ use tokio::time::sleep;
 
 const BOSUN: &str = env!("CARGO_BIN_EXE_bosun");
 
+/// The shared password the test's control plane and node are configured with.
+/// Every client the test drives presents it: the binaries get it through
+/// `BOSUN_PASSWORD`, and the test's own HTTP client attaches it as a default
+/// header.
+const PASSWORD: &str = "e2e-password";
+
 /// Writes a self-signed CA and a leaf certificate for `127.0.0.1`. Returns
 /// the CA, leaf certificate, and leaf key paths.
 fn write_tls_files(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -47,11 +53,12 @@ fn write_tls_files(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 /// An HTTP client that trusts the test CA, so it can reach the HTTPS control
-/// plane.
+/// plane, and presents the shared password the way a real client does.
 fn test_client(ca_path: &Path) -> reqwest::Client {
     let ca = std::fs::read(ca_path).unwrap();
     reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .default_headers(bosun_common::auth::client_headers(Some(PASSWORD)))
         .build()
         .unwrap()
 }
@@ -91,6 +98,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
              node_timeout_secs = 10\n\
+             password = \"env:BOSUN_PASSWORD\"\n\
              data_dir = \"{}\"\n\
              tls_cert = \"{}\"\n\
              tls_key = \"{}\"\n\
@@ -121,7 +129,8 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
              node_name = \"e2e-node\"\n\
              work_dir = \"{}\"\n\
              browse_roots = [\"{}\"]\n\
-             ca_cert = \"{}\"\n",
+             ca_cert = \"{}\"\n\
+             password = \"env:BOSUN_PASSWORD\"\n",
             work_dir.display(),
             root.display(),
             ca_path.display()
@@ -158,8 +167,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     .await;
 
     // Clone a session via the CLI.
-    let clone_out = Command::new(BOSUN)
-        .env("BOSUN_CA_CERT", &ca_path)
+    let clone_out = cli_command(root, &ca_path)
         .args([
             "clone",
             "--node",
@@ -206,8 +214,7 @@ async fn clone_drive_and_stop_a_session_end_to_end() {
     );
 
     // Stop the session.
-    let stop_out = Command::new(BOSUN)
-        .env("BOSUN_CA_CERT", &ca_path)
+    let stop_out = cli_command(root, &ca_path)
         .args(["stop", &session_id, "--cp-url", &cp_url])
         .output()
         .await
@@ -259,6 +266,7 @@ async fn dev_session_in_existing_directory_end_to_end() {
         format!(
             "listen_addr = \"127.0.0.1:{serve_port}\"\n\
              node_timeout_secs = 10\n\
+             password = \"env:BOSUN_PASSWORD\"\n\
              data_dir = \"{}\"\n\
              tls_cert = \"{}\"\n\
              tls_key = \"{}\"\n\
@@ -288,7 +296,8 @@ async fn dev_session_in_existing_directory_end_to_end() {
              node_name = \"e2e-node\"\n\
              work_dir = \"{}\"\n\
              browse_roots = [\"{}\"]\n\
-             ca_cert = \"{}\"\n",
+             ca_cert = \"{}\"\n\
+             password = \"env:BOSUN_PASSWORD\"\n",
             root.join("work").display(),
             root.display(),
             ca_path.display()
@@ -375,8 +384,7 @@ async fn dev_session_in_existing_directory_end_to_end() {
     assert_eq!(dev_response["state"], "waiting_for_input");
 
     // Stop the session; the existing directory stays.
-    let stop_out = Command::new(BOSUN)
-        .env("BOSUN_CA_CERT", &ca_path)
+    let stop_out = cli_command(root, &ca_path)
         .args(["stop", &session_id, "--cp-url", &cp_url])
         .output()
         .await
@@ -413,11 +421,25 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// A `bosun` child running a CLI command: it trusts the test CA, presents the
+/// shared password through `BOSUN_PASSWORD`, and reads no stored CLI config,
+/// so a developer's own `~/.config/bosun/config.toml` cannot stand in for the
+/// environment the flow is meant to exercise.
+fn cli_command(root: &Path, ca_path: &Path) -> Command {
+    let mut command = Command::new(BOSUN);
+    command
+        .env("BOSUN_CA_CERT", ca_path)
+        .env("BOSUN_PASSWORD", PASSWORD)
+        .env("XDG_CONFIG_HOME", root.join("cli-config"));
+    command
+}
+
 fn spawn_bosun(args: &[&str], log_path: &Path, ca_path: &Path) -> Child {
     let log = std::fs::File::create(log_path).unwrap();
     Command::new(BOSUN)
         .args(args)
         .env("BOSUN_CA_CERT", ca_path)
+        .env("BOSUN_PASSWORD", PASSWORD)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .kill_on_drop(true)

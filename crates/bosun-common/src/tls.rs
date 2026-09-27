@@ -36,9 +36,12 @@ pub fn load_client_config(ca_cert: Option<&Path>) -> anyhow::Result<Option<rustl
 }
 
 /// A reqwest client that trusts the PEM CA file when one is configured and
-/// the default trust otherwise.
-pub fn reqwest_client(ca_cert: Option<&Path>) -> anyhow::Result<reqwest::Client> {
-    reqwest_client_with_tls(load_client_config(ca_cert)?.map(Arc::new))
+/// presents `headers` on every request.
+pub fn reqwest_client(
+    ca_cert: Option<&Path>,
+    headers: reqwest::header::HeaderMap,
+) -> anyhow::Result<reqwest::Client> {
+    reqwest_client_with_tls_and_headers(load_client_config(ca_cert)?.map(Arc::new), headers)
 }
 
 /// A reqwest client using a prebuilt TLS config, or the default trust when
@@ -46,13 +49,23 @@ pub fn reqwest_client(ca_cert: Option<&Path>) -> anyhow::Result<reqwest::Client>
 pub fn reqwest_client_with_tls(
     tls: Option<Arc<rustls::ClientConfig>>,
 ) -> anyhow::Result<reqwest::Client> {
-    match tls {
-        Some(config) => Ok(reqwest::Client::builder()
-            .use_preconfigured_tls((*config).clone())
-            .build()
-            .context("failed to build the HTTP client")?),
-        None => Ok(reqwest::Client::new()),
-    }
+    reqwest_client_with_tls_and_headers(tls, reqwest::header::HeaderMap::new())
+}
+
+/// A reqwest client using a prebuilt TLS config, or the default trust when
+/// none is given, presenting `headers` on every request.
+pub fn reqwest_client_with_tls_and_headers(
+    tls: Option<Arc<rustls::ClientConfig>>,
+    headers: reqwest::header::HeaderMap,
+) -> anyhow::Result<reqwest::Client> {
+    let builder = match tls {
+        Some(config) => reqwest::Client::builder().use_preconfigured_tls((*config).clone()),
+        None => reqwest::Client::builder(),
+    };
+    builder
+        .default_headers(headers)
+        .build()
+        .context("failed to build the HTTP client")
 }
 
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {

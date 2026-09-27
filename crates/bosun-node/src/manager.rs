@@ -293,13 +293,14 @@ impl NodeManager {
     /// Starts the node's one outbound tunnel to the control plane. The task
     /// reconnects on its own until the node exits, so sessions never nudge
     /// it, and a control-plane restart needs no per-session nudge either.
-    pub fn start_node_tunnel(self: &Arc<Self>, node_name: &str) {
+    pub fn start_node_tunnel(self: &Arc<Self>, node_name: &str, password: &str) {
         let cp_url = self.cp_url.clone();
         let node_name = node_name.to_string();
+        let password = password.to_string();
         let tls_config = self.tls_config.clone();
         let manager = self.clone();
         tokio::spawn(crate::tunnel::run_node_tunnel(
-            cp_url, node_name, manager, tls_config,
+            cp_url, node_name, manager, tls_config, password,
         ));
     }
 

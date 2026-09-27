@@ -14,23 +14,30 @@ from a terminal client 💻 or the web pane 🌐.
 
 ## 🧭 Status
 
-Single-user MVP. There is no security model and no scalability story yet:
-run it on a network you trust 🔒. Remote skill packages shipped: skills come
-from GitHub repositories the operator manages in the web pane and reach
-sessions through the `skill` tool. MCP support shipped: the control plane
-connects to external MCP servers over HTTP, the operator manages the server
-list and each session's selection in the web pane, and the chosen servers'
-tools reach the model beside the canonical tools. Session summaries shipped:
-each session's own model writes a one-line description of what the session is
-for and what it is doing now, the session's loop refreshes it once the session
-goes idle, and the web pane leads the session row with it. The current sprint
-and the planned roadmap are tracked in [docs/sprints](docs/sprints/).
+Single-user MVP. One shared password guards the control plane: the pane, the
+CLI, the terminal client and every node present it with HTTP Basic, the control
+plane and the node each refuse to start without one, and a node refuses to send
+it over `http` to a non-loopback host unless told to. It is a lock, not a user
+system: one secret covers people and nodes, it sits in plaintext in the config
+file or the environment, there is no rate limiting, and a browser pointed at an
+`http` control plane sends it in the clear. Run it on a network you trust 🔒.
+Remote skill packages shipped: skills come from GitHub repositories the
+operator manages in the web pane and reach sessions through the `skill` tool.
+MCP support shipped: the control plane connects to external MCP servers over
+HTTP, the operator manages the server list and each session's selection in the
+web pane, and the chosen servers' tools reach the model beside the canonical
+tools. Session summaries shipped: each session's own model writes a one-line
+description of what the session is for and what it is doing now, the session's
+loop refreshes it once the session goes idle, and the web pane leads the
+session row with it. The current sprint and the planned roadmap are tracked in
+[docs/sprints](docs/sprints/).
 
 ## ⚙️ How it works
 
 - **🎛️ Control plane** (`bosun serve`) runs one agent loop per session,
   keeps the session store, manages skill repositories and MCP servers in the
-  web pane, and holds one shared connection per enabled MCP server.
+  web pane, and holds one shared connection per enabled MCP server. It refuses
+  to start without the shared password that every request must present.
 - **🖥️ Nodes** (`bosun node`) dial out to the control plane. No open inbound
   ports are needed on a node. Each session runs its tools in-process on the
   node, scoped to the session's working copy and permission.
@@ -78,6 +85,10 @@ and a client 💻. Config files are TOML; commented templates live in
 [`cmd/bosun/settings/`](cmd/bosun/settings/).
 
 ```sh
+# The shared password 🔐. Export it before the control plane, the node and the
+# clients start; the sample configs read it from here.
+export BOSUN_PASSWORD='a long secret you choose'
+
 # 1. Control plane. Models and their API keys are configured here. 🔑
 bosun serve --config cmd/bosun/settings/serve.toml
 
@@ -94,8 +105,12 @@ bosun stop <session-id>
 ```
 
 The control-plane URL defaults to `http://127.0.0.1:8090` and can be set per
-command with `--cp-url`, stored with `bosun config set`, or exported as
-`BOSUN_CP_URL` 🌐.
+command with `--cp-url`, stored with `bosun config set cp-url <url>`, or
+exported as `BOSUN_CP_URL` 🌐. The shared password comes from `BOSUN_PASSWORD`
+or from a value stored with `bosun config set password`; `bosun config get`
+reports whether one is stored and never its value. A control plane reached over
+`http` on a host that is not loopback needs `--insecure` on the node and the
+clients 🔐.
 
 The web pane is served at the control-plane root (`/` or `/ui`). Open it in a
 browser to see the node list, start a session, follow its live transcript,

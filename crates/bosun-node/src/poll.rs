@@ -35,17 +35,27 @@ pub const UPDATE_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// The node's one outbound control loop: heartbeats, command delivery, and
 /// command results all ride this request.
+#[allow(clippy::too_many_arguments)] // the credential is passed in, not read from a global
 pub async fn run_poll_loop(
     cp_url: String,
     node_name: String,
     manager: Arc<NodeManager>,
     tls_config: Option<Arc<ClientConfig>>,
+    password: String,
     update_enabled: bool,
     update_base_url: Option<String>,
     update_retry_delay: Duration,
 ) {
-    let client = bosun_common::tls::reqwest_client_with_tls(tls_config.clone())
-        .expect("failed to build the polling HTTP client");
+    let client = bosun_common::tls::reqwest_client_with_tls_and_headers(
+        tls_config.clone(),
+        bosun_common::auth::client_headers(Some(&password)),
+    )
+    .expect("failed to build the polling HTTP client");
+    // The release feed is not the control plane: the download must never
+    // carry the credential the poll client presents, so it gets a client of
+    // its own, trusting the same TLS config and nothing else.
+    let feed = bosun_common::tls::reqwest_client_with_tls(tls_config.clone())
+        .expect("failed to build the release feed client");
     let url = format!("{}/poll", cp_url.trim_end_matches('/'));
     // The release feed the node fetches update archives from: the config's
     // base URL when set, else the BOSUN_UPDATE_BASE_URL mirror, else GitHub.
@@ -92,6 +102,14 @@ pub async fn run_poll_loop(
             .send()
             .await
         {
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                warn!(
+                    "the control plane requires a password and refused the poll (401); the node keeps polling, so its sessions stall rather than die"
+                );
+                pending = result;
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
             Ok(response) => match response.json().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -152,13 +170,12 @@ pub async fn run_poll_loop(
             // The new attempt supersedes the previous outcome: while it runs
             // the node reports Updating, and its failure replaces the old one.
             *last_outcome.lock().unwrap() = None;
-            let client = client.clone();
+            let feed = feed.clone();
             let update_base_url = update_base_url.clone();
             let expected_version = response.version.clone();
             let outcome = last_outcome.clone();
             update_task = Some(tokio::spawn(async move {
-                if let Err(error) = apply(&client, &update_base_url, &expected_version, false).await
-                {
+                if let Err(error) = apply(&feed, &update_base_url, &expected_version, false).await {
                     let status = status_from_error(&error);
                     error!(error = %error.display_chain(), "node update failed");
                     *outcome.lock().unwrap() = Some(status);
@@ -170,7 +187,7 @@ pub async fn run_poll_loop(
             pending = match command {
                 NodeCommand::Update { id, version, force } => {
                     let result = handle_update_command(
-                        &client,
+                        &feed,
                         &update_base_url,
                         id,
                         &version,
@@ -197,6 +214,7 @@ pub async fn run_poll_loop(
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -205,6 +223,7 @@ mod tests {
     use axum::Json;
     use axum::Router;
     use axum::extract::State;
+    use axum::response::IntoResponse;
     use axum::routing::post;
     use bosun_common::types::CommandResult;
     use bosun_common::types::NodeCommand;
@@ -235,11 +254,17 @@ mod tests {
         }
     }
 
+    /// The password every node under test presents, so a test can prove the
+    /// poll carries it and the release feed does not.
+    const PASSWORD: &str = "hunter2";
+
     /// A control plane that answers polls with a version (strictly newer than
     /// the workspace version by default) and one queued command, so a test can
     /// revert the control plane under a running node or demand an update from
     /// it. It serves no update assets: the node under test fetches them from
-    /// the release-feed stub instead.
+    /// the release-feed stub instead. While `unauthorized` is set it refuses
+    /// every poll with a 401 whose body parses as a poll answer, so a test can
+    /// see that the node goes by the status and not by the body.
     struct FakeControlPlane {
         addr: SocketAddr,
         polls: Arc<AtomicUsize>,
@@ -247,6 +272,8 @@ mod tests {
         last_result: Arc<Mutex<Option<CommandResult>>>,
         version: Arc<Mutex<String>>,
         command: Arc<Mutex<Option<NodeCommand>>>,
+        unauthorized: Arc<AtomicBool>,
+        authorizations: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl FakeControlPlane {
@@ -261,6 +288,16 @@ mod tests {
         fn set_command(&self, command: NodeCommand) {
             *self.command.lock().unwrap() = Some(command);
         }
+
+        fn set_unauthorized(&self, unauthorized: bool) {
+            self.unauthorized.store(unauthorized, Ordering::Relaxed);
+        }
+
+        /// The `Authorization` header of every poll received, in arrival
+        /// order.
+        fn authorizations(&self) -> Vec<Option<String>> {
+            self.authorizations.lock().unwrap().clone()
+        }
     }
 
     async fn fake_control_plane() -> FakeControlPlane {
@@ -271,6 +308,8 @@ mod tests {
             bosun_common::version::VERSION,
         )));
         let command = Arc::new(Mutex::new(None));
+        let unauthorized = Arc::new(AtomicBool::new(false));
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
 
         #[derive(Clone)]
         struct ServerState {
@@ -279,13 +318,35 @@ mod tests {
             last_result: Arc<Mutex<Option<CommandResult>>>,
             version: Arc<Mutex<String>>,
             command: Arc<Mutex<Option<NodeCommand>>>,
+            unauthorized: Arc<AtomicBool>,
+            authorizations: Arc<Mutex<Vec<Option<String>>>>,
         }
 
         async fn serve_poll(
             State(state): State<ServerState>,
+            headers: axum::http::HeaderMap,
             Json(poll): Json<PollRequest>,
-        ) -> Json<PollResponse> {
+        ) -> axum::response::Response {
             state.polls.fetch_add(1, Ordering::Relaxed);
+            state.authorizations.lock().unwrap().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+            );
+            if state.unauthorized.load(Ordering::Relaxed) {
+                // The body parses as a poll answer, so a node that went by the
+                // body alone would treat a refusal as a reply.
+                let version = state.version.lock().unwrap().clone();
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    Json(PollResponse {
+                        command: None,
+                        version,
+                    }),
+                )
+                    .into_response();
+            }
             *state.last_status.lock().unwrap() = Some(poll.update_status);
             // A command result is delivered once; later polls carry None, so
             // the first result must be latched for the test to see.
@@ -294,7 +355,7 @@ mod tests {
             }
             let version = state.version.lock().unwrap().clone();
             let command = state.command.lock().unwrap().take();
-            Json(PollResponse { command, version })
+            Json(PollResponse { command, version }).into_response()
         }
 
         let app = Router::new()
@@ -305,6 +366,8 @@ mod tests {
                 last_result: last_result.clone(),
                 version: version.clone(),
                 command: command.clone(),
+                unauthorized: unauthorized.clone(),
+                authorizations: authorizations.clone(),
             });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -319,6 +382,8 @@ mod tests {
             last_result,
             version,
             command,
+            unauthorized,
+            authorizations,
         }
     }
 
@@ -340,6 +405,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_millis(100),
@@ -394,6 +460,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_millis(100),
@@ -430,6 +497,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_millis(100),
@@ -470,6 +538,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             false,
             Some(feed.base_url()),
             Duration::from_secs(5),
@@ -511,6 +580,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_secs(5),
@@ -524,6 +594,11 @@ mod tests {
         assert!(
             feed.requests() >= 2,
             "the forced downgrade must get past the gate and fetch the release assets"
+        );
+        assert!(
+            feed.authorizations().iter().all(Option::is_none),
+            "the demanded update's release download must carry no credential: {:?}",
+            feed.authorizations()
         );
 
         poll_loop.abort();
@@ -552,6 +627,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_secs(5),
@@ -601,6 +677,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_secs(5),
@@ -654,6 +731,7 @@ mod tests {
             "test-node".into(),
             manager,
             None,
+            PASSWORD.into(),
             true,
             Some(feed.base_url()),
             Duration::from_millis(100),
@@ -666,6 +744,114 @@ mod tests {
         assert!(
             feed.requests() >= 1,
             "the node must have fetched the missing release before reporting no release"
+        );
+
+        poll_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn the_poll_request_presents_the_password() {
+        let cp = fake_control_plane().await;
+        let dir = tempdir().unwrap();
+        let manager = Arc::new(NodeManager::new(
+            dir.path().to_path_buf(),
+            vec![],
+            cp.base_url(),
+            None,
+        ));
+        let poll_loop = tokio::spawn(run_poll_loop(
+            cp.base_url(),
+            "test-node".into(),
+            manager,
+            None,
+            PASSWORD.into(),
+            false,
+            None,
+            Duration::from_secs(5),
+        ));
+
+        wait_until("the node to poll", || cp.polls.load(Ordering::Relaxed) > 0).await;
+        let presented = bosun_common::auth::authorization(PASSWORD);
+        assert_eq!(
+            cp.authorizations().first().cloned().flatten().as_deref(),
+            Some(presented.as_str()),
+            "the poll request must present the node's password"
+        );
+
+        poll_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn a_refused_poll_is_ignored_and_the_loop_keeps_polling() {
+        // The refusal's body parses as a poll answer announcing a newer
+        // version, so a node that went by the body would start an update from
+        // the feed. The node must go by the status instead: ignore the body
+        // and keep polling, so its sessions stall rather than die.
+        let version = bosun_test_support::newer_than(bosun_common::version::VERSION);
+        let cp = fake_control_plane().await;
+        cp.set_version(&version);
+        cp.set_unauthorized(true);
+        let feed = serve_feed(&version, ArchiveBehavior::Mismatch).await;
+        let dir = tempdir().unwrap();
+        let manager = Arc::new(NodeManager::new(
+            dir.path().to_path_buf(),
+            vec![],
+            cp.base_url(),
+            None,
+        ));
+        let poll_loop = tokio::spawn(run_poll_loop(
+            cp.base_url(),
+            "test-node".into(),
+            manager,
+            None,
+            PASSWORD.into(),
+            true,
+            Some(feed.base_url()),
+            Duration::from_secs(5),
+        ));
+
+        wait_until("the node to poll past the refusal", || {
+            cp.polls.load(Ordering::Relaxed) >= 3
+        })
+        .await;
+        assert_eq!(
+            feed.requests(),
+            0,
+            "a refused poll must not be treated as an answer, even when its body parses"
+        );
+
+        poll_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn the_release_download_presents_no_credential() {
+        let version = bosun_test_support::newer_than(bosun_common::version::VERSION);
+        let cp = fake_control_plane().await;
+        cp.set_version(&version);
+        let feed = serve_feed(&version, ArchiveBehavior::Mismatch).await;
+        let dir = tempdir().unwrap();
+        let manager = Arc::new(NodeManager::new(
+            dir.path().to_path_buf(),
+            vec![],
+            cp.base_url(),
+            None,
+        ));
+        let poll_loop = tokio::spawn(run_poll_loop(
+            cp.base_url(),
+            "test-node".into(),
+            manager,
+            None,
+            PASSWORD.into(),
+            true,
+            Some(feed.base_url()),
+            Duration::from_secs(5),
+        ));
+
+        wait_until("the update to fetch the release", || feed.requests() >= 2).await;
+        assert!(
+            feed.authorizations().iter().all(Option::is_none),
+            "the release feed must never see the node's password: {:?}",
+            feed.authorizations()
         );
 
         poll_loop.abort();

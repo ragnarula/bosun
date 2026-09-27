@@ -1281,9 +1281,8 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
         .send()
         .await
         .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("session {session_id} is not available"))?;
+    let what = format!("session {session_id} is not available");
+    let response = crate::check_response(response, &what).await?;
     crate::maybe_print_update_notice(response.headers());
     let session: Session = response.json().await.context("failed to parse session")?;
 
@@ -1415,45 +1414,51 @@ async fn run_attach(
             result = open_stream(client, cp_url, session_id, app.state.last_seq) => result,
             _ = &mut stop_rx => return Ok(()),
         };
-        if let Ok(stream) = opened {
-            // The stream restarted: live deltas do not survive a reconnect,
-            // and the outage is over, so the next drop reports again.
-            app.state.pending_delta = None;
-            noticed = false;
-            app.connected = true;
-            redraw(terminal, app)?;
-            let outcome = stream_events(
-                terminal,
-                app,
-                &mut input_rx,
-                client,
-                cp_url,
-                session_id,
-                stream,
-                &mut stop_rx,
-            )
-            .await?;
-            if outcome == StreamOutcome::Exited {
-                return Ok(());
-            }
-            app.connected = false;
-            if !noticed {
-                noticed = true;
-                app.state.push_line(Line {
-                    kind: LineKind::Status,
-                    text: "connection lost; reconnecting".to_string(),
-                    at_ms: None,
-                });
+        match opened {
+            Ok(stream) => {
+                // The stream restarted: live deltas do not survive a
+                // reconnect, and the outage is over, so the next drop reports
+                // again.
+                app.state.pending_delta = None;
+                noticed = false;
+                app.connected = true;
                 redraw(terminal, app)?;
+                let outcome = stream_events(
+                    terminal,
+                    app,
+                    &mut input_rx,
+                    client,
+                    cp_url,
+                    session_id,
+                    stream,
+                    &mut stop_rx,
+                )
+                .await?;
+                if outcome == StreamOutcome::Exited {
+                    return Ok(());
+                }
+                app.connected = false;
+                if !noticed {
+                    noticed = true;
+                    app.state.push_line(Line {
+                        kind: LineKind::Status,
+                        text: "connection lost; reconnecting".to_string(),
+                        at_ms: None,
+                    });
+                    redraw(terminal, app)?;
+                }
             }
-        } else if !noticed {
-            noticed = true;
-            app.state.push_line(Line {
-                kind: LineKind::Status,
-                text: "connection lost; reconnecting".to_string(),
-                at_ms: None,
-            });
-            redraw(terminal, app)?;
+            Err(error) => {
+                if !noticed {
+                    noticed = true;
+                    app.state.push_line(Line {
+                        kind: LineKind::Status,
+                        text: connection_lost_text(&error),
+                        at_ms: None,
+                    });
+                    redraw(terminal, app)?;
+                }
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(RECONNECT_DELAY) => {}
@@ -1473,9 +1478,8 @@ async fn open_stream(
         .query(&[("after", after)])
         .send()
         .await
-        .context("failed to reach the control plane")?
-        .error_for_status()
-        .context("the control plane returned an error")?;
+        .context("failed to reach the control plane")?;
+    let response = crate::check_response(response, "the control plane returned an error").await?;
     Ok(sse_stream(response.bytes_stream()))
 }
 
@@ -1776,6 +1780,26 @@ fn open_persona_picker(app: &mut App) {
         .unwrap_or(0);
 }
 
+/// The text for a failed control-plane call. A 401 means the password is
+/// missing or wrong, which the operator fixes in the CLI config, so the status
+/// line says that rather than showing the status.
+fn failure_text(error: reqwest::Error) -> String {
+    match error.status() {
+        Some(reqwest::StatusCode::UNAUTHORIZED) => crate::RequiresPassword.to_string(),
+        _ => error.to_string(),
+    }
+}
+
+/// The status line for a live stream that would not open. A 401 means the
+/// password is the problem rather than the link, so the line says that
+/// instead of reporting a lost connection.
+fn connection_lost_text(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<crate::RequiresPassword>() {
+        Some(password) => password.to_string(),
+        None => "connection lost; reconnecting".to_string(),
+    }
+}
+
 /// Sends the input as a session message. `redirect` marks it as a new
 /// instruction rather than an answer, which matters while a surfaced child
 /// ask is pending: an answer routes mechanically to the child that asked, and
@@ -1810,7 +1834,7 @@ async fn send_message(
     if let Err(error) = result {
         app.state.push_line(Line {
             kind: LineKind::Status,
-            text: format!("send failed: {error}"),
+            text: format!("send failed: {}", failure_text(error)),
             at_ms: None,
         });
     }
@@ -1840,7 +1864,7 @@ async fn reject_question(app: &mut App, client: &reqwest::Client, cp_url: &str, 
     if let Err(error) = result {
         app.state.push_line(Line {
             kind: LineKind::Status,
-            text: format!("reject failed: {error}"),
+            text: format!("reject failed: {}", failure_text(error)),
             at_ms: None,
         });
     }
@@ -1868,7 +1892,7 @@ async fn interrupt(app: &mut App, client: &reqwest::Client, cp_url: &str, sessio
     if let Err(error) = result {
         app.state.push_line(Line {
             kind: LineKind::Status,
-            text: format!("interrupt failed: {error}"),
+            text: format!("interrupt failed: {}", failure_text(error)),
             at_ms: None,
         });
     }
@@ -1907,7 +1931,7 @@ async fn toggle_permission(
         Ok(_) => app.state.permission = next,
         Err(error) => app.state.push_line(Line {
             kind: LineKind::Status,
-            text: format!("permission change failed: {error}"),
+            text: format!("permission change failed: {}", failure_text(error)),
             at_ms: None,
         }),
     }
@@ -1942,7 +1966,7 @@ async fn switch_persona(
     if let Err(error) = result {
         app.state.push_line(Line {
             kind: LineKind::Status,
-            text: format!("persona switch failed: {error}"),
+            text: format!("persona switch failed: {}", failure_text(error)),
             at_ms: None,
         });
     }
@@ -1968,7 +1992,9 @@ async fn fetch_personas(client: &reqwest::Client, cp_url: &str, app: &mut App) {
             Ok(personas) => app.personas = personas,
             Err(error) => app.persona_error = Some(format!("failed to parse personas: {error}")),
         },
-        Err(error) => app.persona_error = Some(format!("failed to fetch personas: {error}")),
+        Err(error) => {
+            app.persona_error = Some(format!("failed to fetch personas: {}", failure_text(error)))
+        }
     }
 }
 

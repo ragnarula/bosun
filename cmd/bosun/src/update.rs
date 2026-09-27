@@ -84,17 +84,19 @@ fn gate(cli_version: &str, cp_version: &str, force: bool) -> Result<Gate, Update
 /// fetched from the release feed: the `BOSUN_UPDATE_BASE_URL` mirror when
 /// set, else GitHub Releases. The swap happens in this process on Unix; on
 /// Windows a finalizer copy of this binary installs the staged file after
-/// this process exits.
+/// this process exits. `client` reaches the control plane and `ca_cert` is
+/// the extra trust anchor the release feed is fetched with.
 pub(crate) async fn run_update(
     client: &reqwest::Client,
     cp_url: &str,
+    ca_cert: Option<&Path>,
     force: bool,
 ) -> Result<(), UpdateError> {
     let current = std::env::current_exe().context("failed to find the running binary")?;
     // The CLI config stores no update base URL, so the env override and the
     // GitHub default decide the feed.
     let base_url = resolve_update_base_url(None);
-    apply_update(client, cp_url, &base_url, &current, force).await
+    apply_update(client, cp_url, &base_url, &current, ca_cert, force).await
 }
 
 /// The version the control plane announces on its nodes response header. The
@@ -118,9 +120,8 @@ async fn control_plane_version(
                 "failed to reach the control plane at {cp_url}: bosun update syncs this CLI to the control plane's version, so the control plane must be reachable"
             )
         })?;
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("the control plane at {cp_url} returned an error"))?;
+    let what = format!("the control plane at {cp_url} returned an error");
+    let response = crate::check_response(response, &what).await?;
     let version = response
         .headers()
         .get(X_BOSUN_VERSION)
@@ -152,14 +153,8 @@ pub(crate) async fn update_nodes(
             .send()
             .await
             .with_context(|| format!("failed to reach control plane at {cp_url}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response
-                .text()
-                .await
-                .with_context(|| format!("failed to read response from {cp_url}"))?;
-            return Err(anyhow::anyhow!("update failed for node {node}: {text}"));
-        }
+        let what = format!("update failed for node {node}");
+        crate::check_response(response, &what).await?;
         println!("{}", enqueued_message(node));
     }
     Ok(())
@@ -183,6 +178,7 @@ async fn apply_update(
     cp_url: &str,
     base_url: &str,
     target: &Path,
+    ca_cert: Option<&Path>,
     force: bool,
 ) -> Result<(), UpdateError> {
     let cp_version = control_plane_version(client, cp_url).await?;
@@ -198,7 +194,11 @@ async fn apply_update(
         version = %cp_version,
         "cli update: downloading the release archive"
     );
-    let staged = fetch_release_artifact(client, base_url, &cp_version, TARGET, dir).await?;
+    // The release feed is not the control plane: the download must never
+    // carry the credential the control-plane client presents, so it gets a
+    // client of its own, trusting the same CA file and nothing else.
+    let feed = bosun_common::tls::reqwest_client(ca_cert, reqwest::header::HeaderMap::new())?;
+    let staged = fetch_release_artifact(&feed, base_url, &cp_version, TARGET, dir).await?;
     let outcome = async {
         verify_binary_version(&staged, &cp_version).await?;
         install(target, &staged)?;
@@ -357,6 +357,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::Path as AxumPath;
     use axum::extract::State;
+    use axum::http::HeaderMap;
     use axum::http::HeaderValue;
     use axum::http::StatusCode;
     use axum::http::Uri;
@@ -571,22 +572,27 @@ mod tests {
         (format!("http://127.0.0.1:{}", addr.port()), paths)
     }
 
-    /// A release feed serving `routes` and recording how many requests it
-    /// answered. Everything unserved is a 404, so a request for a wrong asset
-    /// or version fails the flow loudly.
+    /// A release feed serving `routes`, recording how many requests it
+    /// answered and the headers of each one. Everything unserved is a 404, so
+    /// a request for a wrong asset or version fails the flow loudly.
     #[cfg(unix)]
-    async fn release_feed(routes: HashMap<String, Vec<u8>>) -> (String, Arc<AtomicUsize>) {
+    async fn release_feed_recording(
+        routes: HashMap<String, Vec<u8>>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<HeaderMap>>>) {
         #[derive(Clone)]
         struct ServerState {
             routes: Arc<HashMap<String, Vec<u8>>>,
             requests: Arc<AtomicUsize>,
+            headers: Arc<Mutex<Vec<HeaderMap>>>,
         }
 
         async fn serve_asset(
             State(state): State<ServerState>,
             AxumPath(path): AxumPath<String>,
+            headers: HeaderMap,
         ) -> Response {
             state.requests.fetch_add(1, AtomicOrdering::Relaxed);
+            state.headers.lock().unwrap().push(headers);
             let body = state
                 .routes
                 .get(&path)
@@ -599,18 +605,32 @@ mod tests {
         }
 
         let requests = Arc::new(AtomicUsize::new(0));
+        let headers = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/{*path}", get(serve_asset))
             .with_state(ServerState {
                 routes: Arc::new(routes),
                 requests: requests.clone(),
+                headers: headers.clone(),
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://127.0.0.1:{}", addr.port()), requests)
+        (
+            format!("http://127.0.0.1:{}", addr.port()),
+            requests,
+            headers,
+        )
+    }
+
+    /// The release feed's URL and request count, for the flows that ask for no
+    /// more than that.
+    #[cfg(unix)]
+    async fn release_feed(routes: HashMap<String, Vec<u8>>) -> (String, Arc<AtomicUsize>) {
+        let (feed_url, requests, _headers) = release_feed_recording(routes).await;
+        (feed_url, requests)
     }
 
     fn assert_target_untouched(dir: &tempfile::TempDir) {
@@ -638,9 +658,16 @@ mod tests {
         let (cp_url, cp_paths) = control_plane(Some(&version)).await;
         let (feed_url, feed_requests) = release_feed(release_routes(&version, &content)).await;
 
-        apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect("the update should apply");
+        apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect("the update should apply");
 
         assert_eq!(std::fs::read(&target).unwrap(), content);
         assert_eq!(
@@ -659,6 +686,39 @@ mod tests {
         );
     }
 
+    /// The release feed is a third party: the control-plane credential the
+    /// CLI's client presents must never reach it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_update_fetches_the_release_without_the_control_plane_credential() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("bosun");
+        std::fs::write(&target, b"old").unwrap();
+        let version = newer_version();
+        let content = write_version_script(dir.path(), &version);
+        let (cp_url, _cp_paths) = control_plane(Some(&version)).await;
+        let (feed_url, _requests, feed_headers) =
+            release_feed_recording(release_routes(&version, &content)).await;
+        let client = bosun_common::tls::reqwest_client(
+            None,
+            bosun_common::auth::client_headers(Some("hunter2")),
+        )
+        .unwrap();
+
+        apply_update(&client, &cp_url, &feed_url, &target, None, false)
+            .await
+            .expect("the update should apply");
+
+        let headers = feed_headers.lock().unwrap();
+        assert_eq!(headers.len(), 2, "the checksum file and the archive");
+        assert!(
+            headers
+                .iter()
+                .all(|headers| !headers.contains_key(reqwest::header::AUTHORIZATION)),
+            "the release feed must never see the control plane's credential"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn apply_update_allows_a_forced_downgrade() {
@@ -670,9 +730,16 @@ mod tests {
         let (cp_url, cp_paths) = control_plane(Some(&version)).await;
         let (feed_url, feed_requests) = release_feed(release_routes(&version, &content)).await;
 
-        apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, true)
-            .await
-            .expect("--force should allow the downgrade");
+        apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            true,
+        )
+        .await
+        .expect("--force should allow the downgrade");
 
         assert_eq!(std::fs::read(&target).unwrap(), content);
         assert_eq!(*cp_paths.lock().unwrap(), ["/nodes"]);
@@ -689,9 +756,16 @@ mod tests {
         let (cp_url, cp_paths) = control_plane(Some(&version)).await;
         let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect_err("a downgrade without --force must be refused");
+        let err = apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a downgrade without --force must be refused");
 
         assert!(matches!(err, UpdateError::DowngradeRequiresForce { .. }));
         assert_eq!(*cp_paths.lock().unwrap(), ["/nodes"]);
@@ -712,9 +786,16 @@ mod tests {
         let (cp_url, cp_paths) = control_plane(Some(VERSION)).await;
         let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect("equal versions must short-circuit before the release fetch");
+        apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect("equal versions must short-circuit before the release fetch");
 
         assert_eq!(*cp_paths.lock().unwrap(), ["/nodes"]);
         assert_eq!(
@@ -735,9 +816,16 @@ mod tests {
         let (cp_url, _cp_paths) = control_plane(Some(&version)).await;
         let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect_err("a version the release feed does not serve must fail the update");
+        let err = apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a version the release feed does not serve must fail the update");
 
         assert!(matches!(err, UpdateError::NoRelease { .. }));
         assert_eq!(
@@ -759,9 +847,16 @@ mod tests {
         let (cp_url, _cp_paths) = control_plane(Some(&claimed)).await;
         let (feed_url, feed_requests) = release_feed(release_routes(&claimed, &content)).await;
 
-        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect_err("the staged binary must report the control plane's version");
+        let err = apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect_err("the staged binary must report the control plane's version");
 
         assert!(matches!(err, UpdateError::VersionMismatch { .. }));
         assert_eq!(feed_requests.load(AtomicOrdering::Relaxed), 2);
@@ -777,9 +872,16 @@ mod tests {
         let (cp_url, _cp_paths) = control_plane(Some("banana")).await;
         let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect_err("an unparsable control-plane version must fail the update");
+        let err = apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect_err("an unparsable control-plane version must fail the update");
 
         assert!(matches!(err, UpdateError::UnparsableVersion { .. }));
         assert_eq!(
@@ -801,9 +903,16 @@ mod tests {
         let (cp_url, _cp_paths) = control_plane(None).await;
         let (feed_url, feed_requests) = release_feed(HashMap::new()).await;
 
-        let err = apply_update(&reqwest::Client::new(), &cp_url, &feed_url, &target, false)
-            .await
-            .expect_err("a control plane without the version header must fail the update");
+        let err = apply_update(
+            &reqwest::Client::new(),
+            &cp_url,
+            &feed_url,
+            &target,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a control plane without the version header must fail the update");
 
         assert!(matches!(err, UpdateError::Internal(_)));
         let chain = err.display_chain();
@@ -834,6 +943,7 @@ mod tests {
             &cp_url,
             "http://127.0.0.1:1",
             &target,
+            None,
             false,
         )
         .await

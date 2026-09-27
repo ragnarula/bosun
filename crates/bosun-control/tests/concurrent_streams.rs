@@ -87,6 +87,7 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>, tempfile::T
         providers: HashMap::new(),
         personas: HashMap::new(),
         default_persona: None,
+        password: None,
         oauth_redirect_uri: None,
         mcp: Arc::new(bosun_control::mcp_manager::McpManager::new(
             store.clone(),
@@ -172,7 +173,7 @@ async fn node_with_sessions(
             .await
             .expect("the session should start on the node");
     }
-    manager.start_node_tunnel("node-1");
+    manager.start_node_tunnel("node-1", "test-password");
     manager
 }
 

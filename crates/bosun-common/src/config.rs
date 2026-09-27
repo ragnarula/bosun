@@ -32,6 +32,11 @@ pub struct ControlConfig {
     /// `"env:VAR"` read from the environment at boot like a model `api_key`.
     /// Never serialized back to TOML or exposed through the API.
     pub github_token: Option<String>,
+    /// The shared password guarding the control plane's whole HTTP surface: a
+    /// literal, or `"env:VAR"` read from the environment at boot. Never
+    /// serialized back to TOML or exposed through the API. The control plane
+    /// refuses to start without one.
+    pub password: Option<String>,
     /// The control-plane URL the MCP OAuth callback is served at. No default:
     /// a server that needs OAuth cannot be authorised until this is set, and
     /// a wrong value fails the flow with a clear error.
@@ -136,6 +141,7 @@ impl Default for ControlConfig {
             personas: HashMap::new(),
             default_persona: None,
             github_token: None,
+            password: None,
             oauth_redirect_uri: None,
         }
     }
@@ -217,6 +223,11 @@ pub struct NodeConfig {
     pub work_dir: PathBuf,
     pub browse_roots: Vec<PathBuf>,
     pub ca_cert: Option<PathBuf>,
+    /// The password the node presents to the control plane: a literal, or
+    /// `"env:VAR"` read from the environment at boot. Sent only to the
+    /// control plane, never to the release feed, and never logged. The node
+    /// refuses to start without one.
+    pub password: Option<String>,
     pub update: NodeUpdateConfig,
 }
 
@@ -228,6 +239,7 @@ impl Default for NodeConfig {
             work_dir: "work".into(),
             browse_roots: Vec::new(),
             ca_cert: None,
+            password: None,
             update: NodeUpdateConfig::default(),
         }
     }
@@ -237,12 +249,19 @@ impl Default for NodeConfig {
 #[serde(default)]
 pub struct CliConfig {
     pub cp_url: String,
+    /// The control plane's shared password: a literal, or `"env:VAR"` read
+    /// from the environment when a command runs. Never written out while
+    /// unset, and never printed: `bosun config get` reports only whether one
+    /// is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
             cp_url: "http://127.0.0.1:8090".into(),
+            password: None,
         }
     }
 }
@@ -349,6 +368,14 @@ mod tests {
         assert_eq!(config.github_token, None);
         let config: ControlConfig = toml::from_str("github_token = \"env:GITHUB_TOKEN\"").unwrap();
         assert_eq!(config.github_token.as_deref(), Some("env:GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn password_defaults_to_none_and_parses_a_value() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(config.password, None);
+        let config: ControlConfig = toml::from_str("password = \"env:BOSUN_PASSWORD\"").unwrap();
+        assert_eq!(config.password.as_deref(), Some("env:BOSUN_PASSWORD"));
     }
 
     #[test]
@@ -648,6 +675,14 @@ mod tests {
     }
 
     #[test]
+    fn node_password_defaults_to_none_and_parses_a_value() {
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.password, None);
+        let config: NodeConfig = toml::from_str("password = \"env:BOSUN_PASSWORD\"").unwrap();
+        assert_eq!(config.password.as_deref(), Some("env:BOSUN_PASSWORD"));
+    }
+
+    #[test]
     fn node_config_defaults_to_no_browse_roots() {
         let config: NodeConfig = toml::from_str("").unwrap();
         assert!(config.browse_roots.is_empty());
@@ -724,9 +759,30 @@ mod tests {
         let path = dir.path().join("sub").join("config.toml");
         let config = CliConfig {
             cp_url: "http://10.0.0.5:8090".into(),
+            password: Some("env:BOSUN_PASSWORD".into()),
         };
         save_config(&path, &config).unwrap();
         let loaded: CliConfig = load_config_if_exists(&path).unwrap();
         assert_eq!(loaded.cp_url, "http://10.0.0.5:8090");
+        assert_eq!(loaded.password.as_deref(), Some("env:BOSUN_PASSWORD"));
+    }
+
+    #[test]
+    fn a_config_without_a_password_writes_no_key_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        save_config(
+            &path,
+            &CliConfig {
+                cp_url: "http://10.0.0.5:8090".into(),
+                password: None,
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("password"),
+            "an unset password must leave no key behind: {text}"
+        );
     }
 }

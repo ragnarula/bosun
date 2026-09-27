@@ -6,9 +6,13 @@ Each role reads one TOML file passed with `--config`:
 |---|---|---|
 | Control plane | `bosun serve --config serve.toml` | `ControlConfig` |
 | Node | `bosun node --config node.toml` | `NodeConfig` |
-| CLI | stored config file, then `BOSUN_CP_URL`, then a default | `CliConfig` |
+| CLI | `--cp-url`, then `BOSUN_CP_URL`, the stored config file, then a default | `CliConfig` |
 
-Every field has a default, so a config file can be sparse or empty. Deserialization fills missing fields from the struct's `Default` implementation. See `crates/bosun-common/src/config.rs` for the current fields and defaults.
+Every field has a default, so a config file can be sparse or empty; the control
+plane's `password` and the node's are the exceptions and must be set.
+Deserialization fills missing fields from the struct's `Default`
+implementation. See `crates/bosun-common/src/config.rs` for the current fields
+and defaults.
 
 ## Control plane
 
@@ -21,6 +25,7 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `data_dir` | `data` | Directory for the SQLite store and persona prompt files |
 | `nudge` | `true` | Whether the agent loop appends its `[harness nudge]` message when a turn ends with prose and no tool call. `false` takes the pre-nudge path for every session on the control plane: no message is appended and no announcement is checked, so a prose-ending wake ends there, with a root waiting for the operator and a child reporting to its parent and stopping |
 | `github_token` | none | Optional GitHub token, a literal or `env:VAR` read from the environment at boot. Sent as the `Authorization` header when the control plane fetches or updates skill repositories; private repos need it, public repos do not. Never stored or exposed; see skill repositories below |
+| `password` | none | Shared password every control-plane request must present with HTTP Basic, a literal or `env:VAR` read from the environment at boot. The client sends the username `bosun` and the verifier ignores it, so the password is the whole secret. Unset, empty, or unresolvable fails boot; a non-loopback bind without `tls_cert` warns, since the password then travels in cleartext. Never returned or logged |
 | `oauth_redirect_uri` | none | The control-plane URL the MCP OAuth callback is served at. No default. A path the control plane already serves fails boot with a clear error, and an unset value fails an OAuth flow with a clear error; see MCP servers below |
 | `models` | none | Named model entries (see `ModelConfig` below). Sessions never name one directly; a persona's `model` does |
 | `personas` | none | Named personas (see `PersonaConfig` below) |
@@ -151,6 +156,7 @@ without that server's tools and shows a warning.
 | `work_dir` | `work` | Directory session clones are created in |
 | `browse_roots` | none | Directories the interactive `bosun dev` picker may browse and a spawned child session may be placed in. Empty disables `bosun dev` and any caller-named child directory on this node |
 | `ca_cert` | none | PEM certificate the node trusts in addition to the system roots, for a control plane behind a private CA |
+| `password` | none | Shared password the node presents to the control plane with HTTP Basic, a literal or `env:VAR` read from the environment at boot. Unset, empty, or unresolvable fails boot. Never logged, and sent to the control plane alone: the release-feed download carries no credential. A cleartext `http` `cp_url` whose host is neither a loopback address nor `localhost` fails boot unless the node runs with `--insecure`; `node.toml` has no field for that, the flag is the one way |
 | `update.enabled` | `true` | Whether the node fetches a released binary for the control plane's announced version and auto-updates to it |
 | `update.base_url` | none | Release feed the node fetches update archives from. Overrides `BOSUN_UPDATE_BASE_URL`, then GitHub Releases for this repository |
 
@@ -167,16 +173,29 @@ outbound tunnel per session, per `docs/adrs/2026-08-21-nodes-dial-out-only.md`.
 
 ## CLI
 
-The CLI reads its control-plane URL from `~/.config/bosun/config.toml` (or
-`$XDG_CONFIG_HOME/bosun/config.toml` when set). Store it once with:
+The CLI reads its control-plane URL and password from
+`~/.config/bosun/config.toml` (or `$XDG_CONFIG_HOME/bosun/config.toml` when
+set). Store them once with:
 
 ```bash
 bosun config set cp-url http://10.0.0.5:8090
-bosun config get      # shows the stored URL and the file path
-bosun config unset    # resets the stored URL to the default
+bosun config set password env:BOSUN_PASSWORD
+bosun config get             # shows the stored URL, whether a password is set, and the file path
+bosun config unset cp-url    # resets the stored URL to the default
+bosun config unset password  # forgets the stored password
 ```
 
+`bosun config get` reports only whether a password is set; the value is never
+printed, and neither is a password given to `bosun config set`. The stored
+value is a literal or an `env:VAR` reference, read from the environment when a
+command runs.
+
 Every CLI command resolves the URL from, in order: `--cp-url`, `BOSUN_CP_URL`,
-the stored config file, then the default `http://127.0.0.1:8090`. To reach a
-control plane behind a private CA, set `BOSUN_CA_CERT` to a PEM file the CLI
-should trust.
+the stored config file, then the default `http://127.0.0.1:8090`. It resolves
+the password from, in order: the stored value, then `BOSUN_PASSWORD`. It
+presents that password on every control-plane request with HTTP Basic, and
+reports a 401 as the control plane requiring a password rather than as a
+status. A cleartext `http` URL whose host is neither a loopback address nor
+`localhost` is refused unless `--insecure` is given, because the password would
+then travel in the clear. To reach a control plane behind a private CA, set
+`BOSUN_CA_CERT` to a PEM file the CLI should trust.

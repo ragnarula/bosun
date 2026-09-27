@@ -1,9 +1,17 @@
-# Node configuration. Every field is optional.
+# Node configuration. Every field is optional except password.
 cp_url = "http://127.0.0.1:8090"
 node_name = "node-1"
 # work_dir = "work"
 # The launch directory; lets `bosun dev` browse this repository.
 browse_roots = ["."]
+
+# The shared password the node presents to the control plane. A literal, or an
+# `env:VAR` reference read from the environment at boot. Required: the node
+# refuses to start without it, so with the reference below, export
+# BOSUN_PASSWORD. The node refuses an `http` cp_url to a host that is neither
+# loopback nor localhost unless it runs with --insecure; node.toml has no field
+# for that, the flag is the one way.
+password = "env:BOSUN_PASSWORD"
 
 # The node auto-updates to the control plane's version when one is available.
 # The archive is fetched from GitHub Releases; point base_url at a mirror
