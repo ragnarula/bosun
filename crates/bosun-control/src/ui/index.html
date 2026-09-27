@@ -1182,6 +1182,10 @@
     align-items: flex-end;
   }
   .chat-row[hidden] { display: none; }
+  /* A text field is 16px at every width, never the 14px body size: a focused
+     control under 16px makes iOS Safari zoom the page, and a phone in landscape
+     is wider than any breakpoint could catch. A desktop reader sees these two
+     fields one step larger than the text around them, which is the price. */
   .chat-row textarea {
     flex: 1;
     resize: vertical;
@@ -1191,6 +1195,7 @@
     border-radius: 8px;
     padding: 9px 11px;
     font: inherit;
+    font-size: 16px;
   }
   .chat-row textarea:focus, .ask-free textarea:focus { outline: none; border-color: var(--accent); }
   /* A live question is the composer: its options as thumb-width chips, a
@@ -1265,6 +1270,7 @@
     border-radius: 8px;
     padding: 9px 11px;
     font: inherit;
+    font-size: 16px;
   }
   .ask-free-actions { display: flex; gap: 8px; }
   .ask-free-actions button {
@@ -1278,7 +1284,9 @@
     main { padding: 0 12px 16px; }
     #status { padding: 3px 12px 7px; }
     button { min-height: 40px; padding: 8px 14px; }
-    .composer select, .input-row textarea, .ask-free textarea { font-size: 16px; }
+    /* The two text fields above are 16px everywhere now; a picker keeps its
+       phone size here, where the thumb, not the pointer, opens it. */
+    .composer select { font-size: 16px; }
     .session-item { min-height: 48px; }
     .session-row { min-height: 48px; }
     #session-list .children-toggle { min-height: var(--touch-min-height); }
@@ -3404,6 +3412,13 @@ function startFromLink() {
 
 // The view half of opening: the session's header, transcript and event stream,
 // with the previous session's teardown first.
+// A coarse pointer is a touch screen, and a touch screen refuses a focus the
+// reader did not ask for: taking one when a session opens, or when a question
+// arrives, is the focus that sometimes does not land and the one that can zoom
+// the page. Programmatic focuses stay for a fine pointer, and every focus a tap
+// reaches is left alone.
+const coarsePointer = () => window.matchMedia('(pointer: coarse)').matches;
+
 function showSession(id) {
   closeSession();
   current = id;
@@ -3428,7 +3443,7 @@ function showSession(id) {
   // The chat draft survives closing the session; restore it here so the
   // resumed session starts where the user left off.
   input.value = loadDraft();
-  if (!inputRow.hidden) input.focus();
+  if (!inputRow.hidden && !coarsePointer()) input.focus();
 }
 
 function closeSession() {
@@ -3737,7 +3752,7 @@ function renderAskComposer(ask) {
     askChips.hidden = true;
     btnAskType.hidden = true;
     askFree.hidden = false;
-    askInput.focus();
+    if (!coarsePointer()) askInput.focus();
   }
   askSheet.hidden = false;
   chatRow.hidden = true;

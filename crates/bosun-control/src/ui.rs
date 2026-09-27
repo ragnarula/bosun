@@ -1335,6 +1335,56 @@ mod tests {
         );
     }
 
+    // A text field is 16px at every width. A focused control under 16px makes
+    // iOS Safari zoom the page, and a phone in landscape is wider than the
+    // breakpoint that guard used to live in.
+
+    #[test]
+    fn the_pane_keeps_its_text_fields_at_sixteen_pixels() {
+        for rule in [".chat-row textarea {", ".ask-free textarea {"] {
+            let body = segment(PANE, rule, "}");
+            assert!(
+                body.contains("font-size: 16px;"),
+                "`{rule}` must carry the size that keeps a phone from zooming on focus"
+            );
+        }
+        assert!(
+            !PANE.contains(".input-row textarea, .ask-free textarea { font-size: 16px; }"),
+            "and the size must not come from the narrow-screen override, which a landscape phone is wider than"
+        );
+        assert!(
+            PANE.contains(".composer select { font-size: 16px; }"),
+            "a picker keeps its phone size where the thumb opens it"
+        );
+    }
+
+    #[test]
+    fn the_pane_takes_no_focus_without_a_gesture_on_a_coarse_pointer() {
+        assert!(
+            PANE.contains(
+                "const coarsePointer = () => window.matchMedia('(pointer: coarse)').matches;"
+            ),
+            "the pane needs one place that knows a touch screen"
+        );
+        assert!(
+            PANE.contains("if (!inputRow.hidden && !coarsePointer()) input.focus();"),
+            "opening a session must not take the composer's focus on a touch screen: that focus is the one that sometimes does not land"
+        );
+        assert!(
+            PANE.contains("if (!coarsePointer()) askInput.focus();"),
+            "and an arriving question must not take the ask field's either"
+        );
+        assert_eq!(
+            PANE.matches("askInput.focus();").count(),
+            2,
+            "the ask field has two focuses: the arriving one, gated, and the one the `answer in your own words` button takes"
+        );
+        assert!(
+            PANE.contains("input.focus();"),
+            "and the composer keeps the focus send takes after a tap"
+        );
+    }
+
     // The fork control: a session's conversation copies into a new session from
     // the actions sheet, and the pane opens the copy.
 
