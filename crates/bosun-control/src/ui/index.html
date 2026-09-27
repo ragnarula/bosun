@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="bosun-version" content="{{BOSUN_VERSION}}">
 <title>Bosun</title>
 <script src="/ui/mermaid.min.js" id="mermaid-bundle" defer></script>
 <style>
@@ -72,7 +73,10 @@
   #toast {
     position: fixed;
     left: 50%;
-    bottom: 20px;
+    /* A toast reports; it never takes a tap, and it must not cover the composer
+       while it is up. */
+    pointer-events: none;
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
     z-index: 20;
     transform: translateX(-50%);
     max-width: calc(100% - 40px);
@@ -744,6 +748,7 @@
     left: 0;
     right: 0;
     bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
     z-index: 12;
     display: flex;
     flex-direction: column;
@@ -836,6 +841,13 @@
   /* The transcript and the control that returns the reader to its end. The
      control floats inside this box, so it sits just above the composer whatever
      height the composer takes. */
+  /* The one guard every toggled overlay needs: the UA's `[hidden] { display:
+     none }` loses to any author rule that sets `display` on the same element, so
+     an overlay the code believes is hidden can stay rendered — a full-screen
+     `#child-panel` at phone widths, above the session view, eating taps. The
+     element-specific guards below it still name their own elements; this one
+     holds whatever a later rule forgets. */
+  [hidden] { display: none !important; }
   #transcript-wrap {
     position: relative;
     flex: 1;
@@ -944,7 +956,13 @@
   #child-list .child-list-note { display: block; padding: 8px 10px; color: var(--muted); font-size: 12px; }
   /* The child panel's transcript is the only transcript that is not the whole
      view: it takes what the list leaves. */
-  #child-transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; font-size: 13px; }
+  #child-transcript {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    font-size: 13px;
+  }
   /* The control on a child's line that follows it here: the child's id opens it
      as the session view, as it always did. */
   :is(#transcript, #child-transcript) .child-watch {
@@ -1173,7 +1191,10 @@
   .input-row {
     display: grid;
     gap: 10px;
-    padding: 14px 20px;
+    /* The Home indicator's strip is not the composer's: with `viewport-fit=cover`
+       the page reaches under it, so the row keeps its padding and adds the
+       inset. The sheet below and the toast carry the same one. */
+    padding: 14px 20px max(14px, env(safe-area-inset-bottom, 0px));
     background: var(--panel);
     border-top: 1px solid var(--border);
   }
@@ -1306,7 +1327,9 @@
     .view-header { padding: 8px 12px; }
     .dir-browser-head { flex-wrap: wrap; }
     #transcript { padding: 12px 14px; }
-    .input-row { padding: 12px 14px; }
+    /* The narrow row is tighter, and keeps the Home indicator's inset: this
+       rule's shorthand would otherwise drop it where it matters most. */
+    .input-row { padding: 12px 14px max(12px, env(safe-area-inset-bottom, 0px)); }
     /* A side column does not fit a phone: the panel covers the view instead,
        with the same header, which names the child and closes it. */
     #child-panel {
@@ -3918,10 +3941,38 @@ function syncBtnBottom() {
 
 btnBottom.addEventListener('click', jumpToBottom);
 
-transcript.addEventListener('scroll', () => {
+// iOS Safari does not shrink the layout viewport when the keyboard opens, so a
+// session view pinned to that height keeps the composer exactly where the
+// keyboard is drawn, and a tap at the very bottom edge can fall in the Home
+// indicator's strip instead of the field. The visual viewport is the part of the
+// page the reader can actually see, so the view rides it: its height, and its
+// offset when the page is pushed up. A phone without one, or a desktop, never
+// runs this.
+function syncVisualViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  view.style.height = viewport.height + 'px';
+  view.style.top = viewport.offsetTop + 'px';
+  // The keyboard changes the transcript's height, and no scroll event comes
+  // with it: this is the resize #19 named as stale, and the control catches up
+  // here.
+  syncStick();
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', syncVisualViewport);
+  window.visualViewport.addEventListener('scroll', syncVisualViewport);
+}
+
+// Whether the transcript is at its end, and the control that shows when it is
+// not. The scroll listener asks on every scroll; the visual viewport asks too,
+// because the keyboard changes the transcript's height without a scroll.
+function syncStick() {
   stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;
   syncBtnBottom();
-});
+}
+
+transcript.addEventListener('scroll', syncStick);
 
 // A durable event's stamp as the reader's local clock time. The wire carries
 // UTC; the browser converts it, and an empty locale list keeps the reader's

@@ -6,9 +6,22 @@ use axum::response::IntoResponse;
 /// page is data, embedded at compile time; no build step serves it.
 pub async fn pane() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("ui/index.html"),
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // A phone that kept the old page keeps the bug it fixed: an open tab
+            // and a history restore both serve from the browser's store, so the
+            // pane is never stored.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        pane_html(),
     )
+}
+
+/// The pane's page, with the version that served it stamped in. The page stays
+/// a static asset with one placeholder in it, so the only thing the server
+/// writes is the version — which a phone can then be read for at a glance.
+fn pane_html() -> String {
+    include_str!("ui/index.html").replace("{{BOSUN_VERSION}}", bosun_common::version::VERSION)
 }
 
 /// The mermaid bundle the pane renders diagram fences with: mermaid 12.0.0,
@@ -28,6 +41,35 @@ pub async fn mermaid_bundle() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     const PANE: &str = include_str!("ui/index.html");
+
+    #[tokio::test]
+    async fn the_pane_is_served_uncached_and_says_which_build_it_is() {
+        use axum::response::IntoResponse as _;
+        let response = super::pane().await.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store",
+            "a phone that kept the old page keeps the bug it fixed, and a history restore serves from the browser's store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains(&format!(
+                "<meta name=\"bosun-version\" content=\"{}\">",
+                bosun_common::version::VERSION
+            )),
+            "the page names the build that served it, so a phone's version can be read at a glance"
+        );
+        assert!(
+            !body.contains("{{BOSUN_VERSION}}"),
+            "and the placeholder it replaces is not served"
+        );
+    }
 
     /// The selector prefix the transcript's block rules carry: the session's
     /// transcript and the subagent panel's draw the same blocks, so one rule set
@@ -1119,12 +1161,15 @@ mod tests {
             1,
             "one `transcript.addEventListener('scroll'` runs; this check reads the first"
         );
-        assert_eq!(
-            block(&pane, &squeezed("transcript.addEventListener('scroll'")),
-            squeezed(
-                "stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40; syncBtnBottom();"
-            ),
-            "the listener must hold auto-scroll while the end of the transcript is in view, and put the control away with the flag it just read: a listener that clears `stick` on every scroll takes back the jump a keystroke or a send just made, and the sent message and its answer land below the fold again"
+        assert!(
+            PANE.contains("transcript.addEventListener('scroll', syncStick);"),
+            "the scroll listener must read the flag and put the control away with it: a listener that clears `stick` on every scroll takes back the jump a keystroke or a send just made, and the sent message and its answer land below the fold again"
+        );
+        assert!(
+            pane.contains(&squeezed(
+                "function syncStick() { stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40; syncBtnBottom(); }"
+            )),
+            "and that read lives in one place, so the keyboard's resize can ask the same question"
         );
     }
 
@@ -1273,16 +1318,20 @@ mod tests {
             squeezed("btnBottom.hidden = stick;"),
             "the control is hidden while the transcript is at its end, the state `stick` holds: any other rule shows it to a reader who is already at the bottom, or hides it from the reader who is not"
         );
-        let listener = block(&pane, &squeezed("transcript.addEventListener('scroll'"));
-        let read = listener
+        let sync = block(&pane, &squeezed("function syncStick"));
+        let read = sync
             .find(&squeezed("stick = transcript.scrollTop"))
-            .expect("the listener must recompute auto-scroll from where the transcript sits");
-        let synced = listener
+            .expect("the flag must be recomputed from where the transcript sits");
+        let synced = sync
             .find(&squeezed("syncBtnBottom();"))
-            .expect("the listener must sync the control, or a reader who scrolls up keeps a screen with no way back to the newest line");
+            .expect("which must sync the control, or a reader who scrolls up keeps a screen with no way back to the newest line");
         assert!(
             read < synced,
             "the sync must stand after the flag is recomputed, or the control shows the state the reader just left"
+        );
+        assert!(
+            PANE.contains("transcript.addEventListener('scroll', syncStick);"),
+            "and the scroll listener must ask it, so a scroll is still what changes the control"
         );
         assert_eq!(
             pane.matches(&squeezed("btnBottom.hidden")).count(),
@@ -1431,6 +1480,107 @@ mod tests {
             )
             .contains("input.focus();"),
             "and send still re-focuses the composer in its `finally`, where the tap is the gesture"
+        );
+    }
+
+    // The one guard every toggled overlay needs. The UA's `[hidden] { display:
+    // none }` loses to any author rule that sets `display` on the same element,
+    // so an overlay the code believes is hidden can stay rendered — a
+    // full-screen `#child-panel` at phone widths, above the session view,
+    // eating taps meant for the composer.
+
+    #[test]
+    fn the_pane_guards_every_hidden_overlay_against_an_author_display() {
+        assert!(
+            PANE.contains("[hidden] { display: none !important; }"),
+            "a global rule is what holds for any overlay a later rule could outrank"
+        );
+        assert_eq!(
+            PANE.matches("!important").count(),
+            1,
+            "and it is the only `!important` in the sheet: any other would be a fight the reader loses"
+        );
+        for (guard, why) in [
+            (
+                "#child-panel[hidden]",
+                "the panel is a full-screen layer at phone widths",
+            ),
+            ("#view-sheet[hidden]", "the actions sheet covers the view"),
+            ("#ask-sheet[hidden]", "the ask sheet sits in the composer"),
+            ("#activity-log[hidden]", "the console"),
+            ("#watch-banner[hidden]", "the watch banner"),
+            (".chat-row[hidden]", "the composer's row"),
+            (".input-row[hidden]", "the composer"),
+        ] {
+            assert!(
+                PANE.contains(&format!("{guard} {{ display: none; }}")),
+                "`{guard}` keeps its own guard as well ({why}), so the element reads as hidden even where the global rule is not loaded"
+            );
+        }
+    }
+
+    // The composer rides the iOS keyboard: the session view follows the visual
+    // viewport, which is the part of the page a reader can see, and the bottom
+    // rows keep clear of the Home indicator's strip.
+
+    #[test]
+    fn the_pane_rides_the_visual_viewport_and_keeps_clear_of_the_home_indicator() {
+        let pane = flattened();
+        assert!(
+            PANE.contains(
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+            ),
+            "the page has to reach under the Home indicator before an inset can hold anything clear of it"
+        );
+        let handler = block(&pane, &squeezed("function syncVisualViewport("));
+        assert!(
+            handler.contains(&squeezed("const viewport = window.visualViewport;"))
+                && handler.contains(&squeezed("view.style.height = viewport.height + 'px';"))
+                && handler.contains(&squeezed("view.style.top = viewport.offsetTop + 'px';")),
+            "the session view takes the visible height and offset, so the composer is not left where the keyboard is drawn"
+        );
+        assert!(
+            handler.contains(&squeezed("syncStick();")),
+            "and the keyboard's resize re-reads the follow flag: no scroll event arrives with it, which is the staleness #19 named"
+        );
+        assert!(
+            pane.contains(&squeezed(
+                "window.visualViewport.addEventListener('resize', syncVisualViewport);"
+            )) && pane.contains(&squeezed(
+                "window.visualViewport.addEventListener('scroll', syncVisualViewport);"
+            )),
+            "both the resize and the scroll of the visual viewport are followed"
+        );
+        // Every rule that writes the row's padding, the narrow-screen one
+        // included: a shorthand in a media query was what dropped the inset
+        // where it matters most, which the browser harness caught.
+        for rule in [".input-row {"] {
+            let mut rest = PANE;
+            let mut read = 0;
+            while let Some((_, after)) = rest.split_once(rule) {
+                let Some((body, tail)) = after.split_once('}') else {
+                    break;
+                };
+                rest = tail;
+                read += 1;
+                assert!(
+                    body.contains("env(safe-area-inset-bottom"),
+                    "`{rule}` must keep clear of the Home indicator in every rule that writes its padding"
+                );
+            }
+            assert!(read > 0, "`{rule}` must be styled at all");
+        }
+        assert!(
+            segment(PANE, "#view-sheet {", "}").contains("env(safe-area-inset-bottom"),
+            "the sheet that anchors to the bottom keeps clear of the Home indicator; the desktop variant is a side sheet and needs no inset"
+        );
+        assert!(
+            PANE.contains("bottom: calc(20px + env(safe-area-inset-bottom, 0px));"),
+            "and the toast sits above the indicator rather than in it"
+        );
+        assert!(
+            PANE.contains("pointer-events: none;"),
+            "a toast reports and never takes a tap: it used to cover the composer and swallow taps there"
         );
     }
 
