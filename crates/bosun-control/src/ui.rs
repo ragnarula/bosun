@@ -1467,8 +1467,13 @@ mod tests {
             )),
             "the list is the open session's direct children, from the poll the pane already runs"
         );
+        let body = segment(
+            PANE,
+            "function renderChildList(",
+            "\nfunction updateChildPanelDot(",
+        );
         assert!(
-            PANE.contains("dot.className = 'dot ' + child.state;")
+            body.contains("dot.className = 'dot ' + child.state;")
                 && list.contains(&squeezed("childList.appendChild(row);"))
                 && list.contains(&squeezed("name.textContent = childName(child);")),
             "each row the list appends carries the child's state and its name"
@@ -1511,10 +1516,12 @@ mod tests {
         );
         let named = block(&pane, &squeezed("function namedChild("));
         assert!(
-            named.contains(&squeezed(
-                "if (content && typeof content === 'object' && content.child_id)"
-            )),
-            "a result names its child from its content, which is an object before anything flattens it"
+            PANE.contains("if (name === 'spawn') {")
+                && PANE.contains(
+                    "const made = content && typeof content === 'object' ? content.child_id : undefined;"
+                )
+                && PANE.contains("return typeof made === 'string' && made ? made : undefined;"),
+            "a `spawn` result names its child from its content, which is an object before anything flattens it, and only a string counts"
         );
         assert!(
             named.contains(&squeezed(
@@ -1535,14 +1542,17 @@ mod tests {
             )),
             "the renderer hands it the raw content, not the flattened string the line shows"
         );
+        let teardown = segment(PANE, "function closeSession() {", "\nfunction ");
         assert!(
-            PANE.contains("callArgs.clear();"),
-            "and the map belongs to the transcript: `closeChildPanel` clears it, and `closeSession` closes the panel, so nothing survives the session it was filled in"
+            teardown.contains("callArgs.clear();"),
+            "and the map belongs to the transcript: the session's teardown clears it, where the DOM it was filled for clears, and a collapse keeps it so an in-flight `message_child` still gets its control"
         );
         let strip = block(&pane, &squeezed("function appendToolStrip("));
         assert!(
-            strip.contains(&squeezed("if (id) callArgs.set(id, args);")),
-            "the call's arguments are kept, so a `message_child` result can name its child"
+            strip.contains(&squeezed(
+                "if (id && name === 'message_child') callArgs.set(id, args);"
+            )),
+            "only the call whose result may need them keeps its arguments, so no other call's body is held for the life of the transcript"
         );
         let ask = block(&pane, &squeezed("function renderAskBox("));
         assert!(

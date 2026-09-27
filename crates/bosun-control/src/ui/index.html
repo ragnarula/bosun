@@ -3432,6 +3432,11 @@ function showSession(id) {
 }
 
 function closeSession() {
+  // The call arguments are the transcript's: the DOM clears here, and a call
+  // drawn in it cannot be answered after the session it was drawn in has gone.
+  // A collapse keeps them, because a `message_child` drawn in the main
+  // transcript can still be answered while the panel is closed.
+  callArgs.clear();
   if (es) {
     es.close();
     es = null;
@@ -4018,7 +4023,10 @@ const TOOL_SUMMARY_LIMIT = 120;
 const callArgs = new Map();
 
 function appendToolStrip(name, args, atMs, id) {
-  if (id) callArgs.set(id, args);
+  // Only `message_child` reads a call's arguments back, when its own answer
+  // does not name the child. Keeping them for every call would hold a
+  // `file_write`'s whole body for as long as the transcript lives.
+  if (id && name === 'message_child') callArgs.set(id, args);
   const line = document.createElement('div');
   line.className = 'line tool';
   const glyph = document.createElement('span');
@@ -4100,18 +4108,21 @@ function appendReasoningPanel(text, atMs) {
   scrollToBottom();
 }
 
-// The child a result names, or undefined. A `spawn` answers with the child it
-// made, in its content; a `message_child` answers `ok`, so its child comes from
-// the arguments of the call it answers. Only those two tools are asked: another
-// tool's `id` argument is not a child, and a failed call's child may not exist.
+// The child a result names, or undefined. Two tools are asked, and only by
+// name: a `spawn` result carries the child it made in its own content, and a
+// `message_child` result answers `ok`, so its child comes from the arguments of
+// the call it answers. Another tool's result may hold a `child_id` of its own —
+// an MCP tool's JSON — and another tool's `id` argument is not a child at all.
+// A call that failed names no child: the one it meant may not exist.
 function namedChild(content, name, error, id) {
   if (error) return undefined;
-  if (content && typeof content === 'object' && content.child_id) {
-    return content.child_id;
+  if (name === 'spawn') {
+    const made = content && typeof content === 'object' ? content.child_id : undefined;
+    return typeof made === 'string' && made ? made : undefined;
   }
   if (name !== 'message_child' || !id) return undefined;
   const args = callArgs.get(id);
-  return args && args.id ? args.id : undefined;
+  return args && typeof args.id === 'string' && args.id ? args.id : undefined;
 }
 
 function appendToolResult(name, payload, error, atMs, id, content) {
@@ -4907,9 +4918,6 @@ function closeChildPanel() {
     childEs.close();
     childEs = null;
   }
-  // The call arguments are the transcript's: another session may reuse a call
-  // id, and a result that never came must not outlive the thread it was for.
-  callArgs.clear();
   childFollow = null;
   childStick = true;
   childAskBox = null;
