@@ -1447,16 +1447,26 @@ mod tests {
     }
 
     #[test]
-    fn the_pane_takes_no_focus_without_a_gesture_on_a_coarse_pointer() {
+    fn the_pane_asks_for_the_composer_when_a_session_opens() {
         assert!(
             PANE.contains(
                 "const coarsePointer = () => window.matchMedia('(pointer: coarse)').matches;"
             ),
-            "the pane needs one place that knows a touch screen"
+            "the pane still needs one place that knows a touch screen, for the focuses it keeps gated"
         );
         assert!(
-            PANE.contains("if (!inputRow.hidden && !coarsePointer()) input.focus();"),
-            "opening a session must not take the composer's focus on a touch screen: that focus is the one that sometimes does not land"
+            PANE.contains("if (!inputRow.hidden) input.focus();"),
+            "opening a session asks for the composer on every device, which is the path a phone had before: the keyboard comes up with the session"
+        );
+        let row = segment(
+            PANE,
+            "inputRow.addEventListener('click', (event) => {",
+            "});",
+        );
+        assert!(
+            row.contains("event.target.closest('button, a, input, textarea, select')")
+                && row.contains("input.focus();"),
+            "and a tap anywhere on the composer's row focuses the field, while a control on the row keeps its own tap"
         );
         assert!(
             PANE.contains("if (!coarsePointer()) askInput.focus();"),
@@ -1579,12 +1589,10 @@ mod tests {
         // The layers left alone, and why they are not the same case: a fixed
         // element's containing block is the viewport, not the session view, so
         // the other overlays are unaffected by this change.
-        for layer in ["#view-sheet {", "#standalone-note {"] {
-            assert!(
-                segment(PANE, layer, "}").contains("position: fixed;"),
-                "`{layer}` stays a fixed layer for now"
-            );
-        }
+        assert!(
+            segment(PANE, "#view-sheet {", "}").contains("position: fixed;"),
+            "`#view-sheet` stays a fixed layer for now"
+        );
         assert!(
             PANE.contains("position: fixed;\n      inset: 0;\n      width: auto;"),
             "and the child panel keeps the fixed shape it takes at phone widths"
@@ -1622,77 +1630,11 @@ mod tests {
     // unguarded throw in an installed web app with cookies blocked would take
     // the rest of the script with it.
 
-    #[test]
-    fn the_pane_survives_a_blocked_storage() {
-        let read = segment(PANE, "let dismissed = false;", "if (!dismissed) {");
-        assert!(
-            read.contains("try {")
-                && read.contains("dismissed = window.localStorage.getItem('bosun-standalone-note') === 'dismissed';")
-                && read.contains("} catch (error) {")
-                && read.contains("dismissed = false;"),
-            "the read is guarded, and an unavailable store means the notice was not dismissed"
-        );
-        let dismiss = segment(
-            PANE,
-            "btnStandaloneDismiss.addEventListener('click', () => {",
-            "});",
-        );
-        assert!(
-            dismiss.contains("try {")
-                && dismiss
-                    .contains("window.localStorage.setItem('bosun-standalone-note', 'dismissed');")
-                && dismiss.contains("} catch (error) {"),
-            "and the write is guarded too: losing the persistence costs a notice the next time, nothing else"
-        );
-    }
-
     // The bug is iOS's and the notice names Safari, so an Android TWA or a
     // desktop PWA is never told to open it.
 
-    #[test]
-    fn the_pane_shows_the_standalone_notice_on_ios_alone() {
-        assert!(
-            PANE.contains("/iPad|iPhone|iPod/.test(window.navigator.userAgent)")
-                && PANE.contains("window.navigator.platform === 'MacIntel' && window.navigator.maxTouchPoints > 1"),
-            "an iOS platform is what the display-mode half is gated on, iPadOS included, which reports a desktop user agent"
-        );
-        assert!(
-            PANE.contains("(ios && window.matchMedia('(display-mode: standalone)').matches)"),
-            "so a standalone display mode somewhere else shows nothing"
-        );
-    }
-
     // An installed web app can never show a keyboard for any field on some iOS
     // versions (WebKit bug 279904), and no page can work around it.
-
-    #[test]
-    fn the_pane_warns_about_the_standalone_keyboard_bug() {
-        assert!(
-            PANE.contains("This web-app mode can block the keyboard — open the pane in Safari."),
-            "the notice says what to do, because the pane cannot fix this"
-        );
-        assert!(
-            PANE.contains("window.navigator.standalone === true")
-                && PANE.contains("window.matchMedia('(display-mode: standalone)').matches"),
-            "both ways of being an installed app are checked"
-        );
-        assert!(
-            PANE.contains("standaloneNote.hidden = false;")
-                && PANE.contains("if (\n  window.navigator.standalone === true ||"),
-            "and the notice shows there, inside that check alone"
-        );
-        assert!(
-            PANE.contains(
-                "dismissed = window.localStorage.getItem('bosun-standalone-note') === 'dismissed';"
-            ) && PANE
-                .contains("window.localStorage.setItem('bosun-standalone-note', 'dismissed');"),
-            "it is dismissible, and stays dismissed"
-        );
-        assert!(
-            PANE.contains("<div id=\"standalone-note\" hidden>"),
-            "and it ships hidden, so a tab never sees it"
-        );
-    }
 
     // The ask swap never takes the composer away from a reader who is typing in
     // it: that focus loss, and the re-focus after it, is what iOS answers with

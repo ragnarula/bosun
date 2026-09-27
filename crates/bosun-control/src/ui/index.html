@@ -769,23 +769,6 @@
     -webkit-tap-highlight-color: transparent;
   }
   .view-header .btn-more:active { color: var(--accent); }
-  /* Only ever shown in an installed web app, where some iOS versions show no
-     keyboard for any field at all (WebKit bug 279904) and no page can fix it. */
-  #standalone-note {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 30;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
-    background: var(--panel-2);
-    border-top: 1px solid var(--border);
-    font-size: 12px;
-  }
-  #standalone-note button { min-height: 28px; padding: 2px 10px; }
   #view-sheet {
     position: fixed;
     left: 0;
@@ -1609,10 +1592,6 @@
   </div>
 </div>
 
-<div id="standalone-note" hidden>
-  <span>This web-app mode can block the keyboard — open the pane in Safari.</span>
-  <button type="button" id="btn-standalone-dismiss" title="Dismiss">✕</button>
-</div>
 <div id="view-sheet" hidden>
   <div class="view-sheet-head">
     <span>Session actions</span>
@@ -1722,8 +1701,6 @@ const viewWaiting = $('view-waiting');
 const activityLog = $('activity-log');
 const btnBack = $('btn-back');
 const viewSheet = $('view-sheet');
-const standaloneNote = $('standalone-note');
-const btnStandaloneDismiss = $('btn-standalone-dismiss');
 const btnMore = $('btn-more');
 const btnSheetClose = $('btn-sheet-close');
 const btnCopyId = $('btn-copy-id');
@@ -3523,7 +3500,9 @@ function showSession(id) {
   // The chat draft survives closing the session; restore it here so the
   // resumed session starts where the user left off.
   input.value = loadDraft();
-  if (!inputRow.hidden && !coarsePointer()) input.focus();
+  // Opening a session asks for the composer whatever the pointer: this is the
+  // path a phone had before, and the keyboard comes up with the session.
+  if (!inputRow.hidden) input.focus();
 }
 
 function closeSession() {
@@ -3964,6 +3943,15 @@ async function send() {
 }
 
 btnSend.addEventListener('click', send);
+
+// A tap anywhere on the composer's row asks for the field, not only a tap on the
+// box itself: the row is a bigger target, and the tap is the reader's own
+// gesture, which is what a phone needs to raise the keyboard. A control on the
+// row keeps its own tap.
+inputRow.addEventListener('click', (event) => {
+  if (event.target.closest('button, a, input, textarea, select')) return;
+  input.focus();
+});
 // Keep the chat draft in sync with what the user is typing.
 input.addEventListener('input', () => {
   saveDraft();
@@ -4003,42 +3991,6 @@ function syncBtnBottom() {
 }
 
 btnBottom.addEventListener('click', jumpToBottom);
-
-// An installed web app can never show a keyboard for any field on some iOS
-// versions, and no page can work around it: say so once, and only there. A tab
-// is not affected, so a tab never sees this.
-// The bug is iOS's, and the notice names Safari: an Android TWA or a desktop
-// PWA must never be told to open Safari. `standalone` is iOS-only already, and
-// the display-mode half is gated on an iOS platform the same way.
-const ios =
-  /iPad|iPhone|iPod/.test(window.navigator.userAgent) ||
-  (window.navigator.platform === 'MacIntel' && window.navigator.maxTouchPoints > 1);
-if (
-  window.navigator.standalone === true ||
-  (ios && window.matchMedia('(display-mode: standalone)').matches)
-) {
-  // An installed web app with cookies blocked throws on storage access, and an
-  // unguarded throw here would take the rest of the script with it: the pane
-  // would load dead. An unavailable store means "not dismissed".
-  let dismissed = false;
-  try {
-    dismissed = window.localStorage.getItem('bosun-standalone-note') === 'dismissed';
-  } catch (error) {
-    dismissed = false;
-  }
-  if (!dismissed) {
-    standaloneNote.hidden = false;
-  }
-}
-
-btnStandaloneDismiss.addEventListener('click', () => {
-  standaloneNote.hidden = true;
-  try {
-    window.localStorage.setItem('bosun-standalone-note', 'dismissed');
-  } catch (error) {
-    // Losing the persistence costs a notice the next time; nothing else.
-  }
-});
 
 // iOS Safari does not shrink the layout viewport when the keyboard opens, so a
 // session view pinned to that height keeps the composer exactly where the
