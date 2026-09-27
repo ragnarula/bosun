@@ -2587,6 +2587,32 @@ mod tests {
     }
 
     #[test]
+    fn event_lines_draw_the_context_size_note_as_the_loop_words_it() {
+        let note = Event::Message {
+            at_ms: None,
+            message: Message {
+                role: Role::Assistant,
+                block: Block::ContextSize {
+                    tokens: 600_000,
+                    window: 1_000_000,
+                    compact_at: 950_000,
+                },
+            },
+        };
+        // The terminal's copy of the wording: the loop's line, the pane's line
+        // and this one say the same thing, and a change to one of them has to be
+        // made in the others.
+        assert_eq!(
+            event_lines(&note),
+            vec![Line {
+                kind: LineKind::ContextSize,
+                text: "context: 600000 / 1000000 tokens (60%), compaction at 950000".into(),
+                at_ms: None,
+            }]
+        );
+    }
+
+    #[test]
     fn event_lines_maps_each_durable_event_kind() {
         let text = Event::Message {
             at_ms: None,

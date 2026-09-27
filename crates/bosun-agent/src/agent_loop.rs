@@ -1827,10 +1827,6 @@ async fn run_turn_inner(
                 )
                 .await?;
             }
-            // The completion is done and its counts are in, so the session can
-            // be told how full its context is before the turn goes on.
-            append_context_note(deps, session_id, window, state.last_input_tokens).await?;
-
             let calls: Vec<Call> = parse_tool_calls(tool_calls, session_id);
 
             if calls.is_empty() {
@@ -1846,6 +1842,13 @@ async fn run_turn_inner(
                         reason: stop_reason,
                     });
                 }
+                // The turn ends here, so this is its last completion: the note
+                // is written once per turn, not once per completion, and never
+                // inside a completion that still has calls to run — a note there
+                // would split the assistant message its calls are grouped into.
+                // An empty completion writes none: it is retried, and the retry
+                // sends an identical request.
+                append_context_note(deps, session_id, window, state.last_input_tokens).await?;
                 return Ok(TurnOutcome::Finished { text });
             }
             calls
@@ -3167,8 +3170,14 @@ const CONTEXT_NOTE_AT_TOKENS: u64 = CONTEXT_WINDOW_TOKENS / 2;
 /// estimate of the next request: the loop already has it, and an estimate would
 /// describe a request that has not been built. It is a durable message, so the
 /// reader replays the counts' history and the model reads the note in its next
-/// window — which is also why it is written once per completion and not every
-/// turn regardless of size.
+/// window.
+///
+/// The caller writes it at the completion that ends the turn, so a turn writes
+/// one note however many completions it took, and no note ever sits inside a
+/// completion that still has tool calls to run: the serializers group a
+/// completion's text and calls into one assistant message, and a note between
+/// them would break that grouping. A turn that ends by asking a question writes
+/// none, because its next request is the answer rather than the thread.
 async fn append_context_note(
     deps: &LoopDeps,
     session_id: &str,
@@ -5032,6 +5041,8 @@ mod tests {
                 stop(1000, 20),
             ],
             vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
+            // The compacted turn ends the wake, and its own count crosses the
+            // note's threshold, so the note is written after the summary.
             vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
         ]));
         let deps = Arc::new(test_deps_with_compact_at(
@@ -18658,6 +18669,8 @@ mod tests {
             ],
             vec![StreamEvent::TextDelta("carrying on".into()), stop(1000, 20)],
             vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
+            // The compacted turn ends the wake, and its own count crosses the
+            // note's threshold, so the note is written after the summary.
             vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
         ]));
         let deps = Arc::new(test_deps_with_compact_at(
@@ -19891,9 +19904,165 @@ mod tests {
         assert!(
             carried
                 .iter()
-                .any(|text| text.starts_with("context: 600000 / ")),
-            "the next request carries the note: {carried:?}"
+                .any(|text| text == "context: 600000 / 1000000 tokens (60%), compaction at 950000"),
+            "the next request carries the note whole, percentage and compaction count included: {carried:?}"
         );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn the_note_is_written_at_half_the_window_and_not_under_it() {
+        for (tokens, expected) in [
+            (CONTEXT_NOTE_AT_TOKENS, true),
+            (CONTEXT_NOTE_AT_TOKENS - 1, false),
+        ] {
+            let dir = tempdir().unwrap();
+            let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+            let session_id = format!("s-half-{tokens}");
+            store.create_session(&session(&session_id)).await.unwrap();
+            store
+                .append_message(
+                    &session_id,
+                    Role::User,
+                    &Block::Text {
+                        text: "start".into(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let provider = Arc::new(ScriptedProvider::new(vec![vec![
+                StreamEvent::TextDelta("working".into()),
+                stop(tokens, 20),
+            ]]));
+            let deps = Arc::new(test_deps(
+                &store,
+                provider.clone(),
+                Arc::new(MockTools::new(default_outcome())),
+                Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+            ));
+            let handle = spawn_loop(session_id.clone(), deps);
+
+            handle.send(LoopEvent::Wake);
+            wait_for("the turn to end", {
+                let store = store.clone();
+                let session_id = session_id.clone();
+                move || {
+                    let store = store.clone();
+                    let session_id = session_id.clone();
+                    async move {
+                        store.get_session(&session_id).await.unwrap().unwrap().state
+                            == SessionState::WaitingForInput
+                    }
+                }
+            })
+            .await;
+
+            let notes = store
+                .messages(&session_id, true)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(_, message)| matches!(&message.block, Block::ContextSize { .. }))
+                .count();
+            assert_eq!(
+                notes == 1,
+                expected,
+                "at {tokens} input tokens the note is {} (half the window is {CONTEXT_NOTE_AT_TOKENS})",
+                if expected { "written" } else { "silent" }
+            );
+            handle.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_writes_one_note_however_many_completions_it_took() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-per-turn")).await.unwrap();
+        store
+            .append_message(
+                "s-per-turn",
+                Role::User,
+                &Block::Text {
+                    text: "start".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Two completions in one turn, both above half: the first runs a tool,
+        // the second ends the turn.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("shell".into()),
+                    args_delta: r#"{"command":"work"}"#.into(),
+                },
+                stop(600_000, 20),
+            ],
+            vec![StreamEvent::TextDelta("done".into()), stop(700_000, 20)],
+        ]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-per-turn".into(), deps);
+
+        handle.send(LoopEvent::Wake);
+        wait_for("the turn to end", {
+            let store = store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    store
+                        .get_session("s-per-turn")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state
+                        == SessionState::WaitingForInput
+                }
+            }
+        })
+        .await;
+
+        let notes: Vec<u64> = store
+            .messages("s-per-turn", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, message)| match message.block {
+                Block::ContextSize { tokens, .. } => Some(tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [700_000],
+            "one note, at the completion that ended the turn, though the first completion was above half too"
+        );
+        // And the completion that ran the call kept its shape: its text, then its
+        // call and its result, with no note between them.
+        let thread = request_texts(&provider.captured_calls()[1]);
+        let call = thread
+            .iter()
+            .position(|text| text.starts_with("tool call shell"))
+            .expect("the call is in the request");
+        let result = thread
+            .iter()
+            .position(|text| text.starts_with("tool result shell"))
+            .expect("the result is in the request");
+        assert!(
+            !thread.iter().any(|text| text.starts_with("context: ")),
+            "no note sits inside that completion: {thread:?}"
+        );
+        assert!(result > call, "the call and its result stay together");
 
         handle.stop();
     }
@@ -19979,7 +20148,9 @@ mod tests {
                 stop(600_000, 20),
             ],
             vec![StreamEvent::TextDelta("compacted".into()), stop(200, 20)],
-            vec![StreamEvent::TextDelta("ok".into()), stop(3, 1)],
+            // The compacted turn ends the wake, and its own count crosses
+            // the note's threshold, so the note is written after the summary.
+            vec![StreamEvent::TextDelta("ok".into()), stop(700_000, 20)],
         ]));
         let deps = Arc::new(test_deps_with_compact_at(
             &store,
