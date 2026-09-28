@@ -2,13 +2,16 @@
 
 A persistent, distributed harness for AI coding jobs.
 
-Bosun runs coding agents on machines you already own. A job arrives from an
-issue tracker, from a change waiting for review, from a schedule, or from a
-person typing a request. Bosun places it on one of your machines, gives the
-agent the standards you have set, and reports what happened. The job runs in
-the background on the node, so closing your terminal does not stop it, and each
-job gets its own agent, working copy and permission, so one job does not
-disturb another.
+Bosun runs coding jobs on any infrastructure. A job arrives from an issue
+tracker, from a change waiting for review, from a schedule, or from a person
+typing a request. Bosun runs it on one of your machines, gives the agent the
+standards you have set, and reports what happened. The job runs in the
+background on that machine, so closing your terminal does not stop it, and each
+job gets its own agent, working copy and permission, so one job does not disturb
+another.
+
+Capacity grows with the machines you add: each one runs its own node and dials
+out to the control plane, so no machine needs an open inbound port.
 
 Bosun is written in Rust. Sessions run on your control plane, tool calls
 execute on the node the session works on, and you drive sessions from a
@@ -16,8 +19,9 @@ terminal client or the web pane.
 
 ## Status
 
-Single-user MVP. There is no security model, no scheduler, and no scalability
-story yet: run it on a network you trust, and pick the node each job runs on.
+Single-user MVP. One control plane holds every session: there is no security
+model, no scheduler, and no automatic placement yet, so run it on a network you
+trust and name the node each job runs on.
 
 Shipped so far:
 
@@ -63,9 +67,9 @@ The current sprint and the planned roadmap are tracked in
 - **Control plane** (`bosun serve`) runs one agent loop per session, keeps the
   session store, manages skill repositories and MCP servers in the web pane,
   and holds one shared connection per enabled MCP server.
-- **Nodes** (`bosun node`) dial out to the control plane. No open inbound ports
-  are needed on a node. Each session runs its tools in-process on the node,
-  scoped to the session's working copy and permission.
+- **Nodes** (`bosun node`) dial out to the control plane, one node per machine.
+  Each session runs its tools in-process on the node, scoped to the session's
+  working copy and permission.
 - **Clients** are one binary: `bosun clone` starts a session from a repository,
   `bosun dev` starts one in an existing directory on a node, `bosun list` shows
   sessions, and `bosun open` attaches to a live session.
