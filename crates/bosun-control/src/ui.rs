@@ -1698,8 +1698,33 @@ mod tests {
         let handler = block(&pane, &squeezed("function syncVisualViewport("));
         assert!(
             handler.contains(&squeezed("const viewport = window.visualViewport;"))
-                && handler.contains(&squeezed("view.style.height = viewport.height + 'px';")),
-            "the session view takes the visible height, so the composer is not left where the keyboard is drawn"
+                && handler.contains(&squeezed(
+                    "const floor = Math.round(window.innerHeight * 0.4);"
+                ))
+                && handler.contains(&squeezed(
+                    "view.style.height = Math.max(viewport.height, floor) + 'px';"
+                )),
+            "the session view takes the visible height, never below a floor that leaves room for the composer"
+        );
+        // Every write is tied to a field holding the focus: on load iOS can
+        // report the visual viewport wrong, and this pane wrote that number,
+        // which left the view a sliver with the home column beneath it.
+        assert!(
+            PANE.contains("let composerFocused = false;")
+                && PANE.contains("if (!composerFocused) {")
+                && PANE.contains("view.style.height = '';")
+                && PANE.contains(
+                    "document.documentElement.style.setProperty('--keyboard-inset', '0px');"
+                ),
+            "and with no field focused it restores the full height and zeroes the strip, which is also what leaving a field does"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "if (!(viewport.height > 0 && viewport.height <= window.innerHeight)) return;"
+            )) && PANE.contains("document.addEventListener('focusin', (event) => {")
+                && PANE.contains("document.addEventListener('focusout', (event) => {")
+                && PANE.contains("/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)"),
+            "a value that is not a plausible keyboard shrink from a field inside the session view is ignored outright"
         );
         assert!(
             handler.contains(&squeezed(
@@ -1887,8 +1912,8 @@ mod tests {
         );
         assert_eq!(
             handler.matches("view.style.top=").count(),
-            1,
-            "and this is the sync's only write to the view's top: a second write further down would put the view back at the document's top with every string above it still in place"
+            2,
+            "the sync writes the view's top once per branch: the offset while a field holds the focus and the keyboard is up, and the document's top in the restore branch, where a report with no keyboard behind it must not be read as one"
         );
     }
 

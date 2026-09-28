@@ -4010,10 +4010,36 @@ btnBottom.addEventListener('click', jumpToBottom);
 // resize costs one read of the transcript's geometry on the frame it asks for
 // and one more when the numbers settle. A browser without a visual viewport
 // attaches no listeners at all.
+// Whether a text field inside the session view holds the focus. Every write to
+// the view's height is tied to it: iOS reports the visual viewport wrong on load
+// and after stray events, and only a field that really has the focus means a
+// keyboard is really up.
+let composerFocused = false;
+
 function syncVisualViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
-  view.style.height = viewport.height + 'px';
+  // Nothing is being typed into, so nothing here is a keyboard: the view keeps
+  // the height its own rules give it. This is what a fresh page needs — iOS can
+  // report the visual viewport wrong on load, and writing that number left the
+  // session view a sliver with the home column showing beneath it — and it is
+  // also the restore: leaving a field gives the view its whole height back and
+  // zeroes the strip, without waiting for a resize that may report a stale
+  // number.
+  if (!composerFocused) {
+    view.style.height = '';
+    view.style.top = '0px';
+    document.documentElement.style.setProperty('--keyboard-inset', '0px');
+    syncStick();
+    return;
+  }
+  // Only a plausible keyboard shrink is honoured: the visible viewport is never
+  // taller than the layout one, and an empty report is not a keyboard.
+  if (!(viewport.height > 0 && viewport.height <= window.innerHeight)) return;
+  // Belt and braces: a value that would leave no room for the composer is not a
+  // keyboard either, so the view never shrinks past this floor.
+  const floor = Math.round(window.innerHeight * 0.4);
+  view.style.height = Math.max(viewport.height, floor) + 'px';
   // The offset says how far the page has moved under the visible part, and the
   // strip below it is what the keyboard leaves of the layout viewport; both are
   // clamped. The offset is written whenever the visible viewport is pushed or
@@ -4055,6 +4081,23 @@ function syncVisualViewport() {
 // the visible area shows the page beneath it.
 let visualViewportFrame = null;
 let visualViewportSettle = null;
+const isTextField = (target) =>
+  target instanceof Element && view.contains(target) && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName);
+
+document.addEventListener('focusin', (event) => {
+  if (!isTextField(event.target)) return;
+  composerFocused = true;
+  scheduleVisualViewportSync();
+});
+
+document.addEventListener('focusout', (event) => {
+  if (!isTextField(event.target)) return;
+  composerFocused = false;
+  // The field is left: restore now, rather than waiting for the keyboard's own
+  // resize, whose numbers can arrive late or stale.
+  syncVisualViewport();
+});
+
 function scheduleVisualViewportSync() {
   if (visualViewportFrame !== null) return;
   visualViewportFrame = window.requestAnimationFrame(() => {
