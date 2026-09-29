@@ -1730,15 +1730,15 @@ mod tests {
             handler.contains(&squeezed(
                 "const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);"
             )) && handler.contains(&squeezed(
-                "view.style.top = (viewport.height < window.innerHeight && offset > 0)"
+                "view.style.top = (viewport.height < window.innerHeight && pushed > 0)"
             )),
             "and it takes the offset whenever the visible viewport is pushed or shortened, clamped"
         );
         assert!(
             handler.contains(&squeezed(
-                "viewport.height < window.innerHeight && offset > 0"
+                "viewport.height < window.innerHeight && pushed > 0"
             )) && handler.contains(&squeezed(
-                "? Math.min(offset, window.innerHeight - viewport.height) + 'px' : '0px';"
+                "? Math.min(pushed, window.innerHeight - viewport.height) + 'px' : '0px';"
             )),
             "with the fallback a viewport at full height reaches — that is the case the offset is held back for, because on some iOS versions it stays stale after the keyboard closes, and writing it then left the whole view offset — and with the view's own top held at the keyboard, since a stale offset standing past the short viewport would put the composer under it"
         );
@@ -1896,9 +1896,21 @@ mod tests {
         );
         assert!(
             handler.contains(&squeezed(
-                "view.style.top = (viewport.height < window.innerHeight && offset > 0) ? Math.min(offset, window.innerHeight - viewport.height) + 'px' : '0px';"
+                "view.style.top = (viewport.height < window.innerHeight && pushed > 0) ? Math.min(pushed, window.innerHeight - viewport.height) + 'px' : '0px';"
             )),
             "so the view rides the offset on the state the pushed page is in — the viewport is short and the offset is real — and not on a strip that has gone, with zero kept for a viewport at full height"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "const pushed = Math.min(Math.max(0, window.scrollY) + offset, window.innerHeight);"
+            )) && PANE.contains("window.addEventListener('scroll', scheduleVisualViewportSync);"),
+            "the view's top counts the document's own scroll as well as the visual viewport's offset, and a document scroll asks for a sync: Safari can bring the field above the keyboard by scrolling the document, which leaves the offset at zero and carried the view, placed in the document, a keyboard-height up and the transcript off the screen"
+        );
+        assert!(
+            handler.contains(&squeezed(
+                "if (window.scrollY !== 0) window.scrollTo(0, 0);"
+            )),
+            "with no field focused the document goes back to its top, so a scroll the keyboard left does not keep the view moved up"
         );
         assert!(
             !handler.contains(&squeezed("? offset + 'px' : '0px';")),

@@ -4081,6 +4081,9 @@ function syncVisualViewport() {
   if (!composerFocused) {
     view.style.height = '';
     view.style.top = '0px';
+    // Safari can leave the document scrolled after the keyboard closes, and the
+    // view, which sits at the document's top, would stay moved up with it.
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
     document.documentElement.style.setProperty('--keyboard-inset', '0px');
     syncStick();
     return;
@@ -4113,10 +4116,20 @@ function syncVisualViewport() {
   // reading that is consistent — a pushed page's offset is exactly what its
   // short viewport leaves of the layout viewport — and holds the view's bottom
   // edge at the keyboard either way.
+  //
+  // Safari has two ways to bring the field above the keyboard: it moves the
+  // visible viewport inside the layout viewport, which is `offsetTop`, or it
+  // scrolls the document itself, which is `scrollY` and leaves `offsetTop` at
+  // zero. The view is placed in the document, so it moves up with a document
+  // scroll: its top has to be the sum of the two, or the view sits a
+  // keyboard-height above the visible part and the transcript leaves the
+  // screen at the top. The strip is measured against the layout viewport, which
+  // a document scroll does not move, so it takes `offsetTop` alone.
   const offset = Math.min(Math.max(0, viewport.offsetTop), window.innerHeight);
+  const pushed = Math.min(Math.max(0, window.scrollY) + offset, window.innerHeight);
   const covered = Math.max(0, window.innerHeight - viewport.height - offset);
-  view.style.top = (viewport.height < window.innerHeight && offset > 0)
-    ? Math.min(offset, window.innerHeight - viewport.height) + 'px'
+  view.style.top = (viewport.height < window.innerHeight && pushed > 0)
+    ? Math.min(pushed, window.innerHeight - viewport.height) + 'px'
     : '0px';
   document.documentElement.style.setProperty('--keyboard-inset', covered + 'px');
   // The keyboard changes the transcript's height, and no scroll event comes
@@ -4171,6 +4184,8 @@ if (window.visualViewport) {
   document.addEventListener('focusout', scheduleVisualViewportSync);
   document.addEventListener('focusin', scheduleVisualViewportSync);
   window.addEventListener('resize', scheduleVisualViewportSync);
+  // A document scroll moves the view and is not a visual viewport event.
+  window.addEventListener('scroll', scheduleVisualViewportSync);
 }
 
 // Whether the transcript is at its end, and the control that shows when it is
