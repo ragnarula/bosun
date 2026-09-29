@@ -53,7 +53,7 @@ import { refreshSessions, sessions } from './session-list.js';
 import { markListEntry, openSession } from './history.js';
 import { loadDraft, saveDraft, scheduleAskSync } from './composer.js';
 import { follow, syncBtnBottom } from './scroll.js';
-import { scheduleVisualViewportSync } from './viewport.js';
+import { leaveScreen, showScreen } from './screens.js';
 import {
   drawAssistant,
   drawBlock,
@@ -130,8 +130,7 @@ function showSession(id) {
   closeSession();
   const s = newSessionState(id);
   opened = s;
-  coverHome(true);
-  view.hidden = false;
+  showScreen(view);
   const session = sessions.find((listed) => listed.id === id);
   if (session) updateHeader(session);
   fetchSession(s);
@@ -161,10 +160,6 @@ function showSession(id) {
   // Opening a session asks for the composer whatever the pointer: this is the
   // path a phone had before, and the keyboard comes up with the session.
   if (!inputRow.hidden) input.focus();
-  // The keyboard that focus raises moves the visual viewport, and the numbers
-  // settle after this turn: ask for a sync here rather than wait for the next
-  // resize, so the view is at its height as the keyboard arrives.
-  scheduleVisualViewportSync();
 }
 
 function closeSession() {
@@ -188,21 +183,7 @@ function closeSession() {
   // hide it.
   viewSheet.hidden = true;
   clearHeader();
-  view.hidden = true;
-  coverHome(false);
-}
-
-// The session list's scroll position while a session covers it: the list is
-// out of the page then, and a browser drops the scroll of a box it removes.
-let homeScroll = 0;
-const homeColumn = document.querySelector('body > main');
-
-function coverHome(covered) {
-  const wasCovered = document.body.classList.contains('in-session');
-  if (covered === wasCovered) return;
-  if (covered) homeScroll = homeColumn.scrollTop;
-  document.body.classList.toggle('in-session', covered);
-  if (!covered) homeColumn.scrollTop = homeScroll;
+  leaveScreen(view);
 }
 
 // The header and the ⋯ sheet carry the open session's identity, and the footer

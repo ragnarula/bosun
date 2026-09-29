@@ -17,17 +17,32 @@
   }
   * { box-sizing: border-box; }
   * { -webkit-tap-highlight-color: transparent; }
-  /* The document never scrolls: the session view is a full-height box inside
-     it, and Safari's reveal-scroll on focus has nothing to move. This is what
-     the fixed-container family of the iOS focus failure comes down to. */
-  html, body { height: 100%; overflow: hidden; }
-  /* The document never scrolls, so each screen does. The home column (the
-     strips, the panel and the session list) and each tab panel fill the space
-     under the chrome and scroll inside it; without this their tails are clipped
-     with no way to reach them. */
-  body { display: flex; flex-direction: column; }
+  /* The body is the app: as tall as the dynamic viewport, which leaves out
+     the browser's own bars, and the containing box of every sheet. While a
+     text field has the focus, viewport.js sets its height to the visual
+     viewport's, which leaves out an iOS keyboard. The document itself does not
+     scroll. */
+  html { height: 100%; overflow: hidden; }
+  body {
+    position: relative;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  /* The screens: the home column, an open session and the three tabs. One is
+     shown at a time, in the body's flow, and it takes the body's whole height;
+     each scrolls inside itself. */
+  #home, #session-view, #machines-tab, #skills-tab, #mcp-tab {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+  }
   header.top, #status, #health-strip, #skills-strip, #mcp-strip { flex: 0 0 auto; }
-  main, #machines-tab, #skills-tab, #mcp-tab {
+  main {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
@@ -78,14 +93,13 @@
      thumb-heavy page reads last. It auto-hides; background poll errors stay
      in #status as always. */
   #toast {
-    position: fixed;
+    /* Placed in the body, whose bottom stands above an iOS keyboard. */
+    position: absolute;
     left: 50%;
     /* A toast reports; it never takes a tap, and it must not cover the composer
        while it is up. */
     pointer-events: none;
-    /* The layout viewport's bottom is where the keyboard is drawn, so the
-       toast offsets by whatever the visual viewport loses there. */
-    bottom: calc(20px + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
     z-index: 20;
     transform: translateX(-50%);
     max-width: calc(100% - 40px);
@@ -102,14 +116,6 @@
   #toast.ok { border-color: var(--ok); color: var(--ok); }
   /* Machines tab: a full pane listing node health. Down nodes lead, red,
      with their age; an up node's dot already says up, so it shows none. */
-  #machines-tab {
-    position: fixed;
-    inset: 0;
-    z-index: 9;
-    background: var(--bg);
-    display: flex;
-    flex-direction: column;
-  }
   #machines-tab[hidden] { display: none; }
   .machines-head {
     display: flex;
@@ -175,14 +181,6 @@
   #skills-strip .skills-strip-icon { color: var(--accent); font-size: 15px; }
   #skills-strip .skills-strip-text { flex: 1; font-size: 13px; }
   #skills-strip::after { content: '›'; color: var(--muted); }
-  #skills-tab {
-    position: fixed;
-    inset: 0;
-    z-index: 9;
-    background: var(--bg);
-    display: flex;
-    flex-direction: column;
-  }
   #skills-tab[hidden] { display: none; }
   .skills-head {
     display: flex;
@@ -312,14 +310,6 @@
   #mcp-strip .mcp-strip-icon { color: var(--accent); font-size: 15px; }
   #mcp-strip .mcp-strip-text { flex: 1; font-size: 13px; }
   #mcp-strip::after { content: '›'; color: var(--muted); }
-  #mcp-tab {
-    position: fixed;
-    inset: 0;
-    z-index: 9;
-    background: var(--bg);
-    display: flex;
-    flex-direction: column;
-  }
   #mcp-tab[hidden] { display: none; }
   .mcp-head {
     display: flex;
@@ -527,11 +517,11 @@
   }
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: default; }
-  /* The new-session composer is a bottom sheet pinned to the viewport's
+  /* The new-session composer is a bottom sheet pinned to the body's
      bottom edge: recents and the pickers on top, Start under the thumb.
      The home list stays visible above it, so there is no scrim. */
   #new-session-form {
-    position: fixed;
+    position: absolute;
     left: 0;
     right: 0;
     bottom: 0;
@@ -692,16 +682,6 @@
   .dir-entry:active { background: var(--border); }
   .dir-entry .dir-name { flex: 1; word-break: break-all; }
   .dir-entry .dir-repo { color: var(--accent); font-size: 11px; }
-  #session-view {
-    /* Absolute, not fixed: the container the composer lives in must not be a
-       fixed layer, whose geometry iOS does not reflow when the keyboard opens. */
-    position: absolute;
-    inset: 0;
-    z-index: 10;
-    background: var(--bg);
-    display: flex;
-    flex-direction: column;
-  }
   #session-view[hidden] { display: none; }
   /* Thin header: back, `state dot / node·dir`, and ⋯. Everything else moves
      into the ⋯ sheet so the header never scrolls sideways. */
@@ -761,7 +741,7 @@
   }
   .view-header .btn-more:active { color: var(--accent); }
   #view-sheet {
-    position: fixed;
+    position: absolute;
     left: 0;
     right: 0;
     bottom: 0;
@@ -903,12 +883,6 @@
     border: 1px dashed var(--border);
     color: var(--muted);
     font-size: 13px;
-  }
-  /* An open session covers the whole screen, so the home column is taken out
-     of the page while it is open. Nothing of the session list is left to show
-     when the keyboard moves the visible part of the page. */
-  body.in-session > :is(header.top, #status, #health-strip, #skills-strip, #mcp-strip, main) {
-    display: none;
   }
   /* The session's transcript and the subagent panel beside it. The panel is a
      second reader of a child's own stream, so it carries no composer and no
@@ -1373,7 +1347,7 @@
     /* A side column does not fit a phone: the panel covers the view instead,
        with the same header, which names the child and closes it. */
     #child-panel {
-      position: fixed;
+      position: absolute;
       inset: 0;
       width: auto;
       max-width: none;

@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State;
@@ -542,6 +543,7 @@ const RESERVED_PATHS: &[&str] = &[
     "/",
     "/ui",
     "/ui/mermaid.min.js",
+    "/viewport-report",
     "/poll",
     "/nodes",
     "/personas",
@@ -618,6 +620,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(crate::ui::pane))
         .route("/ui/mermaid.min.js", get(crate::ui::mermaid_bundle))
         .route("/ui/{asset}", get(crate::ui::asset))
+        .route(
+            "/viewport-report",
+            post(crate::ui::viewport_report)
+                .layer(DefaultBodyLimit::max(crate::ui::VIEWPORT_REPORT_MAX_BYTES)),
+        )
         .route("/poll", post(poll))
         .route("/nodes", get(nodes))
         .route("/personas", get(personas))
@@ -10408,6 +10415,115 @@ mod tests {
         assert_eq!(callback.status(), StatusCode::NOT_FOUND);
     }
 
+    /// One viewport sample as the pane takes it with the keyboard up.
+    fn viewport_sample() -> Value {
+        json!({
+            "at": 1234.5,
+            "event": "visual resize",
+            "inner_width": 390,
+            "inner_height": 844,
+            "visual": { "width": 390, "height": 500, "offset_top": 0, "page_top": 0, "scale": 1 },
+            "scroll_y": 0,
+            "scroll_height": 844,
+            "view": { "top": 0, "bottom": 500, "height": 500 },
+            "composer": { "top": 420, "bottom": 480, "height": 60 },
+            "focused": "textarea#input",
+        })
+    }
+
+    /// A batch of `samples` as the pane sends it.
+    fn viewport_report(samples: Vec<Value>) -> Value {
+        json!({ "page": "k3j9x2a1", "dropped": 0, "failed": 0, "samples": samples })
+    }
+
+    #[tokio::test]
+    async fn a_viewport_report_is_taken_with_no_content() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/viewport-report"))
+            .json(&viewport_report(vec![viewport_sample()]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // A browser with no visual viewport, and nothing shown or focused.
+        let mut bare = viewport_sample();
+        for field in ["visual", "view", "composer", "focused"] {
+            bare[field] = Value::Null;
+        }
+        let response = client
+            .post(format!("http://{addr}/viewport-report"))
+            .json(&viewport_report(vec![bare]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // A full batch, as the pane sends at most, fits the limit.
+        let response = client
+            .post(format!("http://{addr}/viewport-report"))
+            .json(&viewport_report(vec![viewport_sample(); 16]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_viewport_report_over_the_size_limit_is_refused() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let mut sample = viewport_sample();
+        sample["event"] = Value::String("x".repeat(crate::ui::VIEWPORT_REPORT_MAX_BYTES));
+        let report = viewport_report(vec![sample]);
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/viewport-report"))
+            .json(&report)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_viewport_report_that_is_not_one_is_refused() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/viewport-report"))
+            .json(&json!({ "page": "k3j9x2a1", "samples": [{ "event": "resize" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error(), "{}", response.status());
+    }
+
+    #[tokio::test]
+    async fn an_oauth_redirect_uri_on_the_viewport_report_is_not_registered() {
+        let dir = tempdir().unwrap();
+        let state =
+            test_state_with_redirect_uri(&dir, Some("http://127.0.0.1:8090/viewport-report"));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        // The callback answers GET; the report route answers POST only.
+        let callback = client
+            .get(format!("http://{addr}/viewport-report"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let report = client
+            .post(format!("http://{addr}/viewport-report"))
+            .json(&viewport_report(vec![viewport_sample()]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::NO_CONTENT);
+    }
+
     #[test]
     fn oauth_callback_path_rejects_served_paths_and_accepts_a_free_one() {
         for redirect_uri in [
@@ -10420,6 +10536,7 @@ mod tests {
             "http://127.0.0.1:8090/sessions",
             "http://127.0.0.1:8090/sessions/abc",
             "http://127.0.0.1:8090/mcp/servers",
+            "http://127.0.0.1:8090/viewport-report",
             // A path the router cannot register at all: a missing scheme
             // leaves a path with no leading slash.
             "localhost:8090/mcp/oauth/callback",

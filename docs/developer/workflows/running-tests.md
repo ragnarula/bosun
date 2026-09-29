@@ -57,11 +57,19 @@ the test fails saying so. The script expects the sessions
 `tests/browser.rs` seeds, so it runs only against the server that test starts.
 Run it after any change to the pane.
 
-Chromium differs from iOS Safari in two ways the pane handles itself, and the
+Chromium differs from iOS Safari in three ways the pane handles itself, and the
 script makes Chromium behave like Safari so the checks can see the pane's own
 handling. It turns scroll anchoring off, so inserting older messages would
 move the lines on screen. It takes the hidden session list out of the document
-and puts it back, so the list loses its scroll while a session covers it.
+and puts it back, so the list loses its scroll while another screen shows. It
+replaces the visual viewport with a stub that reports a keyboard, a viewport
+offset and a document scroll, so the checks can see how the pane fits the
+screen to the keyboard. The stub is a model, not Safari. It does not model a
+second reveal scroll, events that arrive only at the end of the keyboard's
+movement, or a scale other than 1, and the checks do not cover the pane's zoom
+guard or its `100dvh` height. The viewport report in
+`docs/adrs/2026-09-29-one-screen-in-the-document.md` is how a phone's own
+numbers are read.
 
 ## Debugging a Failing Test
 

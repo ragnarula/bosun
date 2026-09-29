@@ -1,8 +1,13 @@
+use axum::Json;
 use axum::extract::Path;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use serde::Deserialize;
+use tracing::info;
+use tracing::instrument;
 
 /// The web pane: a page listing nodes and sessions, with a live session view
 /// driven by the session API and the SSE event stream. The page, its
@@ -48,7 +53,13 @@ pub(crate) const ASSETS: &[(&str, &str, &str)] = &[
     ("session-view.js", JS, include_str!("ui/session-view.js")),
     ("composer.js", JS, include_str!("ui/composer.js")),
     ("scroll.js", JS, include_str!("ui/scroll.js")),
+    ("screens.js", JS, include_str!("ui/screens.js")),
     ("viewport.js", JS, include_str!("ui/viewport.js")),
+    (
+        "viewport-report.js",
+        JS,
+        include_str!("ui/viewport-report.js"),
+    ),
     ("transcript.js", JS, include_str!("ui/transcript.js")),
     ("diagram.js", JS, include_str!("ui/diagram.js")),
     ("markdown.js", JS, include_str!("ui/markdown.js")),
@@ -88,6 +99,109 @@ pub async fn mermaid_bundle() -> impl IntoResponse {
     )
 }
 
+/// The largest viewport report body the control plane reads, in bytes. The
+/// pane sends at most 16 samples a batch, about 500 bytes each.
+pub(crate) const VIEWPORT_REPORT_MAX_BYTES: usize = 16 * 1024;
+
+/// A batch of viewport samples from one page load, sent when the page is
+/// loaded with `?viewport-report`.
+#[derive(Debug, Deserialize)]
+pub struct ViewportReport {
+    /// Tells one page load's samples from another's.
+    page: String,
+    /// Samples the pane dropped because its queue was full.
+    #[serde(default)]
+    dropped: u32,
+    /// Samples the pane could not take because a number could not be read.
+    #[serde(default)]
+    failed: u32,
+    samples: Vec<ViewportSample>,
+}
+
+/// What the pane saw of the viewport as one event arrived, before the pane
+/// answered it. Sizes and places are CSS pixels.
+#[derive(Debug, Deserialize)]
+struct ViewportSample {
+    /// The page's `performance.now()` when the event arrived, in ms.
+    at: f64,
+    /// The event that was sampled.
+    event: String,
+    inner_width: f64,
+    inner_height: f64,
+    /// Absent in a browser with no visual viewport API.
+    visual: Option<VisualViewport>,
+    scroll_y: f64,
+    scroll_height: f64,
+    /// Absent while the element is not shown.
+    view: Option<Edges>,
+    composer: Option<Edges>,
+    /// The focused element's tag and id, absent when nothing has the focus.
+    focused: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VisualViewport {
+    width: Option<f64>,
+    height: Option<f64>,
+    offset_top: Option<f64>,
+    page_top: Option<f64>,
+    scale: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Edges {
+    top: f64,
+    bottom: f64,
+    height: f64,
+}
+
+/// Logs a batch of viewport samples, one line each. The keyboard on a phone
+/// cannot be reproduced off the phone, so this log is how its numbers are
+/// read.
+#[instrument(skip_all)]
+pub async fn viewport_report(headers: HeaderMap, Json(report): Json<ViewportReport>) -> StatusCode {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    if report.dropped > 0 || report.failed > 0 {
+        info!(
+            page = ?report.page,
+            dropped = report.dropped,
+            failed = report.failed,
+            "viewport samples lost"
+        );
+    }
+    for sample in report.samples {
+        let visual = sample.visual.unwrap_or_default();
+        let view = sample.view.as_ref();
+        let composer = sample.composer.as_ref();
+        info!(
+            page = ?report.page,
+            at = sample.at,
+            event = ?sample.event,
+            inner_width = sample.inner_width,
+            inner_height = sample.inner_height,
+            visual_width = visual.width,
+            visual_height = visual.height,
+            visual_offset_top = visual.offset_top,
+            visual_page_top = visual.page_top,
+            visual_scale = visual.scale,
+            scroll_y = sample.scroll_y,
+            scroll_height = sample.scroll_height,
+            view_top = view.map(|edges| edges.top),
+            view_bottom = view.map(|edges| edges.bottom),
+            view_height = view.map(|edges| edges.height),
+            composer_top = composer.map(|edges| edges.top),
+            composer_bottom = composer.map(|edges| edges.bottom),
+            composer_height = composer.map(|edges| edges.height),
+            focused = ?sample.focused,
+            user_agent = ?user_agent,
+            "viewport report"
+        );
+    }
+    StatusCode::NO_CONTENT
+}
+
 #[cfg(test)]
 mod tests {
     /// The pane's sources as one text: the markup, then the stylesheet in a
@@ -110,7 +224,9 @@ mod tests {
         include_str!("ui/session-view.js"),
         include_str!("ui/composer.js"),
         include_str!("ui/scroll.js"),
+        include_str!("ui/screens.js"),
         include_str!("ui/viewport.js"),
+        include_str!("ui/viewport-report.js"),
         include_str!("ui/transcript.js"),
         include_str!("ui/diagram.js"),
         include_str!("ui/markdown.js"),
@@ -146,6 +262,74 @@ mod tests {
         assert!(
             !body.contains("{{BOSUN_VERSION}}"),
             "and the placeholder it replaces is not served"
+        );
+    }
+
+    /// A writer the log subscriber shares with the test that reads it.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_viewport_sample_is_logged_at_info_with_its_numbers_as_fields() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let report: super::ViewportReport = serde_json::from_value(serde_json::json!({
+            "page": "k3j9x2a1",
+            "dropped": 2,
+            "samples": [{
+            "at": 1234.5,
+            "event": "visual resize",
+            "inner_width": 390,
+            "inner_height": 844,
+            "visual": { "width": 390, "height": 500, "offset_top": 12, "page_top": 12, "scale": 1 },
+            "scroll_y": 0,
+            "scroll_height": 844,
+            "view": { "top": 0, "bottom": 500, "height": 500 },
+            "composer": null,
+            "focused": "textarea#input",
+            }],
+        }))
+        .unwrap();
+        let status = super::viewport_report(axum::http::HeaderMap::new(), axum::Json(report)).await;
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains(" INFO "), "{log}");
+        assert!(log.contains("dropped=2"), "lost samples are counted: {log}");
+        for field in [
+            "page=\"k3j9x2a1\"",
+            "at=1234.5",
+            "event=\"visual resize\"",
+            "inner_height=844.0",
+            "visual_height=500.0",
+            "visual_offset_top=12.0",
+            "view_bottom=500.0",
+            "focused=Some(\"textarea#input\")",
+        ] {
+            assert!(
+                log.contains(field),
+                "the log line must carry {field}: {log}"
+            );
+        }
+        assert!(
+            !log.contains("composer_top"),
+            "a composer not shown carries no numbers: {log}"
         );
     }
 
@@ -369,6 +553,22 @@ mod tests {
         );
     }
 
+    /// The content of the page's viewport tag.
+    fn viewport_meta() -> &'static str {
+        segment(PANE, "<meta name=\"viewport\" content=\"", "\"")
+    }
+
+    // Chromium on Android shrinks the layout for the keyboard only when the
+    // viewport tag asks for it; the browser checks cannot raise a keyboard.
+
+    #[test]
+    fn the_page_asks_android_to_resize_its_layout_for_the_keyboard() {
+        assert!(
+            viewport_meta().contains("interactive-widget=resizes-content"),
+            "without interactive-widget=resizes-content Android Chrome draws the keyboard over the composer"
+        );
+    }
+
     // The page reaches under the Home indicator, and every row that sits at the
     // bottom of the screen keeps its padding clear of it. `env()` insets are
     // zero in a desktop browser, so this reads the stylesheet.
@@ -376,9 +576,7 @@ mod tests {
     #[test]
     fn the_pane_keeps_its_bottom_rows_clear_of_the_home_indicator() {
         assert!(
-            PANE.contains(
-                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
-            ),
+            viewport_meta().contains("viewport-fit=cover"),
             "the page has to reach under the Home indicator before an inset can hold anything clear of it"
         );
         // Every rule whose selector names one of these rows, wherever it sits and

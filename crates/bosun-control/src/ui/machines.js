@@ -11,6 +11,7 @@ import {
 } from './dom.js';
 import { ago, showStatus } from './common.js';
 import { renderNodeOptions } from './new-session.js';
+import { leaveScreen, showScreen } from './screens.js';
 
 export { nodes, refreshNodes };
 
@@ -32,12 +33,12 @@ function renderHealth() {
 }
 
 function openMachines() {
-  machinesTab.hidden = false;
+  showScreen(machinesTab);
   renderMachines();
 }
 
 function closeMachines() {
-  machinesTab.hidden = true;
+  leaveScreen(machinesTab);
 }
 
 // Down nodes lead, red, with their age; an up node's dot already says "up",

@@ -70,7 +70,10 @@ LANDSCAPE = (844, 390)
 
 # The pane's elements these checks read. A restructure that renames one changes
 # it here only.
-HOME = 'body > main'
+HOME = '#home > main'
+# The pane's screens. Exactly one is in the page at a time.
+HOME_SCREEN = '#home'
+TAB_SCREENS = ['#machines-tab', '#skills-tab', '#mcp-tab']
 SESSION_ROW = '.session-row'
 VIEW = '#session-view'
 TRANSCRIPT = '#transcript'
@@ -118,17 +121,26 @@ def until(page, condition, arg=None, timeout=5000):
         return False
 
 
-# The screen's layout, as the checks see it. The pane today lays the session
-# view over the home column and hides the column; a new layout changes these
-# helpers and leaves the checks alone.
+# The screen's layout, as the checks see it. The pane shows one screen at a
+# time: the home column with the session list, a session, or a tab. A new
+# layout changes these helpers and leaves the checks alone.
+
+SHOWN_SCREENS = """(screens) => screens.filter(sel => getComputedStyle(document.querySelector(sel)).display !== 'none')"""
+
+
+def screens_shown(page):
+    """The screens in the page: home, then the session, then the tabs."""
+    return page.evaluate(SHOWN_SCREENS, [HOME_SCREEN, VIEW] + TAB_SCREENS)
+
 
 def list_showing(page):
-    """The session list is on screen and no session covers it."""
-    return page.is_visible(HOME) and page.is_hidden(VIEW)
+    """The session list is on screen, and no other screen is in the page."""
+    return page.is_visible(HOME) and screens_shown(page) == [HOME_SCREEN]
 
 
 def session_showing(page):
-    return page.is_visible(VIEW) and page.is_hidden(HOME)
+    """A session is on screen, and no other screen is in the page."""
+    return page.is_visible(VIEW) and screens_shown(page) == [VIEW]
 
 
 def list_scroll(page):
@@ -152,37 +164,46 @@ def visible_row(page):
         }""", [HOME, SESSION_ROW]).as_element()
 
 
-# The session view's box in the coordinates of the visible part of the page,
-# which the viewport stub sets: its top is 0 when the view starts at the visible
-# top. The stub fakes a document scroll, so the view's place is moved by the
-# scroll the test set. That models a view placed in the document, which a
-# document scroll carries with the page. A `position: fixed` view stays put
-# under a document scroll, and this measure must then leave scrollY out.
+# The session view's box, and the composer row's bottom edge, in the
+# coordinates of the visible part of the page, which the viewport stub sets:
+# the top is 0 when the view starts at the visible top. The stub fakes a
+# document scroll and a viewport offset, and the view is placed in the
+# document, so a document scroll carries it with the page: its place is moved
+# by the scroll the test set, and the visible part starts at the offset.
 VIEW_IN_VISIBLE_PART = f"""() => {{
   const stub = window.__viewportStub;
+  const moved = stub.realScrollY() - window.scrollY - window.visualViewport.offsetTop;
   const rect = document.querySelector('{VIEW}').getBoundingClientRect();
-  const top = rect.top + stub.realScrollY() - window.scrollY - window.visualViewport.offsetTop;
-  return {{ top: Math.round(top), height: Math.round(rect.height),
+  const composer = document.querySelector('#input-row').getBoundingClientRect();
+  return {{ top: Math.round(rect.top + moved), height: Math.round(rect.height),
+           composerBottom: Math.round(composer.bottom + moved),
            visible: Math.round(window.visualViewport.height) }};
 }}"""
 
 
 def view_covers_visible_part(page, timeout=3000):
     """Whether the view comes to start at the visible top with the visible
-    height, and the box it has."""
-    ok = until(page, f"() => {{ const b = ({VIEW_IN_VISIBLE_PART})(); return b.top === 0 && b.height === b.visible; }}",
+    height and the composer at its bottom, and the box it has."""
+    ok = until(page, f"""() => {{ const b = ({VIEW_IN_VISIBLE_PART})();
+      return b.top === 0 && b.height === b.visible && b.composerBottom === b.visible; }}""",
                timeout=timeout)
     return ok, page.evaluate(VIEW_IN_VISIBLE_PART)
 
 
 def view_covers_screen(page, timeout=3000):
-    """Whether the view comes to cover the whole layout viewport, as it does
-    with no keyboard, and the box it has."""
+    """Whether the view comes to cover the whole layout viewport with the
+    composer at its bottom, as it does with no keyboard, and the box it has."""
     box = f"""() => {{ const r = document.querySelector('{VIEW}').getBoundingClientRect();
-      return {{ top: Math.round(r.top), height: Math.round(r.height), screen: window.innerHeight }}; }}"""
-    ok = until(page, f"() => {{ const b = ({box})(); return b.top === 0 && b.height === b.screen; }}",
+      const c = document.querySelector('#input-row').getBoundingClientRect();
+      return {{ top: Math.round(r.top), height: Math.round(r.height), composerBottom: Math.round(c.bottom),
+               screen: window.innerHeight }}; }}"""
+    ok = until(page, f"() => {{ const b = ({box})(); return b.top === 0 && b.height === b.screen && b.composerBottom === b.screen; }}",
                timeout=timeout)
     return ok, page.evaluate(box)
+
+
+# The document's scroll and the visible part's offset, as the stub holds them.
+DOCUMENT_AT_TOP = '() => window.scrollY === 0 && window.visualViewport.offsetTop === 0'
 
 
 def drop_hidden_list_scroll(page):
@@ -203,11 +224,15 @@ def drop_hidden_list_scroll(page):
 # Replaces the browser's visual viewport with one whose height and offset the
 # test sets, and lets the test set the document's scrollY, which Chromium will
 # not scroll here because the pane's document never overflows. A change is
-# announced with a resize event, as a keyboard's is. `__viewportStub` gives the
+# announced with a resize event, as a keyboard's is. A `window.scrollTo` moves
+# the visible part to the place it names, which clears the offset as well as
+# the scroll: that is how Safari's reveal scroll is expected to answer it, and
+# the phone's viewport report is what confirms it. `__viewportStub` gives the
 # measuring helpers the real scroll beside the one the test set.
 VIEWPORT_STUB = """
 (() => {
   const realScrollY = Object.getOwnPropertyDescriptor(window, 'scrollY');
+  const realScrollTo = window.scrollTo.bind(window);
   const set = { height: null, offsetTop: 0, scrollY: null };
   const viewport = new EventTarget();
   Object.defineProperties(viewport, {
@@ -224,6 +249,12 @@ VIEWPORT_STUB = """
     configurable: true,
     get: () => set.scrollY ?? realScrollY.get.call(window),
   });
+  window.scrollTo = (x, y) => {
+    const top = typeof x === 'object' ? x.top : y;
+    if (set.scrollY !== null) set.scrollY = top;
+    set.offsetTop = 0;
+    realScrollTo(x, y);
+  };
   window.__viewportStub = {
     set(height, offsetTop, scrollY) {
       Object.assign(set, { height, offsetTop, scrollY });
@@ -234,6 +265,19 @@ VIEWPORT_STUB = """
       Object.assign(set, { height, offsetTop, scrollY });
     },
     realScrollY: () => realScrollY.get.call(window),
+  };
+})();
+"""
+
+# Records when the page sends each viewport report, without changing what the
+# request does.
+RECORD_REPORTS = """
+(() => {
+  const real = window.fetch.bind(window);
+  window.__reportTimes = [];
+  window.fetch = (url, ...rest) => {
+    if (String(url).endsWith('/viewport-report')) window.__reportTimes.push(performance.now());
+    return real(url, ...rest);
   };
 })();
 """
@@ -639,8 +683,12 @@ def check_keyboard_ride(browser, errors):
     page.tap(COMPOSER)
     ok, box = keyboard(500, 0, 344)
     check('a document scroll with the composer focused: the view covers the visible part', ok, box)
+    scrolled_back = until(page, DOCUMENT_AT_TOP)
     ok, box = keyboard(500, 344, 0)
     check('a viewport offset with the composer focused: the view covers the visible part', ok, box)
+    offset_back = until(page, DOCUMENT_AT_TOP)
+    check('with the composer focused, the document is kept at its top: a scroll and an offset are both undone',
+          scrolled_back and offset_back, page.evaluate('() => [window.scrollY, window.visualViewport.offsetTop]'))
     ok, box = keyboard(500, 0, 0)
     check('a keyboard that pushes nothing: the view covers the visible part', ok, box)
 
@@ -649,6 +697,9 @@ def check_keyboard_ride(browser, errors):
     page.evaluate('() => document.activeElement.blur()')
     ok, box = view_covers_screen(page)
     check('leaving the field gives the view the whole screen back', ok, box)
+    page.evaluate('() => window.__viewportStub.set(null, 0, 200)')
+    check('with no field focused, the document is kept at its top too', until(page, DOCUMENT_AT_TOP),
+          page.evaluate('() => window.scrollY'))
     page.evaluate('() => window.__viewportStub.set(null, 0, null)')
     page.context.close()
 
@@ -1468,10 +1519,10 @@ def check_keyboard_limits(browser, errors):
 
     viewport(500, 0, 0)
     settled = settles_at([0, 500])
-    viewport(100, 0, 0)
-    floor = round(PORTRAIT[1] * 0.4)
-    check('a keyboard that leaves less than 40% of the screen: the view keeps 40% of it',
-          settled and settles_at([0, floor]), page.evaluate(raw))
+    viewport(200, 0, 0)
+    ok, box = view_covers_visible_part(page)
+    check('a keyboard that leaves a small part of the screen: the view covers that part, composer included',
+          settled and ok, box)
 
     viewport(500, 0, 0)
     settled = settles_at([0, 500])
@@ -1482,9 +1533,10 @@ def check_keyboard_limits(browser, errors):
     check('a viewport report taller than the screen, or empty, is not a keyboard',
           settled and taller and empty, page.evaluate(raw))
 
-    viewport(500, 600, 0)
-    check('an offset that stands past the short viewport: the view stops at the keyboard',
-          settles_at([PORTRAIT[1] - 500, 500]), page.evaluate(raw))
+    viewport(500, 600, 200)
+    ok, box = view_covers_visible_part(page)
+    check('an offset past the short viewport, with a document scroll: both are undone and the view covers the visible part',
+          ok and until(page, DOCUMENT_AT_TOP), box)
 
     viewport(600, 0, 0)
     settled, _ = view_covers_visible_part(page)
@@ -1501,6 +1553,123 @@ def check_keyboard_limits(browser, errors):
     toast = page.evaluate("""() => { const t = document.querySelector('#toast');
       return [t.getBoundingClientRect().bottom, getComputedStyle(t).pointerEvents]; }""")
     check('a toast stands above the keyboard and takes no tap', toast[0] <= 500 and toast[1] == 'none', toast)
+    page.evaluate('() => window.__viewportStub.set(null, 0, null)')
+    page.context.close()
+
+
+def screen_in_flow(page, screen):
+    """Whether `screen` is a child of the body in its normal flow, covering
+    the whole screen."""
+    return page.eval_on_selector(screen, """s => {
+      const r = s.getBoundingClientRect();
+      return s.parentElement === document.body && getComputedStyle(s).position === 'static'
+        && Math.round(r.top) === 0 && Math.round(r.height) === window.innerHeight;
+    }""")
+
+
+def check_screens(browser, errors):
+    """The list, a session and each tab are screens: exactly one is in the
+    page at a time, in the body's flow, and it covers the screen."""
+    page = new_page(browser, errors)
+    open_list(page)
+    check('the list is the only screen in the page, in flow over the whole screen',
+          list_showing(page) and screen_in_flow(page, HOME_SCREEN), screens_shown(page))
+    for strip, tab, back in [
+        ('#health-strip', '#machines-tab', '#btn-machines-back'),
+        ('#skills-strip', '#skills-tab', '#btn-skills-back'),
+        ('#mcp-strip', '#mcp-tab', '#btn-mcp-back'),
+    ]:
+        page.tap(strip)
+        page.wait_for_selector(tab, state='visible')
+        check(f'{tab} is the only screen in the page, in flow over the whole screen',
+              screens_shown(page) == [tab] and screen_in_flow(page, tab), screens_shown(page))
+        page.tap(back)
+        page.wait_for_selector(tab, state='hidden')
+        check(f'leaving {tab} leaves the list as the only screen', list_showing(page), screens_shown(page))
+
+    open_from_list(page, LONG_ROW)
+    check('a session is the only screen in the page, in flow over the whole screen',
+          session_showing(page) and screen_in_flow(page, VIEW), screens_shown(page))
+    # A session reached by forward while a tab shows replaces the tab.
+    leave_session(page)
+    page.tap('#health-strip')
+    page.wait_for_selector('#machines-tab', state='visible')
+    page.go_forward()
+    page.wait_for_selector(VIEW, state='visible')
+    check('a session opened while a tab shows is the only screen in the page',
+          session_showing(page), screens_shown(page))
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    check('back from it leaves the list as the only screen', list_showing(page), screens_shown(page))
+    page.context.close()
+
+
+def check_viewport_report(browser, errors):
+    """With `?viewport-report` in the address the pane sends what it sees of
+    the viewport as each event arrives, in batches at most four a second;
+    without it, nothing."""
+    keys = {'at', 'event', 'inner_width', 'inner_height', 'visual', 'scroll_y', 'scroll_height',
+            'view', 'composer', 'focused'}
+
+    def record(page):
+        page.add_init_script(RECORD_REPORTS)
+        sent = []
+        page.on('response', lambda response: response.url.endswith('/viewport-report') and sent.append(
+            (response.request.post_data_json, response.status)))
+        return sent
+
+    def samples(sent):
+        return [sample for body, _ in sent for sample in body['samples']]
+
+    for query in ('?viewport-report', ''):
+        page = new_page(browser, errors)
+        sent = record(page)
+        page.goto(f'{BASE}/{query}#s={quote(LONG)}')
+        page.wait_for_selector(TRANSCRIPT_LINE)
+        page.tap(COMPOSER)
+        # A burst of resizes, as a keyboard's movement sends.
+        for height in range(844, 500, -20):
+            page.set_viewport_size({'width': PORTRAIT[0], 'height': height})
+        if query:
+            focused = until(page, '() => document.activeElement.id === "input"')
+            page.wait_for_timeout(1200)
+            taken = samples(sent)
+            pages = {body['page'] for body, _ in sent}
+            check('with ?viewport-report the pane sends its viewport samples from one page load, each batch taken with 204',
+                  focused and taken and all(set(sample) == keys for sample in taken) and len(pages) == 1
+                  and all(status == 204 for _, status in sent)
+                  and any(sample['focused'] == 'textarea#input' and sample['composer'] for sample in taken),
+                  sent[:2])
+            # Chromium sends one resize per frame, so a burst gives fewer events
+            # than steps.
+            check('the burst\'s resizes are sampled, and the samples arrive in the order they were taken',
+                  any(sample['event'] == 'resize' for sample in taken)
+                  and [s['at'] for s in taken] == sorted(s['at'] for s in taken),
+                  [s['event'] for s in taken])
+            starts = page.evaluate('() => window.__reportTimes')
+            gaps = [round(b - a) for a, b in zip(starts, starts[1:])]
+            check('the batches come at most four a second', gaps and min(gaps) >= 240, gaps)
+        else:
+            page.wait_for_timeout(1200)
+            check('without ?viewport-report the pane sends no report', not sent, len(sent))
+        page.context.close()
+
+    # A scroll the pane undoes reaches the report as it arrived.
+    page = new_page(browser, errors, stub_viewport=True)
+    sent = record(page)
+    page.goto(f'{BASE}/?viewport-report#s={quote(LONG)}')
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    page.tap(COMPOSER)
+    page.evaluate('(a) => window.__viewportStub.set(...a)', [500, 0, 344])
+    undone = until(page, DOCUMENT_AT_TOP)
+    seen = False
+    for _ in range(30):
+        if any(sample['scroll_y'] == 344 for sample in samples(sent)):
+            seen = True
+            break
+        page.wait_for_timeout(100)
+    check('a document scroll the pane undoes still reaches the report with its scroll',
+          undone and seen, [(s['event'], s['scroll_y']) for s in samples(sent)][-5:])
     page.evaluate('() => window.__viewportStub.set(null, 0, null)')
     page.context.close()
 
@@ -1677,6 +1846,8 @@ CHECKS = [
     check_composer,
     check_layout,
     check_keyboard_limits,
+    check_screens,
+    check_viewport_report,
     check_fork,
     check_following,
     check_ask_records,

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="bosun-version" content="{{BOSUN_VERSION}}">
 <title>Bosun</title>
 <!-- The pane's module runs before the deferred mermaid bundle because it comes
@@ -22,7 +22,9 @@
 <link rel="modulepreload" href="/ui/session-view.js">
 <link rel="modulepreload" href="/ui/composer.js">
 <link rel="modulepreload" href="/ui/scroll.js">
+<link rel="modulepreload" href="/ui/screens.js">
 <link rel="modulepreload" href="/ui/viewport.js">
+<link rel="modulepreload" href="/ui/viewport-report.js">
 <link rel="modulepreload" href="/ui/transcript.js">
 <link rel="modulepreload" href="/ui/diagram.js">
 <link rel="modulepreload" href="/ui/markdown.js">
@@ -32,6 +34,7 @@
 <link rel="stylesheet" href="/ui/pane.css">
 </head>
 <body>
+<div id="home">
 <header class="top">
   <h1>Bosun</h1>
   <span class="origin" id="origin"></span>
@@ -98,6 +101,7 @@
     <div id="session-list" hidden></div>
   </section>
 </main>
+</div>
 
 <div id="machines-tab" hidden>
   <div class="machines-head">

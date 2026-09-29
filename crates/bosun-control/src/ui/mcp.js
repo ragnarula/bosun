@@ -22,6 +22,7 @@ import {
 } from './dom.js';
 import { ago, post, showStatus, showToast, toastOk } from './common.js';
 import { renderMcpOptions } from './new-session.js';
+import { leaveScreen, showScreen } from './screens.js';
 
 export { mcpServers, refreshMcpServers };
 
@@ -61,12 +62,12 @@ function renderMcpStrip() {
 }
 
 function openMcp() {
-  mcpTab.hidden = false;
+  showScreen(mcpTab);
   refreshMcpServers();
 }
 
 function closeMcp() {
-  mcpTab.hidden = true;
+  leaveScreen(mcpTab);
   mcpAdd.hidden = true;
   resetMcpForm();
 }

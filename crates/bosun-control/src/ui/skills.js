@@ -16,6 +16,7 @@ import {
   skillsTab,
 } from './dom.js';
 import { shortSha, showStatus, showToast, toastOk } from './common.js';
+import { leaveScreen, showScreen } from './screens.js';
 
 export { refreshSkillRepos };
 
@@ -54,12 +55,12 @@ function renderSkillsStrip() {
 }
 
 function openSkills() {
-  skillsTab.hidden = false;
+  showScreen(skillsTab);
   refreshSkillRepos();
 }
 
 function closeSkills() {
-  skillsTab.hidden = true;
+  leaveScreen(skillsTab);
   skillsAdd.hidden = true;
 }
 

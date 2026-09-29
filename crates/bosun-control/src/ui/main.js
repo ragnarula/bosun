@@ -8,6 +8,10 @@ import { refreshMcpServers } from './mcp.js';
 import { refreshPersonas } from './new-session.js';
 import { refreshSessions } from './session-list.js';
 import { followHistory, startFromLink } from './history.js';
+// The report samples each viewport event before viewport.js answers it, so it
+// registers its listeners first.
+import './viewport-report.js';
+import './viewport.js';
 
 originEl.textContent = location.origin;
 
