@@ -26,6 +26,10 @@ One key, file, store or peer failing must fail locally and cleanly. Nothing a si
 
 A problem is diagnosed from telemetry that was already emitted — you cannot go back and add a log line. See [logging.md](./logging.md).
 
+## Change the pattern when the pattern is the problem
+
+Follow the established pattern while it solves the problem. When a fix only covers the instance in front of you, or the same failure returns, the pattern is what is wrong: change the pattern instead of adding to it. Another condition in a design that keeps failing hides the next failure and makes the design harder to replace. A pattern earns its place by the failures it removes, not by the code that already follows it.
+
 ---
 
 # Shaping business logic
