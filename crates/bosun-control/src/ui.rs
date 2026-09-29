@@ -77,8 +77,8 @@ mod tests {
     /// rather than repeating it.
     const BLOCKS: &str = ":is(#transcript, #child-transcript) ";
 
-    // The pane ships as one embedded HTML file with no browser test harness,
-    // so these are presence checks, not behaviour tests.
+    // These are presence checks on the pane's source, not behaviour tests. The
+    // behaviour tests drive the pane in a browser: `tests/browser.rs`.
 
     /// The pane's source from `start` to the next `end`, so a check reads one
     /// function or one case instead of the indentation around a single line.

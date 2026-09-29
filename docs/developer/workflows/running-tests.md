@@ -34,6 +34,35 @@ cargo test -p bosun --test e2e -- --ignored --nocapture
 The test uses temp directories and cleans up after itself; it does not touch a
 real deployment.
 
+## Browser Tests
+
+The browser test boots the real control-plane router on a temporary store
+seeded with sessions, then runs `crates/bosun-control/tests/browser/pane.py`,
+which drives the web pane with Playwright in a phone-sized Chromium. It needs
+`python3` with the `playwright` package and Playwright's Chromium, so it is
+`#[ignore]`d and runs on demand:
+
+```bash
+# Once per machine
+python3 -m pip install --user playwright
+python3 -m playwright install chromium
+
+cargo test -p bosun-control --test browser -- --ignored --nocapture
+```
+
+Each check prints `PASS` or `FAIL`, and the test fails when any check fails.
+When Chromium cannot be started, most often because Playwright or its Chromium
+is missing, the script prints the error and the install commands above, and
+the test fails saying so. The script expects the sessions
+`tests/browser.rs` seeds, so it runs only against the server that test starts.
+Run it after any change to the pane.
+
+Chromium differs from iOS Safari in two ways the pane handles itself, and the
+script makes Chromium behave like Safari so the checks can see the pane's own
+handling. It turns scroll anchoring off, so inserting older messages would
+move the lines on screen. It takes the hidden session list out of the document
+and puts it back, so the list loses its scroll while a session covers it.
+
 ## Debugging a Failing Test
 
 ```bash

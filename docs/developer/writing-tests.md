@@ -18,9 +18,12 @@ Cheapest first. Cost tracks how much must be standing before the test can run.
 | Tier | Answers | Location | Needs |
 |---|---|---|---|
 | Unit | Is this logic correct across all its cases? | Inline `#[cfg(test)]` | Nothing |
+| Browser | Does the web pane behave on a phone? | `crates/bosun-control/tests/browser.rs`, `#[ignore]` | `python3` with `playwright` and its Chromium |
 | E2E | Does a real user flow work across the binaries? | `cmd/bosun/tests/e2e.rs`, `#[ignore]` | `git` and `opencode` on PATH |
 
 Edge cases belong in unit tests. The e2e test covers the happy path only.
+
+A browser check drives the pane through the DOM, the browser's history and the viewport, never through the pane's own functions or source text, so it holds while the pane's code is restructured.
 
 ## Polling for Async State
 
