@@ -5,8 +5,9 @@ Usage: python3 pane.py <base url>
 The base url serves the real control-plane router over a store that
 `tests/browser.rs` seeds. This script knows the seeded session ids and their
 contents, and nothing else about the server. It drives the pane only through
-the DOM, the browser's history and a stubbed visual viewport, so the checks
-hold while the pane's code is restructured. Each check prints PASS or FAIL.
+the DOM, the browser's history, a stubbed visual viewport and server responses
+it holds back or rewrites, so the checks hold while the pane's code is
+restructured. Each check prints PASS or FAIL.
 The exit status is 1 when any check fails, and 2 when Chromium cannot be
 started: Playwright or its Chromium is not installed, or it cannot run here.
 """
@@ -38,6 +39,15 @@ BASE = sys.argv[1].rstrip('/')
 LONG = 'long-session'
 ASK = 'ask-session'
 TURNS = 300
+# Found in the list by their summaries.
+LONG_ROW = 'the long session'
+ASK_ROW = 'the ask session'
+RUNNING_ROW = 'the running session'
+PENDING_ASK_ROW = 'the pending ask session'
+EMPTY_ROW = 'the empty session'
+DIAGRAM_ROW = 'the diagram session'
+DIAGRAM = 'diagram-session'
+RUNNING = 'running-session'
 ASK_BEFORE = 100
 ASK_AFTER = 59
 LIST_ROWS = 40
@@ -67,6 +77,12 @@ WATCH_CHILD = '#transcript .child-watch'
 CHILD_PANEL = '#child-panel'
 CHILD_LINE = '#child-transcript .msg'
 CHILD_CLOSE = '#btn-child-collapse'
+VIEW_TITLE = '#view-title'
+STATUS_LABEL = '#view-waiting'
+ACTIVITY_ROW = '#activity-log .activity-row'
+ASK_COMPOSER = '#ask-sheet'
+CHAT_ROW = '#chat-row'
+DIAGRAM_DRAWN = '#transcript .md-mermaid svg'
 # The boxes meant to scroll sideways: code, tables and diagrams, which are
 # wider than a phone by nature. Nothing else may.
 SIDEWAYS_SCROLLERS = 'pre, .md-table-wrap, .md-mermaid'
@@ -205,6 +221,14 @@ VIEWPORT_STUB = """
 })();
 """
 
+# A browser with no visual viewport API. The pane then never measures the
+# viewport, so nothing but its own teardown re-arms the transcript's
+# auto-follow for the next session. This page is the only place the
+# teardown's own re-arm is visible; no current browser lacks the API.
+NO_VISUAL_VIEWPORT = """
+Object.defineProperty(window, 'visualViewport', { configurable: true, get: () => undefined });
+"""
+
 # Chromium keeps the lines on screen still when content is inserted above them
 # (scroll anchoring). iOS Safari does not, so the pane keeps the reader's place
 # itself, and the checks turn anchoring off to see that it does.
@@ -257,7 +281,7 @@ AT_BOTTOM = """
 """
 
 
-def new_page(browser, errors, size=PORTRAIT, stub_viewport=False):
+def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewport=True):
     context = browser.new_context(
         viewport={'width': size[0], 'height': size[1]},
         is_mobile=True,
@@ -267,6 +291,8 @@ def new_page(browser, errors, size=PORTRAIT, stub_viewport=False):
     context.add_init_script(NO_SCROLL_ANCHORING)
     if stub_viewport:
         context.add_init_script(VIEWPORT_STUB)
+    if not visual_viewport:
+        context.add_init_script(NO_VISUAL_VIEWPORT)
     page = context.new_page()
     page.set_default_timeout(15000)
     page.on('pageerror', lambda error: errors.append(f'page error: {error}'))
@@ -277,6 +303,22 @@ def new_page(browser, errors, size=PORTRAIT, stub_viewport=False):
 def open_session(page, session_id):
     page.goto(f'{BASE}/#s={quote(session_id)}')
     page.wait_for_selector(TRANSCRIPT_LINE)
+
+
+def open_from_list(page, summary):
+    """Opens the session whose row shows `summary`, by tapping the row, so the
+    pane opens it in the same document as the session before it."""
+    page.locator(SESSION_ROW, has_text=summary).first.tap()
+    page.wait_for_selector(VIEW, state='visible')
+
+
+def leave_session(page):
+    page.tap(BACK)
+    page.wait_for_selector(VIEW, state='hidden')
+
+
+def shown(selector):
+    return f"() => {{ const el = document.querySelector('{selector}'); return !!el && el.checkVisibility(); }}"
 
 
 def open_list(page):
@@ -569,6 +611,136 @@ def check_keyboard_ride(browser, errors):
     page.context.close()
 
 
+def check_what_a_closed_session_leaves_behind(browser, errors):
+    """Each session opened after another starts from nothing the first one
+    left: its scroll, a read-back still in flight, its state, its activity,
+    its question and its streamed paragraph."""
+    # At the very top the teardown moves no scroll, so no scroll event can
+    # re-arm auto-follow on the closing session's behalf.
+    page = new_page(browser, errors, visual_viewport=False)
+    open_session(page, ASK)
+    read_back_everything(page)
+    page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = 0; }')
+    until(page, shown(BOTTOM_CONTROL))
+    leave_session(page)
+    open_from_list(page, LONG_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    check('a session opened after one left at its top follows its newest line',
+          until(page, AT_BOTTOM, TRANSCRIPT) and until(page, f'() => !({shown(BOTTOM_CONTROL)})()'))
+    page.context.close()
+
+    page = new_page(browser, errors)
+    open_session(page, LONG)
+    page.wait_for_selector(EARLIER)
+
+    # A read-back held until the next session is open, so its page lands there.
+    held = []
+    page.route('**/history?*', lambda route: held.append(route))
+    page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = 0; }')
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    leave_session(page)
+    open_from_list(page, ASK_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    for route in held:
+        with page.expect_response(lambda response: '/history?' in response.url):
+            route.continue_()
+    page.unroute('**/history?*')
+    foreign = f"""() => [...document.querySelectorAll('{USER_LINE}')]
+      .some(e => e.textContent.trim().startsWith('user message'))"""
+    check('a read-back that lands after its session closed draws nothing',
+          held and not until(page, foreign, timeout=1500), f'{len(held)} read-backs held')
+
+    # The label counts every second, not only when the session list is polled.
+    leave_session(page)
+    open_from_list(page, RUNNING_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    page.evaluate("""(sel) => {
+      const label = document.querySelector(sel);
+      window.__labels = new Set();
+      new MutationObserver(() => {
+        if (/· \\d+s$/.test(label.textContent)) window.__labels.add(label.textContent);
+      }).observe(label, { childList: true, characterData: true, subtree: true });
+    }""", STATUS_LABEL)
+    check('a running session counts the seconds since its newest activity',
+          until(page, '() => window.__labels.size >= 3', timeout=5000),
+          page.evaluate('() => [...window.__labels]'))
+
+    # The session list reports a state that no stream event carried. The real
+    # server sends a state event with each change, so this rewrite forces a
+    # race between the list and the stream in the list's favour, which runs
+    # the list-poll path in session-list.js. The label's one-second count must
+    # follow the list, not the state the session opened with.
+    def stopped(route):
+        response = route.fetch()
+        listed = response.json()
+        for session in listed:
+            if session['id'] == RUNNING:
+                session['state'] = 'waiting_for_input'
+        route.fulfill(response=response, json=listed)
+    page.route('**/sessions', stopped)
+    page.wait_for_function(f"() => document.querySelector('{STATUS_LABEL}').hidden", timeout=5000)
+    check('the header follows a state the session list reports',
+          not until(page, f"() => !document.querySelector('{STATUS_LABEL}').hidden", timeout=2500))
+    page.unroute('**/sessions')
+
+    leave_session(page)
+    open_from_list(page, ASK_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    page.tap(VIEW_TITLE)
+    page.wait_for_selector('#activity-log', state='visible')
+    rows = page.locator(ACTIVITY_ROW).count()
+    check('the activity console holds none of the last session\'s activity', rows == 0, f'{rows} rows')
+    page.tap(VIEW_TITLE)
+
+    # The composer holds the focus when a session opens, and the ask composer
+    # waits for it to leave. The pending question has the same text and child
+    # as the ask session's, so a record of it left behind would take the ask
+    # session's answered copy for its own answer.
+    leave_session(page)
+    open_from_list(page, PENDING_ASK_ROW)
+    page.wait_for_selector(ASK_BOX)
+    page.evaluate('() => document.activeElement.blur()')
+    check('the ask composer shows for a pending question', until(page, shown(ASK_COMPOSER)))
+
+    leave_session(page)
+    open_from_list(page, EMPTY_ROW)
+    page.evaluate('() => document.activeElement.blur()')
+    check('a session with no question shows the chat box, not the last session\'s question',
+          not until(page, shown(ASK_COMPOSER), timeout=1500) and page.is_visible(CHAT_ROW))
+
+    leave_session(page)
+    open_from_list(page, ASK_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    check('a session opens with its own answered question, whatever the last session asked',
+          until(page, f"() => !!document.querySelector('{ASK_BOX} {ASK_ANSWER}')"))
+
+    # A stream that sends one delta and ends: the streamed paragraph is the
+    # session's, and the next session's first reply does not replace it.
+    page.route('**/sessions/empty-session/events*', lambda route: route.fulfill(
+        status=200, content_type='text/event-stream', body='data: {"delta": "streamed words"}\n\n'))
+    leave_session(page)
+    open_from_list(page, EMPTY_ROW)
+    streamed = until(page, f"""() => [...document.querySelectorAll('{REPLY_LINE}')]
+      .some(e => e.textContent.includes('streamed words'))""")
+    leave_session(page)
+    page.unroute('**/sessions/empty-session/events*')
+    open_from_list(page, DIAGRAM_ROW)
+    check('a session opens with its own first reply after one that was streaming',
+          streamed and until(page, f"""() => [...document.querySelectorAll('{REPLY_LINE}')]
+            .some(e => e.textContent.includes('Here it is'))"""), f'streamed: {streamed}')
+    page.context.close()
+
+
+def check_diagram(browser, errors):
+    page = new_page(browser, errors)
+    open_session(page, DIAGRAM)
+    check('a mermaid fence draws as a diagram', until(page, shown(DIAGRAM_DRAWN), timeout=20000))
+    page.context.close()
+
+
 CHECKS = [
     check_tail_and_read_back,
     check_ask_across_a_page_boundary,
@@ -577,6 +749,8 @@ CHECKS = [
     check_field_sizes,
     check_bottom_control,
     check_keyboard_ride,
+    check_what_a_closed_session_leaves_behind,
+    check_diagram,
 ]
 
 

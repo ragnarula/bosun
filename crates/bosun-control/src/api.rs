@@ -562,6 +562,10 @@ const RESERVED_PATH_PREFIXES: &[&str] = &[
     "/mcp/servers/",
 ];
 
+/// The parents the router serves any single segment below: `/ui/{asset}`
+/// matches `/ui/main.js` but not `/ui/oauth/callback`.
+const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/"];
+
 /// The `oauth_redirect_uri` names a path the control plane cannot serve as
 /// the OAuth callback.
 #[derive(Debug, thiserror::Error)]
@@ -596,6 +600,10 @@ pub fn oauth_callback_path(redirect_uri: &str) -> Result<String, OauthRedirectUr
         || RESERVED_PATH_PREFIXES
             .iter()
             .any(|prefix| path.starts_with(prefix))
+        || RESERVED_SEGMENT_PARENTS.iter().any(|parent| {
+            path.strip_prefix(parent)
+                .is_some_and(|segment| !segment.is_empty() && !segment.contains('/'))
+        })
     {
         return Err(OauthRedirectUriError(format!(
             "oauth_redirect_uri resolves to path {path}, which the control plane already serves"
@@ -609,6 +617,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(crate::ui::pane))
         .route("/ui", get(crate::ui::pane))
         .route("/ui/mermaid.min.js", get(crate::ui::mermaid_bundle))
+        .route("/ui/{asset}", get(crate::ui::asset))
         .route("/poll", post(poll))
         .route("/nodes", get(nodes))
         .route("/personas", get(personas))
@@ -1657,7 +1666,7 @@ fn validate_mcp_url(url: &str) -> Result<(), ApiError> {
 
 /// The durable line a rejected question leaves in the transcript. Styled as a
 /// user action note by both clients (mirror the literal in
-/// `crates/bosun-control/src/ui/index.html`); it is read by the session's
+/// `crates/bosun-control/src/ui/composer.js`); it is read by the session's
 /// model, so the words stay literal and stable.
 pub const USER_REJECTED_TEXT: &str = "user rejected the question";
 
@@ -3070,6 +3079,77 @@ mod tests {
             body.contains("globalThis[\"mermaid\"]"),
             "the body is the mermaid bundle"
         );
+    }
+
+    #[tokio::test]
+    async fn the_panes_stylesheet_and_modules_are_served_uncached() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        for (name, _, body) in crate::ui::ASSETS {
+            let response = client
+                .get(format!("http://{addr}/ui/{name}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name} is served");
+            let expected = if name.ends_with(".css") {
+                "text/css; charset=utf-8"
+            } else {
+                "text/javascript; charset=utf-8"
+            };
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "{name} has its content type, or the browser refuses to run a module"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{name} is never stored, so a browser cannot mix modules from two builds"
+            );
+            assert_eq!(response.text().await.unwrap(), *body);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_panes_assets_is_not_served_below_ui() {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        // Written to the socket as they are: an HTTP client would resolve the
+        // dot segments before it sent them.
+        for path in [
+            "/ui/../Cargo.toml",
+            "/ui/..%2FCargo.toml",
+            "/ui/%2E%2E/Cargo.toml",
+            "/ui/index.html",
+            "/ui/ui.rs",
+            "/ui/missing.js",
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 404"),
+                "{path} must not be served, got {}",
+                response.lines().next().unwrap_or_default()
+            );
+        }
     }
 
     #[tokio::test]
@@ -10279,6 +10359,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_callback_below_ui_is_served_beside_the_panes_assets() {
+        let dir = tempdir().unwrap();
+        let state =
+            test_state_with_redirect_uri(&dir, Some("http://127.0.0.1:8090/ui/oauth/callback"));
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+
+        let callback = client
+            .get(format!("http://{addr}/ui/oauth/callback"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            callback.status(),
+            StatusCode::NOT_FOUND,
+            "the callback is registered"
+        );
+        let module = client
+            .get(format!("http://{addr}/ui/main.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            module.status(),
+            StatusCode::OK,
+            "the pane's modules still serve"
+        );
+    }
+
+    #[tokio::test]
     async fn a_colliding_oauth_redirect_uri_leaves_the_router_working() {
         // A bare origin resolves to "/", which the router already serves, so
         // the callback is not registered there and the router still builds.
@@ -10305,6 +10415,8 @@ mod tests {
             "http://127.0.0.1:8090",
             "http://127.0.0.1:8090/ui",
             "http://127.0.0.1:8090/ui/mermaid.min.js",
+            "http://127.0.0.1:8090/ui/main.js",
+            "http://127.0.0.1:8090/ui/callback",
             "http://127.0.0.1:8090/sessions",
             "http://127.0.0.1:8090/sessions/abc",
             "http://127.0.0.1:8090/mcp/servers",
@@ -10322,6 +10434,11 @@ mod tests {
         assert_eq!(
             oauth_callback_path("http://127.0.0.1:8090/mcp/oauth/callback").unwrap(),
             "/mcp/oauth/callback"
+        );
+        // `/ui/{asset}` serves one segment below `/ui/`, so a deeper path is free.
+        assert_eq!(
+            oauth_callback_path("http://127.0.0.1:8090/ui/oauth/callback").unwrap(),
+            "/ui/oauth/callback"
         );
         // The URL parser percent-encodes braces, so a brace path is a plain
         // literal path, not axum parameter syntax.

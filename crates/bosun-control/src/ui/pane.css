@@ -1,0 +1,1414 @@
+  :root {
+    color-scheme: dark;
+    --bg: #1b1e25;
+    --panel: #23262e;
+    --panel-2: #2b2f39;
+    --border: #3a4150;
+    --text: #b3b9c3;
+    --muted: #969eae;
+    --accent: #8aa9f0;
+    --user: #c3ab86;
+    --mono: #9fb0c2;
+    --error: #d98d8d;
+    --ok: #86bd9e;
+    --warn: #cfa878;
+    /* One-handed floor: every interactive target is at least this tall. */
+    --touch-min-height: 44px;
+  }
+  * { box-sizing: border-box; }
+  * { -webkit-tap-highlight-color: transparent; }
+  /* The document never scrolls: the session view is a full-height box inside
+     it, and Safari's reveal-scroll on focus has nothing to move. This is what
+     the fixed-container family of the iOS focus failure comes down to. */
+  html, body { height: 100%; overflow: hidden; }
+  /* The document never scrolls, so each screen does. The home column (the
+     strips, the panel and the session list) and each tab panel fill the space
+     under the chrome and scroll inside it; without this their tails are clipped
+     with no way to reach them. */
+  body { display: flex; flex-direction: column; }
+  header.top, #status, #health-strip, #skills-strip, #mcp-strip { flex: 0 0 auto; }
+  main, #machines-tab, #skills-tab, #mcp-tab {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  }
+  header.top {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 10px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header.top h1 { margin: 0; font-size: 18px; }
+  header.top .origin { color: var(--muted); font-size: 13px; }
+  #status { min-height: 20px; padding: 3px 20px 7px; color: var(--muted); font-size: 12px; }
+  /* One-line node health, tappable: it opens the Machines tab, which a later
+     sprint builds. Until then the tap answers with a status toast. */
+  #health-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 14px;
+    padding: 12px 14px;
+    min-height: var(--touch-min-height);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  #health-strip:active { background: var(--panel-2); }
+  #health-strip .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  #health-strip .health-dot.down { background: var(--error); }
+  #health-strip .health-text { font-size: 13px; color: var(--muted); }
+  #health-strip::after {
+    content: '›';
+    color: var(--muted);
+  }
+  main { padding: 0 20px 20px; }
+  /* User-facing errors and confirmations land here, at the bottom where a
+     thumb-heavy page reads last. It auto-hides; background poll errors stay
+     in #status as always. */
+  #toast {
+    position: fixed;
+    left: 50%;
+    /* A toast reports; it never takes a tap, and it must not cover the composer
+       while it is up. */
+    pointer-events: none;
+    /* The layout viewport's bottom is where the keyboard is drawn, so the
+       toast offsets by whatever the visual viewport loses there. */
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
+    z-index: 20;
+    transform: translateX(-50%);
+    max-width: calc(100% - 40px);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 13px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+  }
+  #toast[hidden] { display: none; }
+  #toast.error { border-color: var(--error); color: var(--error); }
+  #toast.ok { border-color: var(--ok); color: var(--ok); }
+  /* Machines tab: a full pane listing node health. Down nodes lead, red,
+     with their age; an up node's dot already says up, so it shows none. */
+  #machines-tab {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #machines-tab[hidden] { display: none; }
+  .machines-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .machines-head .btn-machines-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .machines-head .btn-machines-back:active { color: var(--accent); }
+  .machines-head .machines-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  /* Scrolling like the other two keeps every tab's head pinned the same way,
+     and leaves the tab's own overflow inert. */
+  #machines-list { flex: 1; background: var(--bg); overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  #machines-list .machine-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    min-height: 48px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #machines-list .machine-row .dot { flex: 0 0 auto; }
+  #machines-list .machine-row .machine-name { flex: 1; min-width: 0; font-weight: 600; }
+  #machines-list .machine-row .machine-down {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  #machines-list .empty { color: var(--muted); padding: 16px 14px; }
+  #machines-list .machine-row.down { color: var(--error); }
+  /* Skill repos: a home-screen strip like the health one, and a full-pane
+     sheet (machines-tab pattern). One repo per touch-sized row; the primary
+     tap Updates it (the repeated action), and the per-row buttons under the
+     name hold enable/disable and remove. A package count and a status dot
+     say the state without a table. */
+  #skills-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 14px;
+    padding: 12px 14px;
+    min-height: var(--touch-min-height);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  #skills-strip:active { background: var(--panel-2); }
+  #skills-strip .skills-strip-icon { color: var(--accent); font-size: 15px; }
+  #skills-strip .skills-strip-text { flex: 1; font-size: 13px; }
+  #skills-strip::after { content: '›'; color: var(--muted); }
+  #skills-tab {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #skills-tab[hidden] { display: none; }
+  .skills-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .skills-head .btn-skills-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .skills-head .btn-skills-back:active { color: var(--accent); }
+  .skills-head .skills-title { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); }
+  .skills-head .btn-skills-add {
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+    background: var(--accent);
+    border: none;
+    color: var(--bg);
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 0 14px;
+  }
+  .skills-head .btn-skills-add:active { filter: brightness(1.2); }
+  /* A scroll container reaches the physical bottom with cover on, so its last
+     rows would sit in the Home indicator's strip. */
+  #skills-list { flex: 1; background: var(--bg); overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  #skills-list .empty { color: var(--muted); padding: 16px 14px; }
+  #skills-list .repo-row { padding: 12px 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
+  .repo-primary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: var(--touch-min-height);
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .repo-primary:active .repo-name { color: var(--accent); }
+  .repo-primary .repo-name {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+  }
+  #skills-list .repo-meta { display: block; font-size: 12px; color: var(--muted); }
+  #skills-list .repo-error { color: var(--error); font-size: 12px; }
+  #skills-list .repo-actions { display: flex; gap: 8px; margin-top: 10px; }
+  #skills-list .repo-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #skills-list .repo-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #skills-list .repo-actions .danger { color: var(--error); border-color: var(--error); }
+  /* The add-repo card: one text field for the address, and an optional ref
+     revealed on demand. The address is identity, not prose, so it stays a
+     single input even though the pane's rule keeps text to the chat box. */
+  #skills-add {
+    padding: 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    gap: 10px;
+  }
+  #skills-add[hidden] { display: none; }
+  #skills-add label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  #skills-add input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 11px;
+    font: inherit;
+    font-size: 16px;
+  }
+  #skills-add .skills-add-actions { display: flex; gap: 8px; }
+  #skills-add .skills-add-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #skills-add .skills-add-actions .primary { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
+  #skills-add .skills-add-actions button:active { background: var(--panel-2); border-color: var(--accent); color: var(--text); }
+  #skills-add .btn-ref-toggle {
+    background: none;
+    border: none;
+    color: var(--muted);
+    text-align: left;
+    padding: 0;
+    min-height: 24px;
+    font-size: 12px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #skills-add .btn-ref-toggle:active { color: var(--accent); }
+  /* MCP servers: a home-screen strip like skills, and a full-pane sheet.
+     The list row shows the state without a table: a dot, the name, URL,
+     auth kind, OAuth status, and last error. The primary action is Update
+     (via the add form filled with the row), the buttons hold enable/disable,
+     retry, and remove. */
+  #mcp-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 14px;
+    padding: 12px 14px;
+    min-height: var(--touch-min-height);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  #mcp-strip:active { background: var(--panel-2); }
+  #mcp-strip .mcp-strip-icon { color: var(--accent); font-size: 15px; }
+  #mcp-strip .mcp-strip-text { flex: 1; font-size: 13px; }
+  #mcp-strip::after { content: '›'; color: var(--muted); }
+  #mcp-tab {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #mcp-tab[hidden] { display: none; }
+  .mcp-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .mcp-head .btn-mcp-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mcp-head .btn-mcp-back:active { color: var(--accent); }
+  .mcp-head .mcp-title { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); }
+  .mcp-head .btn-mcp-add {
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+    background: var(--accent);
+    border: none;
+    color: var(--bg);
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 0 14px;
+  }
+  .mcp-head .btn-mcp-add:active { filter: brightness(1.2); }
+  #mcp-list { flex: 1; background: var(--bg); overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  #mcp-list .empty { color: var(--muted); padding: 16px 14px; }
+  #mcp-list .mcp-row { padding: 12px 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
+  .mcp-primary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: var(--touch-min-height);
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mcp-primary:active .mcp-name { color: var(--accent); }
+  .mcp-primary .mcp-name {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+  }
+  #mcp-list .mcp-meta { display: block; font-size: 12px; color: var(--muted); }
+  #mcp-list .mcp-error { color: var(--error); font-size: 12px; }
+  #mcp-list .mcp-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  #mcp-list .mcp-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #mcp-list .mcp-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #mcp-list .mcp-actions .danger { color: var(--error); border-color: var(--error); }
+  /* The add/edit card shares the skills add card's look. Auth kind is a
+     choice, not text, so it is a select. */
+  #mcp-add {
+    padding: 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    gap: 10px;
+  }
+  #mcp-add[hidden] { display: none; }
+  #mcp-add label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  #mcp-add input, #mcp-add select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 11px;
+    font: inherit;
+    font-size: 16px;
+  }
+  #mcp-add .mcp-add-actions { display: flex; gap: 8px; }
+  #mcp-add .mcp-add-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #mcp-add .mcp-add-actions .primary { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
+  #mcp-add .mcp-add-actions button:active { background: var(--panel-2); border-color: var(--accent); color: var(--text); }
+  #mcp-add #form-mcp-bearer:focus { outline: none; border-color: var(--accent); }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .panel h2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  /* One session per row: a whole-row tap target led by the model's summary of
+     the session when it has one, then the node/dir pair, the persona tag and
+     the age. Children nest one level deep under a `N children` toggle on the
+     parent row. */
+  #session-list { padding: 0 0 8px; }
+  #session-list[hidden] { display: none; }
+  #session-list .empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 12px 14px;
+  }
+  .session-item { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+  .session-row {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0;
+    padding: 12px 14px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .session-row:active { background: var(--panel-2); }
+  .session-row .row-main { flex: 1; min-width: 0; }
+  .session-row .row-node,
+  .session-row .row-summary {
+    /* A block box, so a line wider than the row ends in an ellipsis instead
+       of running past it; the meta and time lines are blocks too. */
+    display: block;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-row .row-meta { display: block; font-size: 12px; color: var(--muted); }
+  .session-row .row-time { display: block; font-size: 12px; color: var(--muted); }
+  .children-toggle {
+    margin: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-size: 12px;
+    background: var(--panel-2);
+    color: var(--muted);
+    flex: 0 0 auto;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .children-toggle:active { background: var(--panel); border-color: var(--accent); }
+  .children-toggle.open { color: var(--accent); border-color: var(--accent); }
+  #session-list .child-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 10px 14px 10px 26px;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    background: none;
+    font: inherit;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  #session-list .child-row:active { background: var(--panel-2); }
+  #session-list .child-row[hidden] { display: none; }
+  #session-list .child-row .child-note {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .dot.running, .dot.creating { background: var(--ok); }
+  .dot.interrupted, .dot.stopped { background: var(--error); }
+  .dot.waiting_for_input { background: var(--warn); }
+  .dot.warn { background: var(--warn); }
+  .dot.up { background: var(--ok); }
+  .dot.down { background: var(--error); }
+  button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  /* The new-session composer is a bottom sheet pinned to the viewport's
+     bottom edge: recents and the pickers on top, Start under the thumb.
+     The home list stays visible above it, so there is no scrim. */
+  #new-session-form {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  }
+  #new-session-form[hidden] { display: none; }
+  .sheet-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 16px;
+  }
+  #recent-sessions { display: grid; gap: 4px; }
+  #recent-sessions[hidden] { display: none; }
+  .recent-title {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .recent-entry {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    gap: 4px 10px;
+    align-items: baseline;
+    width: 100%;
+    min-height: var(--touch-min-height);
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 12px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .recent-entry:last-child { border-bottom: none; }
+  .recent-entry:active { background: var(--panel-2); }
+  .recent-entry > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .recent-node { font-weight: 600; }
+  .recent-dir {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .recent-persona { color: var(--muted); font-size: 12px; }
+  .recent-time { color: var(--muted); font-size: 12px; }
+  /* Choices, not text: every picker is a thumb-width chip with :active
+     feedback. One tap selects; the picked node's directory belongs to it. */
+  .composer { display: grid; gap: 16px; }
+  .composer-row { display: grid; gap: 6px; }
+  .composer-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    min-height: var(--touch-min-height);
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--text);
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .chip:active { background: var(--panel); border-color: var(--accent); }
+  .chip.selected { border-color: var(--accent); color: var(--accent); }
+  .chip:disabled { opacity: 0.45; cursor: default; }
+  .chip.down { color: var(--muted); }
+  #form-node[hidden], #form-persona[hidden] { display: none; }
+  .composer select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 10px;
+    font: inherit;
+  }
+  .dir-pick { display: flex; gap: 8px; align-items: center; }
+  #form-dir {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  #form-dir:empty::before { content: 'choose a directory'; }
+  .sheet-actions {
+    flex: 0 0 auto;
+    display: grid;
+    gap: 8px;
+    /* With `viewport-fit=cover` this row reaches the physical bottom, so its
+       buttons would sit in the Home indicator's strip. */
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .sheet-actions button {
+    width: 100%;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .sheet-actions button:active { background: var(--panel-2); border-color: var(--accent); color: var(--text); }
+  .sheet-actions .start { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
+  #dir-browser {
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    font-size: 12px;
+  }
+  #dir-browser[hidden] { display: none; }
+  .dir-browser-head { display: flex; align-items: center; gap: 8px; }
+  .dir-browser-head #dir-path { flex: 1; color: var(--muted); word-break: break-all; }
+  .dir-browser-head .dir-close {
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .dir-browser-head .dir-close:active { background: var(--panel-2); border-color: var(--accent); }
+  .dir-browser-actions {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: 8px;
+  }
+  .dir-browser-actions button {
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .dir-browser-actions button:active { background: var(--panel-2); border-color: var(--accent); }
+  #dir-entries { display: grid; gap: 4px; max-height: 220px; overflow-y: auto; }
+  /* One row per directory: the whole row is the tap target, with :active
+     feedback instead of a hover. A repo is marked so the user can still
+     tell it apart at a glance. */
+  .dir-entry {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .dir-entry:active { background: var(--border); }
+  .dir-entry .dir-name { flex: 1; word-break: break-all; }
+  .dir-entry .dir-repo { color: var(--accent); font-size: 11px; }
+  #session-view {
+    /* Absolute, not fixed: the container the composer lives in must not be a
+       fixed layer, whose geometry iOS does not reflow when the keyboard opens. */
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  #session-view[hidden] { display: none; }
+  /* Thin header: back, `state dot / node·dir`, and ⋯. Everything else moves
+     into the ⋯ sheet so the header never scrolls sideways. */
+  .view-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .view-header .btn-back {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 20px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-header .btn-back:active { color: var(--accent); }
+  .view-header .view-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .view-header .view-title .dot { flex: 0 0 auto; }
+  .view-header .view-title .view-main { flex: 1; min-width: 0; }
+  .view-header .view-title .view-node { font-weight: 600; }
+  .view-header .view-title .view-dir {
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  .view-header .view-title .view-dir::before { content: ' · '; }
+  .view-header .view-title .view-waiting {
+    display: block;
+    font-size: 12px;
+    color: var(--warn);
+  }
+  .view-header .view-title .view-waiting.running { color: var(--text); }
+  .view-header .view-title .view-waiting[hidden] { display: none; }
+  .view-header .btn-more {
+    min-height: 40px;
+    min-width: 44px;
+    background: none;
+    border: none;
+    font-size: 18px;
+    letter-spacing: 0.08em;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-header .btn-more:active { color: var(--accent); }
+  #view-sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    z-index: 12;
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  }
+  #view-sheet[hidden] { display: none; }
+  .view-sheet-row { display: grid; gap: 8px; padding: 12px 16px; }
+  .view-sheet-row button {
+    width: 100%;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-sheet-row button:active { background: var(--panel-2); border-color: var(--accent); }
+  .view-sheet-row .danger { color: var(--error); border-color: var(--error); }
+  .view-sheet-row select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 10px;
+    font: inherit;
+    font-size: 16px;
+  }
+  .view-sheet-note { color: var(--muted); font-size: 12px; }
+  .view-sheet-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  .view-sheet-head button {
+    min-height: 40px;
+    min-width: 40px;
+    background: none;
+    border: none;
+    font-size: 16px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-sheet-head button:active { color: var(--accent); }
+  /* A watch-only child renders one banner in place of the input row: the
+     child cannot be driven, only opened in its own monitor. */
+  #watch-banner {
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 12px 16px;
+    display: grid;
+    gap: 8px;
+  }
+  #watch-banner[hidden] { display: none; }
+  #watch-banner .watch-note { color: var(--muted); font-size: 13px; }
+  #watch-banner button {
+    width: 100%;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #watch-banner button:active { background: var(--panel-2); border-color: var(--accent); }
+  /* The debug console: a monospace activity log between the header and the
+     transcript, closed by default and toggled from the status line. */
+  #activity-log {
+    flex: 0 1 auto;
+    max-height: 40%;
+    overflow-y: auto;
+    padding: 8px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  #activity-log[hidden] { display: none; }
+  #activity-log .activity-row { display: flex; gap: 8px; white-space: nowrap; }
+  #activity-log .activity-label { flex: 0 0 auto; }
+  #activity-log .activity-detail {
+    flex: 1;
+    min-width: 0;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #activity-log .activity-duration { flex: 0 0 auto; color: var(--muted); }
+  /* The transcript and the control that returns the reader to its end. The
+     control floats inside this box, so it sits just above the composer whatever
+     height the composer takes. */
+  /* The one guard every toggled overlay needs: the UA's `[hidden] { display:
+     none }` loses to any author rule that sets `display` on the same element, so
+     an overlay the code believes is hidden can stay rendered — a full-screen
+     `#child-panel` at phone widths, above the session view, eating taps. The
+     element-specific guards below it still name their own elements; this one
+     holds whatever a later rule forgets. */
+  [hidden] { display: none !important; }
+  /* The box is a flex item in the conversation's row, which is as wide as its
+     content unless `min-width` says otherwise: one long code line or table then
+     made the page wider than a phone's screen, and the page cannot be panned
+     back. */
+  #transcript-wrap {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+  }
+  #transcript { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+  #btn-bottom {
+    position: absolute;
+    right: 16px;
+    bottom: 14px;
+    width: var(--touch-min-height);
+    height: var(--touch-min-height);
+    padding: 0;
+    border-radius: 50%;
+    background: var(--panel-2);
+    color: var(--accent);
+    font-size: 18px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.32);
+  }
+  #btn-bottom:active { border-color: var(--accent); }
+  #btn-bottom[hidden] { display: none; }
+  /* The first row of a transcript opened at its newest messages: it says older
+     ones exist, and a tap reads them back, as scrolling near the top does. */
+  #earlier {
+    display: block;
+    width: 100%;
+    min-height: var(--touch-min-height);
+    margin: 0 0 10px;
+    background: none;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 13px;
+  }
+  /* An open session covers the whole screen, so the home column is taken out
+     of the page while it is open. Nothing of the session list is left to show
+     when the keyboard moves the visible part of the page. */
+  body.in-session > :is(header.top, #status, #health-strip, #skills-strip, #mcp-strip, main) {
+    display: none;
+  }
+  /* The session's transcript and the subagent panel beside it. The panel is a
+     second reader of a child's own stream, so it carries no composer and no
+     history of its own: following a child here is not opening it. */
+  #conversation {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+  }
+  #child-panel {
+    flex: 0 0 auto;
+    width: 420px;
+    max-width: 45%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+  }
+  #child-panel[hidden] { display: none; }
+  #child-panel .child-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px 6px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  #child-panel .child-panel-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--muted);
+  }
+  #child-panel .child-panel-head button {
+    min-height: var(--touch-min-height);
+    min-width: var(--touch-min-height);
+    background: none;
+    border: none;
+    font-size: 16px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #child-panel .child-panel-head button:active { color: var(--accent); }
+  /* The open session's children: one row each, the followed one marked. The
+     transcript below takes the rest of the panel. */
+  #child-list {
+    flex: 0 0 auto;
+    max-height: 40%;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--border);
+  }
+  #child-list[hidden] { display: none; }
+  #child-list .child-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: var(--touch-min-height);
+    padding: 4px 10px;
+    background: none;
+    border: none;
+    border-left: 2px solid transparent;
+    text-align: left;
+    font-size: 12px;
+    color: var(--text);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #child-list .child-row:active { background: var(--panel-2); }
+  #child-list .child-row.followed { border-left-color: var(--accent); background: var(--panel-2); }
+  #child-list .child-row .child-row-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #child-list .child-row .child-row-id {
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+  #child-list .child-list-note { display: block; padding: 8px 10px; color: var(--muted); font-size: 12px; }
+  /* The child panel's transcript is the only transcript that is not the whole
+     view: it takes what the list leaves. */
+  #child-transcript {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    font-size: 13px;
+  }
+  /* The control on a child's line that follows it here: the child's id opens it
+     as the session view, as it always did. */
+  :is(#transcript, #child-transcript) .child-watch {
+    min-height: var(--touch-min-height);
+    padding: 0 8px;
+    margin-left: 4px;
+    font-size: 11px;
+    background: none;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  :is(#transcript, #child-transcript) .child-watch:active { border-color: var(--accent); }
+  /* A stamped entry is one flex row: the time holds the leading gutter and the
+     entry takes the rest of the width, so a block entry's first line shares
+     the row with its time and still wraps on a narrow screen. */
+  :is(#transcript, #child-transcript) .stamp-row { display: flex; align-items: baseline; }
+  /* The time a durable entry landed, in the row's leading gutter. Tabular
+     figures keep the times aligned down the transcript. */
+  :is(#transcript, #child-transcript) .stamp-row .ts {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    margin-right: 6px;
+  }
+  :is(#transcript, #child-transcript) .stamp-row > :last-child { flex: 1; min-width: 0; }
+  :is(#transcript, #child-transcript) .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* User and assistant messages carry a left accent gutter like opencode's
+     message boxes: the user's is tinted with the user color, the assistant's
+     with the plain panel border. */
+  :is(#transcript, #child-transcript) .msg.user {
+    border-left: 3px solid var(--user);
+    padding: 2px 0 2px 12px;
+    color: var(--user);
+  }
+  :is(#transcript, #child-transcript) .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
+  /* A rejected question leaves a durable note, not a typed message: muted and
+     italic, so it never reads as words the user composed. */
+  :is(#transcript, #child-transcript) .msg.user.rejected {
+    color: var(--muted);
+    font-style: italic;
+    border-left-color: var(--border);
+  }
+  :is(#transcript, #child-transcript) .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* A durable note the loop recorded, such as an unavailable MCP server: meta,
+     not conversation. */
+  :is(#transcript, #child-transcript) .line.warning { color: var(--warn); }
+  /* Tool traffic: one inline row per call, glyph + name + args, with the
+     payload collapsed until clicked. The result nests under its call as a
+     bordered block, so a call and its outcome read as one unit. Rows and
+     clipped results are touch targets: feedback on :active, never hover. */
+  :is(#transcript, #child-transcript) .tool {
+    background: var(--panel-2);
+    border-radius: 6px;
+    padding: 8px 10px;
+    display: block;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+  }
+  :is(#transcript, #child-transcript) .tool:active { background: var(--border); }
+  :is(#transcript, #child-transcript) .tool .glyph { color: var(--muted); margin-right: 6px; }
+  :is(#transcript, #child-transcript) .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
+  :is(#transcript, #child-transcript) .tool.open .toggle { color: var(--accent); }
+  /* Thinking reuses the tool strip's tap-to-open row, restyled as prose:
+     muted and italic so it does not read as something the session said. */
+  :is(#transcript, #child-transcript) .reasoning { color: var(--muted); font-style: italic; }
+  :is(#transcript, #child-transcript) .reasoning .body {
+    display: block;
+    margin-top: 6px;
+    padding-left: 10px;
+    border-left: 2px solid var(--border);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-style: normal;
+  }
+  :is(#transcript, #child-transcript) .reasoning .body[hidden] { display: none; }
+  :is(#transcript, #child-transcript) .tool-result {
+    margin: 0 0 6px 20px;
+    border-left: 2px solid var(--border);
+    padding: 4px 0 4px 10px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  :is(#transcript, #child-transcript) .tool-result.clipped {
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    color: var(--muted);
+    border-left: 2px solid var(--accent);
+  }
+  :is(#transcript, #child-transcript) .tool-result.clipped:active { color: var(--text); }
+  :is(#transcript, #child-transcript) .tool-result.clipped .expand-hint {
+    color: var(--accent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    display: block;
+  }
+  /* An error result stays red even when clipped; the muted affordance must
+     not hide that the tool failed. */
+  :is(#transcript, #child-transcript) .tool-result.error { color: var(--error); }
+  :is(#transcript, #child-transcript) .tool-result.error:active { color: var(--error); }
+  :is(#transcript, #child-transcript) .tool-result.error .expand-hint { color: var(--error); }
+  :is(#transcript, #child-transcript) .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
+  :is(#transcript, #child-transcript) .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--mono); }
+  :is(#transcript, #child-transcript) .error { color: var(--error); }
+  :is(#transcript, #child-transcript) .state { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) .context {
+    color: var(--muted);
+    text-align: center;
+    font-size: 12px;
+  }
+  :is(#transcript, #child-transcript) .summary {
+    color: var(--muted);
+    font-style: italic;
+    text-align: center;
+    font-size: 12px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+    margin-top: 10px;
+  }
+  /* The break a cleared context made in the thread: a divider like a summary,
+     in the accent so a reader can find where the session started over. */
+  :is(#transcript, #child-transcript) .cleared {
+    color: var(--accent);
+    text-align: center;
+    font-size: 12px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+    margin-top: 10px;
+  }
+  :is(#transcript, #child-transcript) .child-report { color: var(--muted); padding-left: 18px; }
+  :is(#transcript, #child-transcript) .child-link {
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  :is(#transcript, #child-transcript) .unknown { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) .ask {
+    margin: 6px 0;
+    padding: 10px 14px;
+    border: 1px solid var(--accent);
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    background: rgba(138, 169, 240, 0.10);
+    overflow-wrap: anywhere;
+  }
+  :is(#transcript, #child-transcript) .ask .options { margin: 6px 0 0; padding-left: 18px; }
+  :is(#transcript, #child-transcript) .ask .answer { margin-top: 6px; color: var(--ok); }
+  :is(#transcript, #child-transcript) .ask .ask-to { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #child-transcript) h1, :is(#transcript, #child-transcript) h2, :is(#transcript, #child-transcript) h3, :is(#transcript, #child-transcript) h4, :is(#transcript, #child-transcript) h5, :is(#transcript, #child-transcript) h6 {
+    margin: 12px 0 4px;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  :is(#transcript, #child-transcript) h1 { font-size: 18px; }
+  :is(#transcript, #child-transcript) h2 { font-size: 16px; }
+  :is(#transcript, #child-transcript) h3 { font-size: 15px; }
+  :is(#transcript, #child-transcript) h4 { font-size: 14px; }
+  :is(#transcript, #child-transcript) h5, :is(#transcript, #child-transcript) h6 { font-size: 13px; color: var(--muted); }
+  :is(#transcript, #child-transcript) .msg p { margin: 0 0 6px; }
+  :is(#transcript, #child-transcript) .md-bold { font-weight: 700; }
+  :is(#transcript, #child-transcript) .md-italic { font-style: italic; }
+  :is(#transcript, #child-transcript) .md-code {
+    padding: 0 4px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+  }
+  :is(#transcript, #child-transcript) .md-link { color: var(--accent); text-decoration: underline; }
+  :is(#transcript, #child-transcript) pre.md-pre {
+    margin: 6px 0;
+    padding: 10px 12px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--mono);
+    white-space: pre;
+  }
+  :is(#transcript, #child-transcript) .md-mermaid { margin: 6px 0; overflow-x: auto; }
+  :is(#transcript, #child-transcript) .md-mermaid svg { display: block; }
+  /* A markdown table: the holder scrolls sideways, as the diagram holder
+     does, so a table wider than a phone stays readable instead of squeezing
+     its columns or overflowing the transcript. */
+  :is(#transcript, #child-transcript) .md-table-wrap { margin: 6px 0; overflow-x: auto; }
+  :is(#transcript, #child-transcript) .md-table {
+    border-collapse: collapse;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  :is(#transcript, #child-transcript) .md-table th,
+  :is(#transcript, #child-transcript) .md-table td {
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    color: var(--text);
+    text-align: left;
+    /* A cell keeps its own line: the holder scrolls for a wide table. */
+    white-space: nowrap;
+  }
+  :is(#transcript, #child-transcript) .md-table th {
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+  }
+  :is(#transcript, #child-transcript) .md-table .md-align-right { text-align: right; }
+  :is(#transcript, #child-transcript) .md-table .md-align-center { text-align: center; }
+  :is(#transcript, #child-transcript) blockquote {
+    margin: 4px 0 8px;
+    padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border);
+    color: var(--muted);
+  }
+  :is(#transcript, #child-transcript) blockquote p { margin: 0; }
+  :is(#transcript, #child-transcript) hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  :is(#transcript, #child-transcript) .md-li { margin: 2px 0; }
+  :is(#transcript, #child-transcript) .md-marker { color: var(--muted); }
+  .input-row {
+    display: grid;
+    gap: 10px;
+    /* The Home indicator's strip is not the composer's: with `viewport-fit=cover`
+       the page reaches under it, so the row keeps its padding and adds the
+       inset. The sheet below and the toast carry the same one. */
+    padding: 14px 20px max(14px, env(safe-area-inset-bottom, 0px));
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+  .input-row[hidden] { display: none; }
+  /* The normal chat box: one row with the textarea and Send. It yields the
+     whole composer while a question is on screen, so ask and chat are never
+     editable at the same time. */
+  .chat-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  .chat-row[hidden] { display: none; }
+  /* A text field is 16px at every width, never the 14px body size: a focused
+     control under 16px makes iOS Safari zoom the page, and a phone in landscape
+     is wider than any breakpoint could catch. A desktop reader sees these two
+     fields one step larger than the text around them, which is the price. */
+  .chat-row textarea {
+    flex: 1;
+    resize: vertical;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font: inherit;
+    font-size: 16px;
+  }
+  .chat-row textarea:focus, .ask-free textarea:focus { outline: none; border-color: var(--accent); }
+  /* A picker is opened by the thumb on a phone and by the pointer on a desktop,
+     and iOS zooms a focused control under 16px either way: this one carries the
+     size at every width too, so no breakpoint can be the wrong side of it. */
+  .composer select { font-size: 16px; }
+  /* A live question is the composer: its options as thumb-width chips, a
+     Dismiss control to reject it, and an optional free-text answer. The
+     durable ask record with the question stays in the transcript above. */
+  #ask-sheet {
+    display: grid;
+    gap: 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  #ask-sheet[hidden] { display: none; }
+  .ask-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .ask-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .ask-dismiss {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 13px;
+    min-height: var(--touch-min-height);
+    padding: 0 4px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ask-dismiss:active { color: var(--accent); }
+  .ask-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ask-chips[hidden] { display: none; }
+  .ask-chips button {
+    flex: 1 1 auto;
+    min-height: var(--touch-min-height);
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 15px;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .ask-chips button:active { background: var(--border); border-color: var(--accent); }
+  .ask-type-toggle {
+    background: none;
+    border: none;
+    color: var(--accent);
+    text-align: left;
+    padding: 0;
+    min-height: var(--touch-min-height);
+    font-size: 13px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ask-type-toggle[hidden] { display: none; }
+  .ask-free { display: grid; gap: 8px; }
+  .ask-free[hidden] { display: none; }
+  .ask-free textarea {
+    flex: 1;
+    resize: vertical;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font: inherit;
+    font-size: 16px;
+  }
+  .ask-free-actions { display: flex; gap: 8px; }
+  .ask-free-actions button {
+    flex: 1;
+    min-height: var(--touch-min-height);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ask-free-actions .primary { background: var(--accent); border: none; color: var(--bg); font-weight: 600; }
+  @media (max-width: 640px) {
+    header.top { flex-wrap: wrap; padding: 10px 12px; }
+    main { padding: 0 12px 16px; }
+    #status { padding: 3px 12px 7px; }
+    button { min-height: 40px; padding: 8px 14px; }
+    .session-item { min-height: 48px; }
+    .session-row { min-height: 48px; }
+    #session-list .children-toggle { min-height: var(--touch-min-height); }
+    #session-list .child-row { min-height: var(--touch-min-height); }
+    #dir-entries .dir-entry {
+      min-height: var(--touch-min-height);
+      padding: 5px 8px;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #dir-entries .dir-entry:active { background: var(--border); }
+    .view-header { padding: 8px 12px; }
+    .dir-browser-head { flex-wrap: wrap; }
+    #transcript { padding: 12px 14px; }
+    /* The narrow row is tighter, and keeps the Home indicator's inset: this
+       rule's shorthand would otherwise drop it where it matters most. */
+    .input-row { padding: 12px 14px max(12px, env(safe-area-inset-bottom, 0px)); }
+    /* A side column does not fit a phone: the panel covers the view instead,
+       with the same header, which names the child and closes it. */
+    #child-panel {
+      position: fixed;
+      inset: 0;
+      width: auto;
+      max-width: none;
+      z-index: 11;
+      border-left: none;
+    }
+    /* The narrow padding is a shorthand: it would drop the base rule's inset,
+       which is the same mistake the harness caught on the composer's row. */
+    #child-transcript { padding: 12px 14px max(12px, env(safe-area-inset-bottom, 0px)); }
+  }
+  @media (max-width: 560px) {
+    .view-header .view-title .view-dir { max-width: 40%; }
+  }
+  /* Desktop: the session actions become a small popup under the ⋯ button
+     instead of a bottom sheet. The head row (⋯ + ✕) is a mobile affordance;
+     on a pointer the popup is dismissed by clicking elsewhere or Escape. */
+  @media (min-width: 900px) {
+    #view-sheet {
+      position: fixed;
+      top: 52px;
+      right: 20px;
+      bottom: auto;
+      left: auto;
+      width: 280px;
+      max-height: calc(100vh - 70px);
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+    }
+    #view-sheet .view-sheet-head {
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      z-index: 1;
+      border-radius: 10px 10px 0 0;
+    }
+  }

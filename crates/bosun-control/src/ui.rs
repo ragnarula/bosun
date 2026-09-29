@@ -1,9 +1,13 @@
+use axum::extract::Path;
+use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::IntoResponse;
+use axum::response::Response;
 
-/// The web pane: a self-contained page listing nodes and sessions, with a
-/// live session view driven by the session API and the SSE event stream. The
-/// page is data, embedded at compile time; no build step serves it.
+/// The web pane: a page listing nodes and sessions, with a live session view
+/// driven by the session API and the SSE event stream. The page, its
+/// stylesheet and its modules are data, embedded at compile time; no build
+/// step serves them.
 pub async fn pane() -> impl IntoResponse {
     (
         [
@@ -24,9 +28,55 @@ fn pane_html() -> String {
     include_str!("ui/index.html").replace("{{BOSUN_VERSION}}", bosun_common::version::VERSION)
 }
 
+const CSS: &str = "text/css; charset=utf-8";
+const JS: &str = "text/javascript; charset=utf-8";
+
+/// The pane's stylesheet and modules: the name each is served at below `/ui/`,
+/// its content type, and its body. A name outside this table is not served, so
+/// a request cannot reach any other file.
+pub(crate) const ASSETS: &[(&str, &str, &str)] = &[
+    ("pane.css", CSS, include_str!("ui/pane.css")),
+    ("dom.js", JS, include_str!("ui/dom.js")),
+    ("common.js", JS, include_str!("ui/common.js")),
+    ("machines.js", JS, include_str!("ui/machines.js")),
+    ("skills.js", JS, include_str!("ui/skills.js")),
+    ("mcp.js", JS, include_str!("ui/mcp.js")),
+    ("new-session.js", JS, include_str!("ui/new-session.js")),
+    ("activity.js", JS, include_str!("ui/activity.js")),
+    ("session-list.js", JS, include_str!("ui/session-list.js")),
+    ("history.js", JS, include_str!("ui/history.js")),
+    ("session-view.js", JS, include_str!("ui/session-view.js")),
+    ("composer.js", JS, include_str!("ui/composer.js")),
+    ("scroll.js", JS, include_str!("ui/scroll.js")),
+    ("viewport.js", JS, include_str!("ui/viewport.js")),
+    ("transcript.js", JS, include_str!("ui/transcript.js")),
+    ("diagram.js", JS, include_str!("ui/diagram.js")),
+    ("markdown.js", JS, include_str!("ui/markdown.js")),
+    ("subagents.js", JS, include_str!("ui/subagents.js")),
+    ("earlier.js", JS, include_str!("ui/earlier.js")),
+    ("main.js", JS, include_str!("ui/main.js")),
+];
+
+/// One of the pane's `ASSETS`. It is served `no-store` like the page: the
+/// modules import each other by fixed names, so a browser that kept one module
+/// from an older build would run it against the newer modules beside it.
+pub async fn asset(Path(name): Path<String>) -> Response {
+    match ASSETS.iter().find(|(served, _, _)| *served == name) {
+        Some((_, content_type, body)) => (
+            [
+                (header::CONTENT_TYPE, *content_type),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            *body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// The mermaid bundle the pane renders diagram fences with: mermaid 12.0.0,
 /// vendored from the npm tarball and never edited. Embedded as data like the
-/// pane, so the control plane needs no build step and no asset directory.
+/// pane, so the control plane needs no build step.
 pub async fn mermaid_bundle() -> impl IntoResponse {
     (
         [
@@ -40,7 +90,35 @@ pub async fn mermaid_bundle() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    const PANE: &str = include_str!("ui/index.html");
+    /// The pane's sources as one text: the markup, then the stylesheet in a
+    /// `<style>` block, then the modules in one `<script>` block in `ASSETS`
+    /// order, which is the shape `code()` and `styles()` read.
+    const PANE: &str = concat!(
+        include_str!("ui/index.html"),
+        "<style>\n",
+        include_str!("ui/pane.css"),
+        "</style>\n<script>\n",
+        include_str!("ui/dom.js"),
+        include_str!("ui/common.js"),
+        include_str!("ui/machines.js"),
+        include_str!("ui/skills.js"),
+        include_str!("ui/mcp.js"),
+        include_str!("ui/new-session.js"),
+        include_str!("ui/activity.js"),
+        include_str!("ui/session-list.js"),
+        include_str!("ui/history.js"),
+        include_str!("ui/session-view.js"),
+        include_str!("ui/composer.js"),
+        include_str!("ui/scroll.js"),
+        include_str!("ui/viewport.js"),
+        include_str!("ui/transcript.js"),
+        include_str!("ui/diagram.js"),
+        include_str!("ui/markdown.js"),
+        include_str!("ui/subagents.js"),
+        include_str!("ui/earlier.js"),
+        include_str!("ui/main.js"),
+        "\n</script>\n",
+    );
 
     #[tokio::test]
     async fn the_pane_is_served_uncached_and_says_which_build_it_is() {
@@ -69,6 +147,34 @@ mod tests {
             !body.contains("{{BOSUN_VERSION}}"),
             "and the placeholder it replaces is not served"
         );
+    }
+
+    #[test]
+    fn every_stylesheet_and_module_in_the_ui_directory_is_served_and_checked() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| {
+                (name.ends_with(".js") || name.ends_with(".css")) && name != "mermaid.min.js"
+            })
+            .collect();
+        on_disk.sort();
+        let mut served: Vec<String> = super::ASSETS
+            .iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect();
+        served.sort();
+        assert_eq!(
+            served, on_disk,
+            "a file the pane loads must be in `ASSETS`, or the browser gets a 404 for it"
+        );
+        for (name, _, body) in super::ASSETS {
+            assert!(
+                PANE.contains(body),
+                "`{name}` must be in `PANE`, or the source checks do not read it"
+            );
+        }
     }
 
     /// The selector prefix the transcript's block rules carry: the session's
@@ -360,6 +466,54 @@ mod tests {
                 "<script src=\"/ui/mermaid.min.js\" id=\"mermaid-bundle\" defer></script>"
             ),
             "the pane is served at both / and /ui, so the bundle loads by absolute path"
+        );
+    }
+
+    // The browser learns a module's imports only once it has that module, so
+    // without these links it fetches the import graph one level at a time.
+
+    #[test]
+    fn the_page_preloads_every_module_the_entry_module_imports() {
+        for (name, _, _) in super::ASSETS {
+            if !name.ends_with(".js") || *name == "main.js" {
+                continue;
+            }
+            assert!(
+                PANE.contains(&format!("<link rel=\"modulepreload\" href=\"/ui/{name}\">")),
+                "the page must preload `{name}`, or the browser waits for the module that imports it"
+            );
+        }
+        for link in PANE
+            .split("<link rel=\"modulepreload\" href=\"/ui/")
+            .skip(1)
+        {
+            let name = link
+                .split_once('"')
+                .expect("a preload link closes its href")
+                .0;
+            assert!(
+                super::ASSETS.iter().any(|(served, _, _)| *served == name),
+                "the page preloads `{name}`, which `ASSETS` does not serve"
+            );
+        }
+    }
+
+    // The diagram module waits for the bundle's `load` event. Deferred scripts
+    // and module scripts run in document order, so a module placed after the
+    // bundle would listen once the event had fired, and every diagram would
+    // wait forever.
+
+    #[test]
+    fn the_pane_runs_its_modules_before_the_mermaid_bundle() {
+        let module = PANE
+            .find("<script type=\"module\" src=\"/ui/main.js\"></script>")
+            .expect("the page loads its entry module by absolute path");
+        let bundle = PANE
+            .find("<script src=\"/ui/mermaid.min.js\"")
+            .expect("the page loads the mermaid bundle");
+        assert!(
+            module < bundle,
+            "the entry module must come before the bundle, or the diagram module misses its load event"
         );
     }
 
@@ -1369,7 +1523,7 @@ mod tests {
             );
         }
         let teardown = squeezed("function closeSession(");
-        let armed = top_level(&pane, &teardown, &squeezed("stick = true;"))
+        let armed = top_level(&pane, &teardown, &squeezed("setStick(true);"))
             .expect("closing a session must re-arm auto-follow at a statement the teardown always reaches, or a branch around it leaves the session the pane opens next following nothing");
         let synced = top_level(&pane, &teardown, &squeezed("syncBtnBottom();"))
             .expect("closing a session must put the control away at a statement the teardown always reaches, or a branch around it leaves the control of the session the reader left over the next one");
@@ -1381,6 +1535,21 @@ mod tests {
         assert!(
             open.starts_with(&squeezed("closeSession();")),
             "every open runs the teardown first, so a reopened session starts on its newest line with the control hidden"
+        );
+    }
+
+    // `closeSession` clears the ask composer's timer and forgets its id through
+    // `setAskSyncTimer`. A setter that dropped the write would leave the id of a
+    // timer already cleared, which nothing on screen shows, so this check reads
+    // the setter itself. The other setters' writes are checked in the browser:
+    // `tests/browser/pane.py`.
+
+    #[test]
+    fn the_ask_timer_setter_writes_the_timer() {
+        let setter = block(&flattened(), "functionsetAskSyncTimer(value)");
+        assert_eq!(
+            setter, "askSyncTimer=value;",
+            "`setAskSyncTimer` must write the timer's id, so a session that opens next starts with none"
         );
     }
 
@@ -2344,9 +2513,9 @@ mod tests {
             "the panel draws a child's durable messages and nothing else"
         );
         assert!(
-            handler.contains(&squeezed("out = childTranscript;"))
-                && handler.contains(&squeezed("out = previousOut;"))
-                && handler.contains(&squeezed("openAskBox = previousAsk;")),
+            handler.contains(&squeezed("setOut(childTranscript);"))
+                && handler.contains(&squeezed("setOut(previousOut);"))
+                && handler.contains(&squeezed("setOpenAskBox(previousAsk);")),
             "a child's frame draws into the panel and puts the session's render target and ask record back"
         );
         for token in [
@@ -2376,13 +2545,13 @@ mod tests {
         let handler = block(&pane, &squeezed("function handleChildFrame("));
         assert!(
             handler.contains(&squeezed(
-                "out = childTranscript; openAskBox = childAskBox;"
+                "setOut(childTranscript); setOpenAskBox(childAskBox);"
             )),
             "a child's frame draws into the panel and with the panel's ask record, or the record the child's own question built is dropped and the frame that answers it draws a second box"
         );
         assert!(
             handler.contains(&squeezed(
-                "childAskBox = openAskBox; openAskBox = previousAsk;"
+                "childAskBox = openAskBox; setOpenAskBox(previousAsk);"
             )),
             "the record the frame left is the panel's for the next frame, and the session's record goes back with the render target"
         );
@@ -2484,7 +2653,7 @@ mod tests {
         let close = block(&pane, &squeezed("function closeSession()"));
         assert!(
             close.contains(&squeezed(
-                "earlier = before: null, more: false, loading: false;"
+                "setEarlier(before: null, more: false, loading: false);"
             )),
             "closing a session drops its read-back state, so a late page sees a new object and draws nothing"
         );
@@ -2502,7 +2671,7 @@ mod tests {
         let prepend = block(&pane, &squeezed("function prependEvents(events)"));
         assert!(
             prepend.contains(&squeezed(
-                "finally out = previousOut; openAskBox = previousAsk;"
+                "finally setOut(previousOut); setOpenAskBox(previousAsk);"
             )),
             "a read-back gives the session its own `out` and ask record back, whatever the page held"
         );

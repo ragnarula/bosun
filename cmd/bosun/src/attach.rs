@@ -515,7 +515,7 @@ fn clip(text: &str, max: usize) -> String {
     clipped
 }
 
-// Mirrors the web pane's `clip` in `crates/bosun-control/src/ui/index.html`;
+// Mirrors the web pane's `clip` in `crates/bosun-control/src/ui/transcript.js`;
 // keep the two in step.
 
 /// Word-wraps text to `width` columns, splitting on newlines first. A word
@@ -721,7 +721,7 @@ fn prefix_for(kind: LineKind, text: &str) -> Cow<'static, str> {
 /// so a reader sees what ran before reading its name and args. Unknown tools
 /// fall back to a generic gear.
 ///
-/// Mirrors the web pane's `toolGlyph` in `crates/bosun-control/src/ui/index.html`;
+/// Mirrors the web pane's `toolGlyph` in `crates/bosun-control/src/ui/transcript.js`;
 /// keep both in step with the canonical tool list in `bosun_common::tool::canonical_tools`.
 /// Every glyph measures one column in `unicode-width` (which ratatui uses to
 /// lay out rows), because the prefix width is counted in chars; a glyph that

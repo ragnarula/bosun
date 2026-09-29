@@ -43,6 +43,15 @@ const CHILD: &str = "child-session";
 const ASK: &str = "ask-session";
 /// The child whose question the ask session surfaced.
 const ASK_CHILD: &str = "ask-child";
+/// A running session whose newest event is loop activity, so its header
+/// counts the seconds since that activity.
+const RUNNING: &str = "running-session";
+/// A session whose last message is a question nobody has answered.
+const PENDING_ASK: &str = "pending-ask-session";
+/// A session with no messages at all.
+const EMPTY: &str = "empty-session";
+/// A session whose one reply holds a mermaid diagram.
+const DIAGRAM: &str = "diagram-session";
 /// How many turns the long session holds. Each turn is four messages, so the
 /// transcript is many pages long.
 const TURNS: usize = 300;
@@ -120,6 +129,10 @@ async fn seed(store: &Store) {
     seed_long_session(store).await;
     seed_child(store).await;
     seed_ask_session(store).await;
+    seed_running_session(store).await;
+    seed_pending_ask_session(store).await;
+    create(store, EMPTY, None, Some("the empty session"), 1_999_990).await;
+    seed_diagram_session(store).await;
     for i in 0..FILLER_SESSIONS {
         // A summary with no break in it is what a model writes for a path or
         // an identifier, and the list row must still fit the screen.
@@ -279,6 +292,65 @@ async fn seed_ask_session(store: &Store) {
     for i in 0..59 {
         text(store, ASK, Role::User, &format!("after {i}")).await;
     }
+}
+
+/// The state change is recorded before the first message, so the stream's tail
+/// does not replay it: the pane learns the state from the session list only.
+async fn seed_running_session(store: &Store) {
+    create(store, RUNNING, None, Some("the running session"), 1_999_993).await;
+    store
+        .set_state(RUNNING, SessionState::Running)
+        .await
+        .unwrap();
+    text(store, RUNNING, Role::User, "start working").await;
+    store
+        .append_event(
+            RUNNING,
+            &Event::Activity {
+                at_ms: now_ms(),
+                phase: ActivityPhase::WakeStarted,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn seed_pending_ask_session(store: &Store) {
+    create(
+        store,
+        PENDING_ASK,
+        None,
+        Some("the pending ask session"),
+        1_999_992,
+    )
+    .await;
+    text(store, PENDING_ASK, Role::User, "ask me something").await;
+    message(
+        store,
+        PENDING_ASK,
+        Role::Assistant,
+        // The ask session's question, word for word and from the same child.
+        Block::Ask {
+            message: "Which one?".into(),
+            options: vec!["first".into(), "second".into()],
+            child_id: Some(ASK_CHILD.into()),
+            answer: None,
+        },
+    )
+    .await;
+}
+
+async fn seed_diagram_session(store: &Store) {
+    // The reply is the session's first message, so a session opened after one
+    // that was streaming draws it first.
+    create(store, DIAGRAM, None, Some("the diagram session"), 1_999_991).await;
+    text(
+        store,
+        DIAGRAM,
+        Role::Assistant,
+        "Here it is:\n\n```mermaid\ngraph TD\n  A --> B\n```",
+    )
+    .await;
 }
 
 async fn create(
