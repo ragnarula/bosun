@@ -622,6 +622,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/persona", post(switch_persona))
         .route("/sessions/{id}/model-calls", get(session_model_calls))
         .route("/sessions/{id}/events", get(events))
+        .route("/sessions/{id}/history", get(history))
         .route("/clone", post(clone))
         .route("/dev", post(dev))
         .route("/nodes/{name}/dirs", get(dirs))
@@ -1907,6 +1908,61 @@ async fn switch_persona(
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     after: Option<i64>,
+    /// Replay only the newest this-many messages, with the events between
+    /// them, when the request carries no cursor. The stream then opens with a
+    /// `history` frame saying where the replay starts, so the client can ask
+    /// `/sessions/{id}/history` for what came before it.
+    tail: Option<usize>,
+}
+
+/// The most messages one history page may carry: a client asking for more
+/// gets this many, so one request cannot read a whole long session.
+const HISTORY_PAGE_MAX: usize = 500;
+
+/// How many messages a history page carries when the request names none.
+const HISTORY_PAGE_DEFAULT: usize = 50;
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    before: i64,
+    messages: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryPage {
+    /// The page's events, oldest first, in the stream's `{seq, event}` shape.
+    events: Vec<serde_json::Value>,
+    /// Whether the session has events older than the page.
+    more: bool,
+}
+
+/// The session's events before `before`, a page of messages at a time, for a
+/// client that opened the stream with `tail=` and is reading back.
+#[instrument(skip(state))]
+async fn history(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryPage>, ApiError> {
+    if state.store.get_session(&id).await?.is_none() {
+        return Err(ApiError::SessionNotFound { id });
+    }
+    let messages = query
+        .messages
+        .unwrap_or(HISTORY_PAGE_DEFAULT)
+        .min(HISTORY_PAGE_MAX);
+    let page = state
+        .store
+        .events_page(&id, Some(query.before), messages)
+        .await?;
+    Ok(Json(HistoryPage {
+        events: page
+            .events
+            .into_iter()
+            .map(|(seq, event)| json!({ "seq": seq, "event": event }))
+            .collect(),
+        more: page.more,
+    }))
 }
 
 /// SSE stream for a session: durable store events replayed from `after`, then
@@ -1926,19 +1982,36 @@ async fn events(
     // The explicit `after=` cursor wins; otherwise resume from the
     // `Last-Event-ID` header, which EventSource sends automatically on
     // reconnect with the seq of the last durable frame it received.
-    let after = query
-        .after
-        .or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse().ok())
-        })
-        .unwrap_or(0);
+    let cursor = query.after.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+    });
 
-    let replayed = state.store.events_after(&id, after).await?;
-    let last_seq = replayed.last().map(|(seq, _)| *seq).unwrap_or(after);
-    let replay = stream::iter(replayed.into_iter().map(durable_frame)).boxed();
+    // A cursor always wins over `tail`: a reconnect resumes where it left off
+    // rather than replaying the tail again.
+    let (history, replayed) = match (cursor, query.tail) {
+        (None, Some(tail)) => {
+            let page = state
+                .store
+                .events_page(&id, None, tail.min(HISTORY_PAGE_MAX))
+                .await?;
+            let before = page.events.first().map(|(seq, _)| *seq);
+            (Some(history_frame(before, page.more)), page.events)
+        }
+        _ => (
+            None,
+            state.store.events_after(&id, cursor.unwrap_or(0)).await?,
+        ),
+    };
+    let last_seq = replayed
+        .last()
+        .map(|(seq, _)| *seq)
+        .unwrap_or(cursor.unwrap_or(0));
+    let replay = stream::iter(history.into_iter().map(Ok))
+        .chain(stream::iter(replayed.into_iter().map(durable_frame)))
+        .boxed();
 
     // Polls the store for durable events past the last emitted seq. Events
     // at or below the cursor are skipped, so a replay that overlaps a poll
@@ -1985,6 +2058,15 @@ async fn events(
 
     Ok(Sse::new(stream::select(replay.chain(poll), live))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// Where a tail replay starts: `before` is the seq of its first event, and
+/// `more` says whether the session has older events to ask for. The frame has
+/// no SSE id, so a reconnect's `Last-Event-ID` never points at it.
+fn history_frame(before: Option<i64>, more: bool) -> SseEvent {
+    SseEvent::default()
+        .json_data(json!({ "history": { "before": before, "more": more } }))
+        .expect("serializing a json value cannot fail")
 }
 
 /// One durable frame: the seq in the SSE id and in the payload, so a client
@@ -6367,6 +6449,263 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data["seq"], 2);
         assert_eq!(frames[0].data["event"]["kind"], "state");
+    }
+
+    /// Three user messages, each followed by a state change: seq 1 to 6.
+    async fn three_turns(store: &Store) {
+        store.create_session(&session("s1")).await.unwrap();
+        for text in ["one", "two", "three"] {
+            store
+                .append_message("s1", Role::User, &Block::Text { text: text.into() })
+                .await
+                .unwrap();
+            store
+                .set_state("s1", SessionState::WaitingForInput)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn events_stream_with_tail_replays_the_newest_messages_after_a_history_frame() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        three_turns(&store).await;
+
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/s1/events?tail=2"))
+                .send()
+                .await
+                .unwrap(),
+            |frames| frames.len() >= 5,
+        )
+        .await;
+        assert_eq!(frames[0].data["history"]["before"], 3);
+        assert_eq!(frames[0].data["history"]["more"], true);
+        assert_eq!(frames[0].id, None, "the history frame is not a cursor");
+        let seqs: Vec<i64> = frames[1..]
+            .iter()
+            .map(|frame| frame.data["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, [3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn events_stream_with_tail_continues_live_without_repeating_the_replay() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        three_turns(&store).await;
+
+        let response = client
+            .get(format!("http://{addr}/sessions/s1/events?tail=1"))
+            .send()
+            .await
+            .unwrap();
+        let appended = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            store
+                .append_message(
+                    "s1",
+                    Role::User,
+                    &Block::Text {
+                        text: "four".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let frames = read_sse_frames(response, |frames| frames.len() >= 4).await;
+        appended.await.unwrap();
+        let seqs: Vec<i64> = frames[1..]
+            .iter()
+            .map(|frame| frame.data["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            seqs,
+            [5, 6, 7],
+            "the poll starts after the replay's last seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_stream_with_tail_zero_replays_one_message_not_the_session() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        three_turns(&store).await;
+
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/s1/events?tail=0"))
+                .send()
+                .await
+                .unwrap(),
+            |frames| frames.len() >= 3,
+        )
+        .await;
+        assert_eq!(frames[0].data["history"]["before"], 5);
+        let seqs: Vec<i64> = frames[1..]
+            .iter()
+            .map(|frame| frame.data["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, [5, 6]);
+    }
+
+    #[tokio::test]
+    async fn events_stream_with_tail_on_an_empty_session_says_there_is_nothing_older() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("s1")).await.unwrap();
+
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/s1/events?tail=5"))
+                .send()
+                .await
+                .unwrap(),
+            |frames| !frames.is_empty(),
+        )
+        .await;
+        assert_eq!(frames[0].data["history"]["before"], Value::Null);
+        assert_eq!(frames[0].data["history"]["more"], false);
+    }
+
+    #[tokio::test]
+    async fn history_caps_the_page_and_never_answers_more_with_an_empty_page() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("s1")).await.unwrap();
+        for index in 0..HISTORY_PAGE_MAX + 5 {
+            store
+                .append_message(
+                    "s1",
+                    Role::User,
+                    &Block::Text {
+                        text: index.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let newest = i64::try_from(HISTORY_PAGE_MAX + 5).unwrap();
+
+        let page: Value = client
+            .get(format!(
+                "http://{addr}/sessions/s1/history?before={}&messages=100000",
+                newest + 1
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), HISTORY_PAGE_MAX);
+        assert_eq!(page["more"], true);
+
+        let page: Value = client
+            .get(format!(
+                "http://{addr}/sessions/s1/history?before=3&messages=0"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(page["events"][0]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn events_stream_resumes_from_a_cursor_whatever_the_tail() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        three_turns(&store).await;
+
+        // EventSource reconnects to the same URL, tail included, and sends the
+        // last seq it saw: the stream resumes there and sends no history frame.
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/s1/events?tail=1"))
+                .header("last-event-id", "4")
+                .send()
+                .await
+                .unwrap(),
+            |frames| frames.len() >= 2,
+        )
+        .await;
+        let seqs: Vec<i64> = frames
+            .iter()
+            .map(|frame| frame.data["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, [5, 6]);
+    }
+
+    #[tokio::test]
+    async fn history_returns_the_page_before_a_seq() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        three_turns(&store).await;
+
+        let page: Value = client
+            .get(format!(
+                "http://{addr}/sessions/s1/history?before=5&messages=1"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let seqs: Vec<i64> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|frame| frame["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, [3, 4]);
+        assert_eq!(page["events"][0]["event"]["kind"], "message");
+        assert_eq!(page["more"], true);
+
+        let page: Value = client
+            .get(format!("http://{addr}/sessions/s1/history?before=3"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), 2);
+        assert_eq!(page["more"], false);
+
+        let response = client
+            .get(format!("http://{addr}/sessions/ghost/history?before=3"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -1158,8 +1158,8 @@ mod tests {
         assert_eq!(
             pane.matches(&squeezed("transcript.addEventListener('scroll'"))
                 .count(),
-            1,
-            "one `transcript.addEventListener('scroll'` runs; this check reads the first"
+            2,
+            "two `transcript.addEventListener('scroll'` run: the follow flag's, which this check reads, and the read-back of earlier messages"
         );
         assert!(
             PANE.contains("transcript.addEventListener('scroll', syncStick);"),
@@ -1271,8 +1271,8 @@ mod tests {
         let wrap = segment(PANE, "#transcript-wrap {", "}");
         assert_eq!(
             squeezed(wrap),
-            squeezed("position: relative; flex: 1; min-height: 0; display: flex;"),
-            "the box takes the transcript's place in the view, anchors the control, and holds nothing else: a plain box loses the flex and the transcript grows to its content and spills over the composer, a floor above zero stops the box shrinking to leave the composer on screen, and any further declaration here moves the box out of its place"
+            squeezed("position: relative; flex: 1; min-height: 0; min-width: 0; display: flex;"),
+            "the box takes the transcript's place in the view, anchors the control, and holds nothing else: a plain box loses the flex and the transcript grows to its content and spills over the composer, a floor above zero stops the box shrinking to leave the composer on screen, a width floor above zero lets one long line make the page wider than a phone's screen, and any further declaration here moves the box out of its place"
         );
         let control = segment(PANE, "#btn-bottom {", "}");
         assert_eq!(
@@ -2438,6 +2438,93 @@ mod tests {
                 "if (out === childTranscript) { if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight; return; }"
             )),
             "a render follows the transcript it drew into, so a child's frame scrolls the panel and never the session"
+        );
+    }
+
+    #[test]
+    fn the_pane_opens_a_session_at_its_newest_messages_and_reads_back_on_scroll() {
+        let pane = squeezed(PANE);
+        let show = block(&pane, &squeezed("function showSession(id)"));
+        assert!(
+            show.contains(&squeezed(
+                "'/sessions/' + encodeURIComponent(id) + '/events?tail=' + TAIL_MESSAGES"
+            )),
+            "the session's stream asks for the tail only: a full replay renders the whole history before the reader sees anything"
+        );
+        let frame = block(&pane, &squeezed("function handleFrame(frame)"));
+        assert!(
+            frame.contains(&squeezed(
+                "if (frame.history) startEarlier(frame.history); return;"
+            )),
+            "the stream's history frame says where the tail starts, and is not drawn"
+        );
+        let load = block(&pane, &squeezed("async function loadEarlier()"));
+        assert!(
+            load.contains(&squeezed("'/history?before=' + read.before")),
+            "a read-back asks for the page before the oldest event drawn"
+        );
+        assert!(
+            load.matches(&squeezed("if (earlier !== read) return;"))
+                .count()
+                >= 2,
+            "a page that lands after the session changed draws nothing, before and after its body is read"
+        );
+        let close = block(&pane, &squeezed("function closeSession()"));
+        assert!(
+            close.contains(&squeezed(
+                "earlier = before: null, more: false, loading: false;"
+            )),
+            "closing a session drops its read-back state, so a late page sees a new object and draws nothing"
+        );
+        let scroll = block(&pane, &squeezed("function scrollToBottom()"));
+        let own = scroll
+            .find(&squeezed("if (out !== transcript) return;"))
+            .expect("a page drawn off screen must not move the transcript");
+        let follow = scroll
+            .find(&squeezed("if (stick) transcript.scrollTop"))
+            .expect("the session's transcript still follows on `stick`");
+        assert!(
+            own < follow,
+            "the off-screen guard stands before the follow"
+        );
+        let prepend = block(&pane, &squeezed("function prependEvents(events)"));
+        assert!(
+            prepend.contains(&squeezed(
+                "finally out = previousOut; openAskBox = previousAsk;"
+            )),
+            "a read-back gives the session its own `out` and ask record back, whatever the page held"
+        );
+        assert!(
+            prepend.contains(&squeezed("pageAsk.el.appendChild(answer);")),
+            "a question the page cut from its answered copy takes the answer, so it shows once"
+        );
+    }
+
+    #[test]
+    fn the_pane_takes_the_home_column_out_while_a_session_is_open() {
+        let pane = squeezed(PANE);
+        assert!(
+            pane.contains(&squeezed(
+                "body.in-session > :is(header.top, #status, #health-strip, #skills-strip, #mcp-strip, main) { display: none; }"
+            )),
+            "every part of the home column leaves the page while a session is open, so the keyboard cannot bring the session list into view"
+        );
+        let show = block(&pane, &squeezed("function showSession(id)"));
+        assert!(
+            show.contains(&squeezed("coverHome(true);")),
+            "opening a session covers the home column"
+        );
+        let close = block(&pane, &squeezed("function closeSession()"));
+        assert!(
+            close.ends_with(&squeezed("view.hidden = true; coverHome(false);")),
+            "closing a session brings the home column back, last, once the view is hidden"
+        );
+        let cover = block(&pane, &squeezed("function coverHome(covered)"));
+        assert!(
+            cover.contains(&squeezed(
+                "if (!covered) homeColumn.scrollTop = homeScroll;"
+            )),
+            "the list comes back at the scroll it had"
         );
     }
 }

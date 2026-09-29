@@ -23,6 +23,7 @@ use bosun_common::session::SessionState;
 use bosun_common::skills::SkillAd;
 use bosun_common::skills::SkillPackage;
 use bosun_common::skills::SkillRepo;
+use rusqlite::OptionalExtension;
 use rusqlite::params;
 use serde::Deserialize;
 use serde::Serialize;
@@ -111,6 +112,14 @@ pub struct PendingAsk {
 pub struct ForkSource {
     pub session: Session,
     pub window: Vec<(i64, Message)>,
+}
+
+/// One page of a session's events, oldest first, and whether the session has
+/// events older than the page.
+#[derive(Debug, Clone)]
+pub struct EventsPage {
+    pub events: Vec<(i64, Event)>,
+    pub more: bool,
 }
 
 /// What routing a user's answer to a pending raised ask did.
@@ -809,6 +818,67 @@ impl Store {
                 events.push((seq, event));
             }
             Ok(events)
+        })
+        .await
+    }
+
+    /// The last `messages` message events before `before`, and every other
+    /// event between the first of them and `before`, in seq order. With no
+    /// `before` the page ends at the session's newest event. Counting message
+    /// events, not all events, keeps the page the same size to a reader
+    /// whatever the loop's activity and metering add between messages.
+    /// `more` says whether the session has events older than the page. A page
+    /// holds at least one message: an empty page would say `more` without
+    /// moving back, and a reader that follows `more` would never stop.
+    pub async fn events_page(
+        &self,
+        session_id: &str,
+        before: Option<i64>,
+        messages: usize,
+    ) -> Result<EventsPage, StoreError> {
+        let session_id = session_id.to_string();
+        let before = before.unwrap_or(i64::MAX);
+        let offset = i64::try_from(messages.max(1) - 1).unwrap_or(i64::MAX);
+        self.with_conn(move |conn| {
+            // The page starts at the oldest message it holds. When the session
+            // has fewer messages than the page, it starts at the first event.
+            let start: Option<i64> = conn
+                .query_row(
+                    "SELECT seq FROM events
+                     WHERE session_id = ?1 AND seq < ?2
+                       AND json_extract(payload, '$.kind') = 'message'
+                     ORDER BY seq DESC LIMIT 1 OFFSET ?3",
+                    params![session_id, before, offset],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("failed to find the page's first message")?;
+            let start = start.unwrap_or(0);
+            let more: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 AND seq < ?2)",
+                    params![session_id, start],
+                    |row| row.get(0),
+                )
+                .context("failed to check for older events")?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, payload FROM events
+                     WHERE session_id = ?1 AND seq >= ?2 AND seq < ?3 ORDER BY seq",
+                )
+                .context("failed to prepare event page query")?;
+            let mut rows = stmt
+                .query(params![session_id, start, before])
+                .context("failed to query event page")?;
+            let mut events = Vec::new();
+            while let Some(row) = rows.next().context("failed to read event row")? {
+                let seq: i64 = row.get("seq")?;
+                let payload: String = row.get("payload")?;
+                let event: Event =
+                    serde_json::from_str(&payload).context("failed to parse event payload")?;
+                events.push((seq, event));
+            }
+            Ok(EventsPage { events, more })
         })
         .await
     }
@@ -2791,6 +2861,102 @@ mod tests {
         let seqs: Vec<i64> = events.iter().map(|(seq, _)| *seq).collect();
         assert_eq!(seqs, [2, 3]);
         assert!(store.events_after("a", 3).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_page_counts_messages_and_keeps_the_events_between_them() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        // seq 1..=6: message, state, message, state, message, state.
+        for text in ["one", "two", "three"] {
+            store
+                .append_message("a", Role::User, &Block::Text { text: text.into() })
+                .await
+                .unwrap();
+            store
+                .set_state("a", SessionState::WaitingForInput)
+                .await
+                .unwrap();
+        }
+
+        let tail = store.events_page("a", None, 2).await.unwrap();
+        let seqs: Vec<i64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, [3, 4, 5, 6], "the page starts at its oldest message");
+        assert!(tail.more);
+
+        let older = store.events_page("a", Some(3), 2).await.unwrap();
+        let seqs: Vec<i64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(
+            seqs,
+            [1, 2],
+            "fewer messages than the page: from the first event"
+        );
+        assert!(!older.more);
+
+        let whole = store.events_page("a", None, 10).await.unwrap();
+        assert_eq!(whole.events.len(), 6);
+        assert!(!whole.more);
+
+        // A page of no messages is read as a page of one, so `more` always
+        // comes with a page that moves back.
+        let zero = store.events_page("a", None, 0).await.unwrap();
+        let seqs: Vec<i64> = zero.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, [5, 6]);
+        assert!(zero.more);
+
+        // A cut before a state event still starts at a message.
+        let from_state = store.events_page("a", Some(4), 1).await.unwrap();
+        let seqs: Vec<i64> = from_state.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, [3]);
+    }
+
+    #[tokio::test]
+    async fn events_page_of_a_session_with_no_messages_holds_its_other_events() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+        assert!(
+            store
+                .events_page("a", None, 5)
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
+        store
+            .set_state("a", SessionState::WaitingForInput)
+            .await
+            .unwrap();
+        let page = store.events_page("a", None, 5).await.unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert!(!page.more);
+    }
+
+    #[tokio::test]
+    async fn events_page_keeps_to_its_own_session() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+        store.create_session(&session("b")).await.unwrap();
+        store
+            .append_message("b", Role::User, &Block::Text { text: "b".into() })
+            .await
+            .unwrap();
+        store
+            .append_message("a", Role::User, &Block::Text { text: "a".into() })
+            .await
+            .unwrap();
+
+        let page = store.events_page("a", None, 5).await.unwrap();
+        let seqs: Vec<i64> = page.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, [2]);
+        assert!(
+            !page.more,
+            "another session's older events are not this one's"
+        );
     }
 
     #[tokio::test]
