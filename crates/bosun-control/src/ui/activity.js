@@ -2,30 +2,21 @@
 
 import { activityLog, viewWaiting } from './dom.js';
 import { sessions } from './session-list.js';
-import { current, viewState } from './session-view.js';
+import { opened } from './session-view.js';
 
 export {
   MAX_ACTIVITIES,
-  activities,
   appendActivityRow,
   liveChildrenLabel,
   refreshStatusLabel,
   renderActivityConsole,
-  setActivities,
   updateStatusLabel,
 };
 
-// Loop-activity frames received for the open session, fed to the debug
+// The open session's loop-activity frames, its `activities`, feed the debug
 // console and the status indicator. Activity never enters the transcript.
 // The buffer is capped and drops the oldest; the store holds the full record.
 const MAX_ACTIVITIES = 5000;
-let activities = [];
-
-// Another module cannot assign an imported binding, so it writes `activities`
-// through this.
-function setActivities(value) {
-  activities = value;
-}
 
 // The count of a session's direct children that can still act. A child is
 // live for display when its state is not stopped.
@@ -58,7 +49,8 @@ function phaseLabel(activity) {
 // counted from when the frame arrived locally. The wire `at_ms` orders the
 // history; clock skew must not distort the live counter.
 function runningStatus() {
-  const newest = activities[activities.length - 1];
+  if (!opened) return null;
+  const newest = opened.activities[opened.activities.length - 1];
   if (!newest) return null;
   const label = phaseLabel(newest);
   if (!label) return null;
@@ -125,6 +117,8 @@ function appendActivityRow(activity, previous) {
 
 function renderActivityConsole() {
   activityLog.textContent = '';
+  if (!opened) return;
+  const activities = opened.activities;
   activities.forEach((activity, index) => {
     appendActivityRow(activity, index > 0 ? activities[index - 1] : null);
   });
@@ -158,5 +152,5 @@ function updateStatusLabel(session) {
 // The elapsed counter advances once a second while a session is open; the
 // state events and the session poll alone would leave it stale.
 function refreshStatusLabel() {
-  if (current && viewState) updateStatusLabel({ id: current, state: viewState });
+  if (opened && opened.state) updateStatusLabel({ id: opened.id, state: opened.state });
 }

@@ -10,41 +10,23 @@ import {
 } from './dom.js';
 import { showStatus } from './common.js';
 import { sessions } from './session-list.js';
-import { current } from './session-view.js';
-import {
-  appendAssistant,
-  clip,
-  openAskBox,
-  out,
-  renderBlock,
-  setOpenAskBox,
-  setOut,
-} from './transcript.js';
+import { opened } from './session-view.js';
+import { clip, drawAssistant, drawBlock } from './transcript.js';
 
-export {
-  childName,
-  childStick,
-  closeChildPanel,
-  renderChildList,
-  updateChildPanelDot,
-  watchControl,
-};
-
-let childFollow = null;  // the child the panel shows, or null when it is closed
-let childEs = null;      // that child's own event stream
-let childStick = true;   // auto-scroll for the panel's transcript, its own flag
-// The ask record of the panel's transcript. The renderers keep the record of the
-// box they last drew in `openAskBox`, which belongs to the session: the panel
-// keeps its own, so a child's question and the frame that answers it are one box
-// there and neither record is lost.
-let childAskBox = null;
+export { childName, closeChildPanel, renderChildList, updateChildPanelDot, watchControl };
 
 // ---- Subagent panel ----
 // One child at a time, followed on its own event stream while the session stays
 // exactly where it is. The panel writes no history entry, carries no composer
 // and adds no watch-only banner: it is a second reader of a child's own
 // transcript, not a second session view. It starts closed, and closing the
-// session takes it with it.
+// session takes it with it: the open session's `panel` is the followed child's
+// state, or null while the panel is closed.
+
+// The child the panel follows, or null.
+function followed() {
+  return opened && opened.panel ? opened.panel.id : null;
+}
 
 /// How wide a child's name may be before it is cut: one line of a panel row.
 const CHILD_NAME_MAX = 60;
@@ -83,10 +65,9 @@ function watchControl(childId) {
 // The open session's direct children, running and stopped, each with its state
 // and its name. The followed one is marked, and a row follows its child.
 function renderChildList() {
-  // No open session means no children: `closeSession` nulls `current` before
-  // this runs, and every root would match a null parent.
-  const children = current
-    ? sessions.filter((session) => session.parent_id === current)
+  // No open session means no children: every root would match a null parent.
+  const children = opened
+    ? sessions.filter((session) => session.parent_id === opened.id)
     : [];
   childList.textContent = '';
   childList.hidden = children.length === 0;
@@ -101,7 +82,7 @@ function renderChildList() {
   for (const child of children) {
     const row = document.createElement('button');
     row.type = 'button';
-    row.className = 'child-row' + (child.id === childFollow ? ' followed' : '');
+    row.className = 'child-row' + (child.id === followed() ? ' followed' : '');
     row.title = child.id;
     const dot = document.createElement('span');
     dot.className = 'dot ' + child.state;
@@ -120,7 +101,7 @@ function renderChildList() {
 }
 
 function updateChildPanelDot() {
-  const child = sessions.find((session) => session.id === childFollow);
+  const child = sessions.find((session) => session.id === followed());
   childPanelDot.className = child ? 'dot ' + child.state : 'dot';
   // The name arrives with the child's first summary, so the poll refreshes it.
   // A child the list has dropped keeps the name it had: this is a header, not a
@@ -135,43 +116,44 @@ function updateChildPanelDot() {
 // child is followed at a time. Nothing here touches the address bar or the
 // history: the session on screen keeps its entry and its place.
 function followChild(id) {
-  if (!id) return;
-  if (childFollow === id) {
+  const s = opened;
+  if (!id || !s) return;
+  if (s.panel && s.panel.id === id) {
     childPanel.hidden = false;
     return;
   }
   closeChildPanel();
-  childFollow = id;
-  childStick = true;
-  childAskBox = null;
+  // The panel's transcript has its own follow flag and its own record for the
+  // block renderers, so a child's question and the frame that answers it are
+  // one box there and the session's record is untouched.
+  const panel = { id, es: null, stick: true, askBox: null, callArgs: new Map() };
+  s.panel = panel;
   updateChildPanelDot();
   renderChildList();
   childPanel.hidden = false;
   // EventSource reconnects automatically; the child's durable frames carry
   // their seq as the SSE id, so the browser resumes with Last-Event-ID.
-  childEs = new EventSource('/sessions/' + encodeURIComponent(id) + '/events');
-  childEs.onmessage = (event) => {
+  panel.es = new EventSource('/sessions/' + encodeURIComponent(id) + '/events');
+  panel.es.onmessage = (event) => {
+    if (opened !== s || s.panel !== panel) return;
     try {
-      handleChildFrame(JSON.parse(event.data));
+      handleChildFrame(panel, JSON.parse(event.data));
     } catch (error) {
       showStatus('child events: ' + error.message);
     }
   };
-  childEs.onerror = () => {
-    showStatus('child events: stream lost, reconnecting');
+  panel.es.onerror = () => {
+    if (opened === s && s.panel === panel) showStatus('child events: stream lost, reconnecting');
   };
 }
 
 // Collapsing leaves the session's view exactly as it was: the panel closes the
 // child's stream and drops the lines it drew, and nothing else changes.
 function closeChildPanel() {
-  if (childEs) {
-    childEs.close();
-    childEs = null;
+  if (opened && opened.panel) {
+    opened.panel.es.close();
+    opened.panel = null;
   }
-  childFollow = null;
-  childStick = true;
-  childAskBox = null;
   childTranscript.textContent = '';
   childPanelTitle.textContent = '';
   updateChildPanelDot();
@@ -182,44 +164,34 @@ function closeChildPanel() {
 // The panel's own frame handler: a child's durable messages render into the
 // panel and nothing else does. The session-state frames — the header dot, the
 // status label, the activity console, the ask composer — describe the session
-// the pane is showing, so a child's frames never touch them.
-function handleChildFrame(frame) {
+// the pane is showing, so a child's frames never touch them. The child's live
+// paragraph and last message are not the session's either.
+function handleChildFrame(panel, frame) {
   if (!frame.event || frame.event.kind !== 'message') return;
-  // The renderers append to `out` and keep the ask record of the box they last
-  // drew. A child's frame draws into the panel and with the panel's own record,
-  // so its question and the frame that answers it stay one box there, and the
-  // session's record and transcript are untouched.
-  const previousOut = out;
-  const previousAsk = openAskBox;
-  setOut(childTranscript);
-  setOpenAskBox(childAskBox);
-  try {
-    renderChildMessage(frame.event.message, frame.event.at_ms);
-  } finally {
-    setOut(previousOut);
-    childAskBox = openAskBox;
-    setOpenAskBox(previousAsk);
-  }
+  const message = frame.event.message;
+  const atMs = frame.event.at_ms;
+  const drawn = message.role === 'assistant' && message.block.kind === 'text'
+    ? drawAssistant(message.block.text, atMs)
+    : drawBlock(message, atMs, panel);
+  if (drawn) childTranscript.appendChild(drawn);
+  followPanel();
 }
 
-// One durable message of the panel's child, drawn with the session's own block
-// renderers but without its state: the child's live paragraph, its last message
-// and its ask record are not the session's.
-function renderChildMessage(message, atMs) {
-  const block = message.block;
-  if (message.role === 'assistant' && block.kind === 'text') {
-    appendAssistant(block.text, atMs);
-    return;
-  }
-  renderBlock(message, atMs);
+// The panel's transcript stays at the child's newest line until the reader
+// scrolls the panel up.
+function followPanel() {
+  const panel = opened && opened.panel;
+  if (panel && panel.stick) childTranscript.scrollTop = childTranscript.scrollHeight;
 }
 
-// The panel's own follow flag: it stays at the child's newest line until the
-// reader scrolls the panel up, and a render reads it through `scrollToBottom`.
 childTranscript.addEventListener('scroll', () => {
-  childStick =
+  const panel = opened && opened.panel;
+  if (!panel) return;
+  panel.stick =
     childTranscript.scrollTop + childTranscript.clientHeight >=
     childTranscript.scrollHeight - 40;
 });
+// A tap that opens a line makes the panel's transcript taller.
+childTranscript.addEventListener('click', followPanel);
 
 btnChildCollapse.addEventListener('click', closeChildPanel);

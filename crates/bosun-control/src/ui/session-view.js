@@ -44,46 +44,79 @@ import { post, showStatus, toastError, toastOk } from './common.js';
 import { personas } from './new-session.js';
 import {
   MAX_ACTIVITIES,
-  activities,
   appendActivityRow,
   refreshStatusLabel,
   renderActivityConsole,
-  setActivities,
   updateStatusLabel,
 } from './activity.js';
 import { refreshSessions, sessions } from './session-list.js';
 import { markListEntry, openSession } from './history.js';
-import { askSyncTimer, loadDraft, saveDraft, setAskSyncTimer } from './composer.js';
-import { setStick, syncBtnBottom } from './scroll.js';
+import { loadDraft, saveDraft, scheduleAskSync } from './composer.js';
+import { follow, syncBtnBottom } from './scroll.js';
 import { scheduleVisualViewportSync } from './viewport.js';
 import {
-  appendDelta,
-  appendLine,
-  callArgs,
+  drawAssistant,
+  drawBlock,
+  drawLine,
+  drawLiveParagraph,
   modelCallLine,
-  renderMessage,
-  setLastMsg,
-  setLiveEl,
-  setOpenAskBox,
 } from './transcript.js';
 import { closeChildPanel } from './subagents.js';
-import { TAIL_MESSAGES, setEarlier, startEarlier } from './earlier.js';
+import { TAIL_MESSAGES, startEarlier } from './earlier.js';
 
-export { closeSession, coarsePointer, current, setViewState, showSession, viewState };
+export { closeSession, coarsePointer, opened, showSession };
 
-let current = null;   // the open session id
-let viewState = null; // the open session's last known state
-let statusTick = null; // the 1s header-label interval for the open session
-let es = null;        // the open EventSource
+// The open session, or null while the list shows. Everything the pane holds
+// for one open session is a field of this object, so closing a session drops
+// all of it at once and the next session starts from a new one. Other modules
+// write its fields; only this module replaces it. A reply that arrives after an
+// await compares the object it started with against this one, so a reply for a
+// session the pane has left does nothing.
+let opened = null;
 
-// Another module cannot assign an imported binding, so it writes `viewState`
-// through this.
-function setViewState(value) {
-  viewState = value;
+function newSessionState(id) {
+  return {
+    id,
+    // The session's last known state, from the list, the detail fetch or the
+    // stream.
+    state: null,
+    // The session's event stream, and the one-second timer that advances the
+    // header's elapsed count.
+    es: null,
+    statusTick: null,
+    // Whether the transcript follows its newest line.
+    stick: true,
+    // The assistant paragraph live deltas stream into.
+    liveEl: null,
+    // The last durable message block drawn: it decides whether a question is
+    // live on screen.
+    lastMsg: null,
+    // The transcript's record for the block renderers: its latest question's
+    // box and the arguments of its unanswered `message_child` calls.
+    askBox: null,
+    callArgs: new Map(),
+    // Loop-activity frames, for the console and the status label.
+    activities: [],
+    // The timer that settles the ask composer after a burst of messages.
+    askSyncTimer: null,
+    // The older part of the transcript, read back a page at a time: the seq
+    // the next page ends before, whether the session has more, whether a read
+    // is in flight, and the row at the transcript's top that asks for it.
+    earlier: { before: null, more: false, loading: false, row: null },
+    // The child the subagent panel follows, or null while the panel is closed.
+    panel: null,
+  };
 }
 
-// The view half of opening: the session's header, transcript and event stream,
-// with the previous session's teardown first.
+// Stops what the session's object started: its stream, its timers, and the
+// stream of the child its panel follows.
+function stopSession(s) {
+  if (s.es) s.es.close();
+  if (s.panel) s.panel.es.close();
+  window.clearInterval(s.statusTick);
+  window.clearTimeout(s.askSyncTimer);
+}
+
 // A coarse pointer is a touch screen, and a touch screen refuses a focus the
 // reader did not ask for: taking one when a session opens, or when a question
 // arrives, is the focus that sometimes does not land and the one that can zoom
@@ -91,33 +124,37 @@ function setViewState(value) {
 // reaches is left alone.
 const coarsePointer = () => window.matchMedia('(pointer: coarse)').matches;
 
+// The view half of opening: the session's header, transcript and event stream,
+// with the previous session's teardown first.
 function showSession(id) {
   closeSession();
-  current = id;
+  const s = newSessionState(id);
+  opened = s;
   coverHome(true);
   view.hidden = false;
-  const session = sessions.find((s) => s.id === id);
+  const session = sessions.find((listed) => listed.id === id);
   if (session) updateHeader(session);
-  fetchSession(id);
+  fetchSession(s);
   // EventSource reconnects automatically; durable frames carry the event seq
   // as their SSE id, so the browser resumes with Last-Event-ID.
   // The stream replays only the newest messages; older ones are read back as
   // the reader scrolls up. A long session would otherwise render its whole
   // history before the reader sees anything.
-  es = new EventSource(
+  s.es = new EventSource(
     '/sessions/' + encodeURIComponent(id) + '/events?tail=' + TAIL_MESSAGES
   );
-  es.onmessage = (event) => {
+  s.es.onmessage = (event) => {
+    if (opened !== s) return;
     try {
-      handleFrame(JSON.parse(event.data));
+      handleFrame(s, JSON.parse(event.data));
     } catch (error) {
       showStatus('events: ' + error.message);
     }
   };
-  es.onerror = () => {
-    showStatus('events: stream lost, reconnecting');
+  s.es.onerror = () => {
+    if (opened === s) showStatus('events: stream lost, reconnecting');
   };
-  statusTick = window.setInterval(refreshStatusLabel, 1000);
+  s.statusTick = window.setInterval(refreshStatusLabel, 1000);
   // The chat draft survives closing the session; restore it here so the
   // resumed session starts where the user left off.
   input.value = loadDraft();
@@ -131,35 +168,15 @@ function showSession(id) {
 }
 
 function closeSession() {
-  // The call arguments are the transcript's: the DOM clears here, and a call
-  // drawn in it cannot be answered after the session it was drawn in has gone.
-  // A collapse keeps them, because a `message_child` drawn in the main
-  // transcript can still be answered while the panel is closed.
-  callArgs.clear();
-  if (es) {
-    es.close();
-    es = null;
-  }
-  current = null;
-  viewState = null;
-  setLiveEl(null);
-  setLastMsg(null);
-  setActivities([]);
+  if (opened) stopSession(opened);
+  opened = null;
   activityLog.hidden = true;
   activityLog.textContent = '';
-  setOpenAskBox(null);
-  if (statusTick) window.clearInterval(statusTick);
-  statusTick = null;
-  if (askSyncTimer) window.clearTimeout(askSyncTimer);
-  setAskSyncTimer(null);
   transcript.textContent = '';
-  setEarlier({ before: null, more: false, loading: false });
-  // The panel belongs to the session the pane is leaving: its child, its stream
-  // and the lines it drew go with it.
+  // The panel belongs to the session the pane is leaving: its lines go with it.
   closeChildPanel();
-  // The next session opens on its newest line, so re-arm auto-follow and hide
-  // the control at this teardown.
-  setStick(true);
+  // The next session opens on its newest line, so the control that returns
+  // there goes away with this one.
   syncBtnBottom();
   saveDraft();
   input.value = '';
@@ -213,37 +230,37 @@ function clearHeader() {
   viewFork.textContent = '';
 }
 
-async function fetchSession(id) {
+async function fetchSession(s) {
   try {
-    const response = await fetch('/sessions/' + encodeURIComponent(id));
+    const response = await fetch('/sessions/' + encodeURIComponent(s.id));
     // The pane may have left this session while the fetch was in flight: a
     // late reply must not write the header, or close the view, of whichever
     // session the pane shows now.
-    if (current !== id) return;
+    if (opened !== s) return;
     // The control plane has no such session: the entry the pane is on stops
     // naming it, so the session screen does not outlive the session and a
     // reload does not open it again.
     if (response.status === 404) {
-      showStatus('session ' + id + ' ended');
+      showStatus('session ' + s.id + ' ended');
       markListEntry();
       closeSession();
       return;
     }
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const session = await response.json();
-    if (current !== id) return;
+    if (opened !== s) return;
     updateHeader(session);
   } catch (error) {
     // A failure for a session the pane has left is not this screen's to
     // report.
-    if (current !== id) return;
+    if (opened !== s) return;
     showStatus('session: ' + error.message);
   }
 }
 
 function updateHeader(session) {
   viewStateDot.className = 'dot ' + session.state;
-  viewState = session.state;
+  opened.state = session.state;
   viewNode.textContent = session.node;
   viewDir.textContent = session.dir;
   viewIdCopy.textContent = session.id;
@@ -294,18 +311,18 @@ btnFork.addEventListener('click', async () => {
   // The clone takes seconds, and the reader may leave the session in them: the
   // fork is theirs either way, but the pane only jumps to it if they are still
   // here.
-  const started = current;
+  const started = opened;
   try {
-    const response = await post('/sessions/' + encodeURIComponent(started) + '/fork', {});
+    const response = await post('/sessions/' + encodeURIComponent(started.id) + '/fork', {});
     const fork = await response.json();
     await refreshSessions();
     // The reader may have left while the clone ran: the fork is in the list
     // either way, and the pane only acts on a session it is still showing.
-    if (current !== started) return;
+    if (opened !== started) return;
     viewSheet.hidden = true;
     openSession(fork.id);
   } catch (error) {
-    if (current === started) viewFork.textContent = 'fork: ' + error.message;
+    if (opened === started) viewFork.textContent = 'fork: ' + error.message;
   } finally {
     btnFork.disabled = false;
   }
@@ -313,7 +330,7 @@ btnFork.addEventListener('click', async () => {
 
 btnInterrupt.addEventListener('click', async () => {
   try {
-    await post('/sessions/' + encodeURIComponent(current) + '/interrupt', {});
+    await post('/sessions/' + encodeURIComponent(opened.id) + '/interrupt', {});
   } catch (error) {
     toastError('interrupt: ' + error.message);
   }
@@ -322,7 +339,7 @@ btnInterrupt.addEventListener('click', async () => {
 btnPermission.addEventListener('click', async () => {
   const next = viewPermission.textContent === 'read_only' ? 'read_write' : 'read_only';
   try {
-    await post('/sessions/' + encodeURIComponent(current) + '/permission', {
+    await post('/sessions/' + encodeURIComponent(opened.id) + '/permission', {
       permission: next,
     });
   } catch (error) {
@@ -336,10 +353,11 @@ btnPersona.addEventListener('click', async () => {
     toastError('persona: pick a persona first');
     return;
   }
+  const s = opened;
   try {
-    await post('/sessions/' + encodeURIComponent(current) + '/persona', { persona: name });
+    await post('/sessions/' + encodeURIComponent(s.id) + '/persona', { persona: name });
     personaName.value = '';
-    await fetchSession(current);
+    await fetchSession(s);
   } catch (error) {
     toastError('persona: ' + error.message);
   }
@@ -347,13 +365,13 @@ btnPersona.addEventListener('click', async () => {
 
 btnStop.addEventListener('click', async () => {
   if (!window.confirm('Stop and delete this session?')) return;
-  const id = current;
+  const s = opened;
   try {
-    await post('/stop', { session_id: id });
+    await post('/stop', { session_id: s.id });
     toastOk('session stopped');
     // The pane may have left this session while the stop was in flight, so the
     // close belongs only to a screen still showing the session that stopped.
-    if (current === id) {
+    if (opened === s) {
       markListEntry();
       closeSession();
     }
@@ -409,22 +427,65 @@ btnCopyId.addEventListener('click', async () => {
 // A watch-only child can only be watched; acting on it means opening the
 // tree owner, which is the only session in the tree that accepts input.
 btnWatchOpen.addEventListener('click', () => {
-  const owner = sessions.find((session) => session.id === current);
+  const owner = sessions.find((session) => session.id === opened.id);
   const ownerId = owner && owner.owner_id ? owner.owner_id : null;
-  openSession(ownerId || current);
+  openSession(ownerId || opened.id);
 });
 
-function handleEvent(event) {
+// One durable message of the open session. The session's own state moves with
+// it: the last message, the live paragraph it replaces, the ask record and the
+// ask composer.
+function drawMessage(s, message, atMs) {
+  const block = message.block;
+  s.lastMsg = block;
+  // Any message that is not itself the pending ask closes the previous ask's
+  // record: it is history once the stream has moved past it.
+  if (block.kind !== 'ask') s.askBox = null;
+  if (message.role === 'assistant' && block.kind === 'text') {
+    const reply = drawAssistant(block.text, atMs);
+    if (s.liveEl) {
+      s.liveEl.replaceWith(reply);
+      s.liveEl = null;
+    } else {
+      transcript.appendChild(reply);
+    }
+  } else {
+    // A durable block supersedes the streamed live paragraph. Text replaces it
+    // above; any other kind held tool output or reasoning, not assistant
+    // prose, so the paragraph is dropped rather than left in the transcript.
+    if (s.liveEl) {
+      s.liveEl.remove();
+      s.liveEl = null;
+    }
+    const drawn = drawBlock(message, atMs, s);
+    if (drawn) transcript.appendChild(drawn);
+  }
+  follow();
+  scheduleAskSync();
+}
+
+// Live deltas stream into one assistant paragraph until the turn's durable
+// text arrives or another message begins.
+function drawDelta(s, text) {
+  if (!s.liveEl) {
+    s.liveEl = drawLiveParagraph();
+    transcript.appendChild(s.liveEl);
+  }
+  s.liveEl.textContent += text;
+  follow();
+}
+
+function handleEvent(s, event) {
   switch (event.kind) {
     case 'message':
-      renderMessage(event.message, event.at_ms);
+      drawMessage(s, event.message, event.at_ms);
       break;
     case 'state':
       // The current state lives once, in the header dot; a transcript line
       // would repeat what is already on screen.
       viewStateDot.className = 'dot ' + event.state;
-      viewState = event.state;
-      if (current) updateStatusLabel({ id: current, state: event.state });
+      s.state = event.state;
+      updateStatusLabel({ id: s.id, state: event.state });
       break;
     case 'permission':
       updatePermissionBadge(event.permission);
@@ -436,17 +497,18 @@ function handleEvent(event) {
     case 'model_call':
       // Model calls are metering history, not conversation: the line is
       // transcript bookkeeping, never a message or an activity-console row.
-      appendLine('mono', modelCallLine(event), event.at_ms);
+      transcript.appendChild(drawLine('mono', modelCallLine(event), event.at_ms));
+      follow();
       break;
     case 'activity': {
       // Loop activity is machinery, not conversation: it feeds the debug
       // console and the phase indicator, and never the transcript. The local
       // receipt time is stamped for the elapsed counter.
       event.received = Date.now();
-      const previous = activities[activities.length - 1];
-      activities.push(event);
-      if (activities.length > MAX_ACTIVITIES) {
-        activities.shift();
+      const previous = s.activities[s.activities.length - 1];
+      s.activities.push(event);
+      if (s.activities.length > MAX_ACTIVITIES) {
+        s.activities.shift();
         // The console mirrors the capped buffer, so drop the oldest row too.
         if (activityLog.firstChild) activityLog.removeChild(activityLog.firstChild);
       }
@@ -454,25 +516,26 @@ function handleEvent(event) {
         appendActivityRow(event, previous);
         activityLog.scrollTop = activityLog.scrollHeight;
       }
-      if (current && viewState) updateStatusLabel({ id: current, state: viewState });
+      if (s.state) updateStatusLabel({ id: s.id, state: s.state });
       break;
     }
     case 'warning':
       // A durable note the loop recorded, such as a selected MCP server being
       // unavailable.
-      appendLine('warning', event.text);
+      transcript.appendChild(drawLine('warning', event.text));
+      follow();
       break;
   }
 }
 
-function handleFrame(frame) {
+function handleFrame(s, frame) {
   if (Object.prototype.hasOwnProperty.call(frame, 'delta')) {
-    appendDelta(frame.delta);
+    drawDelta(s, frame.delta);
     return;
   }
   if (frame.history) {
-    startEarlier(frame.history);
+    startEarlier(s, frame.history);
     return;
   }
-  if (frame.event) handleEvent(frame.event);
+  if (frame.event) handleEvent(s, frame.event);
 }

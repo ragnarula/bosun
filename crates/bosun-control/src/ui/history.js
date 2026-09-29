@@ -1,6 +1,6 @@
 // The open session's browser history entry, addressed by a `#s=` fragment.
 
-import { closeSession, current, showSession } from './session-view.js';
+import { closeSession, opened, showSession } from './session-view.js';
 
 export { followHistory, markListEntry, openSession, startFromLink };
 
@@ -62,7 +62,7 @@ function openSession(id) {
   // takes it, so the list stays the entry behind a session. Anywhere else —
   // the list, or an entry the pane did not write — the list entry goes under
   // the session instead.
-  if (current && isOwnEntry(history.state, current)) {
+  if (opened && isOwnEntry(history.state, opened.id)) {
     history.replaceState(paneEntry(id), '', sessionLink(id));
   } else {
     pushSession(id);
@@ -77,7 +77,7 @@ function followHistory() {
   const id = sessionFromLink();
   // The entry on screen already: rebuilding the view would drop the transcript
   // and reopen the stream for nothing.
-  if (id === current) return;
+  if (id === (opened ? opened.id : null)) return;
   if (!id) {
     closeSession();
     return;

@@ -12,10 +12,13 @@ The exit status is 1 when any check fails, and 2 when Chromium cannot be
 started: Playwright or its Chromium is not installed, or it cannot run here.
 """
 
+import json
 import re
 import sys
 import traceback
+from datetime import datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -48,6 +51,16 @@ EMPTY_ROW = 'the empty session'
 DIAGRAM_ROW = 'the diagram session'
 DIAGRAM = 'diagram-session'
 RUNNING = 'running-session'
+EMPTY = 'empty-session'
+CHILD = 'child-session'
+ASK_CHILD = 'ask-child'
+PENDING_ASK = 'pending-ask-session'
+KINDS = 'kinds-session'
+KINDS_ROW = 'the kinds session'
+REUSE_ROW = 'the reuse session'
+OPEN_ASK = 'open-ask-session'
+# A child's name when it has no summary: the first line of its instructions.
+CHILD_NAME = 'look around'
 ASK_BEFORE = 100
 ASK_AFTER = 59
 LIST_ROWS = 40
@@ -216,8 +229,24 @@ VIEWPORT_STUB = """
       Object.assign(set, { height, offsetTop, scrollY });
       viewport.dispatchEvent(new Event('resize'));
     },
+    // A change with no event, as the tail of a keyboard's movement can be.
+    quiet(height, offsetTop, scrollY) {
+      Object.assign(set, { height, offsetTop, scrollY });
+    },
     realScrollY: () => realScrollY.get.call(window),
   };
+})();
+"""
+
+# Counts the event streams the page has open, without changing what they do.
+COUNT_STREAMS = """
+(() => {
+  const Real = window.EventSource;
+  const all = [];
+  window.EventSource = class extends Real {
+    constructor(...args) { super(...args); all.push(this); }
+  };
+  window.__openStreams = () => all.filter(es => es.readyState !== Real.CLOSED).map(es => es.url);
 })();
 """
 
@@ -281,14 +310,20 @@ AT_BOTTOM = """
 """
 
 
-def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewport=True):
+def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewport=True,
+             touch=True, http_errors=False, **context_options):
+    """A phone page. `touch=False` gives a desktop page with a fine pointer.
+    `http_errors=True` is for a check whose routes answer with an error
+    status on purpose: the browser logs each such response to the console."""
     context = browser.new_context(
         viewport={'width': size[0], 'height': size[1]},
-        is_mobile=True,
-        has_touch=True,
+        is_mobile=touch,
+        has_touch=touch,
         device_scale_factor=3,
+        **context_options,
     )
     context.add_init_script(NO_SCROLL_ANCHORING)
+    context.add_init_script(COUNT_STREAMS)
     if stub_viewport:
         context.add_init_script(VIEWPORT_STUB)
     if not visual_viewport:
@@ -296,7 +331,14 @@ def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewpor
     page = context.new_page()
     page.set_default_timeout(15000)
     page.on('pageerror', lambda error: errors.append(f'page error: {error}'))
-    page.on('console', lambda msg: msg.type == 'error' and errors.append(f'console: {msg.text}'))
+
+    def console(msg):
+        if msg.type != 'error':
+            return
+        if http_errors and msg.text.startswith('Failed to load resource'):
+            return
+        errors.append(f'console: {msg.text}')
+    page.on('console', console)
     return page
 
 
@@ -741,6 +783,880 @@ def check_diagram(browser, errors):
     page.context.close()
 
 
+def sse(*frames, retry=600000):
+    """An event-stream body carrying `frames`. The long retry keeps the
+    browser from replaying the body while a check reads what it drew."""
+    return f'retry: {retry}\n\n' + ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames)
+
+
+def staged_stream(page, session_id, first, later):
+    """Answers the session's event stream with `first` at once, and holds the
+    reconnect that follows it. The returned function answers the held
+    reconnect with `later`, so a check can act on the screen in between."""
+    held = []
+    served = [0]
+
+    def handle(route):
+        served[0] += 1
+        if served[0] == 1:
+            body = sse(*first, retry=50)
+        elif served[0] == 2:
+            held.append(route)
+            return
+        else:
+            body = sse()
+        route.fulfill(status=200, content_type='text/event-stream', body=body)
+    page.route(f'**/sessions/{session_id}/events*', handle)
+
+    def release():
+        wait_for(page, lambda: held)
+        held[0].fulfill(status=200, content_type='text/event-stream', body=sse(*later))
+    return release
+
+
+def message_frame(role, block, at_ms=None):
+    event = {'kind': 'message', 'message': {'role': role, 'block': block}}
+    if at_ms is not None:
+        event['at_ms'] = at_ms
+    return {'event': event}
+
+
+def route_stream(page, session_id, *frames):
+    """Answers the session's event stream with `frames` instead of the store's."""
+    page.route(f'**/sessions/{session_id}/events*', lambda route: route.fulfill(
+        status=200, content_type='text/event-stream', body=sse(*frames)))
+
+
+def wait_for(page, condition, timeout=5000):
+    """Whether the Python `condition` becomes true within `timeout` ms."""
+    for _ in range(timeout // 100):
+        if condition():
+            return True
+        page.wait_for_timeout(100)
+    return condition()
+
+
+def wait_for_poll(page):
+    """Waits for the session list's next poll to answer and be drawn."""
+    try:
+        with page.expect_response(lambda r: r.url.endswith('/sessions'), timeout=6000):
+            pass
+    except PlaywrightTimeout:
+        return False
+    page.wait_for_timeout(300)
+    return True
+
+
+def texts(page, selector):
+    return page.eval_on_selector_all(selector, 'els => els.map(e => e.textContent)')
+
+
+def focused_id(page):
+    return page.evaluate('() => document.activeElement ? document.activeElement.id : null')
+
+
+def rect(page, selector):
+    return page.eval_on_selector(
+        selector, 'e => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; }')
+
+
+def check_list(browser, errors):
+    page = new_page(browser, errors)
+    open_list(page)
+    item = page.locator('.session-item', has=page.locator(SESSION_ROW, has_text=LONG_ROW)).first
+    lines = item.locator('.row-main > *')
+    lead = [lines.nth(0).inner_text(), lines.nth(1).inner_text()]
+    check('a summarized session row leads with its summary, with the node and directory under it',
+          lead == [LONG_ROW, 'node-1 / /work/repo'], lead)
+
+    toggle = item.locator('.children-toggle')
+    child_line = page.locator('#session-list .child-row', has_text=CHILD[:8])
+    toggle.tap()
+    polled = wait_for_poll(page)
+    check('an opened children group stays open when the list refreshes',
+          polled and child_line.is_visible() and toggle.inner_text() == 'hide children')
+    toggle.tap()
+    polled = wait_for_poll(page)
+    check('a closed children group stays closed when the list refreshes',
+          polled and child_line.is_hidden() and toggle.inner_text() == '1 child')
+
+    # The panel's child rows have rules of their own, which must not reach the
+    # session list's child lines. The wide screen has no narrow-screen minimum.
+    page.set_viewport_size({'width': LANDSCAPE[0], 'height': LANDSCAPE[1]})
+    toggle.tap()
+    look = child_line.evaluate('e => { const s = getComputedStyle(e); return [s.display, s.paddingLeft, s.minHeight]; }')
+    check('a child line in the session list keeps its own look, not the panel row\'s',
+          look[:2] == ['flex', '26px'] and look[2] in ('auto', '0px'), look)
+    page.context.close()
+
+
+def check_stamps(browser, errors):
+    zone = 'Asia/Kolkata'
+    page = new_page(browser, errors, locale='en-US', timezone_id=zone)
+    open_session(page, KINDS)
+    page.wait_for_selector(f'{REPLY_LINE} >> text=kinds end')
+    events = page.request.get(f'{BASE}/sessions/{KINDS}/history?before=1000000000&messages=200').json()['events']
+    first = next(e['event'] for e in events
+                 if e['event']['kind'] == 'message' and e['event']['message']['block'].get('text') == 'kinds start')
+    local = datetime.fromtimestamp(first['at_ms'] / 1000, ZoneInfo(zone))
+    shown_time = page.evaluate("""(sel) => {
+      const line = [...document.querySelectorAll(sel)].find(e => e.textContent.trim() === 'kinds start');
+      const row = line.closest('.stamp-row');
+      return row ? row.querySelector('.ts').textContent : null;
+    }""", USER_LINE)
+    match = re.fullmatch(r'(\d{1,2}):(\d\d):(\d\d)', shown_time or '')
+    check('a line\'s time is the reader\'s local time on a 00-23 clock',
+          match and tuple(int(g) for g in match.groups()) == (local.hour, local.minute, local.second),
+          f'{shown_time} for {local:%H:%M:%S}')
+
+    unstamped = page.evaluate("""(sel) => [...document.querySelector(sel).children]
+      .filter(e => !(e.classList.contains('stamp-row') && e.querySelector(':scope > .ts')))
+      .map(e => e.className || e.tagName)""", TRANSCRIPT)
+    check('every durable entry carries its time, except a warning, whose event has none',
+          unstamped == ['line warning'], unstamped)
+
+    layout = page.evaluate("""(sel) => {
+      const line = [...document.querySelectorAll(sel)].find(e => e.textContent.trim() === 'kinds start');
+      const row = line.closest('.stamp-row').getBoundingClientRect();
+      const ts = line.closest('.stamp-row').querySelector('.ts').getBoundingClientRect();
+      const entry = line.getBoundingClientRect();
+      return { tsRight: ts.right, tsTop: ts.top, entryLeft: entry.left, entryTop: entry.top,
+               entryRight: entry.right, rowRight: row.right };
+    }""", USER_LINE)
+    check('the time stands in a column beside its entry, on its first line, and the entry takes the rest of the row',
+          layout['tsRight'] <= layout['entryLeft'] + 0.5
+          and abs(layout['entryRight'] - layout['rowRight']) <= 1
+          and abs(layout['tsTop'] - layout['entryTop']) <= 16, layout)
+
+    # A message whose event carries no stamp, then a streamed paragraph.
+    route_stream(page, EMPTY,
+                 message_frame('user', {'kind': 'text', 'text': 'no stamp'}),
+                 {'delta': 'streaming words'})
+    leave_session(page)
+    open_from_list(page, EMPTY_ROW)
+    page.wait_for_selector(f'{REPLY_LINE} >> text=streaming words')
+    placed = page.evaluate("""([user, reply]) => {
+      const bare = [...document.querySelectorAll(user)].find(e => e.textContent === 'no stamp');
+      const live = [...document.querySelectorAll(reply)].find(e => e.textContent === 'streaming words');
+      const alone = (e) => !!e && e.parentElement.id === 'transcript' && !e.closest('.stamp-row');
+      return [alone(bare), alone(live), document.querySelectorAll('#transcript .ts').length];
+    }""", [USER_LINE, REPLY_LINE])
+    check('an entry whose event has no time draws with no time column', placed[0] and placed[2] == 0, placed)
+    check('a streamed paragraph carries no time', placed[1] and placed[2] == 0, placed)
+    page.unroute(f'**/sessions/{EMPTY}/events*')
+    page.context.close()
+
+
+def check_kinds(browser, errors):
+    page = new_page(browser, errors)
+    # From the list, so the child's line is drawn with the child's name.
+    open_list(page)
+    open_from_list(page, KINDS_ROW)
+    page.wait_for_selector(f'{REPLY_LINE} >> text=kinds end')
+    lines = texts(page, '#transcript .line.mono')
+    check('a model call draws as one line with its counts and its cost',
+          lines == ['test-model completion (10 in, 3 cached, 5 out, $0.5000)'], lines)
+    lines = texts(page, '#transcript .line.context')
+    check('a context size note states the count, the window, the percentage and the compaction point',
+          lines == ['context: 50000 / 100000 tokens (50%), compaction at 80000'], lines)
+    lines = texts(page, '#transcript .line.cleared')
+    border = page.eval_on_selector('#transcript .line.cleared', 'e => getComputedStyle(e).borderTopStyle')
+    check('a cleared context draws as a break that names its reason and not the fresh instructions',
+          len(lines) == 1 and 'starting over' in lines[0] and 'fresh instructions' not in page.inner_text(TRANSCRIPT)
+          and border == 'dashed', [lines, border])
+
+    tables = page.evaluate("""() => [...document.querySelectorAll('#transcript table')].map(t => ({
+      head: [...t.querySelectorAll('th')].map(c => [c.textContent, getComputedStyle(c).textAlign]),
+      rows: [...t.querySelectorAll('tr')].filter(r => r.querySelector('td'))
+        .map(r => [...r.querySelectorAll('td')].map(c => [c.textContent, getComputedStyle(c).textAlign])),
+    }))""")
+    aligned = next((t for t in tables if t['head'] and t['head'][0][0] == 'left'), None)
+    check('a table draws each column with the alignment its delimiter row asks for, and the delimiter row is no row',
+          aligned is not None
+          and [c[0] for c in aligned['head']] == ['left', 'centre', 'right']
+          and aligned['head'][1][1] == 'center' and aligned['head'][2][1] == 'right'
+          and len(aligned['rows']) == 1
+          and [c[0] for c in aligned['rows'][0]] == ['l', 'c', 'r']
+          and aligned['rows'][0][0][1] in ('start', 'left')
+          and aligned['rows'][0][1][1] == 'center' and aligned['rows'][0][2][1] == 'right', tables)
+    prose = page.evaluate("""() => [...document.querySelectorAll('#transcript .msg.assistant p')]
+      .some(p => p.textContent === 'a | b')""")
+    check('a lone pipe in prose stays prose', prose and len(tables) == 2, len(tables))
+    holder = page.evaluate("""() => {
+      const wrap = [...document.querySelectorAll('#transcript .md-table-wrap')]
+        .find(w => w.querySelector('th') && w.querySelector('th').textContent === 'wide');
+      return [wrap.scrollWidth > wrap.clientWidth, getComputedStyle(wrap).overflowX];
+    }""")
+    result = overflow(page)
+    check('a wide table scrolls sideways inside its own holder, and the page does not',
+          holder == [True, 'auto'] and fits(result), [holder, result])
+    cells = page.evaluate("""() => {
+      const th = document.querySelector('#transcript th'), td = document.querySelector('#transcript td');
+      const s = (e) => getComputedStyle(e);
+      return [s(th).borderTopStyle, s(th).borderTopWidth, s(td).borderTopStyle,
+              s(th).backgroundColor !== s(td).backgroundColor];
+    }""")
+    check('a table\'s cells are ruled and its header row is shaded', cells == ['solid', '1px', 'solid', True], cells)
+
+    results = page.evaluate("""() => [...document.querySelectorAll('#transcript .tool-result')]
+      .map(r => [r.textContent, !!r.querySelector('.child-watch')])""")
+    by_text = {text.replace('watch', ''): watched for text, watched in results}
+    check('a message_child result carries the watch control of the child its call named',
+          by_text.get('ok: true') is True, results)
+    check('a failed spawn, and another tool\'s result that carries a child id, carry no watch control',
+          by_text.get('spawn failedno node') is False
+          and any(t.startswith('child_id: ') and w is False for t, w in by_text.items()), results)
+    link = page.eval_on_selector('#transcript .line.child-report .child-link', 'e => [e.textContent, e.title]')
+    watch = page.locator('#transcript .line.child-report .child-watch').count()
+    check('a child\'s line leads with its name, keeps its id in the tooltip, and carries the watch control',
+          link[0] == CHILD_NAME and link[1].startswith(CHILD) and watch == 1, [link, watch])
+
+    leave_session(page)
+    open_from_list(page, REUSE_ROW)
+    page.wait_for_selector('#transcript .tool-result')
+    check('a call the last session left unanswered names no child in the next session\'s result',
+          page.locator('#transcript .tool-result .child-watch').count() == 0)
+
+    leave_session(page)
+    open_from_list(page, ASK_ROW)
+    page.wait_for_selector(ASK_BOX)
+    check('a child\'s question carries the watch control', page.locator(f'{ASK_BOX} .child-watch').count() == 1)
+
+    leave_session(page)
+    open_from_list(page, RUNNING_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    page.tap(VIEW_TITLE)
+    page.wait_for_selector('#activity-log', state='visible')
+    labels = texts(page, f'{ACTIVITY_ROW} .activity-label')
+    check('the activity console lists the session\'s activity', labels == ['working'], labels)
+    page.context.close()
+
+
+def check_panel(browser, errors):
+    page = new_page(browser, errors, size=LANDSCAPE)
+    open_session(page, LONG)
+    check('the panel is closed until a child is followed', page.is_hidden(CHILD_PANEL))
+    entries = page.evaluate('[history.length, location.hash]')
+    page.tap(WATCH_CHILD)
+    page.wait_for_selector(CHILD_LINE)
+    streams = page.evaluate('window.__openStreams()')
+    check('following a child opens its own stream beside the session\'s',
+          len(streams) == 2 and any(url.endswith(f'/sessions/{CHILD}/events') for url in streams), streams)
+    check('following a child writes no history entry', page.evaluate('[history.length, location.hash]') == entries)
+    rows = page.evaluate("""() => [...document.querySelectorAll('#child-list .child-row')].map(r => ({
+      followed: r.classList.contains('followed'), dot: r.querySelector('.dot').className,
+      name: r.querySelector('.child-row-name').textContent, id: r.querySelector('.child-row-id').textContent,
+      title: r.title }))""")
+    check('the panel lists the session\'s children with their state, name and short id, the followed one marked',
+          rows == [{'followed': True, 'dot': 'dot waiting_for_input', 'name': CHILD_NAME,
+                    'id': CHILD[:8], 'title': CHILD}], rows)
+    box = page.evaluate("""() => {
+      const r = (sel) => document.querySelector(sel).getBoundingClientRect();
+      const panel = r('#child-panel'), wrap = r('#transcript-wrap'), row = r('#conversation');
+      return { panelLeft: panel.left, panelWidth: panel.width, wrapRight: wrap.right,
+               wrapWidth: wrap.width, rowWidth: row.width };
+    }""")
+    check('on a wide screen the panel is a column beside the transcript, at most 420px and 45% wide',
+          box['panelLeft'] >= box['wrapRight'] - 1 and box['wrapWidth'] > 0
+          and box['panelWidth'] <= 420.5 and box['panelWidth'] <= box['rowWidth'] * 0.45 + 0.5, box)
+    check('the panel follows its child\'s newest line', until(page, AT_BOTTOM, '#child-transcript'))
+    # The panel sets a smaller type size on its transcript, so a line whose
+    # size follows its transcript's is compared as a share of it.
+    diffs = page.evaluate("""() => {
+      const props = ['color', 'fontFamily', 'fontStyle', 'paddingTop', 'paddingLeft', 'marginTop',
+                     'borderTopStyle', 'backgroundColor', 'whiteSpace', 'textAlign', 'display'];
+      const size = (e, box) => (parseFloat(getComputedStyle(e).fontSize) / parseFloat(getComputedStyle(box).fontSize)).toFixed(3);
+      const session = document.querySelector('#transcript'), panel = document.querySelector('#child-transcript');
+      const diffs = [];
+      for (const sel of ['.msg.user', '.msg.assistant', '.stamp-row', '.ts', 'pre']) {
+        const a = session.querySelector(sel), b = panel.querySelector(sel);
+        if (!a || !b) { diffs.push(sel + ' missing'); continue; }
+        const sa = getComputedStyle(a), sb = getComputedStyle(b);
+        for (const p of props) if (sa[p] !== sb[p]) diffs.push(`${sel} ${p}: ${sa[p]} / ${sb[p]}`);
+        if (sa.fontSize !== sb.fontSize && size(a, session) !== size(b, panel)) diffs.push(`${sel} size: ${size(a, session)} / ${size(b, panel)}`);
+      }
+      return diffs;
+    }""")
+    check('a line in the panel draws like the same line in the session\'s transcript', not diffs, diffs)
+
+    page.set_viewport_size({'width': PORTRAIT[0], 'height': PORTRAIT[1]})
+    check('on a phone the panel covers the view as a sheet',
+          rect(page, CHILD_PANEL) == [0, 0, PORTRAIT[0], PORTRAIT[1]], rect(page, CHILD_PANEL))
+    page.tap(CHILD_CLOSE)
+    page.wait_for_selector(CHILD_PANEL, state='hidden')
+    streams = page.evaluate('window.__openStreams()')
+    check('collapsing the panel closes the child\'s stream and keeps the session\'s',
+          len(streams) == 1 and not any(CHILD in url for url in streams), streams)
+
+    page.tap(WATCH_CHILD)
+    page.wait_for_selector(CHILD_LINE)
+    # The panel covers the view on a phone, so the browser's back leaves.
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    streams = page.evaluate('window.__openStreams()')
+    open_from_list(page, LONG_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    check('leaving a session closes its panel and the child\'s stream',
+          streams == [] and page.is_hidden(CHILD_PANEL) and not page.locator(CHILD_LINE).count(), streams)
+
+    # One child at a time: the kinds session names two. The panel is a column
+    # here, so the transcript's controls stay in reach.
+    page.set_viewport_size({'width': LANDSCAPE[0], 'height': LANDSCAPE[1]})
+    leave_session(page)
+    open_from_list(page, KINDS_ROW)
+    page.wait_for_selector(f'{REPLY_LINE} >> text=kinds end')
+    page.tap('#transcript .line.child-report .child-watch')
+    page.wait_for_selector(CHILD_LINE)
+    page.locator('#transcript .tool-result .child-watch').first.tap()
+    replaced = until(page, "(id) => document.querySelector('#child-panel-title').title === id", ASK_CHILD)
+    streams = page.evaluate('window.__openStreams()')
+    check('following another child replaces the one followed, on one stream',
+          replaced and len(streams) == 2 and any(url.endswith(f'/sessions/{ASK_CHILD}/events') for url in streams)
+          and not page.locator(CHILD_LINE).count(), streams)
+
+    # The child's name opens it as the session view, which takes the session's
+    # entry: back goes to the list.
+    page.tap(CHILD_CLOSE)
+    page.tap('#transcript .child-link')
+    opened = until(page, "(hash) => location.hash === hash", '#s=' + quote(CHILD))
+    page.wait_for_selector('#watch-banner', state='visible')
+    check('a child\'s name in the transcript opens it as the session view, watch-only', opened)
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    check('back from a session opened from a session lands on the list',
+          list_showing(page) and page.evaluate('location.hash') == '')
+    page.context.close()
+
+
+def check_panel_frames(browser, errors):
+    page = new_page(browser, errors)
+    route_stream(page, CHILD,
+                 {'event': {'kind': 'state', 'state': 'running', 'at_ms': 1}},
+                 {'event': {'kind': 'activity', 'phase': 'wake_started', 'at_ms': 1}},
+                 message_frame('assistant', {'kind': 'ask', 'message': 'Child question?', 'options': ['a', 'b']}, 1),
+                 message_frame('assistant', {'kind': 'ask', 'message': 'Child question?', 'options': ['a', 'b'],
+                                             'answer': 'a'}, 2))
+    open_session(page, LONG)
+    page.tap(VIEW_TITLE)
+    page.wait_for_selector('#activity-log', state='visible')
+    before = page.evaluate(f"""() => [document.querySelector('#view-state-dot').className,
+      document.querySelector('{STATUS_LABEL}').textContent,
+      document.querySelectorAll('{ACTIVITY_ROW}').length,
+      document.querySelectorAll('#transcript > *').length]""")
+    page.tap(WATCH_CHILD)
+    page.wait_for_selector('#child-transcript .ask .answer')
+    asks = page.eval_on_selector_all('#child-transcript .ask', 'els => els.map(e => e.querySelectorAll(".answer").length)')
+    check('a child\'s question and its answered copy are one box in the panel', asks == [1], asks)
+    after = page.evaluate(f"""() => [document.querySelector('#view-state-dot').className,
+      document.querySelector('{STATUS_LABEL}').textContent,
+      document.querySelectorAll('{ACTIVITY_ROW}').length,
+      document.querySelectorAll('#transcript > *').length]""")
+    check('a child\'s frames leave the session\'s header, console and transcript alone', after == before,
+          [before, after])
+    page.context.close()
+
+    page = new_page(browser, errors)
+    naming = {}
+
+    def rename(route):
+        response = route.fetch()
+        listed = response.json()
+        for session in listed:
+            if session['id'] == CHILD:
+                session.update(naming)
+        route.fulfill(response=response, json=listed)
+    page.route('**/sessions', rename)
+    open_session(page, LONG)
+    page.tap(WATCH_CHILD)
+    page.wait_for_selector(CHILD_LINE)
+    for rule, given, name in [
+        ('by its summary', {'summary': 'the child summary'}, 'the child summary'),
+        ('by its summary, cut to one row', {'summary': 'x' * 80}, 'x' * 60 + '…'),
+        ('without one, by the first line of its instructions that is not blank',
+         {'summary': None, 'prompt': '\n   \n  first line  \nsecond line'}, 'first line'),
+        ('with neither, by its id', {'summary': None, 'prompt': None}, CHILD),
+    ]:
+        naming.clear()
+        naming.update(given)
+        named = until(page, "(name) => document.querySelector('#child-panel-title').textContent === name", name,
+                      timeout=7000)
+        check(f'a child is named {rule}',
+              named and page.eval_on_selector('#child-panel-title', 'e => e.title') == CHILD,
+              page.inner_text('#child-panel-title'))
+    page.unroute('**/sessions')
+    page.context.close()
+
+
+def check_addresses(browser, errors):
+    page = new_page(browser, errors)
+    page.goto(f'{BASE}/#s=%E0%A4%A')
+    page.wait_for_function("""([sel, n]) => document.querySelectorAll(sel).length >= n""", arg=[SESSION_ROW, LIST_ROWS])
+    check('an address whose session id does not decode shows the list', list_showing(page))
+    page.context.close()
+
+    # Safari copies the entry's state onto an address pasted over it, so the
+    # new entry carries another session's state. Chromium does not, so the
+    # check writes that entry itself, and a load opens it.
+    page = new_page(browser, errors)
+    open_session(page, LONG)
+    page.evaluate("(id) => history.pushState(history.state, '', '#s=' + encodeURIComponent(id))", ASK)
+    page.reload()
+    moved = until(page, """(sel) => [...document.querySelectorAll(sel)]
+      .some(e => e.textContent.trim().startsWith('after'))""", USER_LINE)
+    page.go_back()
+    check('an address that carries another session\'s entry opens its own session, with the list under it',
+          moved and until(page, f"() => document.querySelector('{VIEW}').hidden && location.hash === ''")
+          and list_showing(page))
+    page.context.close()
+
+    page = new_page(browser, errors)
+    open_list(page)
+    open_from_list(page, LONG_ROW)
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    length = page.evaluate('history.length')
+    page.reload()
+    page.wait_for_selector(TRANSCRIPT_LINE)
+    kept = session_showing(page) and page.evaluate('history.length') == length
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    check('a reload keeps the open session and adds no entry', kept and list_showing(page))
+    page.context.close()
+
+    closed = "() => location.hash === '' && document.querySelector('#session-view').hidden"
+    page = new_page(browser, errors, http_errors=True)
+    page.on('dialog', lambda dialog: dialog.accept())
+    open_list(page)
+    page.route(f'**/sessions/{EMPTY}', lambda route: route.fulfill(status=404, body='no such session'))
+    page.locator(SESSION_ROW, has_text=EMPTY_ROW).first.tap()
+    check('a session the control plane no longer has closes, and the address stops naming it',
+          until(page, closed) and list_showing(page) and 'ended' in page.inner_text('#status'))
+    page.unroute(f'**/sessions/{EMPTY}')
+
+    open_from_list(page, EMPTY_ROW)
+
+    def without(route):
+        response = route.fetch()
+        route.fulfill(response=response, json=[s for s in response.json() if s['id'] != EMPTY])
+    page.route('**/sessions', without)
+    check('a session the list no longer shows closes, and the address stops naming it',
+          until(page, closed, timeout=7000) and list_showing(page))
+    page.unroute('**/sessions')
+
+    page.route('**/stop', lambda route: route.fulfill(status=200, content_type='application/json', body='{}'))
+    open_from_list(page, EMPTY_ROW)
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    page.tap('#btn-stop')
+    check('a stopped session closes, and the address stops naming it', until(page, closed) and list_showing(page))
+    page.unroute('**/stop')
+
+    # A detail reply held until the pane has moved on to another session.
+    for late, what in [('body', 'a late reply for a session the pane left leaves the header alone'),
+                       ('404', 'a late "no such session" for a session the pane left closes nothing'),
+                       ('abort', 'a late failure for a session the pane left writes nothing to the status line')]:
+        held = []
+        page.route(f'**/sessions/{ASK}', lambda route: held.append(route))
+        open_from_list(page, ASK_ROW)
+        wait_for(page, lambda: held)
+        leave_session(page)
+        open_from_list(page, EMPTY_ROW)
+        for route in held:
+            if late == 'body':
+                response = route.fetch()
+                body = response.json()
+                body.update({'node': 'other-node', 'dir': '/elsewhere'})
+                route.fulfill(response=response, json=body)
+            elif late == '404':
+                route.fulfill(status=404, body='no such session')
+            else:
+                route.abort()
+        page.unroute(f'**/sessions/{ASK}')
+        page.wait_for_timeout(800)
+        header = page.evaluate("() => [document.querySelector('#view-node').textContent, document.querySelector('#view-dir').textContent]")
+        status = page.inner_text('#status')
+        check(what, held and session_showing(page) and page.evaluate('location.hash') == '#s=' + quote(EMPTY)
+              and header == ['node-1', '/work/repo'] and not status.startswith('session: '),
+              [len(held), header, status])
+        leave_session(page)
+    page.context.close()
+
+
+def check_leaving_clears_the_view(browser, errors):
+    page = new_page(browser, errors)
+    open_session(page, CHILD)
+    page.wait_for_selector('#watch-banner', state='visible')
+    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-interrupt', 'row-stop']
+      .map(id => document.getElementById(id).hidden)""")
+    check('a watch-only child has no chat box and no controls in its sheet', all(hidden), hidden)
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    state = page.evaluate("""() => {
+      const $ = (id) => document.getElementById(id);
+      return {
+        sheets: [$('view-sheet').hidden, $('ask-sheet').hidden],
+        text: ['view-node', 'view-dir', 'view-id-copy', 'view-sheet-meta', 'view-waiting', 'view-permission', 'view-fork']
+          .map(id => $(id).textContent).join(''),
+        waiting: $('view-waiting').hidden,
+        footer: [$('input-row').hidden, $('watch-banner').hidden],
+        rows: ['row-permission', 'row-persona', 'row-fork', 'row-interrupt', 'row-stop'].map(id => $(id).hidden),
+        permission: $('btn-permission').textContent,
+        dot: $('view-state-dot').className,
+        persona: $('persona-name').value,
+      };
+    }""")
+    check('leaving a session clears its header and sheet, closes its sheets and gives the footer back', state == {
+        'sheets': [True, True], 'text': '', 'waiting': True, 'footer': [False, True],
+        'rows': [False] * 5, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
+    }, state)
+    page.context.close()
+
+
+def check_composer(browser, errors):
+    for touch in (True, False):
+        label = 'a touch screen' if touch else 'a fine pointer'
+        page = new_page(browser, errors, touch=touch)
+        press = page.tap if touch else page.click
+        posts = []
+
+        def sent(route):
+            posts.append(route.request.post_data_json)
+            route.fulfill(status=200, content_type='application/json', body='{}')
+        page.route('**/messages', sent)
+        open_session(page, LONG)
+        check(f'opening a session focuses the chat box on {label}',
+              until(page, "() => document.activeElement && document.activeElement.id === 'input'"))
+
+        page.fill(COMPOSER, 'hello')
+        page.evaluate('() => document.activeElement.blur()')
+        page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = t.scrollHeight / 2; }')
+        until(page, shown(BOTTOM_CONTROL))
+        press('#btn-send')
+        delivered = wait_for(page, lambda: posts) and posts[0].get('content') == 'hello'
+        check(f'sending returns the transcript to the bottom on {label}',
+              delivered and until(page, AT_BOTTOM, TRANSCRIPT)
+              and until(page, "(sel) => document.querySelector(sel).value === ''", COMPOSER), posts)
+        if touch:
+            check('on a touch screen, sending leaves the focus where the tap put it', focused_id(page) != 'input')
+        else:
+            check('on a fine pointer, sending gives the focus back to the chat box',
+                  until(page, "() => document.activeElement.id === 'input'"))
+
+        page.fill(COMPOSER, 'again')
+        page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = t.scrollHeight / 2; }')
+        until(page, shown(BOTTOM_CONTROL))
+        page.focus(COMPOSER)
+        page.keyboard.press('Control+Enter')
+        check(f'Ctrl+Enter sends the chat box on {label}',
+              wait_for(page, lambda: len(posts) == 2) and posts[1].get('content') == 'again'
+              and until(page, AT_BOTTOM, TRANSCRIPT), posts)
+
+        page.evaluate('() => document.activeElement.blur()')
+        page.dispatch_event('#input-row', 'click')
+        check(f'a tap on the chat box\'s row focuses the field on {label}', focused_id(page) == 'input')
+
+        page.goto(f'{BASE}/#s={quote(PENDING_ASK)}')
+        page.wait_for_selector(ASK_BOX)
+        if touch:
+            check('the ask composer waits while the chat box holds the focus',
+                  not until(page, shown(ASK_COMPOSER), timeout=1000) and page.is_visible(CHAT_ROW)
+                  and focused_id(page) == 'input')
+        page.evaluate('() => document.activeElement.blur()')
+        until(page, shown(ASK_COMPOSER))
+        press('#btn-ask-type')
+        page.wait_for_selector('#ask-free', state='visible')
+        if touch:
+            check('on a touch screen, answering in your own words leaves the focus where the tap put it',
+                  focused_id(page) != 'ask-input')
+        else:
+            check('on a fine pointer, answering in your own words focuses the answer field',
+                  until(page, "() => document.activeElement.id === 'ask-input'"))
+
+        page.goto(f'{BASE}/#s={quote(OPEN_ASK)}')
+        page.wait_for_selector(ASK_BOX)
+        page.evaluate('() => document.activeElement.blur()')
+        page.wait_for_selector('#ask-free', state='visible')
+        if touch:
+            check('on a touch screen, a question with no options does not take the focus',
+                  not until(page, "() => document.activeElement.id === 'ask-input'", timeout=1000))
+        else:
+            check('on a fine pointer, a question with no options focuses its answer field',
+                  until(page, "() => document.activeElement.id === 'ask-input'"))
+        page.context.close()
+
+    page = new_page(browser, errors)
+    route_stream(page, EMPTY, *[{'delta': f'streamed line {i}\n'} for i in range(200)])
+    open_list(page)
+    open_from_list(page, EMPTY_ROW)
+    grew = until(page, "(sel) => { const t = document.querySelector(sel); return t.scrollHeight > t.clientHeight * 2; }",
+                 TRANSCRIPT)
+    check('a transcript at its newest line follows the lines that arrive', grew and until(page, AT_BOTTOM, TRANSCRIPT))
+    page.context.close()
+
+
+def check_layout(browser, errors):
+    page = new_page(browser, errors)
+    open_session(page, LONG)
+    page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = t.scrollHeight / 2; }')
+    until(page, shown(BOTTOM_CONTROL))
+    place = page.evaluate("""() => {
+      const r = (sel) => document.querySelector(sel).getBoundingClientRect();
+      const b = r('#btn-bottom'), t = r('#transcript'), c = r('#input-row');
+      return { w: b.width, h: b.height, right: t.right - b.right, above: c.top - b.bottom,
+               inside: b.top >= t.top && b.left >= t.left };
+    }""")
+    check('the bottom control floats in the transcript\'s lower corner above the chat box, at thumb size',
+          place['w'] >= 44 and place['h'] >= 44 and 0 <= place['right'] <= 32 and 0 <= place['above'] <= 32
+          and place['inside'], place)
+    page.context.close()
+
+    hidden_shown = """() => [...document.querySelectorAll('[hidden]')]
+      .filter(e => getComputedStyle(e).display !== 'none').map(e => e.id || e.className || e.tagName)"""
+    page = new_page(browser, errors)
+    for size in (PORTRAIT, LANDSCAPE):
+        label = f'{size[0]}x{size[1]}'
+        page.set_viewport_size({'width': size[0], 'height': size[1]})
+        open_list(page)
+        on_list = page.evaluate(hidden_shown)
+        open_session(page, LONG)
+        in_session = page.evaluate(hidden_shown)
+        check(f'every hidden element is off the screen at {label}', not on_list and not in_session,
+              [on_list, in_session])
+
+    page.set_viewport_size({'width': PORTRAIT[0], 'height': PORTRAIT[1]})
+    open_list(page)
+    doc = page.evaluate('() => [document.scrollingElement.scrollHeight, window.innerHeight]')
+    screens = []
+    for strip, tab, listing, back in [
+        ('#health-strip', '#machines-tab', '#machines-list', '#btn-machines-back'),
+        ('#skills-strip', '#skills-tab', '#skills-list', '#btn-skills-back'),
+        ('#mcp-strip', '#mcp-tab', '#mcp-list', '#btn-mcp-back'),
+    ]:
+        page.tap(strip)
+        page.wait_for_selector(tab, state='visible')
+        screens.append(page.evaluate("""([tab, listing]) => {
+          const t = document.querySelector(tab).getBoundingClientRect();
+          const l = document.querySelector(listing);
+          return [Math.round(t.bottom) <= window.innerHeight, getComputedStyle(l).overflowY,
+                  Math.round(l.getBoundingClientRect().bottom) <= window.innerHeight];
+        }""", [tab, listing]))
+        page.tap(back)
+        page.wait_for_selector(tab, state='hidden')
+    check('the document never scrolls, and each tab scrolls its own list inside the screen',
+          doc[0] <= doc[1] and all(s == [True, 'auto', True] for s in screens), [doc, screens])
+
+    page.goto(f'{BASE}/ui#s={quote(DIAGRAM)}')
+    check('a mermaid fence draws as a diagram on the page served at /ui',
+          until(page, shown(DIAGRAM_DRAWN), timeout=20000))
+    page.context.close()
+
+
+def check_keyboard_limits(browser, errors):
+    page = new_page(browser, errors, stub_viewport=True)
+    open_session(page, LONG)
+    page.tap(COMPOSER)
+    raw = """() => { const r = document.querySelector('#session-view').getBoundingClientRect();
+                    return [Math.round(r.top), Math.round(r.height)]; }"""
+
+    def viewport(height, offset_top, scroll_y, quiet=False):
+        page.evaluate('(a) => window.__viewportStub.' + ('quiet' if quiet else 'set') + '(...a)',
+                      [height, offset_top, scroll_y])
+
+    def settles_at(box, timeout=3000):
+        return until(page, f'(box) => JSON.stringify(({raw})()) === JSON.stringify(box)', box, timeout=timeout)
+
+    viewport(500, 0, 0)
+    settled = settles_at([0, 500])
+    viewport(100, 0, 0)
+    floor = round(PORTRAIT[1] * 0.4)
+    check('a keyboard that leaves less than 40% of the screen: the view keeps 40% of it',
+          settled and settles_at([0, floor]), page.evaluate(raw))
+
+    viewport(500, 0, 0)
+    settled = settles_at([0, 500])
+    viewport(PORTRAIT[1] + 100, 0, 0)
+    taller = not until(page, f'() => ({raw})()[1] !== 500', timeout=800)
+    viewport(0, 0, 0)
+    empty = not until(page, f'() => ({raw})()[1] !== 500', timeout=800)
+    check('a viewport report taller than the screen, or empty, is not a keyboard',
+          settled and taller and empty, page.evaluate(raw))
+
+    viewport(500, 600, 0)
+    check('an offset that stands past the short viewport: the view stops at the keyboard',
+          settles_at([PORTRAIT[1] - 500, 500]), page.evaluate(raw))
+
+    viewport(600, 0, 0)
+    settled, _ = view_covers_visible_part(page)
+    page.wait_for_timeout(100)
+    viewport(500, 344, 0, quiet=True)
+    ok, box = view_covers_visible_part(page, timeout=1500)
+    check('a keyboard still moving after its last report: the view catches up once it settles',
+          settled and ok, box)
+
+    viewport(500, 0, 0)
+    settles_at([0, 500])
+    page.evaluate("() => document.getElementById('btn-copy-id').click()")
+    page.wait_for_selector('#toast', state='visible')
+    toast = page.evaluate("""() => { const t = document.querySelector('#toast');
+      return [t.getBoundingClientRect().bottom, getComputedStyle(t).pointerEvents]; }""")
+    check('a toast stands above the keyboard and takes no tap', toast[0] <= 500 and toast[1] == 'none', toast)
+    page.evaluate('() => window.__viewportStub.set(null, 0, null)')
+    page.context.close()
+
+
+def check_fork(browser, errors):
+    page = new_page(browser, errors, http_errors=True)
+    held = []
+    page.route('**/fork', lambda route: held.append(route))
+    open_session(page, LONG)
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    page.tap('#btn-fork')
+    wait_for(page, lambda: held)
+    check('the fork control is off while the clone runs', held and page.is_disabled('#btn-fork'))
+    for route in held:
+        route.fulfill(status=200, content_type='application/json', body=json.dumps({'id': EMPTY}))
+    page.unroute('**/fork')
+    check('a fork opens the fork',
+          until(page, "(hash) => location.hash === hash", '#s=' + quote(EMPTY))
+          and page.is_hidden(SHEET) and not page.is_disabled('#btn-fork'))
+
+    page.route('**/fork', lambda route: route.fulfill(status=409, body='no repository'))
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    page.tap('#btn-fork')
+    refused = until(page, "() => document.querySelector('#view-fork').textContent.startsWith('fork: ')")
+    check('a refused fork says so in the sheet, and the control comes back',
+          refused and page.is_visible(SHEET) and not page.is_disabled('#btn-fork'))
+    page.context.close()
+
+
+
+def text_frame(role, text):
+    return message_frame(role, {'kind': 'text', 'text': text}, 1)
+
+
+def ask_block(message, answer=None, child_id=None):
+    block = {'kind': 'ask', 'message': message, 'options': ['a', 'b']}
+    if answer is not None:
+        block['answer'] = answer
+    if child_id is not None:
+        block['child_id'] = child_id
+    return block
+
+
+def check_following(browser, errors):
+    # Lines that arrive while the reader is scrolled up leave them where they
+    # are.
+    page = new_page(browser, errors)
+    release = staged_stream(page, EMPTY, [text_frame('user', f'early {i}') for i in range(80)],
+                            [text_frame('user', 'late line'), {'delta': 'late words'}])
+    open_list(page)
+    open_from_list(page, EMPTY_ROW)
+    page.wait_for_selector(f'{USER_LINE} >> text=early 79')
+    until(page, AT_BOTTOM, TRANSCRIPT)
+    page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = t.scrollHeight / 2; }')
+    until(page, shown(BOTTOM_CONTROL))
+    top = page.eval_on_selector(TRANSCRIPT, 't => t.scrollTop')
+    release()
+    page.wait_for_selector(f'{REPLY_LINE} >> text=late words')
+    after = page.eval_on_selector(TRANSCRIPT, 't => t.scrollTop')
+    check('lines that arrive while the reader is scrolled up leave the reader where they are',
+          top > 0 and abs(after - top) <= 1 and page.locator(f'{USER_LINE} >> text=late line').count() == 1,
+          [top, after])
+    page.context.close()
+
+    # A streamed paragraph is replaced by its durable text, and dropped by a
+    # durable block of another kind.
+    page = new_page(browser, errors)
+    route_stream(page, EMPTY,
+                 {'delta': 'streamed then stored'},
+                 message_frame('assistant', {'kind': 'text', 'text': 'streamed then stored'}, 1),
+                 {'delta': 'streamed then dropped'},
+                 message_frame('assistant', {'kind': 'tool_call', 'id': 'call-x', 'name': 'shell',
+                                             'args': {'command': 'true'}}, 2))
+    open_list(page)
+    open_from_list(page, EMPTY_ROW)
+    page.wait_for_selector('#transcript .line.tool')
+    stored = texts(page, REPLY_LINE)
+    check('a streamed paragraph followed by its durable text shows the text once',
+          stored.count('streamed then stored') == 1, stored)
+    check('a streamed paragraph followed by a tool call leaves no streamed paragraph',
+          not any('streamed then dropped' in t for t in texts(page, TRANSCRIPT)), stored)
+    page.context.close()
+
+    # Opening a line makes the transcript taller: a reader at the newest line
+    # stays there, and a reader scrolled up is not moved.
+    page = new_page(browser, errors)
+    open_session(page, LONG)
+    until(page, AT_BOTTOM, TRANSCRIPT)
+    open_line = """([sel, which]) => {
+      const lines = [...document.querySelectorAll(sel)].filter(l => l.textContent.includes('/very/long/path'));
+      const line = which === 'last' ? lines[lines.length - 1] : lines[Math.floor(lines.length / 2)];
+      const t = document.querySelector('#transcript');
+      const before = t.scrollHeight;
+      line.click();
+      return t.scrollHeight - before;
+    }"""
+    grew = page.evaluate(open_line, ['#transcript .line.tool', 'last'])
+    check('opening a line at the newest line keeps the reader at the newest line',
+          grew > 0 and until(page, AT_BOTTOM, TRANSCRIPT), grew)
+    page.eval_on_selector(TRANSCRIPT, 't => { t.scrollTop = t.scrollHeight / 2; }')
+    until(page, shown(BOTTOM_CONTROL))
+    top = page.eval_on_selector(TRANSCRIPT, 't => t.scrollTop')
+    grew = page.evaluate(open_line, ['#transcript .line.tool', 'middle'])
+    page.wait_for_timeout(300)
+    after = page.eval_on_selector(TRANSCRIPT, 't => t.scrollTop')
+    check('opening a line while scrolled up does not move the reader',
+          grew > 0 and top > 0 and abs(after - top) <= 1,
+          [grew, top, after])
+    page.context.close()
+
+
+def check_ask_records(browser, errors):
+    # The panel's frames keep their own ask record: the session's question
+    # still takes its own answered copy after a child's question is drawn.
+    page = new_page(browser, errors)
+    release = staged_stream(page, EMPTY,
+                            [message_frame('assistant', ask_block('Session question?', child_id=CHILD), 1)],
+                            [message_frame('assistant', ask_block('Session question?', 'a', CHILD), 2)])
+    route_stream(page, CHILD, message_frame('assistant', ask_block('Child question?'), 1))
+    open_list(page)
+    open_from_list(page, EMPTY_ROW)
+    page.wait_for_selector(ASK_BOX)
+    page.tap(f'{ASK_BOX} .child-watch')
+    page.wait_for_selector('#child-transcript .ask')
+    release()
+    page.wait_for_selector(f'{ASK_BOX} {ASK_ANSWER}')
+    boxes = page.eval_on_selector_all(ASK_BOX, 'els => els.map(e => e.querySelectorAll(".answer").length)')
+    check('a child\'s question in the panel leaves the session\'s question to take its own answer', boxes == [1], boxes)
+    page.context.close()
+
+    # A page read back draws with an ask record of its own: the session's
+    # question still takes its own answered copy after the page is drawn.
+    page = new_page(browser, errors)
+    release = staged_stream(page, EMPTY,
+                            [{'history': {'before': 1000, 'more': True}}]
+                            + [text_frame('user', f'recent {i}') for i in range(3)]
+                            + [message_frame('assistant', ask_block('Tail question?'), 1)],
+                            [message_frame('assistant', ask_block('Tail question?', 'a'), 2)])
+    older = {'events': [{'seq': 500 + i, 'event': {'kind': 'message', 'at_ms': 1, 'message': {
+        'role': 'user', 'block': {'kind': 'text', 'text': f'older {i}'}}}} for i in range(3)], 'more': False}
+    page.route(f'**/sessions/{EMPTY}/history*', lambda route: route.fulfill(
+        status=200, content_type='application/json', body=json.dumps(older)))
+    open_list(page)
+    open_from_list(page, EMPTY_ROW)
+    page.wait_for_selector(ASK_BOX)
+    page.tap(EARLIER)
+    page.wait_for_selector(f'{USER_LINE} >> text=older 0')
+    release()
+    page.wait_for_selector(f'{ASK_BOX} {ASK_ANSWER}')
+    boxes = page.eval_on_selector_all(ASK_BOX, 'els => els.map(e => e.querySelectorAll(".answer").length)')
+    check('a page read back leaves the session\'s question to take its own answer', boxes == [1], boxes)
+    page.context.close()
+
+
 CHECKS = [
     check_tail_and_read_back,
     check_ask_across_a_page_boundary,
@@ -751,6 +1667,19 @@ CHECKS = [
     check_keyboard_ride,
     check_what_a_closed_session_leaves_behind,
     check_diagram,
+    check_list,
+    check_stamps,
+    check_kinds,
+    check_panel,
+    check_panel_frames,
+    check_addresses,
+    check_leaving_clears_the_view,
+    check_composer,
+    check_layout,
+    check_keyboard_limits,
+    check_fork,
+    check_following,
+    check_ask_records,
 ]
 
 

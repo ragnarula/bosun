@@ -1,47 +1,31 @@
-// The transcript's auto-follow flag and the control that returns to the
-// newest line.
+// The transcript's auto-follow and the control that returns to the newest
+// line. The follow flag is the open session's `stick`.
 
-import { btnBottom, childTranscript, transcript } from './dom.js';
-import { out } from './transcript.js';
-import { childStick } from './subagents.js';
+import { btnBottom, transcript } from './dom.js';
+import { opened } from './session-view.js';
 
-export { jumpToBottom, scrollToBottom, setStick, syncBtnBottom, syncStick };
+export { follow, jumpToBottom, syncBtnBottom, syncStick };
 
-let stick = true;     // auto-scroll the transcript when true
-
-// Another module cannot assign an imported binding, so it writes `stick`
-// through this.
-function setStick(value) {
-  stick = value;
-}
-
-// The transcript a render just drew into is the one that follows: the session's
-// own, on `stick`, or the panel's, on its own flag. A child's frame must never
-// move the session's transcript.
-function scrollToBottom() {
-  if (out === childTranscript) {
-    if (childStick) childTranscript.scrollTop = childTranscript.scrollHeight;
-    return;
-  }
-  // A page of older messages is drawn off screen before it goes in above the
-  // rest, and must not move the transcript while it is drawn.
-  if (out !== transcript) return;
-  if (stick) transcript.scrollTop = transcript.scrollHeight;
+// Moves the session's transcript to its newest line, if the reader is there.
+// A renderer's caller asks for this after it adds a line.
+function follow() {
+  if (opened && opened.stick) transcript.scrollTop = transcript.scrollHeight;
 }
 
 // A keystroke in the composer, a sent message and a press of the control all
 // ask for the newest lines, so this one moves the transcript whatever `stick`
 // said before.
 function jumpToBottom() {
-  stick = true;
+  if (opened) opened.stick = true;
   transcript.scrollTop = transcript.scrollHeight;
   syncBtnBottom();
 }
 
 // Auto-follow off means the reader is off the newest line, so the control and
-// the flag are the same state.
+// the flag are the same state. With no session open there is no line to return
+// to.
 function syncBtnBottom() {
-  btnBottom.hidden = stick;
+  btnBottom.hidden = !opened || opened.stick;
 }
 
 btnBottom.addEventListener('click', jumpToBottom);
@@ -50,8 +34,13 @@ btnBottom.addEventListener('click', jumpToBottom);
 // not. The scroll listener asks on every scroll; the visual viewport asks too,
 // because the keyboard changes the transcript's height without a scroll.
 function syncStick() {
-  stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;
+  if (opened) {
+    opened.stick = transcript.scrollTop + transcript.clientHeight >= transcript.scrollHeight - 40;
+  }
   syncBtnBottom();
 }
 
 transcript.addEventListener('scroll', syncStick);
+// A tap that opens a line makes the transcript taller, and a reader at the
+// newest line stays there.
+transcript.addEventListener('click', follow);

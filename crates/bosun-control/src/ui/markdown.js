@@ -4,7 +4,9 @@ import { mdPre, renderMermaid } from './diagram.js';
 
 export { renderMarkdown };
 
-function renderMarkdown(container, text) {
+// The nodes that `text` draws as, in order, for the caller to place.
+function renderMarkdown(text) {
+  const nodes = document.createDocumentFragment();
   const lines = text.split('\n');
   let inCode = false;
   let fenceLanguage = '';
@@ -14,7 +16,7 @@ function renderMarkdown(container, text) {
     if (para.length === 0) return;
     const paragraph = document.createElement('p');
     appendInline(paragraph, para.join('\n'));
-    container.appendChild(paragraph);
+    nodes.appendChild(paragraph);
     para = [];
   };
   const codeOut = (closed) => {
@@ -24,10 +26,10 @@ function renderMarkdown(container, text) {
     code = [];
     fenceLanguage = '';
     if (closed && language === 'mermaid') {
-      renderMermaid(container, source);
+      nodes.appendChild(renderMermaid(source));
       return;
     }
-    container.appendChild(mdPre(source));
+    nodes.appendChild(mdPre(source));
   };
   let i = 0;
   while (i < lines.length) {
@@ -68,7 +70,7 @@ function renderMarkdown(container, text) {
           body.push(tableCells(lines[i]));
           i += 1;
         }
-        container.appendChild(tableNode(header, body, aligns));
+        nodes.appendChild(tableNode(header, body, aligns));
         continue;
       }
     }
@@ -77,13 +79,13 @@ function renderMarkdown(container, text) {
       paraOut();
       const el = document.createElement('h' + heading);
       appendInline(el, line.slice(heading).trim());
-      container.appendChild(el);
+      nodes.appendChild(el);
       i += 1;
       continue;
     }
     if (isRule(line)) {
       paraOut();
-      container.appendChild(document.createElement('hr'));
+      nodes.appendChild(document.createElement('hr'));
       i += 1;
       continue;
     }
@@ -96,7 +98,7 @@ function renderMarkdown(container, text) {
         quote.appendChild(paragraph);
         i += 1;
       }
-      container.appendChild(quote);
+      nodes.appendChild(quote);
       continue;
     }
     const marker = listMarker(line);
@@ -109,7 +111,7 @@ function renderMarkdown(container, text) {
       bullet.textContent = marker;
       item.appendChild(bullet);
       appendInline(item, line.slice(marker.length));
-      container.appendChild(item);
+      nodes.appendChild(item);
       i += 1;
       continue;
     }
@@ -120,6 +122,7 @@ function renderMarkdown(container, text) {
   // Text that ends inside a fence is still streaming: it shows its source
   // rather than a diagram of the part that arrived.
   if (inCode && code.length > 0) codeOut(false);
+  return nodes;
 }
 
 function headingLevel(line) {

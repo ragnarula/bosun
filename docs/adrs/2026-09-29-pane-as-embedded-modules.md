@@ -21,7 +21,7 @@ Constraints fixed going in:
 - Each part of the pane lives in its own file, and a file states what it takes from the others.
 - A browser runs code from two builds together only when a new build starts between the page fetch and its module fetches, and a reload recovers from it.
 - The router serves the pane's files and nothing else under `/ui/`.
-- The source checks in `ui.rs` keep reading every line of the pane.
+- The browser checks in `crates/bosun-control/tests/browser/pane.py` drive the files the browser runs, and the source checks in `ui.rs` read the files as written.
 
 ## Options Considered
 
@@ -35,7 +35,7 @@ It needs no serving work, but every name stays global. A change to one part of t
 
 **3. A bundler, such as esbuild, that builds one file from the modules. (rejected)**
 
-It keeps a single served file and allows long-lived caching, but it adds a JavaScript toolchain to every build and to CI, and the file the browser runs is no longer the source the checks read.
+It keeps a single served file and allows long-lived caching, but it adds a JavaScript toolchain to every build and to CI, and the file the browser runs is no longer the source a reader edits or the source checks read.
 
 **4. Several classic `<script src>` files sharing the global scope. (rejected)**
 
@@ -57,9 +57,11 @@ The pane is `crates/bosun-control/src/ui/`: `index.html` holds the markup, `pane
 
 The page loads `/ui/main.js` before the deferred mermaid bundle. Deferred scripts and module scripts run in document order, and the diagram module listens for the bundle's `load` event, so it must run first.
 
-The modules share mutable state through live bindings. A module reads another module's top-level `let` through an import. It writes one through a setter that the owning module exports, such as `setOut` or `setStick`, because an imported binding is read-only.
+Everything the pane holds for the open session is one object, `opened` in `session-view.js`: its state, its event stream and timers, the transcript's follow flag, live paragraph, last message and ask record, its activity, its read-back position and its subagent panel. `showSession` creates it and `closeSession` drops it. Other modules read it through a live binding and write its fields; only `session-view.js` replaces it, because an imported binding is read-only. A reply that lands after an await compares the object it started with against `opened`, so a reply for a session the pane has left does nothing. App-wide state, such as the session list, the nodes, the personas and the open children groups, stays in the module that fetches or owns it, and only that module writes it.
 
-The source checks in `ui.rs` read `PANE`, which joins `index.html`, `pane.css` in a `<style>` block and the modules in one `<script>` block, in `ASSETS` order.
+The block renderers in `transcript.js` return the element they build. The caller places it, in the session's transcript, the panel's or a page read back off screen, and decides whether that transcript follows. Each caller passes the record the renderers read and write: its ask box and the arguments of its `message_child` calls.
+
+The pane's behaviour is held by the browser checks in `crates/bosun-control/tests/browser/pane.py`, which `tests/browser.rs` runs on demand against the real router. The source checks in `ui.rs` keep only what a browser cannot check well: that `ASSETS` matches the directory, the preload links, the order of the entry module and the mermaid tag, that no text is inserted as HTML, the link schemes, mermaid's settings and the Home-indicator insets. They read `PANE`, which joins `index.html`, `pane.css` in a `<style>` block and the modules in one `<script>` block, in `ASSETS` order.
 
 ## Consequences
 
@@ -69,7 +71,7 @@ The source checks in `ui.rs` read `PANE`, which joins `index.html`, `pane.css` i
 - A new stylesheet or module needs an `ASSETS` entry, an `include_str!` line in `PANE`, and, for a module, a `modulepreload` link. The unit tests fail until each exists.
 - The order of the entry module and the mermaid tag in `index.html` matters. A source check in `ui.rs` holds it, and a browser check in `tests/browser/pane.py` draws a diagram, which fails in the other order.
 - Module scripts are deferred and strict. The inline script was strict too, and ran after the markup it reads, so neither change alters what the code sees.
-- Shared mutable state still lives in several modules' top-level variables, and a write from another module goes through a setter. That is one call per write where the single script had an assignment, and a setter that stops writing breaks the pane with no error. The browser checks fail when any setter's write is lost, except `setAskSyncTimer`'s, which nothing on screen shows and a source check in `ui.rs` reads.
+- Closing a session drops its whole object, so no piece of it can outlive the session. The browser checks fail when a session opened after another shows the first one's scroll position, read-back, activity, question, streamed paragraph or unanswered `message_child` calls, or when a late reply for the first one writes to the second. Nothing stops a module from writing a field the object does not declare: `newSessionState` in `session-view.js` is where the fields are listed.
 
 ## Revisit When
 

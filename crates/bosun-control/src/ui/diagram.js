@@ -29,13 +29,17 @@ function mdPre(source) {
   return pre;
 }
 
-async function renderMermaid(container, source) {
-  // The holder is in place before the first await, so the diagram keeps its
-  // place in the transcript while the bundle loads.
+// The diagram's holder, returned at once so the caller can place it; the
+// diagram fills it once the bundle has loaded, and the fence's source replaces
+// it on any failure.
+function renderMermaid(source) {
   const holder = document.createElement('div');
   holder.className = 'md-mermaid';
-  container.appendChild(holder);
+  fillMermaid(holder, source);
+  return holder;
+}
 
+async function fillMermaid(holder, source) {
   try {
     const mermaid = await mermaidReady;
     if (!mermaidApi) {

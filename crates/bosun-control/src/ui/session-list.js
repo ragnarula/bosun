@@ -4,7 +4,7 @@ import { sessionListEl, view, viewStateDot } from './dom.js';
 import { ago, shortId, showStatus } from './common.js';
 import { liveChildrenLabel, updateStatusLabel } from './activity.js';
 import { markListEntry, openSession } from './history.js';
-import { closeSession, current, setViewState } from './session-view.js';
+import { closeSession, opened } from './session-view.js';
 import { renderChildList, updateChildPanelDot } from './subagents.js';
 
 export { refreshSessions, sessions };
@@ -175,14 +175,14 @@ async function refreshSessions() {
     // The waiting label follows the freshest list too: a child's state
     // changes without a state event for the open session, so the event
     // stream alone would leave it stale between fetches.
-    const viewed = sessions.find((session) => session.id === current);
-    if (current && !viewed) {
-      showStatus('session ' + current + ' ended');
+    const viewed = opened && sessions.find((session) => session.id === opened.id);
+    if (opened && !viewed) {
+      showStatus('session ' + opened.id + ' ended');
       markListEntry();
       closeSession();
     } else if (viewed && !view.hidden) {
       viewStateDot.className = 'dot ' + viewed.state;
-      setViewState(viewed.state);
+      opened.state = viewed.state;
       updateStatusLabel(viewed);
     }
   } catch (error) {

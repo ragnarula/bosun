@@ -1,62 +1,20 @@
-// The transcript's block renderers.
+// The transcript's block renderers. Each one returns the element it built, and
+// the caller decides which transcript it goes into and whether that transcript
+// follows it.
+//
+// A transcript has a record the renderers read and write: `askBox`, the box of
+// the most recent question, which the durable answered-ask event updates in
+// place instead of drawing the question twice; and `callArgs`, the arguments of
+// the `message_child` calls drawn in it, by call id. The session's transcript,
+// the subagent panel's and a page read back each pass their own.
 
-import { transcript } from './dom.js';
 import { sessions } from './session-list.js';
 import { openSession } from './history.js';
-import { USER_REJECTED_TEXT, scheduleAskSync } from './composer.js';
-import { scrollToBottom } from './scroll.js';
+import { USER_REJECTED_TEXT } from './composer.js';
 import { renderMarkdown } from './markdown.js';
 import { childName, watchControl } from './subagents.js';
 
-export {
-  appendAssistant,
-  appendDelta,
-  appendLine,
-  callArgs,
-  clip,
-  lastMsg,
-  modelCallLine,
-  openAskBox,
-  out,
-  renderBlock,
-  renderMessage,
-  setLastMsg,
-  setLiveEl,
-  setOpenAskBox,
-  setOut,
-};
-
-// The last durable message block seen, and the transcript box for the most
-// recent ask. `lastMsg` decides whether a question is live on screen; the box
-// is kept so the durable answered-ask event updates the record in place
-// instead of duplicating it. Only one question can be live at a time.
-let lastMsg = null;
-let openAskBox = null;
-
-let liveEl = null;    // the assistant paragraph live deltas stream into
-
-// Where the block renderers append: the session's own transcript, or the
-// panel's while one of a child's frames is drawn. The two share every renderer,
-// so this is the only thing that decides which transcript a block lands in.
-let out = transcript;
-
-// Another module cannot assign an imported binding, so it writes these
-// through the setters below.
-function setLiveEl(value) {
-  liveEl = value;
-}
-
-function setLastMsg(value) {
-  lastMsg = value;
-}
-
-function setOpenAskBox(value) {
-  openAskBox = value;
-}
-
-function setOut(value) {
-  out = value;
-}
+export { clip, drawAssistant, drawBlock, drawLine, drawLiveParagraph, modelCallLine };
 
 // A durable event's stamp as the reader's local clock time. The wire carries
 // UTC; the browser converts it, and an empty locale list keeps the reader's
@@ -81,12 +39,11 @@ function stampRow(el, atMs) {
   return row;
 }
 
-function appendLine(kind, text, atMs) {
+function drawLine(kind, text, atMs) {
   const line = document.createElement('div');
   line.className = 'line ' + kind;
   line.textContent = text;
-  out.appendChild(stampRow(line, atMs));
-  scrollToBottom();
+  return stampRow(line, atMs);
 }
 
 // Tool traffic renders as one subtle strip so assistant text is not buried
@@ -173,16 +130,12 @@ const TOOL_SUMMARY_LIMIT = 120;
 
 // One-line tool strip: the glyph, the tool name, and a compact label of what
 // it acted on. The full args stay hidden until the line is clicked.
-// The arguments of the calls the transcript has drawn, by call id: a result
-// that does not name a child itself (`message_child` answers `{"ok": true}`)
-// is followed by the child its call named.
-const callArgs = new Map();
-
-function appendToolStrip(name, args, atMs, id) {
-  // Only `message_child` reads a call's arguments back, when its own answer
-  // does not name the child. Keeping them for every call would hold a
-  // `file_write`'s whole body for as long as the transcript lives.
-  if (id && name === 'message_child') callArgs.set(id, args);
+function drawToolStrip(name, args, atMs, id, record) {
+  // A `message_child` result answers `{"ok": true}`, so the child it names is
+  // the one its call named, and only that call's arguments are kept. Keeping
+  // them for every call would hold a `file_write`'s whole body for as long as
+  // the transcript lives.
+  if (id && name === 'message_child') record.callArgs.set(id, args);
   const line = document.createElement('div');
   line.className = 'line tool';
   const glyph = document.createElement('span');
@@ -211,10 +164,8 @@ function appendToolStrip(name, args, atMs, id) {
     body.hidden = false;
     line.classList.add('open');
     toggle.textContent = '▾';
-    scrollToBottom();
   });
-  out.appendChild(stampRow(line, atMs));
-  scrollToBottom();
+  return stampRow(line, atMs);
 }
 
 // A tool result nests under its call as a bordered block, so the call and
@@ -227,9 +178,9 @@ const TOOL_RESULT_PREVIEW = 400;
 
 // One completion's thinking, collapsed. The label carries its size so the
 // reader can judge whether to open it without it being shown twice.
-function appendReasoningPanel(text, atMs) {
+function drawReasoningPanel(text, atMs) {
   const body = text == null ? '' : String(text);
-  if (body === '') return;
+  if (body === '') return null;
   const line = document.createElement('div');
   line.className = 'line tool reasoning';
   const toggle = document.createElement('span');
@@ -258,10 +209,8 @@ function appendReasoningPanel(text, atMs) {
     full.hidden = false;
     line.classList.add('open');
     toggle.textContent = '\u25be';
-    scrollToBottom();
   });
-  out.appendChild(stampRow(line, atMs));
-  scrollToBottom();
+  return stampRow(line, atMs);
 }
 
 // The child a result names, or undefined. Two tools are asked, and only by
@@ -270,25 +219,25 @@ function appendReasoningPanel(text, atMs) {
 // the call it answers. Another tool's result may hold a `child_id` of its own —
 // an MCP tool's JSON — and another tool's `id` argument is not a child at all.
 // A call that failed names no child: the one it meant may not exist.
-function namedChild(content, name, error, id) {
+function namedChild(content, name, error, id, record) {
   if (error) return undefined;
   if (name === 'spawn') {
     const made = content && typeof content === 'object' ? content.child_id : undefined;
     return typeof made === 'string' && made ? made : undefined;
   }
   if (name !== 'message_child' || !id) return undefined;
-  const args = callArgs.get(id);
+  const args = record.callArgs.get(id);
   return args && typeof args.id === 'string' && args.id ? args.id : undefined;
 }
 
-function appendToolResult(name, payload, error, atMs, id, content) {
+function drawToolResult(name, payload, error, atMs, id, content, record) {
   const text = payload == null ? '' : String(payload);
-  const named = namedChild(content, name, error, id);
-  // Only a `message_child` call's arguments are kept, and they go as its result
-  // renders: their child is known now. The session's teardown clears whatever
-  // never got an answer.
-  if (id && name === 'message_child') callArgs.delete(id);
-  if (!error && text === '') return;
+  const named = namedChild(content, name, error, id, record);
+  // A `message_child` call's arguments go as its result renders: their child is
+  // known now. A call that never gets an answer leaves them in the record,
+  // which goes with the transcript it was drawn in.
+  if (id && name === 'message_child') record.callArgs.delete(id);
+  if (!error && text === '') return null;
   const line = document.createElement('div');
   line.className = 'tool-result' + (error ? ' error' : '');
   if (error) {
@@ -320,11 +269,9 @@ function appendToolResult(name, payload, error, atMs, id, content) {
         line.classList.add('expanded');
         line.classList.remove('clipped');
       }
-      scrollToBottom();
     });
   }
-  out.appendChild(stampRow(line, atMs));
-  scrollToBottom();
+  return stampRow(line, atMs);
 }
 
 // A tool result for a human reader: strings read raw and structure flattens
@@ -343,45 +290,33 @@ function readableValue(value) {
   return String(value);
 }
 
-function appendMsg(role, text, atMs) {
+function drawMsg(role, text, atMs) {
   const paragraph = document.createElement('p');
   paragraph.className = 'msg ' + role;
   // A rejection is a durable user action, not a typed message; it renders
   // as a muted note so it never reads as words the user composed.
   if (role === 'user' && text === USER_REJECTED_TEXT) paragraph.classList.add('rejected');
   paragraph.textContent = text;
-  out.appendChild(stampRow(paragraph, atMs));
-  scrollToBottom();
+  return stampRow(paragraph, atMs);
 }
 
 // Assistant turns render markdown like the terminal client; user text stays
 // plain. Renders the same subset the TUI parses: headings, emphasis, inline
 // code, code fences, links, lists, blockquotes, rules and tables.
-function appendAssistant(text, atMs) {
+function drawAssistant(text, atMs) {
   const container = document.createElement('div');
   container.className = 'msg assistant';
-  renderMarkdown(container, text);
-  out.appendChild(stampRow(container, atMs));
-  scrollToBottom();
+  container.appendChild(renderMarkdown(text));
+  return stampRow(container, atMs);
 }
 
-// Live deltas stream into one assistant paragraph until the turn's durable
-// text arrives (which supersedes the stream) or another message begins.
-function appendDelta(text) {
-  if (!liveEl) {
-    liveEl = document.createElement('p');
-    liveEl.className = 'msg assistant';
-    out.appendChild(liveEl);
-  }
-  liveEl.textContent += text;
-  scrollToBottom();
-}
-
-function closeLive() {
-  if (liveEl) {
-    liveEl.remove();
-    liveEl = null;
-  }
+// The paragraph live deltas stream into until the turn's durable text arrives
+// (which supersedes the stream) or another message begins. It is not durable,
+// so it carries no time.
+function drawLiveParagraph() {
+  const paragraph = document.createElement('p');
+  paragraph.className = 'msg assistant';
+  return paragraph;
 }
 
 function askBoxKey(block) {
@@ -390,19 +325,20 @@ function askBoxKey(block) {
 
 // The durable ask record in the transcript. When an ask is answered, the
 // control plane appends a matching answered-ask event after the surface it
-// resolves; the box updates in place so the same question never renders twice.
-function renderAskBox(block, atMs) {
+// resolves; the box updates in place so the same question never renders twice,
+// and nothing new is returned.
+function drawAskBox(block, atMs, record) {
   const key = askBoxKey(block);
-  if (openAskBox && openAskBox.key === key && !openAskBox.answered) {
+  const open = record.askBox;
+  if (open && open.key === key && !open.answered) {
     if (block.answer) {
       const note = document.createElement('div');
       note.className = 'answer';
       note.textContent = 'answered: ' + block.answer;
-      openAskBox.el.appendChild(note);
-      openAskBox.answered = true;
-      scrollToBottom();
+      open.el.appendChild(note);
+      open.answered = true;
     }
-    return;
+    return null;
   }
   const box = document.createElement('div');
   box.className = 'ask';
@@ -431,52 +367,23 @@ function renderAskBox(block, atMs) {
     box.appendChild(note);
   }
   if (block.child_id) box.appendChild(watchControl(block.child_id));
-  out.appendChild(stampRow(box, atMs));
-  scrollToBottom();
-  openAskBox = { key, el: box, answered: !!block.answer };
+  record.askBox = { key, el: box, answered: !!block.answer };
+  return stampRow(box, atMs);
 }
 
-function renderMessage(message, atMs) {
-  const block = message.block;
-  lastMsg = block;
-  // Any message that is not itself the pending ask closes the previous ask's
-  // record: it is history once the stream has moved past it.
-  if (block.kind !== 'ask') openAskBox = null;
-  if (message.role === 'assistant' && block.kind === 'text') {
-    if (liveEl) {
-      const container = document.createElement('div');
-      container.className = 'msg assistant';
-      renderMarkdown(container, block.text);
-      liveEl.replaceWith(stampRow(container, atMs));
-      liveEl = null;
-      scrollToBottom();
-      scheduleAskSync();
-      return;
-    }
-    appendAssistant(block.text, atMs);
-    scheduleAskSync();
-    return;
-  }
-  // A durable block supersedes the streamed live paragraph. Text replaces it
-  // above; any other kind held tool output or reasoning, not assistant prose,
-  // so the paragraph is dropped rather than left in the transcript.
-  closeLive();
-  renderBlock(message, atMs);
-  scheduleAskSync();
-}
-
-// One durable message, drawn into `out`. The caller owns the state around it:
-// the session's last message, its live paragraph and its ask record.
-function renderBlock(message, atMs) {
+// One durable message block, drawn with `record`, the ask record and call
+// arguments of the transcript it goes into. Returns the element, or null when
+// the block adds nothing: an empty result, or an answer that joined the box of
+// its question. The caller owns the state around it: the session's last
+// message and its live paragraph.
+function drawBlock(message, atMs, record) {
   const block = message.block;
   switch (block.kind) {
     case 'text':
-      appendMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs);
-      break;
+      return drawMsg(message.role === 'user' ? 'user' : 'assistant', block.text, atMs);
     case 'tool_call': {
       const args = block.args == null ? {} : block.args;
-      appendToolStrip(block.name, args, atMs, block.id);
-      break;
+      return drawToolStrip(block.name, args, atMs, block.id, record);
     }
     case 'tool_result': {
       const content = block.content;
@@ -484,40 +391,34 @@ function renderBlock(message, atMs) {
         typeof content === 'string' || content === null
           ? String(content)
           : readableValue(content);
-      appendToolResult(block.name, payload, block.is_error, atMs, block.id, content);
-      break;
+      return drawToolResult(block.name, payload, block.is_error, atMs, block.id, content, record);
     }
     case 'ask':
-      renderAskBox(block, atMs);
-      break;
+      return drawAskBox(block, atMs, record);
     case 'reasoning':
-      appendReasoningPanel(block.text, atMs);
-      break;
+      return drawReasoningPanel(block.text, atMs);
     case 'summary':
-      appendLine('summary', block.text, atMs);
-      break;
+      return drawLine('summary', block.text, atMs);
     case 'context_size':
       // How full the context was when the last completion finished. The line is
       // the loop's own count, not an estimate, and its percentage is the only
       // warning there is.
-      appendLine(
+      return drawLine(
         'context',
         'context: ' + block.tokens + ' / ' + block.window + ' tokens (' +
           Math.floor((block.tokens * 100) / block.window) + '%), compaction at ' + block.compact_at,
         atMs
       );
-      break;
     case 'context_cleared':
       // The break the session made in its own thread: a divider naming why it
       // cleared, not something anyone said. The fresh instructions stand below
       // it as the message the session continues from, so this line does not
       // repeat them.
-      appendLine(
+      return drawLine(
         'cleared',
         'context cleared: ' + block.reason + ' · continuing from a fresh prompt',
         atMs
       );
-      break;
     case 'child_event': {
       // Child activity renders as one line whose child id expands into that
       // child's own thread (watch-only): clicking it attaches the view.
@@ -539,13 +440,10 @@ function renderBlock(message, atMs) {
       const tail = document.createElement('span');
       tail.textContent = ' ' + (block.event_kind || 'report') + '] ' + block.text;
       line.appendChild(tail);
-      out.appendChild(stampRow(line, atMs));
-      scrollToBottom();
-      break;
+      return stampRow(line, atMs);
     }
     default:
-      appendLine('unknown', JSON.stringify(block), atMs);
-      break;
+      return drawLine('unknown', JSON.stringify(block), atMs);
   }
 }
 

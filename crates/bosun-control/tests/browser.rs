@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use bosun_common::session::ActivityPhase;
 use bosun_common::session::Block;
+use bosun_common::session::ChildEventKind;
 use bosun_common::session::Event;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
@@ -52,10 +53,21 @@ const PENDING_ASK: &str = "pending-ask-session";
 const EMPTY: &str = "empty-session";
 /// A session whose one reply holds a mermaid diagram.
 const DIAGRAM: &str = "diagram-session";
+/// A session with one of every block kind the transcript draws, and one of
+/// every tool result that may or may not name a child.
+const KINDS: &str = "kinds-session";
+/// A session whose `message_child` result answers a call id that the kinds
+/// session left unanswered, so a result here names no child.
+const REUSE: &str = "reuse-session";
+/// A session whose last message is a question with no options to tap.
+const OPEN_ASK: &str = "open-ask-session";
+/// The call id the kinds session leaves unanswered and the reuse session
+/// answers.
+const UNANSWERED_CALL: &str = "message-child-open";
 /// How many turns the long session holds. Each turn is four messages, so the
 /// transcript is many pages long.
 const TURNS: usize = 300;
-/// How long the whole script may run. It takes about 15 seconds; a hung
+/// How long the whole script may run. It takes about 70 seconds; a hung
 /// browser must not hold the test forever.
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// The exit status `pane.py` returns when it cannot start Chromium, most often
@@ -133,6 +145,9 @@ async fn seed(store: &Store) {
     seed_pending_ask_session(store).await;
     create(store, EMPTY, None, Some("the empty session"), 1_999_990).await;
     seed_diagram_session(store).await;
+    seed_kinds_session(store).await;
+    seed_reuse_session(store).await;
+    seed_open_ask_session(store).await;
     for i in 0..FILLER_SESSIONS {
         // A summary with no break in it is what a model writes for a path or
         // an identifier, and the list row must still fit the screen.
@@ -351,6 +366,236 @@ async fn seed_diagram_session(store: &Store) {
         "Here it is:\n\n```mermaid\ngraph TD\n  A --> B\n```",
     )
     .await;
+}
+
+async fn seed_kinds_session(store: &Store) {
+    create(store, KINDS, None, Some("the kinds session"), 1_999_989).await;
+    text(store, KINDS, Role::User, "kinds start").await;
+    // A `message_child` call and its result: the result answers `ok`, so the
+    // child it names is the one its call named. The call names the ask
+    // session's child, so following it replaces a followed long-session child.
+    call(
+        store,
+        KINDS,
+        "message-child-1",
+        "message_child",
+        json!({ "id": ASK_CHILD, "message": "hi" }),
+    )
+    .await;
+    result(
+        store,
+        KINDS,
+        "message-child-1",
+        "message_child",
+        false,
+        json!({ "ok": true }),
+    )
+    .await;
+    // A spawn that failed names no child, and neither does another tool's
+    // result that carries a `child_id`, or another tool's `id` argument.
+    call(
+        store,
+        KINDS,
+        "spawn-failed",
+        "spawn",
+        json!({ "prompt": "x" }),
+    )
+    .await;
+    result(
+        store,
+        KINDS,
+        "spawn-failed",
+        "spawn",
+        true,
+        json!("no node"),
+    )
+    .await;
+    call(
+        store,
+        KINDS,
+        "status-1",
+        "session_status",
+        json!({ "id": CHILD }),
+    )
+    .await;
+    result(
+        store,
+        KINDS,
+        "status-1",
+        "session_status",
+        false,
+        json!({ "child_id": CHILD, "state": "idle" }),
+    )
+    .await;
+    call(
+        store,
+        KINDS,
+        UNANSWERED_CALL,
+        "message_child",
+        json!({ "id": CHILD, "message": "hello" }),
+    )
+    .await;
+    message(
+        store,
+        KINDS,
+        Role::Assistant,
+        Block::Reasoning {
+            text: "thinking hard".into(),
+        },
+    )
+    .await;
+    message(
+        store,
+        KINDS,
+        Role::Assistant,
+        Block::Summary {
+            text: "a summary line".into(),
+        },
+    )
+    .await;
+    message(
+        store,
+        KINDS,
+        Role::Assistant,
+        Block::ContextSize {
+            tokens: 50_000,
+            window: 100_000,
+            compact_at: 80_000,
+        },
+    )
+    .await;
+    message(
+        store,
+        KINDS,
+        Role::User,
+        Block::ContextCleared {
+            reason: "starting over".into(),
+            instructions: "fresh instructions text".into(),
+        },
+    )
+    .await;
+    message(
+        store,
+        KINDS,
+        Role::User,
+        Block::ChildEvent {
+            child_id: CHILD.into(),
+            kind: ChildEventKind::Report,
+            text: "done".into(),
+            origin: None,
+        },
+    )
+    .await;
+    message(
+        store,
+        KINDS,
+        Role::Assistant,
+        Block::Ask {
+            message: "Proceed?".into(),
+            options: vec!["yes".into(), "no".into()],
+            child_id: None,
+            answer: Some("yes".into()),
+        },
+    )
+    .await;
+    store
+        .append_event(
+            KINDS,
+            &Event::ModelCall {
+                at_ms: Some(now_ms()),
+                model: "test-model".into(),
+                provider: "test-provider".into(),
+                kind: "completion".into(),
+                input_tokens: Some(10),
+                cached_input_tokens: Some(3),
+                output_tokens: Some(5),
+                cost: Some(0.5),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .append_event(
+            KINDS,
+            &Event::Warning {
+                text: "a server is unavailable".into(),
+            },
+        )
+        .await
+        .unwrap();
+    // An aligned table, a lone pipe in prose, and a table wider than a phone.
+    let tables = format!(
+        "tables\n\n| left | centre | right |\n|---|:---:|---:|\n| l | c | r |\n\na | b\n\n| wide | table |\n|---|---|\n| {} | {} |",
+        "wide cell ".repeat(20),
+        "more ".repeat(20),
+    );
+    text(store, KINDS, Role::Assistant, &tables).await;
+    text(store, KINDS, Role::Assistant, "kinds end").await;
+}
+
+async fn seed_reuse_session(store: &Store) {
+    create(store, REUSE, None, Some("the reuse session"), 1_999_988).await;
+    text(store, REUSE, Role::User, "reuse start").await;
+    result(
+        store,
+        REUSE,
+        UNANSWERED_CALL,
+        "message_child",
+        false,
+        json!({ "ok": true }),
+    )
+    .await;
+}
+
+async fn seed_open_ask_session(store: &Store) {
+    create(
+        store,
+        OPEN_ASK,
+        None,
+        Some("the open ask session"),
+        1_999_987,
+    )
+    .await;
+    text(store, OPEN_ASK, Role::User, "ask me anything").await;
+    message(
+        store,
+        OPEN_ASK,
+        Role::Assistant,
+        Block::Ask {
+            message: "What next?".into(),
+            options: vec![],
+            child_id: None,
+            answer: None,
+        },
+    )
+    .await;
+}
+
+async fn call(store: &Store, session: &str, id: &str, name: &str, args: serde_json::Value) {
+    let block = Block::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        args,
+        continues_completion: false,
+    };
+    message(store, session, Role::Assistant, block).await;
+}
+
+async fn result(
+    store: &Store,
+    session: &str,
+    id: &str,
+    name: &str,
+    is_error: bool,
+    content: serde_json::Value,
+) {
+    let block = Block::ToolResult {
+        id: id.into(),
+        name: name.into(),
+        is_error,
+        content,
+    };
+    message(store, session, Role::User, block).await;
 }
 
 async fn create(

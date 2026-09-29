@@ -17,21 +17,12 @@ import {
   view,
 } from './dom.js';
 import { post, toastError } from './common.js';
-import { coarsePointer, current } from './session-view.js';
+import { coarsePointer, opened } from './session-view.js';
 import { jumpToBottom } from './scroll.js';
-import { lastMsg } from './transcript.js';
 
-export { USER_REJECTED_TEXT, askSyncTimer, loadDraft, saveDraft, scheduleAskSync, setAskSyncTimer };
-
-let askSyncTimer = null;
+export { USER_REJECTED_TEXT, loadDraft, saveDraft, scheduleAskSync };
 
 let sending = false;
-
-// Another module cannot assign an imported binding, so it writes `askSyncTimer`
-// through this.
-function setAskSyncTimer(value) {
-  askSyncTimer = value;
-}
 
 // The unsent chat draft, so closing a session and returning to it never
 // loses what the user was typing.
@@ -82,7 +73,8 @@ function renderAskComposer(ask) {
   askChips.textContent = '';
   askFree.hidden = true;
   btnAskBack.hidden = true;
-  if (ask.options && ask.options.length > 0) {
+  const hasOptions = !!ask.options && ask.options.length > 0;
+  if (hasOptions) {
     for (const option of ask.options) {
       const chip = document.createElement('button');
       chip.type = 'button';
@@ -98,7 +90,6 @@ function renderAskComposer(ask) {
     askChips.hidden = true;
     btnAskType.hidden = true;
     askFree.hidden = false;
-    if (!coarsePointer()) askInput.focus();
   }
   // The reader is typing: leave the composer in place. Hiding it takes the
   // focus with it, and a programmatic re-focus right after is the one iOS
@@ -107,14 +98,17 @@ function renderAskComposer(ask) {
   if (document.activeElement === input) return;
   askSheet.hidden = false;
   chatRow.hidden = true;
+  // A field inside a hidden sheet cannot take the focus, so this comes after
+  // the sheet shows.
+  if (!hasOptions && !coarsePointer()) askInput.focus();
 }
 
 // A blur is the moment the refusal above can be retried.
 input.addEventListener('blur', scheduleAskSync);
 
 function applyAskComposer() {
-  if (view.hidden || inputRow.hidden) return;
-  const block = lastMsg;
+  if (!opened || view.hidden || inputRow.hidden) return;
+  const block = opened.lastMsg;
   const live = block && block.kind === 'ask' && !block.answer ? block : null;
   if (live) {
     renderAskComposer(live);
@@ -125,21 +119,24 @@ function applyAskComposer() {
 
 // A replay or live burst can deliver many messages quickly; the ask composer
 // only reflects the settled end of the stream, so a resolved question never
-// flashes as live mid-replay.
+// flashes as live mid-replay. The timer is the open session's, so closing the
+// session clears it.
 function scheduleAskSync() {
-  if (askSyncTimer) window.clearTimeout(askSyncTimer);
-  askSyncTimer = window.setTimeout(applyAskComposer, 250);
+  const s = opened;
+  if (!s) return;
+  window.clearTimeout(s.askSyncTimer);
+  s.askSyncTimer = window.setTimeout(applyAskComposer, 250);
 }
 
 // A tap on an ask option answers the question exactly like a typed message.
 async function answer(text) {
-  if (sending || !text.trim() || !current) return;
+  if (sending || !text.trim() || !opened) return;
   // An answer resolves the live question; leave the ask composer immediately.
   // The durable event that confirms it re-syncs the composer on arrival.
   showChatComposer();
   sending = true;
   try {
-    await post('/sessions/' + encodeURIComponent(current) + '/messages', {
+    await post('/sessions/' + encodeURIComponent(opened.id) + '/messages', {
       content: text,
       redirect: false,
     });
@@ -155,12 +152,12 @@ async function answer(text) {
 // the binding is cleared, and the model is not woken — the session keeps
 // waiting until the user types its next message.
 async function dismissAsk() {
-  if (sending || !current) return;
+  if (sending || !opened) return;
   showChatComposer();
   sending = true;
   try {
     const response = await fetch(
-      '/sessions/' + encodeURIComponent(current) + '/reject',
+      '/sessions/' + encodeURIComponent(opened.id) + '/reject',
       { method: 'POST' }
     );
     if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -185,7 +182,8 @@ btnAskType.addEventListener('click', () => {
 btnAskBack.addEventListener('click', () => {
   askFree.hidden = true;
   btnAskBack.hidden = true;
-  if (lastMsg && lastMsg.options && lastMsg.options.length > 0) {
+  const block = opened ? opened.lastMsg : null;
+  if (block && block.options && block.options.length > 0) {
     askChips.hidden = false;
     btnAskType.hidden = false;
   }
@@ -205,12 +203,12 @@ askInput.addEventListener('keydown', (event) => {
 });
 
 async function send() {
-  if (sending || !input.value.trim()) return;
+  if (sending || !opened || !input.value.trim()) return;
   jumpToBottom();
   sending = true;
   btnSend.disabled = true;
   try {
-    await post('/sessions/' + encodeURIComponent(current) + '/messages', {
+    await post('/sessions/' + encodeURIComponent(opened.id) + '/messages', {
       content: input.value,
       redirect: false,
     });
