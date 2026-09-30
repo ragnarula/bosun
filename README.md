@@ -39,7 +39,9 @@ Shipped so far:
 - **Context control.** The transcript states the session's context size once a
   turn, from half the window up, so the session can see how close it is to
   compaction. A session can also clear its own context, giving a reason, and
-  continue from a fresh prompt; the reader's transcript keeps everything.
+  continue from a fresh prompt; the reader's transcript keeps everything. The
+  pane's actions sheet lets the reader clear the session's context too: the
+  session waits for the reader's next message, which starts the new thread.
 - **Remote skill packages.** Skills come from GitHub repositories the operator
   manages in the web pane, and reach sessions through the `skill` tool.
 - **MCP support.** The control plane connects to external MCP servers over

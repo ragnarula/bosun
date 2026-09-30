@@ -78,6 +78,9 @@ SESSION_ROW = '.session-row'
 VIEW = '#session-view'
 TRANSCRIPT = '#transcript'
 TRANSCRIPT_LINE = '#transcript .msg'
+# Every row the transcript draws, whatever kind: a message is `.msg`, and a
+# divider, a tool strip or a warning is `.line`.
+TRANSCRIPT_ROWS = '#transcript > *'
 USER_LINE = '#transcript .msg.user'
 REPLY_LINE = '#transcript .msg.assistant'
 EARLIER = '#earlier'
@@ -89,6 +92,9 @@ BACK = '#btn-back'
 MORE = '#btn-more'
 SHEET = '#view-sheet'
 SHEET_CLOSE = '#btn-sheet-close'
+CLEAR_ROW = '#row-clear'
+CLEAR_BTN = '#btn-clear'
+CLEAR_NOTE = '#view-clear'
 WATCH_CHILD = '#transcript .child-watch'
 CHILD_PANEL = '#child-panel'
 CHILD_LINE = '#child-transcript .msg'
@@ -426,6 +432,20 @@ def numbers(page, selector, prefix):
 
 def drawn_lines(page):
     return page.locator(TRANSCRIPT_LINE).count()
+
+
+def settled_rows(page):
+    """How many rows the transcript holds once the tail replay has stopped
+    drawing: the count is read until two reads in a row agree, so a check does
+    not mistake the replay's own arrivals for a row a control drew."""
+    rows = -1
+    for _ in range(50):
+        counted = page.locator(TRANSCRIPT_ROWS).count()
+        if counted == rows:
+            return counted
+        rows = counted
+        page.wait_for_timeout(100)
+    return rows
 
 
 def page_drawn(page, lines_before):
@@ -1333,10 +1353,41 @@ def check_addresses(browser, errors):
 
 
 def check_leaving_clears_the_view(browser, errors):
-    page = new_page(browser, errors)
+    # The fork's route is held and then aborted, so the browser logs the failed
+    # request it was made to fail: this page declares its own error responses.
+    page = new_page(browser, errors, http_errors=True)
+    # A request the reader walks away from must not hold the next screen's
+    # control or leave its note there. The fork's request is held open, so
+    # nothing but the teardown can give the control back: the handler's own
+    # re-enable belongs to the screen the request was made for.
+    held = []
+    page.route('**/fork', lambda route: held.append(route))
+    open_session(page, LONG)
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    page.tap('#btn-fork')
+    check('a fork in flight turns the control off and names what it waits for',
+          until(page, "() => document.querySelector('#view-fork').textContent === 'forking…'")
+          and page.is_disabled('#btn-fork'), page.inner_text('#view-fork'))
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    open_from_list(page, LONG_ROW)
+    left_behind = page.evaluate("""() => {
+      const $ = (id) => document.getElementById(id);
+      return {
+        disabled: [$('btn-fork').disabled, $('btn-clear').disabled],
+        notes: [$('view-fork').textContent, $('view-clear').textContent],
+      };
+    }""")
+    check('a request left behind holds no control and leaves no note on the next session',
+          left_behind == {'disabled': [False, False], 'notes': ['', '']}, left_behind)
+    for route in held:
+        route.abort()
+    page.unroute('**/fork')
+
     open_session(page, CHILD)
     page.wait_for_selector('#watch-banner', state='visible')
-    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-interrupt', 'row-stop']
+    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-interrupt', 'row-stop']
       .map(id => document.getElementById(id).hidden)""")
     check('a watch-only child has no chat box and no controls in its sheet', all(hidden), hidden)
     page.tap(MORE)
@@ -1347,11 +1398,11 @@ def check_leaving_clears_the_view(browser, errors):
       const $ = (id) => document.getElementById(id);
       return {
         sheets: [$('view-sheet').hidden, $('ask-sheet').hidden],
-        text: ['view-node', 'view-dir', 'view-id-copy', 'view-sheet-meta', 'view-waiting', 'view-permission', 'view-fork']
+        text: ['view-node', 'view-dir', 'view-id-copy', 'view-sheet-meta', 'view-waiting', 'view-permission', 'view-fork', 'view-clear']
           .map(id => $(id).textContent).join(''),
         waiting: $('view-waiting').hidden,
         footer: [$('input-row').hidden, $('watch-banner').hidden],
-        rows: ['row-permission', 'row-persona', 'row-fork', 'row-interrupt', 'row-stop'].map(id => $(id).hidden),
+        rows: ['row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-interrupt', 'row-stop'].map(id => $(id).hidden),
         permission: $('btn-permission').textContent,
         dot: $('view-state-dot').className,
         persona: $('persona-name').value,
@@ -1359,7 +1410,7 @@ def check_leaving_clears_the_view(browser, errors):
     }""")
     check('leaving a session clears its header and sheet, closes its sheets and gives the footer back', state == {
         'sheets': [True, True], 'text': '', 'waiting': True, 'footer': [False, True],
-        'rows': [False] * 5, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
+        'rows': [False] * 6, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
     }, state)
     page.context.close()
 
@@ -1701,6 +1752,78 @@ def check_fork(browser, errors):
     page.context.close()
 
 
+def check_clear(browser, errors):
+    page = new_page(browser, errors, http_errors=True)
+    # The control asks before it posts, so every press here answers the
+    # browser's own confirm box.
+    page.on('dialog', lambda dialog: dialog.accept())
+    open_session(page, LONG)
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    check('a root session offers the clear control in its actions sheet',
+          page.is_visible(CLEAR_ROW) and page.inner_text(CLEAR_BTN) == 'Clear context',
+          page.inner_text(CLEAR_BTN))
+
+    # The pane draws nothing for a clear: the break is the marker's own durable
+    # event on the session's stream, and this route sends none. Every row the
+    # transcript holds is counted, the divider kind included, so a handler that
+    # drew the break itself fails here.
+    rows = settled_rows(page)
+    page.route('**/clear', lambda route: route.fulfill(status=204, body=''))
+    page.tap(CLEAR_BTN)
+    check('a clear closes the sheet, toasts, and draws no row of its own',
+          until(page, "() => document.querySelector('#toast').textContent === 'context cleared'")
+          and page.is_hidden(SHEET) and settled_rows(page) == rows,
+          settled_rows(page))
+    # The answer leaves nothing to wait for: the sheet that opens next has no
+    # note and a live control, not the `clearing…` the request wrote.
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    check('a clear that answered leaves no note behind and a live control',
+          page.inner_text(CLEAR_NOTE) == '' and not page.is_disabled(CLEAR_BTN),
+          [page.inner_text(CLEAR_NOTE), page.is_disabled(CLEAR_BTN)])
+    page.unroute('**/clear')
+
+    page.route('**/clear', lambda route: route.fulfill(
+        status=409, body='the session is running; interrupt it first'))
+    page.tap(MORE)
+    page.wait_for_selector(SHEET, state='visible')
+    page.tap(CLEAR_BTN)
+    refused = until(page, f"() => document.querySelector('{CLEAR_NOTE}').textContent.startsWith('clear: ')")
+    check('a refused clear says so beside the control, and the control comes back',
+          refused and page.is_visible(SHEET) and not page.is_disabled(CLEAR_BTN),
+          page.inner_text(CLEAR_NOTE))
+    page.unroute('**/clear')
+
+    # A request that never answers must not leave a control stuck: it names what
+    # it waits for while it runs, and the session change that follows gives the
+    # control and the note back. The route is held open, so nothing but the
+    # session change can answer for it.
+    held = []
+    page.route('**/clear', lambda route: held.append(route))
+    page.wait_for_selector(SHEET, state='visible')
+    page.tap(CLEAR_BTN)
+    check('a clear in flight turns the control off and names what it waits for',
+          until(page, f"() => document.querySelector('{CLEAR_NOTE}').textContent === 'clearing…'")
+          and page.is_disabled(CLEAR_BTN), page.inner_text(CLEAR_NOTE))
+
+    page.go_back()
+    page.wait_for_selector(VIEW, state='hidden')
+    open_from_list(page, LONG_ROW)
+    # The sheet is hidden again, so the control and its note are read from the
+    # document rather than through a visible-locator call.
+    after = page.evaluate(
+        f"() => [document.querySelector('{CLEAR_BTN}').disabled, "
+        f"document.querySelector('{CLEAR_NOTE}').textContent]")
+    check('leaving the session gives the clear control and its note back',
+          after == [False, ''], after)
+    # The held request is aborted before the route is dropped, so it never
+    # reaches the server and cannot clear the session the later checks read.
+    for route in held:
+        route.abort()
+    page.unroute('**/clear')
+    page.context.close()
+
 
 def text_frame(role, text):
     return message_frame(role, {'kind': 'text', 'text': text}, 1)
@@ -1849,6 +1972,7 @@ CHECKS = [
     check_screens,
     check_viewport_report,
     check_fork,
+    check_clear,
     check_following,
     check_ask_records,
 ]

@@ -7,6 +7,7 @@ import {
   askFree,
   askSheet,
   btnBack,
+  btnClear,
   btnCopyId,
   btnFork,
   btnInterrupt,
@@ -21,6 +22,7 @@ import {
   inputRow,
   isNarrow,
   personaName,
+  rowClear,
   rowFork,
   rowInterrupt,
   rowPermission,
@@ -28,6 +30,7 @@ import {
   rowStop,
   transcript,
   view,
+  viewClear,
   viewDir,
   viewFork,
   viewIdCopy,
@@ -206,9 +209,16 @@ function clearHeader() {
   rowPermission.hidden = false;
   rowPersona.hidden = false;
   rowFork.hidden = false;
+  rowClear.hidden = false;
   rowInterrupt.hidden = false;
   rowStop.hidden = false;
+  // The sheet's controls come back live with their rows: a request the reader
+  // left behind is nobody's to answer, so it must not hold a control off, or
+  // leave its note, on the session the pane shows next.
+  btnFork.disabled = false;
+  btnClear.disabled = false;
   viewFork.textContent = '';
+  viewClear.textContent = '';
 }
 
 async function fetchSession(s) {
@@ -270,6 +280,7 @@ function updateHeader(session) {
   rowPermission.hidden = watchOnly;
   rowPersona.hidden = watchOnly;
   rowFork.hidden = watchOnly;
+  rowClear.hidden = watchOnly;
   rowInterrupt.hidden = watchOnly;
   rowStop.hidden = watchOnly;
 }
@@ -285,9 +296,10 @@ function updatePermissionBadge(permission) {
 // from here on. A refusal — no recorded repository, a child, a session that is
 // not waiting for input — is shown in the sheet, which is where the control is.
 btnFork.addEventListener('click', async () => {
-  viewFork.textContent = '';
   // The clone takes seconds, and a second click would start a second fork: the
-  // control is disabled until this one answers.
+  // control is disabled until this one answers, and the note says what it is
+  // waiting for.
+  viewFork.textContent = 'forking…';
   btnFork.disabled = true;
   // The clone takes seconds, and the reader may leave the session in them: the
   // fork is theirs either way, but the pane only jumps to it if they are still
@@ -305,7 +317,48 @@ btnFork.addEventListener('click', async () => {
   } catch (error) {
     if (opened === started) viewFork.textContent = 'fork: ' + error.message;
   } finally {
-    btnFork.disabled = false;
+    // The control belongs to the screen this request was made for; a later
+    // screen's is the teardown's to set.
+    if (opened === started) btnFork.disabled = false;
+  }
+});
+
+// Clearing cuts the session's thread at a durable marker and starts the model
+// fresh from the next message. The transcript keeps everything, so the pane
+// draws nothing itself: the session's own stream carries the divider.
+btnClear.addEventListener('click', async () => {
+  if (
+    !window.confirm(
+      "Clear this session's context? The transcript keeps everything; the model starts fresh."
+    )
+  ) {
+    return;
+  }
+  viewClear.textContent = 'clearing…';
+  // The clear is one store write, but a second click would post a second one:
+  // the control is disabled until this one answers, and the note says what it
+  // is waiting for.
+  btnClear.disabled = true;
+  // The reader may leave the session while the write is in flight: the sheet
+  // and the toast belong only to a screen still showing the session it was for.
+  const started = opened;
+  try {
+    await post('/sessions/' + encodeURIComponent(started.id) + '/clear', {});
+    if (opened !== started) return;
+    // The request answered, so there is nothing to wait for: the note goes
+    // with the sheet, and the toast is what reports the clear.
+    viewClear.textContent = '';
+    viewSheet.hidden = true;
+    toastOk('context cleared');
+  } catch (error) {
+    // A refusal — a running session, one still being created, a pending
+    // question — is shown where the control is, in the sheet.
+    if (opened === started) viewClear.textContent = 'clear: ' + error.message;
+  } finally {
+    // Only the screen this request was made for takes its control back: the
+    // next screen's state is the teardown's, and an old attempt's answer must
+    // not re-enable a control a new attempt has just turned off.
+    if (opened === started) btnClear.disabled = false;
   }
 });
 

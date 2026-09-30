@@ -16,6 +16,7 @@ export {
   btnBottom,
   btnBrowse,
   btnChildCollapse,
+  btnClear,
   btnCopyId,
   btnDirClose,
   btnDirUp,
@@ -84,6 +85,7 @@ export {
   personaChips,
   personaName,
   recentList,
+  rowClear,
   rowFork,
   rowInterrupt,
   rowPermission,
@@ -100,6 +102,7 @@ export {
   toastEl,
   transcript,
   view,
+  viewClear,
   viewDir,
   viewFork,
   viewIdCopy,
@@ -200,6 +203,9 @@ const rowPersona = $('row-persona');
 const rowFork = $('row-fork');
 const btnFork = $('btn-fork');
 const viewFork = $('view-fork');
+const rowClear = $('row-clear');
+const btnClear = $('btn-clear');
+const viewClear = $('view-clear');
 const rowInterrupt = $('row-interrupt');
 const rowStop = $('row-stop');
 const inputRow = $('input-row');

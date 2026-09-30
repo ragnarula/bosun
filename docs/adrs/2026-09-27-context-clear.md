@@ -3,6 +3,8 @@
 **Date:** 2026-09-27
 **Author:** Raghav
 
+> Superseded in part by `2026-09-29-reader-clears-the-context.md`: the reader can clear a session's context from the pane — the same marker and cut, with no instructions row, so the session waits for the reader's next message. The tool's decisions, the marker's shape, the archive boundary and the pending-ask refusal stand.
+
 ## Context
 
 A session's model reads a window: the active messages of its store thread, oldest first, plus the fixed session context and manifest. `crates/bosun-agent/src/agent_loop.rs` reads that window at the start of every turn, and `maybe_compact` retires the oldest half of it when a completion reports a full context, replacing the retired tail with a `Block::Summary` message and archiving the rows it retired. The reader — the terminal client and the web pane — sees a different thing: the durable event stream, where every message row also lands as an event, and archived rows stay in it.

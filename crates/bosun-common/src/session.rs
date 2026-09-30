@@ -184,13 +184,16 @@ pub enum Block {
     /// this point and continued from `instructions`. The row is durable and
     /// visible, and the loop archives it with the history it closes, so the
     /// model's next window starts after it while the reader's transcript keeps
-    /// everything.
+    /// everything. An empty `instructions` is the reader's clear: no prompt was
+    /// written, and the session waits for the reader's next message.
     ContextCleared {
         /// Why the session cleared its context, in the words it gave. The
         /// reason is required: a clear must say what it is for.
         reason: String,
         /// The prompt the session continues from: the first row of its next
-        /// window, and the task it picks the work up with.
+        /// window, and the task it picks the work up with. Empty when the
+        /// reader cleared the context: nothing was written for the session to
+        /// answer, and the reader's next message starts the new thread.
         instructions: String,
     },
     /// The model's thinking for one completion, when the provider streams it

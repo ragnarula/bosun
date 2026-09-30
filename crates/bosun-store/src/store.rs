@@ -963,44 +963,7 @@ impl Store {
         let instructions = instructions.to_string();
         self.with_session(session_id, move |conn, session_id| {
             let tx = transaction(conn)?;
-            // The window as it stands inside the transaction: what the model
-            // could read, which is what the boundary is about.
-            let active: Vec<i64> = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT id FROM messages WHERE session_id = ?1 AND archived = 0 ORDER BY id",
-                    )
-                    .context("failed to prepare the window query")?;
-                stmt.query_map(params![session_id], |row| row.get(0))?
-                    .collect::<Result<Vec<i64>, _>>()
-                    .context("failed to read the window")?
-            };
-            let marker_id = insert_message(
-                &tx,
-                session_id,
-                &Message {
-                    role: Role::Assistant,
-                    block: Block::ContextCleared {
-                        reason,
-                        instructions: instructions.clone(),
-                    },
-                },
-            )?;
-            tx.execute(
-                "UPDATE messages SET archived = 1 WHERE session_id = ?1 AND id <= ?2",
-                params![session_id, marker_id],
-            )
-            .context("failed to archive the cleared history")?;
-            for id in active {
-                if own.contains(&id) {
-                    continue;
-                }
-                tx.execute(
-                    "UPDATE messages SET archived = 0 WHERE session_id = ?1 AND id = ?2",
-                    params![session_id, id],
-                )
-                .context("failed to keep an unread message in the window")?;
-            }
+            let marker_id = cut_context_tx(&tx, session_id, Some(&own), &reason, &instructions)?;
             let instructions_id = insert_message(
                 &tx,
                 session_id,
@@ -1011,6 +974,33 @@ impl Store {
             )?;
             tx.commit().context("failed to commit the clear")?;
             Ok((marker_id, instructions_id))
+        })
+        .await
+    }
+
+    /// Clears a session's context for its reader: the marker row and the
+    /// archive cut at it, in one transaction and one lock hold, and no
+    /// instructions row — the session waits for the reader's next message,
+    /// which starts the new thread. The marker records an empty `instructions`
+    /// field, because the reader gives none.
+    ///
+    /// The cut retires every active row and restores none. Unlike the agent's
+    /// clear this runs outside a turn: there is no row the session has not
+    /// read to put back, and the reader's next message is a new row, above the
+    /// boundary and active like any other.
+    ///
+    /// Returns the marker row's id.
+    pub async fn clear_context_by_reader(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<i64, StoreError> {
+        let reason = reason.to_string();
+        self.with_session(session_id, move |conn, session_id| {
+            let tx = transaction(conn)?;
+            let marker_id = cut_context_tx(&tx, session_id, None, &reason, "")?;
+            tx.commit().context("failed to commit the clear")?;
+            Ok(marker_id)
         })
         .await
     }
@@ -2212,6 +2202,70 @@ fn insert_message(
         },
     )?;
     Ok(message_id)
+}
+
+/// The one clear cut both callers run in their transaction: the marker row, the
+/// archive cut at it, and the rows the cut would otherwise swallow put back in
+/// the window.
+///
+/// `own` names the rows a clearing turn wrote itself, which the boundary
+/// retires with the history; every other row that was active when the cut ran
+/// is put back, because the session has not read it. `None` is the reader's
+/// clear: it retires every active row and restores none.
+///
+/// `instructions` is what the marker records. It is the empty string when the
+/// caller writes no instructions row, which is the reader's clear: the caller
+/// appends that row itself, inside the same transaction, when it has one.
+///
+/// Returns the marker's id.
+fn cut_context_tx(
+    tx: &rusqlite::Transaction,
+    session_id: &str,
+    own: Option<&[i64]>,
+    reason: &str,
+    instructions: &str,
+) -> Result<i64, anyhow::Error> {
+    let unread: Vec<i64> = match own {
+        // The window as it stands inside the transaction: what the model could
+        // read, which is what the boundary is about.
+        Some(own) => {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM messages WHERE session_id = ?1 AND archived = 0 ORDER BY id",
+                )
+                .context("failed to prepare the window query")?;
+            let active: Vec<i64> = stmt
+                .query_map(params![session_id], |row| row.get(0))?
+                .collect::<Result<Vec<i64>, _>>()
+                .context("failed to read the window")?;
+            active.into_iter().filter(|id| !own.contains(id)).collect()
+        }
+        None => Vec::new(),
+    };
+    let marker_id = insert_message(
+        tx,
+        session_id,
+        &Message {
+            role: Role::Assistant,
+            block: Block::ContextCleared {
+                reason: reason.to_string(),
+                instructions: instructions.to_string(),
+            },
+        },
+    )?;
+    tx.execute(
+        "UPDATE messages SET archived = 1 WHERE session_id = ?1 AND id <= ?2",
+        params![session_id, marker_id],
+    )
+    .context("failed to archive the cleared history")?;
+    for id in unread {
+        tx.execute(
+            "UPDATE messages SET archived = 0 WHERE session_id = ?1 AND id = ?2",
+            params![session_id, id],
+        )
+        .context("failed to keep an unread message in the window")?;
+    }
+    Ok(marker_id)
 }
 
 /// The session's pending raised ask row, when it has one.
@@ -3600,6 +3654,132 @@ mod tests {
             active.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             [instructions],
             "only the fresh prompt is left: the retired row stays retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_context_by_reader_retires_the_window_and_writes_no_prompt() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        let first = store
+            .append_message("a", Role::User, &Block::Text { text: "old".into() })
+            .await
+            .unwrap();
+        let second = store
+            .append_message(
+                "a",
+                Role::Assistant,
+                &Block::Text {
+                    text: "older".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let marker = store
+            .clear_context_by_reader("a", "the reader started fresh")
+            .await
+            .unwrap();
+
+        assert!(
+            store.messages("a", false).await.unwrap().is_empty(),
+            "the reader's clear retires every active row and starts from nothing"
+        );
+        let all = store.messages("a", true).await.unwrap();
+        assert_eq!(
+            all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first, second, marker],
+            "the marker is the newest row: no instructions row follows it"
+        );
+        assert!(
+            matches!(&all[2].1.block, Block::ContextCleared { reason, instructions }
+                if reason == "the reader started fresh" && instructions.is_empty()),
+            "the marker carries the reason and no instructions"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_context_by_reader_appends_the_marker_as_the_newest_event() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+        store
+            .append_message("a", Role::User, &Block::Text { text: "old".into() })
+            .await
+            .unwrap();
+
+        store
+            .clear_context_by_reader("a", "the reader started fresh")
+            .await
+            .unwrap();
+
+        let events = store.events_after("a", 0).await.unwrap();
+        assert_eq!(events.len(), 2, "the message and the marker's own event");
+        assert!(
+            matches!(&events[1].1, Event::Message { message, .. }
+                if matches!(&message.block, Block::ContextCleared { reason, .. }
+                    if reason == "the reader started fresh")),
+            "the divider both clients draw arrives as the marker's message event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_appended_after_the_readers_clear_stays_active() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+        store
+            .append_message("a", Role::User, &Block::Text { text: "old".into() })
+            .await
+            .unwrap();
+        let marker = store
+            .clear_context_by_reader("a", "the reader started fresh")
+            .await
+            .unwrap();
+
+        let next = store
+            .append_message(
+                "a",
+                Role::User,
+                &Block::Text {
+                    text: "carry on".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let active = store.messages("a", false).await.unwrap();
+        assert_eq!(
+            active.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [next],
+            "the row the reader sent after the clear is above the boundary"
+        );
+        assert!(next > marker, "it was written after the marker");
+    }
+
+    #[tokio::test]
+    async fn clearing_an_empty_thread_writes_only_the_marker() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("a")).await.unwrap();
+
+        let marker = store
+            .clear_context_by_reader("a", "the reader started fresh")
+            .await
+            .unwrap();
+
+        let all = store.messages("a", true).await.unwrap();
+        assert_eq!(
+            all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [marker],
+            "there was nothing to retire, so the marker is the whole thread"
+        );
+        assert!(
+            matches!(&all[0].1.block, Block::ContextCleared { reason, instructions }
+                if reason == "the reader started fresh" && instructions.is_empty()),
+            "and it records the same reason and no instructions"
         );
     }
 

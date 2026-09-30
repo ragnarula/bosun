@@ -635,4 +635,28 @@ mod tests {
             "the toast sits above the Home indicator rather than in it"
         );
     }
+
+    // The clear control is a row of the actions sheet. What the row does when
+    // it is pressed is checked in a browser (`tests/browser.rs`); this reads the
+    // source a browser check cannot: the markup row, the URL the handler posts
+    // to, and the watch-only token that keeps the row off a child.
+
+    #[test]
+    fn the_pane_clears_the_context_from_the_actions_sheet() {
+        assert!(
+            PANE.contains(
+                "<div class=\"view-sheet-row\" id=\"row-clear\">\n    <button type=\"button\" id=\"btn-clear\">Clear context</button>\n    <span class=\"view-sheet-note\" id=\"view-clear\"></span>"
+            ),
+            "the clear control lives in the session actions sheet, with its own row and its own note"
+        );
+        let handler = squeezed(segment(PANE, "btnClear.addEventListener('click'", "\n});"));
+        assert!(
+            handler.contains(&squeezed("encodeURIComponent(started.id) + '/clear'")),
+            "the control posts to the clear route for the session it was clicked in"
+        );
+        assert!(
+            PANE.contains("rowClear.hidden = watchOnly;"),
+            "the row is hidden for a watch-only child, like the sheet's other controls"
+        );
+    }
 }

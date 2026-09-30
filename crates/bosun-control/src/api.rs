@@ -633,6 +633,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/messages", post(add_message))
         .route("/sessions/{id}/reject", post(reject_ask))
         .route("/sessions/{id}/fork", post(fork))
+        .route("/sessions/{id}/clear", post(clear))
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/permission", post(set_permission))
         .route("/sessions/{id}/persona", post(switch_persona))
@@ -1085,6 +1086,57 @@ async fn fork(
         "session forked"
     );
     Ok(Json(stored))
+}
+
+/// The reason recorded on a clear the reader asked for from the pane. The
+/// `clear_context` tool takes its reason from the model; the reader's clear
+/// has none to take, and the marker still has to say why the thread breaks.
+const READER_CLEAR_REASON: &str = "the reader started fresh";
+
+/// Clears a session's context for its reader: the marker row and the archive
+/// cut at it, and no instructions row, so the session waits for the reader's
+/// next message and starts the new thread from it. Nothing is appended and no
+/// wake is sent — the session keeps its state, and its next turn reads the
+/// fresh window. Any session may be cleared: a child's context is its own.
+#[instrument(skip(state))]
+async fn clear(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id });
+    };
+    match session.state {
+        // The loop holds the window a running session reads, and it writes the
+        // turn's own rows back after a clear; a clear from outside the turn
+        // would race it.
+        SessionState::Running => {
+            return Err(ApiError::Conflict(
+                "the session is running; interrupt it first".into(),
+            ));
+        }
+        // A session being created has no thread to read yet.
+        SessionState::Creating => {
+            return Err(ApiError::Conflict(
+                "the session is still being created; try again when it is waiting for input".into(),
+            ));
+        }
+        _ => {}
+    }
+    // A question the session raised lives in the rows the cut archives, while
+    // the `pending_asks` binding survives: the question would leave the model's
+    // window and the next `ask` would still be refused.
+    if state.store.get_pending_ask(&id).await?.is_some() {
+        return Err(ApiError::Conflict(
+            "a question is pending; answer it, or reject it, before clearing the context".into(),
+        ));
+    }
+    state
+        .store
+        .clear_context_by_reader(&id, READER_CLEAR_REASON)
+        .await?;
+    info!(session_id = %id, "the reader cleared the context");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[instrument(skip(state))]
@@ -8234,6 +8286,179 @@ mod tests {
                 && carried.iter().any(|text| text == "take it further"),
             "the fork's first request carries the copied thread and the new message: {carried:?}"
         );
+    }
+
+    /// The pane's clear: the session's context is cut at the marker, no row
+    /// follows it, and the session waits for the reader's next message.
+    #[tokio::test]
+    async fn clear_cuts_the_context_and_leaves_the_session_waiting() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let mut waiting = session("root-1");
+        waiting.state = SessionState::WaitingForInput;
+        state.store.create_session(&waiting).await.unwrap();
+        state
+            .store
+            .append_message(
+                "root-1",
+                Role::User,
+                &Block::Text {
+                    text: "the task".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let addr = serve(state.clone()).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/sessions/root-1/clear"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            state
+                .store
+                .messages("root-1", false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the whole thread is archived and no row follows the marker"
+        );
+        let all = state.store.messages("root-1", true).await.unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "the task's row and the marker are the whole thread"
+        );
+        assert!(
+            matches!(&all[1].1.block, Block::ContextCleared { reason, instructions }
+                if reason == READER_CLEAR_REASON && instructions.is_empty()),
+            "the marker carries the reader's reason and no instructions"
+        );
+        assert_eq!(
+            state
+                .store
+                .get_session("root-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            SessionState::WaitingForInput,
+            "the clear wakes nothing and changes no state"
+        );
+    }
+
+    /// A clear refuses a session whose state or open question would make the
+    /// cut wrong, and writes nothing: the thread stays as it was, with no
+    /// marker.
+    #[tokio::test]
+    async fn clear_refuses_a_running_creating_or_asked_session_without_writing() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        for (id, session_state) in [
+            ("running-1", SessionState::Running),
+            ("creating-1", SessionState::Creating),
+            ("asked-1", SessionState::WaitingForInput),
+        ] {
+            let mut row = session(id);
+            row.state = session_state;
+            state.store.create_session(&row).await.unwrap();
+            state
+                .store
+                .append_message(
+                    id,
+                    Role::User,
+                    &Block::Text {
+                        text: "the task".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        state
+            .store
+            .set_pending_ask("asked-1", "child-1", "child-1", "may I push?", 1)
+            .await
+            .unwrap();
+
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let clear = |id: &str| {
+            client
+                .post(format!("http://{addr}/sessions/{id}/clear"))
+                .send()
+        };
+
+        // The statuses are the check. The wording is presentation.
+        assert_eq!(
+            clear("ghost").await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        for id in ["running-1", "creating-1", "asked-1"] {
+            assert_eq!(
+                clear(id).await.unwrap().status(),
+                StatusCode::CONFLICT,
+                "{id} refuses the clear"
+            );
+            assert_eq!(
+                state.store.messages(id, true).await.unwrap().len(),
+                1,
+                "{id} keeps its thread and gains no marker"
+            );
+        }
+    }
+
+    /// The states a clear accepts: a stopped or an interrupted session has a
+    /// thread to cut and no turn that could be reading it, so it clears like one
+    /// waiting for input.
+    #[tokio::test]
+    async fn clear_cuts_the_context_of_a_stopped_or_interrupted_session() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        for (id, session_state) in [
+            ("stopped-1", SessionState::Stopped),
+            ("interrupted-1", SessionState::Interrupted),
+        ] {
+            let mut row = session(id);
+            row.state = session_state;
+            state.store.create_session(&row).await.unwrap();
+            state
+                .store
+                .append_message(
+                    id,
+                    Role::User,
+                    &Block::Text {
+                        text: "the task".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        for id in ["stopped-1", "interrupted-1"] {
+            let response = client
+                .post(format!("http://{addr}/sessions/{id}/clear"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{id} clears");
+
+            assert!(
+                state.store.messages(id, false).await.unwrap().is_empty(),
+                "{id}: every earlier row is archived and no row follows the marker"
+            );
+            let all = state.store.messages(id, true).await.unwrap();
+            assert_eq!(all.len(), 2, "{id}: the task's row and the marker");
+            assert!(
+                matches!(&all[1].1.block, Block::ContextCleared { reason, instructions }
+                    if reason == READER_CLEAR_REASON && instructions.is_empty()),
+                "{id}: the marker carries the reader's reason and no instructions"
+            );
+        }
     }
 
     /// The resume waits for the session's node: the nodes dial back in after a
