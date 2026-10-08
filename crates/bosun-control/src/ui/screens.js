@@ -1,14 +1,17 @@
 // The pane's screens: the home column with the session list, an open session,
-// and the machines, skills and MCP tabs. Exactly one is in the page at a time,
-// in the body's normal flow; the others are hidden.
+// and the projects, machines, skills, MCP and crew tabs. On a phone exactly
+// one is in the page at a time, in the body's normal flow; the others are
+// hidden. From 900px
+// an open session keeps the home column beside it as a rail, so the reader
+// moves between sessions without leaving the one on screen.
 
-import { $, machinesTab, mcpTab, skillsTab, view } from './dom.js';
+import { $, crewTab, isWide, machinesTab, mcpTab, projectsTab, skillsTab, view } from './dom.js';
 
 export { home, leaveScreen, showScreen };
 
 const home = $('home');
 const homeList = home.querySelector('main');
-const SCREENS = [home, view, machinesTab, skillsTab, mcpTab];
+const SCREENS = [home, view, machinesTab, skillsTab, mcpTab, crewTab, projectsTab];
 
 let current = home;
 // The session list's scroll while another screen shows: a hidden box leaves
@@ -17,13 +20,23 @@ let listScroll = 0;
 
 function showScreen(screen) {
   if (screen === current) return;
-  if (current === home) listScroll = homeList.scrollTop;
-  for (const each of SCREENS) each.hidden = each !== screen;
+  if (!home.hidden) listScroll = homeList.scrollTop;
   current = screen;
-  if (screen === home) homeList.scrollTop = listScroll;
+  layout();
+  if (!home.hidden) homeList.scrollTop = listScroll;
+}
+
+// Shows the current screen, and the home column beside an open session on a
+// wide screen.
+function layout() {
+  const rail = current === view && isWide();
+  for (const each of SCREENS) each.hidden = each !== current && !(rail && each === home);
+  document.body.classList.toggle('with-rail', rail);
 }
 
 // Returns to the home column, if `screen` is the one showing.
 function leaveScreen(screen) {
   if (current === screen) showScreen(home);
 }
+
+window.addEventListener('resize', layout);

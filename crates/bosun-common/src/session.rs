@@ -82,6 +82,49 @@ pub struct Session {
     pub summary: Option<String>,
 }
 
+/// What a session is doing, served beside it in the session list so a client
+/// can draw the session without opening its stream.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionOverview {
+    /// The summed cost of the session's metered model calls.
+    #[serde(default)]
+    pub cost: f64,
+    /// The session's newest loop activity.
+    #[serde(default)]
+    pub activity: Option<ActivityAt>,
+    /// Whether the session's newest message is a question with no answer.
+    #[serde(default)]
+    pub asking: bool,
+    /// The session's task list, counted by status.
+    #[serde(default)]
+    pub tasks: TaskCounts,
+}
+
+/// One loop activity and when the loop recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityAt {
+    pub at_ms: u64,
+    #[serde(flatten)]
+    pub phase: ActivityPhase,
+}
+
+/// A task list counted by status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCounts {
+    pub total: usize,
+    pub done: usize,
+    pub in_progress: usize,
+}
+
+/// A session as the session list serves it: the row, then its overview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    #[serde(flatten)]
+    pub session: Session,
+    #[serde(flatten)]
+    pub overview: SessionOverview,
+}
+
 fn default_allowed_tools() -> String {
     ALL_TOOLS.into()
 }
@@ -315,6 +358,13 @@ pub enum Event {
         #[serde(flatten)]
         phase: ActivityPhase,
     },
+    /// The root session's task list, as `todowrite` last replaced it. Each
+    /// item is the call's own object: `id`, `content`, `status`, and the
+    /// optional `kind` and `owner`.
+    Todos {
+        at_ms: Option<u64>,
+        items: Vec<Value>,
+    },
     /// A note the loop recorded for the user: something it handled that the
     /// user should see, such as a selected MCP server being unavailable.
     Warning {
@@ -333,7 +383,8 @@ impl Event {
             | Event::State { at_ms, .. }
             | Event::Permission { at_ms, .. }
             | Event::Persona { at_ms, .. }
-            | Event::ModelCall { at_ms, .. } => *at_ms,
+            | Event::ModelCall { at_ms, .. }
+            | Event::Todos { at_ms, .. } => *at_ms,
             Event::Activity { at_ms, .. } => Some(*at_ms),
             Event::Warning { .. } => None,
         }
@@ -361,6 +412,13 @@ pub enum ActivityPhase {
     },
     ToolStarted {
         name: String,
+        /// What the call works on, read from its arguments: the path a file
+        /// tool reads or writes, the first line of a shell command, a search
+        /// pattern, a URL, a skill, a persona to spawn, or a child to message.
+        /// A client says "editing winsw.ts" from the event alone. Skipped when
+        /// None, so a call with no target serializes as it did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     ToolFinished {
         name: String,
@@ -383,6 +441,22 @@ pub enum ActivityPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_start_without_a_target_serializes_as_it_did_before_targets() {
+        let phase = ActivityPhase::ToolStarted {
+            name: "ask".into(),
+            target: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&phase).unwrap(),
+            serde_json::json!({ "phase": "tool_started", "name": "ask" })
+        );
+        let old: ActivityPhase =
+            serde_json::from_value(serde_json::json!({ "phase": "tool_started", "name": "ask" }))
+                .unwrap();
+        assert_eq!(old, phase, "a stored start with no target reads back");
+    }
 
     #[test]
     fn permission_parses_and_serializes_snake_case() {
@@ -675,6 +749,11 @@ mod tests {
             },
             ActivityPhase::ToolStarted {
                 name: "shell".into(),
+                target: None,
+            },
+            ActivityPhase::ToolStarted {
+                name: "edit".into(),
+                target: Some("src/main.rs".into()),
             },
             ActivityPhase::ToolFinished {
                 name: "shell".into(),

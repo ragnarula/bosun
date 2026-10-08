@@ -18,13 +18,15 @@ import {
   btnStop,
   btnWatchOpen,
   chatRow,
+  chipPermission,
+  chipPermissionText,
+  chipPersona,
   input,
   inputRow,
   isNarrow,
   personaName,
   rowClear,
   rowFork,
-  rowInterrupt,
   rowPermission,
   rowPersona,
   rowStop,
@@ -39,6 +41,7 @@ import {
   viewSheet,
   viewSheetMeta,
   viewStateDot,
+  viewSummary,
   viewTitle,
   viewWaiting,
   watchBanner,
@@ -66,6 +69,9 @@ import {
 } from './transcript.js';
 import { closeChildPanel } from './subagents.js';
 import { TAIL_MESSAGES, startEarlier } from './earlier.js';
+import { closeCrew, openCrew, personaChipContent, renderCrew } from './crew.js';
+import { updateProjectLink } from './project-map.js';
+import { closeNotifications } from './device.js';
 
 export { closeSession, coarsePointer, opened, showSession };
 
@@ -108,6 +114,9 @@ function newSessionState(id) {
     earlier: { before: null, more: false, loading: false, row: null },
     // The child the subagent panel follows, or null while the panel is closed.
     panel: null,
+    // The crew: the session's whole tree on one stream, drawn in the Chat,
+    // Tasks and Files views; null until the session's tree root is known.
+    crew: null,
   };
 }
 
@@ -115,6 +124,7 @@ function newSessionState(id) {
 // stream of the child its panel follows.
 function stopSession(s) {
   if (s.es) s.es.close();
+  closeCrew(s);
   if (s.panel) s.panel.es.close();
   window.clearInterval(s.statusTick);
   window.clearTimeout(s.askSyncTimer);
@@ -135,7 +145,13 @@ function showSession(id) {
   opened = s;
   showScreen(view);
   const session = sessions.find((listed) => listed.id === id);
-  if (session) updateHeader(session);
+  if (session) {
+    updateHeader(session);
+    openCrew(s, session.owner_id || session.id);
+  }
+  // The reader has the tree on screen, so its notification has done its job.
+  closeNotifications(session ? session.owner_id || session.id : id);
+  updateProjectLink();
   fetchSession(s);
   // EventSource reconnects automatically; durable frames carry the event seq
   // as their SSE id, so the browser resumes with Last-Event-ID.
@@ -195,6 +211,10 @@ function closeSession() {
 // cannot read yet shows nothing of the session before it.
 function clearHeader() {
   viewStateDot.className = 'dot';
+  viewSummary.textContent = '';
+  chipPersona.textContent = '';
+  chipPermissionText.textContent = '';
+  btnInterrupt.hidden = true;
   viewNode.textContent = '';
   viewDir.textContent = '';
   viewIdCopy.textContent = '';
@@ -210,7 +230,6 @@ function clearHeader() {
   rowPersona.hidden = false;
   rowFork.hidden = false;
   rowClear.hidden = false;
-  rowInterrupt.hidden = false;
   rowStop.hidden = false;
   // The sheet's controls come back live with their rows: a request the reader
   // left behind is nobody's to answer, so it must not hold a control off, or
@@ -241,6 +260,7 @@ async function fetchSession(s) {
     const session = await response.json();
     if (opened !== s) return;
     updateHeader(session);
+    if (!s.crew) openCrew(s, session.owner_id || session.id);
   } catch (error) {
     // A failure for a session the pane has left is not this screen's to
     // report.
@@ -252,6 +272,11 @@ async function fetchSession(s) {
 function updateHeader(session) {
   viewStateDot.className = 'dot ' + session.state;
   opened.state = session.state;
+  // The session's own one-line description names it; until its model writes
+  // one, the node does.
+  viewSummary.textContent = session.summary || session.node;
+  chipPersona.textContent = '';
+  if (session.persona) chipPersona.appendChild(personaChipContent(session.persona));
   viewNode.textContent = session.node;
   viewDir.textContent = session.dir;
   viewIdCopy.textContent = session.id;
@@ -281,12 +306,22 @@ function updateHeader(session) {
   rowPersona.hidden = watchOnly;
   rowFork.hidden = watchOnly;
   rowClear.hidden = watchOnly;
-  rowInterrupt.hidden = watchOnly;
   rowStop.hidden = watchOnly;
+  chipPersona.hidden = watchOnly || !session.persona;
+  chipPermission.hidden = watchOnly;
+  syncStopButton(session.state, watchOnly);
+}
+
+// Stop is in the header while the crew works, where the thumb finds it at
+// once; with nothing running there is nothing to stop.
+function syncStopButton(state, watchOnly) {
+  const running = state === 'running' || state === 'creating';
+  btnInterrupt.hidden = !!watchOnly || !running;
 }
 
 function updatePermissionBadge(permission) {
   viewPermission.textContent = permission;
+  chipPermissionText.textContent = permission === 'read_only' ? 'read-only' : 'read-write';
   btnPermission.textContent =
     permission === 'read_only' ? 'Switch to read-write' : 'Switch to read-only';
 }
@@ -430,11 +465,21 @@ btnMore.addEventListener('click', () => {
   viewSheet.hidden = false;
 });
 
+// On a wide screen the header carries the persona and permission: the
+// permission chip switches it at once, and the persona chip opens the sheet at
+// its picker.
+chipPermission.addEventListener('click', () => btnPermission.click());
+chipPersona.addEventListener('click', () => {
+  viewSheet.hidden = false;
+  personaName.focus();
+});
+
 // On desktop the actions are a popup: clicking anywhere else, or Escape,
 // dismisses it. Mobile keeps the full bottom sheet, which has its own ✕.
 document.addEventListener('click', (event) => {
   if (viewSheet.hidden || isNarrow()) return;
-  if (viewSheet.contains(event.target) || event.target === btnMore) return;
+  if (viewSheet.contains(event.target) || btnMore.contains(event.target)) return;
+  if (chipPersona.contains(event.target)) return;
   viewSheet.hidden = true;
 });
 
@@ -520,6 +565,8 @@ function handleEvent(s, event) {
       viewStateDot.className = 'dot ' + event.state;
       s.state = event.state;
       updateStatusLabel({ id: s.id, state: event.state });
+      syncStopButton(event.state, !watchBanner.hidden);
+      renderCrew();
       break;
     case 'permission':
       updatePermissionBadge(event.permission);

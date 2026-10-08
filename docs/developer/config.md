@@ -20,8 +20,9 @@ Every field has a default, so a config file can be sparse or empty. Deserializat
 | `tls_key` | none | PEM private key. When set with `tls_cert`, the control plane serves HTTPS |
 | `data_dir` | `data` | Directory for the SQLite store and persona prompt files |
 | `nudge` | `true` | Whether the agent loop appends its `[harness nudge]` message when a turn ends with prose and no tool call. `false` takes the pre-nudge path for every session on the control plane: no message is appended and no announcement is checked, so a prose-ending wake ends there, with a root waiting for the operator and a child reporting to its parent and stopping |
-| `github_token` | none | Optional GitHub token, a literal or `env:VAR` read from the environment at boot. Sent as the `Authorization` header when the control plane fetches or updates skill repositories; private repos need it, public repos do not. Never stored or exposed; see skill repositories below |
+| `github_token` | none | Optional GitHub token, a literal or `env:VAR` read from the environment at boot. Sent as the `Authorization` header when the control plane fetches or updates skill repositories, and when the project map reads pull requests; private repos need it, public repos do not, and the project map reads no pull requests without it. Never stored or exposed; see skill repositories below |
 | `oauth_redirect_uri` | none | The control-plane URL the MCP OAuth callback is served at. No default. A path the control plane already serves fails boot with a clear error, and an unset value fails an OAuth flow with a clear error; see MCP servers below |
+| `merged_branch_hours` | `24` | How long the project map shows a branch after it merges into the main branch |
 | `models` | none | Named model entries (see `ModelConfig` below). Sessions never name one directly; a persona's `model` does |
 | `personas` | none | Named personas (see `PersonaConfig` below) |
 | `default_persona` | none | Persona sessions use when the request does not name one |

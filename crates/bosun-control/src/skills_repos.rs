@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::Context;
 use axum::http::StatusCode;
 use bosun_common::error::ErrorExt;
 use bosun_common::skills::SkillPackage;
@@ -60,6 +61,7 @@ pub enum SkillsFetchError {
 /// and `raw_base` are constructor parameters so tests can point them at a
 /// local stub. The token, when set, is sent only as a bearer `Authorization`
 /// header and is never logged or stored.
+#[derive(Clone)]
 pub struct GitHubClient {
     api_base: String,
     raw_base: String,
@@ -182,6 +184,35 @@ impl GitHubClient {
             });
         }
         Ok(json.tree)
+    }
+
+    /// Whether requests carry a token.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// GETs an API path, such as `/repos/{owner}/{name}/pulls`, with its
+    /// query pairs, and reads the JSON body. A status other than success is
+    /// an error.
+    pub async fn api_json(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = reqwest::Url::parse_with_params(&format!("{}{path}", self.api_base), query)
+            .with_context(|| format!("failed to build the GitHub URL for {path}"))?;
+        let response = self
+            .send(url.as_str())
+            .await
+            .with_context(|| format!("failed to reach GitHub for {path}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("GitHub answered {status} for {path}");
+        }
+        response
+            .json()
+            .await
+            .with_context(|| format!("failed to read GitHub's answer for {path}"))
     }
 
     /// Sends a GET and returns the response, or a [`SkillsFetchError`] when

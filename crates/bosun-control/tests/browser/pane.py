@@ -73,7 +73,7 @@ LANDSCAPE = (844, 390)
 HOME = '#home > main'
 # The pane's screens. Exactly one is in the page at a time.
 HOME_SCREEN = '#home'
-TAB_SCREENS = ['#machines-tab', '#skills-tab', '#mcp-tab']
+TAB_SCREENS = ['#machines-tab', '#skills-tab', '#mcp-tab', '#crew-tab', '#projects-tab']
 SESSION_ROW = '.session-row'
 VIEW = '#session-view'
 TRANSCRIPT = '#transcript'
@@ -197,10 +197,14 @@ def view_covers_visible_part(page, timeout=3000):
 
 
 def view_covers_screen(page, timeout=3000):
-    """Whether the view comes to cover the whole layout viewport with the
-    composer at its bottom, as it does with no keyboard, and the box it has."""
+    """Whether the view comes to cover the whole layout viewport with its
+    bottom bars at its bottom, as it does with no keyboard, and the box it
+    has. With no field focused the view tabs sit under the composer, so the
+    lower of the two is the edge that must meet the screen's."""
     box = f"""() => {{ const r = document.querySelector('{VIEW}').getBoundingClientRect();
-      const c = document.querySelector('#input-row').getBoundingClientRect();
+      const composer = document.querySelector('#input-row').getBoundingClientRect();
+      const tabs = document.querySelector('#view-tabs').getBoundingClientRect();
+      const c = tabs.height ? tabs : composer;
       return {{ top: Math.round(r.top), height: Math.round(r.height), composerBottom: Math.round(c.bottom),
                screen: window.innerHeight }}; }}"""
     ok = until(page, f"() => {{ const b = ({box})(); return b.top === 0 && b.height === b.screen && b.composerBottom === b.screen; }}",
@@ -296,7 +300,11 @@ COUNT_STREAMS = """
   window.EventSource = class extends Real {
     constructor(...args) { super(...args); all.push(this); }
   };
-  window.__openStreams = () => all.filter(es => es.readyState !== Real.CLOSED).map(es => es.url);
+  // The crew's one tree stream is counted apart: the session and panel
+  // checks are about the per-session streams.
+  const open = () => all.filter(es => es.readyState !== Real.CLOSED).map(es => es.url);
+  window.__openStreams = () => open().filter(url => !url.includes('/tree-events'));
+  window.__openTreeStreams = () => open().filter(url => url.includes('/tree-events'));
 })();
 """
 
@@ -361,19 +369,28 @@ AT_BOTTOM = """
 
 
 def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewport=True,
-             touch=True, http_errors=False, **context_options):
+             touch=True, http_errors=False, view='log', service_workers='block',
+             **context_options):
     """A phone page. `touch=False` gives a desktop page with a fine pointer.
     `http_errors=True` is for a check whose routes answer with an error
-    status on purpose: the browser logs each such response to the console."""
+    status on purpose: the browser logs each such response to the console.
+    `view` is the session view the pane opens on: the transcript checks read
+    the Log view, which is the session's own transcript. The pane's service
+    worker is blocked unless `service_workers='allow'`: Playwright's routes do
+    not see a request the worker answers, and the checks hold and rewrite
+    requests through them."""
     context = browser.new_context(
         viewport={'width': size[0], 'height': size[1]},
         is_mobile=touch,
         has_touch=touch,
         device_scale_factor=3,
+        service_workers=service_workers,
         **context_options,
     )
     context.add_init_script(NO_SCROLL_ANCHORING)
     context.add_init_script(COUNT_STREAMS)
+    context.add_init_script(
+        "try { localStorage.setItem('bosun.view', %s); } catch (error) {}" % json.dumps(view))
     if stub_viewport:
         context.add_init_script(VIEWPORT_STUB)
     if not visual_viewport:
@@ -934,30 +951,21 @@ def rect(page, selector):
 def check_list(browser, errors):
     page = new_page(browser, errors)
     open_list(page)
-    item = page.locator('.session-item', has=page.locator(SESSION_ROW, has_text=LONG_ROW)).first
-    lines = item.locator('.row-main > *')
-    lead = [lines.nth(0).inner_text(), lines.nth(1).inner_text()]
-    check('a summarized session row leads with its summary, with the node and directory under it',
-          lead == [LONG_ROW, 'node-1 / /work/repo'], lead)
-
-    toggle = item.locator('.children-toggle')
-    child_line = page.locator('#session-list .child-row', has_text=CHILD[:8])
-    toggle.tap()
+    card = page.locator('.bs-session', has_text=LONG_ROW).first
+    title = card.locator('.bs-session__title').inner_text()
+    check('a summarized tree\'s card leads with its summary', title == LONG_ROW, title)
+    faces = card.locator('.bs-avatars .bs-avatar').count()
+    check('a tree\'s card shows its crew, the child folded into it', faces == 2, faces)
+    check('a child has no card of its own on Home',
+          page.locator('.bs-session[data-session="%s"]' % CHILD).count() == 0)
+    groups = page.evaluate("() => [...document.querySelectorAll('.session-group')].map(e => e.textContent.split(' · ')[0])")
+    check('the groups read Needs you, Working, Idle, in that order, when present',
+          groups == [g for g in ['Needs you', 'Working', 'Idle'] if g in groups] and len(groups) > 0, groups)
+    asking = page.locator('.bs-session.is-needs-you').count()
+    check('a tree with an open question sits under Needs you with its border', asking >= 1, asking)
     polled = wait_for_poll(page)
-    check('an opened children group stays open when the list refreshes',
-          polled and child_line.is_visible() and toggle.inner_text() == 'hide children')
-    toggle.tap()
-    polled = wait_for_poll(page)
-    check('a closed children group stays closed when the list refreshes',
-          polled and child_line.is_hidden() and toggle.inner_text() == '1 child')
-
-    # The panel's child rows have rules of their own, which must not reach the
-    # session list's child lines. The wide screen has no narrow-screen minimum.
-    page.set_viewport_size({'width': LANDSCAPE[0], 'height': LANDSCAPE[1]})
-    toggle.tap()
-    look = child_line.evaluate('e => { const s = getComputedStyle(e); return [s.display, s.paddingLeft, s.minHeight]; }')
-    check('a child line in the session list keeps its own look, not the panel row\'s',
-          look[:2] == ['flex', '26px'] and look[2] in ('auto', '0px'), look)
+    check('the cards survive a refresh of the list',
+          polled and page.locator('.bs-session', has_text=LONG_ROW).count() == 1)
     page.context.close()
 
 
@@ -1387,7 +1395,7 @@ def check_leaving_clears_the_view(browser, errors):
 
     open_session(page, CHILD)
     page.wait_for_selector('#watch-banner', state='visible')
-    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-interrupt', 'row-stop']
+    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-clear', 'btn-interrupt', 'row-stop']
       .map(id => document.getElementById(id).hidden)""")
     check('a watch-only child has no chat box and no controls in its sheet', all(hidden), hidden)
     page.tap(MORE)
@@ -1402,7 +1410,7 @@ def check_leaving_clears_the_view(browser, errors):
           .map(id => $(id).textContent).join(''),
         waiting: $('view-waiting').hidden,
         footer: [$('input-row').hidden, $('watch-banner').hidden],
-        rows: ['row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-interrupt', 'row-stop'].map(id => $(id).hidden),
+        rows: ['row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-stop'].map(id => $(id).hidden),
         permission: $('btn-permission').textContent,
         dot: $('view-state-dot').className,
         persona: $('persona-name').value,
@@ -1410,7 +1418,7 @@ def check_leaving_clears_the_view(browser, errors):
     }""")
     check('leaving a session clears its header and sheet, closes its sheets and gives the footer back', state == {
         'sheets': [True, True], 'text': '', 'waiting': True, 'footer': [False, True],
-        'rows': [False] * 6, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
+        'rows': [False] * 5, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
     }, state)
     page.context.close()
 
@@ -1629,6 +1637,8 @@ def check_screens(browser, errors):
         ('#health-strip', '#machines-tab', '#btn-machines-back'),
         ('#skills-strip', '#skills-tab', '#btn-skills-back'),
         ('#mcp-strip', '#mcp-tab', '#btn-mcp-back'),
+        ('#crew-strip-btn', '#crew-tab', '#btn-crew-back'),
+        ('#projects-strip', '#projects-tab', '#btn-projects-back'),
     ]:
         page.tap(strip)
         page.wait_for_selector(tab, state='visible')
@@ -1652,6 +1662,79 @@ def check_screens(browser, errors):
     page.go_back()
     page.wait_for_selector(VIEW, state='hidden')
     check('back from it leaves the list as the only screen', list_showing(page), screens_shown(page))
+    page.context.close()
+
+
+def check_projects(browser, errors):
+    """The Projects tab opens on the one seeded project: two lanes off main,
+    the file both change, the branch only on GitHub, and why pull requests
+    are off. A lane opens on its files and commits, Live names who did what,
+    and a session's header opens the map on its own lane and returns to it.
+    From 900px the lanes are drawn off main, with Live beside them."""
+    page = new_page(browser, errors)
+    open_list(page)
+    page.tap('#projects-strip')
+    page.wait_for_selector('.pm-lane .pm-branch')
+    branches = texts(page, '.pm-lane .pm-branch')
+    check('one project opens on its map, a card per lane',
+          sorted(branches) == ['crew-view', 'project-map'], branches)
+    check('the title names the repository', page.inner_text('#project-title') == 'bosun')
+    warn = page.inner_text('#project-warn')
+    check('a file two lanes change is named above the lanes',
+          'api.rs is changing on crew-view and project-map' in warn, warn)
+    moving = page.locator('.bs-label', has_text='Moving').count()
+    check('the running session\'s lane is under Moving', moving == 1, moving)
+    main = page.inner_text('#project-main')
+    check('a branch only on GitHub is one quiet line', '1 more branch is only on GitHub' in main, main)
+    check('without a token the map says why it has no pull requests', 'no github_token' in main, main)
+    meta = page.locator('.pm-lane', has_text='project-map').locator('.pm-meta').inner_text()
+    check('a lane counts ahead, behind, not pushed and not committed',
+          all(part in meta for part in ['2 ahead', '1 behind', '1 not pushed', '1 not committed']), meta)
+
+    page.locator('.pm-lane', has_text='project-map').tap()
+    page.wait_for_selector('.pm-detail')
+    detail = page.eval_on_selector('#project-side', 'side => side.textContent')
+    check('a lane opens on its files not committed and its commits',
+          'Not committed · 1' in detail and 'watch.rs' in detail and 'Draw the lanes' in detail, detail)
+    check('the open lane takes the list\'s place on a phone', not page.is_visible('#project-main'))
+    page.tap('#btn-projects-back')
+    page.wait_for_selector('#project-main', state='visible')
+    page.tap('[data-pm="live"]')
+    page.wait_for_selector('.pm-event')
+    feed = texts(page, '.pm-event__text')
+    check('Live names the edit and who made it',
+          any('created watch.rs' in line for line in feed), feed)
+    check('Live names the overlap', any('api.rs is changing on two branches' in line for line in feed), feed)
+    page.tap('#btn-projects-back')
+    page.wait_for_selector('#projects-tab', state='hidden')
+    check('back from the map returns Home', list_showing(page), screens_shown(page))
+
+    open_from_list(page, 'the map session')
+    page.wait_for_selector('#btn-project', state='visible')
+    page.tap('#btn-project')
+    page.wait_for_selector('.pm-detail')
+    head = page.inner_text('.pm-detail__head')
+    check('the session\'s header opens the map on its own lane', 'project-map' in head, head)
+    page.tap('#btn-projects-back')
+    page.tap('#btn-projects-back')
+    page.wait_for_selector(VIEW, state='visible')
+    check('back from the map returns to the session', session_showing(page), screens_shown(page))
+    page.context.close()
+
+    page = new_page(browser, errors, size=(1280, 800), touch=False)
+    open_list(page)
+    page.click('#projects-strip')
+    page.wait_for_selector('.pm-map svg')
+    lanes = page.locator('.pm-map svg .m-lane').count()
+    check('from 900px the lanes are drawn off main', lanes >= 2, lanes)
+    check('the two lanes that share a file are joined', page.locator('.m-overlap').count() == 1)
+    check('Live stands beside the map', page.is_visible('#project-side .pm-event'))
+    page.locator('.pm-card', has_text='crew-view').click()
+    page.wait_for_selector('#project-side .pm-detail')
+    check('a lane opens beside the map, which stays', page.is_visible('.pm-map'))
+    page.click('.pm-detail__close')
+    page.wait_for_selector('#project-side .pm-event')
+    check('closing the lane brings Live back', True)
     page.context.close()
 
 
@@ -1761,7 +1844,7 @@ def check_clear(browser, errors):
     page.tap(MORE)
     page.wait_for_selector(SHEET, state='visible')
     check('a root session offers the clear control in its actions sheet',
-          page.is_visible(CLEAR_ROW) and page.inner_text(CLEAR_BTN) == 'Clear context',
+          page.is_visible(CLEAR_ROW) and page.inner_text(CLEAR_BTN).startswith('Clear context'),
           page.inner_text(CLEAR_BTN))
 
     # The pane draws nothing for a clear: the break is the marker's own durable
@@ -1949,6 +2032,120 @@ def check_ask_records(browser, errors):
     page.context.close()
 
 
+# Lets a check hide and show the page: Chromium reports a page in a test as
+# visible whatever happens to it.
+VISIBILITY_SWITCH = """
+(() => {
+  let hidden = false;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true, get: () => (hidden ? 'hidden' : 'visible') });
+  window.setPageHidden = (value) => {
+    hidden = value;
+    document.dispatchEvent(new Event('visibilitychange'));
+  };
+})();
+"""
+
+
+def check_installable(browser, errors):
+    """The pane can be installed: its manifest names icons that load, its
+    worker keeps the build, and a pane opened with no network shows the last
+    list and says the control plane cannot be reached."""
+    # Offline, the browser logs each request that cannot leave.
+    page = new_page(browser, errors, service_workers='allow', http_errors=True)
+    open_list(page)
+    manifest = page.evaluate("""async () => {
+      const link = document.querySelector('link[rel=manifest]');
+      const manifest = await (await fetch(link.href)).json();
+      const icons = await Promise.all(manifest.icons.map(async (icon) => (await fetch(icon.src)).status));
+      return { name: manifest.name, display: manifest.display, icons };
+    }""")
+    check('the manifest names the app, a standalone window and icons that load',
+          manifest['name'] == 'Bosun' and manifest['display'] == 'standalone'
+          and manifest['icons'] and all(status == 200 for status in manifest['icons']), manifest)
+    build = page.get_attribute('meta[name=bosun-version]', 'content')
+    kept = page.evaluate("""async (build) => {
+      await navigator.serviceWorker.ready;
+      const cache = await caches.open('bosun-pane-' + build);
+      return (await cache.keys()).map((request) => new URL(request.url).pathname);
+    }""", build)
+    check('the worker keeps the page, its modules, its fonts and its icons',
+          all(path in kept for path in ['/', '/ui/main.js', '/ui/pane.css', '/ui/device.js',
+                                        '/ui/fonts/geist.woff2', '/ui/icons/icon-192.png']), kept)
+
+    # The worker controls the pages loaded after it activates.
+    page.reload()
+    page.wait_for_function('() => !!navigator.serviceWorker.controller')
+    page.wait_for_selector(SESSION_ROW)
+    page.context.set_offline(True)
+    page.reload()
+    page.wait_for_selector('#offline', state='visible')
+    rows = page.locator(SESSION_ROW).count()
+    note = page.text_content('#offline')
+    check('with no network the pane opens from the worker and shows the list it last had',
+          rows >= LIST_ROWS and 'Cannot reach the control plane' in note, (rows, note))
+    page.context.set_offline(False)
+    page.wait_for_selector('#offline', state='hidden', timeout=10000)
+    check('the note goes when the control plane answers again', True)
+    page.context.close()
+
+
+def check_polls_follow_visibility(browser, errors):
+    """A hidden pane polls nothing, and one that comes back reads the list at
+    once."""
+    page = new_page(browser, errors)
+    page.context.add_init_script(VISIBILITY_SWITCH)
+    reads = []
+    page.on('request', lambda request: reads.append(request.url)
+            if request.url.endswith('/sessions') and request.method == 'GET' else None)
+    open_list(page)
+    page.evaluate('setPageHidden(true)')
+    before = len(reads)
+    # Longer than the list's 3-second poll.
+    page.wait_for_timeout(4000)
+    check('a hidden pane does not poll the session list', len(reads) == before, len(reads) - before)
+    page.evaluate('setPageHidden(false)')
+    page.wait_for_timeout(500)
+    check('a pane that comes back reads the list at once', len(reads) > before, len(reads) - before)
+    page.context.close()
+
+
+def check_shortcuts(browser, errors):
+    """The installed app's shortcuts open the new-session sheet and the
+    Projects tab, and leave an address that reloads to the list."""
+    page = new_page(browser, errors)
+    page.goto(BASE + '/?open=new')
+    page.wait_for_selector('#new-session-form', state='visible')
+    check('the New session shortcut opens the sheet, with its query off the address',
+          'open=' not in page.url, page.url)
+    page.goto(BASE + '/?open=projects')
+    page.wait_for_selector('#projects-tab', state='visible')
+    check('the Projects shortcut opens the Projects tab', 'open=' not in page.url, page.url)
+    page.context.close()
+
+
+def check_plain_http(browser, errors):
+    """Over plain HTTP to another machine's name the pane is a page: it works,
+    registers no worker, and the notifications control says why it is off."""
+    other = browser.browser_type.launch(
+        args=['--host-resolver-rules=MAP bosun.test 127.0.0.1'])
+    try:
+        page = new_page(other, errors)
+        base = BASE.replace('127.0.0.1', 'bosun.test')
+        page.goto(base + '/')
+        page.wait_for_selector(SESSION_ROW)
+        secure = page.evaluate("() => [window.isSecureContext, 'serviceWorker' in navigator]")
+        check('a page on plain HTTP has no secure context and no worker', secure == [False, False], secure)
+        page.tap('#btn-notify')
+        page.wait_for_selector('#toast', state='visible')
+        check('the notifications control says it needs HTTPS',
+              'HTTPS' in page.text_content('#toast'), page.text_content('#toast'))
+        page.context.close()
+    finally:
+        other.close()
+
+
 CHECKS = [
     check_tail_and_read_back,
     check_ask_across_a_page_boundary,
@@ -1975,6 +2172,11 @@ CHECKS = [
     check_clear,
     check_following,
     check_ask_records,
+    check_projects,
+    check_installable,
+    check_polls_follow_visibility,
+    check_shortcuts,
+    check_plain_http,
 ]
 
 

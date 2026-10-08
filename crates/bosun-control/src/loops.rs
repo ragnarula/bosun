@@ -20,9 +20,11 @@ use bosun_agent::provider::Provider;
 use bosun_common::config::PersonaConfig;
 use bosun_store::store::Store;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::commands::CommandQueue;
+use crate::projects::ToolActivity;
 use crate::registry::NodeRegistry;
 use crate::spawn::ChildSessionSpawner;
 use crate::tools::TunnelToolExecutor;
@@ -54,6 +56,10 @@ pub struct AgentRegistry {
     /// registry starts. Set from the config at boot; `new` leaves it on, the
     /// default an absent config field gets.
     pub nudge: bool,
+    /// Where every loop's tool executor reports its calls starting and
+    /// finishing. Set at boot to the project map's channel; None reports
+    /// nowhere.
+    pub tool_activity: Option<mpsc::UnboundedSender<ToolActivity>>,
 }
 
 impl AgentRegistry {
@@ -71,6 +77,7 @@ impl AgentRegistry {
             spawner: RwLock::new(None),
             mcp: None,
             nudge: true,
+            tool_activity: None,
         }
     }
 
@@ -118,6 +125,7 @@ impl AgentRegistry {
             tools: Arc::new(TunnelToolExecutor {
                 tunnels,
                 store: tool_store,
+                activity: self.tool_activity.clone(),
             }),
             delta_sink: Arc::new(LiveSink { tx: sender }),
             compact_at_input_tokens: COMPACT_AT_INPUT_TOKENS,

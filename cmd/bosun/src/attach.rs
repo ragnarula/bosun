@@ -22,6 +22,7 @@ use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
 use bosun_common::session::SessionState;
+use bosun_common::session::SessionView;
 use bosun_control::api::PersonaSummary;
 use bosun_control::api::USER_REJECTED_TEXT;
 use chrono::FixedOffset;
@@ -64,6 +65,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::crew;
+use crate::crew::Crew;
 use crate::markdown::DiagramCache;
 use crate::markdown::markdown_rows;
 
@@ -102,6 +105,36 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INPUT_CHARS: usize = 10_000;
 /// Submitted messages kept for arrow-key recall.
 const MAX_HISTORY: usize = 200;
+/// From this many columns the Tasks and Files views sit in a column beside
+/// the main view, and the view keys switch only Chat and Log.
+const WIDE_COLUMNS: u16 = 140;
+
+/// The views of an open session, on the keys 1 to 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Chat,
+    Tasks,
+    Files,
+    Log,
+}
+
+impl View {
+    const ALL: [View; 4] = [View::Chat, View::Tasks, View::Files, View::Log];
+
+    fn name(self) -> &'static str {
+        match self {
+            View::Chat => "Chat",
+            View::Tasks => "Tasks",
+            View::Files => "Files",
+            View::Log => "Log",
+        }
+    }
+
+    /// Tasks and Files move into the side column when the terminal is wide.
+    fn in_side_column(self) -> bool {
+        matches!(self, View::Tasks | View::Files)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -177,6 +210,12 @@ pub struct ClientState {
     /// waiting indicator and the debug console; activity never enters the
     /// transcript.
     pub activities: Vec<ActivityRecord>,
+    /// The crew of the tree the session belongs to, built from every frame
+    /// of the tree stream.
+    pub crew: Crew,
+    /// The opened session's id. A frame with no session id is the opened
+    /// session's.
+    own_id: String,
     /// Rendered diagrams, held between redraws because a draw renders every
     /// line again and one diagram costs milliseconds.
     diagram_cache: DiagramCache,
@@ -193,6 +232,8 @@ impl ClientState {
             session_state,
             live_ask: None,
             activities: Vec::new(),
+            crew: Crew::default(),
+            own_id: String::new(),
             diagram_cache: DiagramCache::new(),
         }
     }
@@ -250,6 +291,24 @@ impl ClientState {
             self.push_line(line);
         }
         true
+    }
+
+    /// Applies one durable frame of the tree stream. Every frame feeds the
+    /// crew; the opened session's own frames also feed the transcript and the
+    /// session's state. Frames at or below the last applied seq are a replay
+    /// and are skipped. Returns true when the frame was applied.
+    pub fn apply_frame(&mut self, seq: i64, session_id: Option<&str>, event: &Event) -> bool {
+        if seq <= self.last_seq {
+            return false;
+        }
+        let session_id = session_id.unwrap_or(&self.own_id).to_string();
+        self.crew.apply(&session_id, event);
+        if session_id == self.own_id {
+            self.apply_event(seq, event)
+        } else {
+            self.last_seq = seq;
+            true
+        }
     }
 
     /// Appends a live text delta to the pending line.
@@ -421,6 +480,9 @@ fn event_lines(event: &Event) -> Vec<Line> {
             text: format!("persona: {persona}"),
             at_ms,
         }],
+        // The task list's own view draws it; the transcript already shows
+        // the `todowrite` call that replaced it.
+        Event::Todos { .. } => Vec::new(),
         Event::Warning { text } => vec![Line {
             kind: LineKind::Status,
             text: format!("warning: {text}"),
@@ -520,7 +582,7 @@ fn clip(text: &str, max: usize) -> String {
 
 /// Word-wraps text to `width` columns, splitting on newlines first. A word
 /// longer than the width is hard-wrapped at character width.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for paragraph in text.split('\n') {
@@ -777,6 +839,17 @@ fn span_rows_to_lines(rows: &[(LineKind, Vec<Span<'static>>)]) -> Vec<TuiLine<'s
 pub struct App {
     pub session: Session,
     pub state: ClientState,
+    /// The view the main pane shows.
+    pub view: View,
+    /// The terminal was at least `WIDE_COLUMNS` wide at the last draw, so
+    /// Tasks and Files sit in the side column.
+    wide: bool,
+    /// The crew member whose posts the chat shows; None shows everyone.
+    chat_filter: Option<String>,
+    /// The highlighted row of the Files view.
+    file_selected: usize,
+    /// The Files view shows the highlighted file's diff lines.
+    file_detail: bool,
     /// Rows of the output pane that are hidden above the viewport.
     pub scroll: usize,
     /// Follow the newest rows instead of holding a manual scroll position.
@@ -819,9 +892,19 @@ impl App {
         let permission = session.permission;
         let session_state = session.state;
         let watch_only = session.parent_id.is_some();
+        let mut state = ClientState::new(permission, session_state);
+        state.own_id = session.id.clone();
+        state.crew = Crew::new(&session.owner_id);
         Self {
             session,
-            state: ClientState::new(permission, session_state),
+            state,
+            // A child is watched for its own transcript; a root opens on the
+            // crew's chat.
+            view: if watch_only { View::Log } else { View::Chat },
+            wide: false,
+            chat_filter: None,
+            file_selected: 0,
+            file_detail: false,
             scroll: 0,
             follow: true,
             viewport: 0,
@@ -838,6 +921,43 @@ impl App {
             show_console: false,
             live_children: 0,
         }
+    }
+
+    /// The view the main pane draws: a side-column view shows Chat there.
+    fn main_view(&self) -> View {
+        if self.wide && self.view.in_side_column() {
+            View::Chat
+        } else {
+            self.view
+        }
+    }
+
+    /// Switches the main pane to `view`. A wide terminal shows Tasks and Files
+    /// beside the main pane, so the keys switch only Chat and Log there.
+    fn show_view(&mut self, view: View) {
+        if self.wide && view.in_side_column() {
+            return;
+        }
+        self.view = view;
+        self.file_detail = false;
+        // The chat and the log follow their newest rows; a list starts at
+        // its top.
+        self.follow = matches!(view, View::Chat | View::Log);
+        self.scroll = 0;
+    }
+
+    /// Moves the chat filter to the next crew member, and past the last one
+    /// back to everyone.
+    fn cycle_chat_filter(&mut self) {
+        let members = &self.state.crew.members;
+        self.chat_filter = match &self.chat_filter {
+            None => members.first().map(|member| member.id.clone()),
+            Some(id) => members
+                .iter()
+                .position(|member| member.id == *id)
+                .and_then(|index| members.get(index + 1))
+                .map(|member| member.id.clone()),
+        };
     }
 
     /// Moves the input to the previous submitted message, saving the current
@@ -881,55 +1001,43 @@ impl App {
     }
 }
 
-/// Draws the whole screen: status bar, scrollable output pane, and the input
-/// box pinned to the bottom with a visible cursor.
+/// Draws the whole screen: status bar, crew line, the main pane with the
+/// side column on a wide terminal, and the input box pinned to the bottom
+/// with a visible cursor.
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
+    let crew_rows = u16::from(!app.state.crew.members.is_empty());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(crew_rows),
             Constraint::Min(0),
             Constraint::Length(3),
         ])
         .split(area);
 
-    let status = status_line(app);
-    frame.render_widget(Paragraph::new(status), chunks[0]);
-
-    let output = chunks[1];
-    let inner = output.inner(ratatui::layout::Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let width = inner.width as usize;
-    let rows = transcript_rows(&mut app.state, width);
-    app.viewport = inner.height;
-    let max_scroll = rows.len().saturating_sub(inner.height as usize);
-    app.max_scroll = max_scroll;
-    let scroll = if app.follow {
-        max_scroll
+    let body = chunks[2];
+    app.wide = body.width >= WIDE_COLUMNS;
+    frame.render_widget(Paragraph::new(status_line(app)), chunks[0]);
+    if crew_rows > 0 {
+        let line = crew::crew_line(&app.state.crew, chunks[1].width as usize);
+        frame.render_widget(Paragraph::new(line), chunks[1]);
+    }
+    let output = if app.wide {
+        let side_width = (body.width * 2 / 5).clamp(48, 72);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(side_width)])
+            .split(body);
+        draw_side_column(frame, app, columns[1]);
+        columns[0]
     } else {
-        app.scroll.min(max_scroll)
+        body
     };
-    app.scroll = scroll;
-    let scroll_y = scroll.min(u16::MAX as usize) as u16;
+    draw_main_pane(frame, app, output);
 
-    let tui_lines = span_rows_to_lines(&rows);
-    let transcript = Paragraph::new(tui_lines)
-        .block(
-            TuiBlock::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    "transcript",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-        )
-        .scroll((scroll_y, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(transcript, output);
-
-    let input = chunks[2];
+    let input = chunks[3];
     let interactive = !app.watch_only;
     let inner_width = input.width.saturating_sub(2) as usize;
     let input_widget = if interactive {
@@ -937,7 +1045,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         let title = if app.state.live_ask.is_some() {
             "question — Enter answers · ^R rejects · esc/^C interrupt".to_string()
         } else {
-            "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^D console  ·  ^Q quit  ·  ↑/↓ history  ·  pgup/pgdn scroll".to_string()
+            "message (^R redirect)  ·  esc/^C interrupt  ·  ^P permission  ·  ^O persona  ·  ^D console  ·  ^Q quit  ·  alt+1-4 or F1-F4 views  ·  tab crew  ·  ↑/↓ history  ·  pgup/pgdn scroll".to_string()
         };
         Paragraph::new(text)
             .block(
@@ -948,7 +1056,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             .wrap(Wrap { trim: false })
     } else {
         Paragraph::new(TuiLine::from(Span::styled(
-            "watch-only: this session is a child; it renders here but accepts no input. esc/^C/^Q quit · ^D console · pgup/pgdn scroll",
+            "watch-only: this session is a child; it renders here but accepts no input. esc/^C/^Q quit · 1-4 views · tab crew · ^D console · pgup/pgdn scroll",
             Style::default().fg(Color::DarkGray),
         )))
         .block(
@@ -972,6 +1080,101 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if app.show_console {
         render_activity_console(frame, output, app);
     }
+}
+
+/// The main pane: the current view's rows, scrolled to follow the newest row
+/// or held where the reader scrolled.
+fn draw_main_pane(frame: &mut ratatui::Frame, app: &mut App, output: ratatui::layout::Rect) {
+    let inner = output.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let width = inner.width as usize;
+    let view = app.main_view();
+    let lines = match view {
+        View::Log => span_rows_to_lines(&transcript_rows(&mut app.state, width)),
+        View::Chat => crew::chat_lines(&app.state.crew, app.chat_filter.as_deref(), width),
+        View::Tasks => crew::tasks_lines(&app.state.crew, width),
+        View::Files => crew::files_lines(
+            &app.state.crew,
+            Some(app.file_selected),
+            app.file_detail,
+            width,
+            now_ms(),
+        ),
+    };
+    app.viewport = inner.height;
+    // The pane wraps a line wider than itself, so the bottom is counted in the
+    // rows the wrapped lines take, not in lines: a long chat line counted as
+    // one row would push the newest rows below the window.
+    let rows = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width);
+    let max_scroll = rows.saturating_sub(inner.height as usize);
+    app.max_scroll = max_scroll;
+    let scroll = if app.follow {
+        max_scroll
+    } else {
+        app.scroll.min(max_scroll)
+    };
+    app.scroll = scroll;
+    let scroll_y = scroll.min(u16::MAX as usize) as u16;
+
+    let title = match (view, app.chat_filter.as_deref()) {
+        (View::Log, _) => "transcript".to_string(),
+        (View::Chat, Some(id)) => {
+            let name = app
+                .state
+                .crew
+                .member(id)
+                .map_or_else(|| crew::short_id(id), |member| member.name.clone());
+            format!("chat · {name} only (tab: next)")
+        }
+        (View::Chat, None) => "chat".to_string(),
+        (View::Tasks, _) => "tasks".to_string(),
+        (View::Files, _) => "files (↑/↓ pick, enter diff)".to_string(),
+    };
+    let pane = Paragraph::new(lines)
+        .block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    title,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+        )
+        .scroll((scroll_y, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(pane, output);
+}
+
+/// The side column of a wide terminal: Tasks above Files.
+fn draw_side_column(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let width = area.width.saturating_sub(2) as usize;
+    let panes = [
+        ("tasks", crew::tasks_lines(&app.state.crew, width)),
+        (
+            "files",
+            crew::files_lines(&app.state.crew, None, false, width, now_ms()),
+        ),
+    ];
+    for ((title, lines), rect) in panes.into_iter().zip(rows.iter()) {
+        let pane = Paragraph::new(lines).block(TuiBlock::default().borders(Borders::ALL).title(
+            Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+        ));
+        frame.render_widget(pane, *rect);
+    }
+}
+
+/// The wall clock in unix milliseconds, for the Files view's ages.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// The persona picker: a bordered list of the configured personas rendered
@@ -1046,7 +1249,7 @@ fn phase_detail(phase: &ActivityPhase) -> String {
         ActivityPhase::RequestSent { model, provider } => format!("{model} via {provider}"),
         ActivityPhase::FirstToken { latency_ms } => format!("{latency_ms}ms"),
         ActivityPhase::ResponseComplete { stop_reason } => stop_reason.clone(),
-        ActivityPhase::ToolStarted { name } => name.clone(),
+        ActivityPhase::ToolStarted { name, .. } => name.clone(),
         ActivityPhase::ToolFinished {
             name,
             ok,
@@ -1165,7 +1368,7 @@ fn phase_label(phase: &ActivityPhase) -> Option<String> {
         ActivityPhase::RequestSent { .. } => "awaiting model".to_string(),
         ActivityPhase::FirstToken { .. } => "receiving reply".to_string(),
         ActivityPhase::ResponseComplete { .. } => "processing reply".to_string(),
-        ActivityPhase::ToolStarted { name } => format!("running tool {name}"),
+        ActivityPhase::ToolStarted { name, .. } => format!("running tool {name}"),
         ActivityPhase::ToolFinished { name, .. } => format!("ran tool {name}"),
         ActivityPhase::EmptyRetry { attempt, limit, .. } => {
             format!("retrying empty reply ({attempt}/{limit})")
@@ -1221,14 +1424,33 @@ fn status_line(app: &App) -> TuiLine<'static> {
         "connecting"
     };
     let mode = if app.watch_only { " · watch-only" } else { "" };
-    TuiLine::from(vec![
+    let mut spans = vec![
         Span::styled("session", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {id} · {} · ", app.session.model)),
         Span::styled(state, Style::default().fg(Color::Cyan)),
         Span::raw(format!(" · {} · ", permission_name(app.state.permission))),
         Span::styled(connection, Style::default().fg(Color::DarkGray)),
         Span::styled(mode, Style::default().fg(Color::Yellow)),
-    ])
+        Span::raw("  "),
+    ];
+    for (index, view) in View::ALL.into_iter().enumerate() {
+        if app.wide && view.in_side_column() {
+            continue;
+        }
+        let style = if view == app.main_view() {
+            Style::default()
+                .fg(Color::Black)
+                .bg(crew::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crew::MUTED)
+        };
+        spans.push(Span::styled(
+            format!(" {} {} ", index + 1, view.name()),
+            style,
+        ));
+    }
+    TuiLine::from(spans)
 }
 
 /// The input box content and the length of the visible text tail. The text is
@@ -1254,20 +1476,43 @@ fn input_row(input: &str, inner_width: usize) -> (TuiLine<'static>, usize) {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SseFrame {
-    Live { delta: String },
-    Durable { seq: i64, event: Event },
+    Live {
+        delta: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    Durable {
+        seq: i64,
+        #[serde(default)]
+        session_id: Option<String>,
+        event: Event,
+    },
 }
 
-/// Applies one SSE event to the state: a live delta appends to the pending
-/// line, a durable event is replayed through `apply_event`.
+/// Applies one SSE frame of the tree stream to the state: the root's live
+/// delta streams into the chat, and into the transcript when the root is the
+/// opened session; a durable event goes through `apply_frame`. A frame that
+/// names no session is the opened session's.
 fn apply_sse(state: &mut ClientState, sse: &SseEvent) {
     let Ok(frame) = serde_json::from_str::<SseFrame>(&sse.data) else {
         return;
     };
     match frame {
-        SseFrame::Live { delta } => state.apply_delta(&delta),
-        SseFrame::Durable { seq, event } => {
-            state.apply_event(seq, &event);
+        SseFrame::Live { delta, session_id } => {
+            let session_id = session_id.as_deref();
+            if session_id == Some(state.crew.root_id.as_str()) {
+                state.crew.apply_delta(&delta);
+            }
+            if session_id.is_none_or(|id| id == state.own_id) {
+                state.apply_delta(&delta);
+            }
+        }
+        SseFrame::Durable {
+            seq,
+            session_id,
+            event,
+        } => {
+            state.apply_frame(seq, session_id.as_deref(), &event);
         }
     }
 }
@@ -1305,8 +1550,8 @@ pub async fn attach(cp_url: &str, session_id: &str) -> anyhow::Result<()> {
 
     let mut app = App::new(session);
     fetch_personas(&client, cp_url, &mut app).await;
-    if let Ok(count) = live_children_count(&client, cp_url, session_id).await {
-        app.live_children = count;
+    if let Ok(sessions) = fetch_session_list(&client, cp_url).await {
+        apply_session_list(&mut app, &sessions);
     }
     let result = run_attach(
         &mut terminal,
@@ -1419,6 +1664,7 @@ async fn run_attach(
             // The stream restarted: live deltas do not survive a reconnect,
             // and the outage is over, so the next drop reports again.
             app.state.pending_delta = None;
+            app.state.crew.chat_delta = None;
             noticed = false;
             app.connected = true;
             redraw(terminal, app)?;
@@ -1469,7 +1715,7 @@ async fn open_stream(
     after: i64,
 ) -> anyhow::Result<impl Stream<Item = Result<SseEvent, SseError>>> {
     let response = client
-        .get(format!("{cp_url}/sessions/{session_id}/events"))
+        .get(format!("{cp_url}/sessions/{session_id}/tree-events"))
         .query(&[("after", after)])
         .send()
         .await
@@ -1523,10 +1769,9 @@ async fn stream_events(
                 Some(Err(_)) | None => return Ok(StreamOutcome::Reconnect),
             },
             _ = children_interval.tick() => {
-                if let Ok(count) = live_children_count(client, cp_url, session_id).await
-                    && count != app.live_children
+                if let Ok(sessions) = fetch_session_list(client, cp_url).await
+                    && apply_session_list(app, &sessions)
                 {
-                    app.live_children = count;
                     redraw(terminal, app)?;
                 }
             }
@@ -1574,6 +1819,9 @@ async fn handle_key(
     session_id: &str,
     key: KeyEvent,
 ) -> anyhow::Result<Action> {
+    if app.watch_only && handle_view_key(app, &key) {
+        return Ok(Action::Continue);
+    }
     if app.watch_only {
         // Watch-only attach sends nothing: scroll keys work, everything else
         // is ignored, and the exit keys quit instead of interrupting a child
@@ -1640,6 +1888,9 @@ async fn handle_key(
             }
             _ => Ok(Action::Continue),
         };
+    }
+    if handle_view_key(app, &key) {
+        return Ok(Action::Continue);
     }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1713,6 +1964,61 @@ async fn handle_key(
             Ok(Action::Continue)
         }
         _ => Ok(Action::Continue),
+    }
+}
+
+/// The view a key switches to. Alt+1 to Alt+4 and F1 to F4 always do; a bare
+/// digit does only where there is no input box, so a message can start with
+/// a digit.
+fn view_for_key(key: &KeyEvent, bare_digits: bool) -> Option<View> {
+    let number = match key.code {
+        KeyCode::F(number @ 1..=4) => number as usize,
+        KeyCode::Char(digit @ '1'..='4')
+            if key.modifiers.contains(KeyModifiers::ALT)
+                || (bare_digits && key.modifiers.is_empty()) =>
+        {
+            digit as usize - '0' as usize
+        }
+        _ => return None,
+    };
+    Some(View::ALL[number - 1])
+}
+
+/// Handles the keys the views own: the view keys, Tab for the chat filter,
+/// and the Files view's arrows, Enter and Esc. Returns true when the key was
+/// used.
+fn handle_view_key(app: &mut App, key: &KeyEvent) -> bool {
+    if let Some(view) = view_for_key(key, app.watch_only) {
+        app.show_view(view);
+        return true;
+    }
+    match (app.main_view(), key.code) {
+        (View::Chat, KeyCode::Tab) => {
+            app.cycle_chat_filter();
+            true
+        }
+        (View::Files, KeyCode::Up) => {
+            app.file_selected = app.file_selected.saturating_sub(1);
+            true
+        }
+        (View::Files, KeyCode::Down) => {
+            if app.file_selected + 1 < app.state.crew.files.len() {
+                app.file_selected += 1;
+            }
+            true
+        }
+        // Enter with a typed message still sends it.
+        (View::Files, KeyCode::Enter)
+            if app.state.input.is_empty() && !app.state.crew.files.is_empty() =>
+        {
+            app.file_detail = true;
+            true
+        }
+        (View::Files, KeyCode::Esc) if app.file_detail => {
+            app.file_detail = false;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1972,17 +2278,15 @@ async fn fetch_personas(client: &reqwest::Client, cp_url: &str, app: &mut App) {
     }
 }
 
-/// The count of the attached session's direct children whose state is not
-/// `stopped`, for the status line's waiting-for-children label. The TUI has
-/// no other view of the session tree, so it polls the session list.
-async fn live_children_count(
+/// The session list, for the crew's members and the status line's count of
+/// live children.
+async fn fetch_session_list(
     client: &reqwest::Client,
     cp_url: &str,
-    session_id: &str,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Vec<SessionView>> {
     // A half-open connection would otherwise hold the whole TUI: the poll
     // runs inside the event select, so the request side gets the same timeout
-    // as the other client calls, and a miss just keeps the last count until
+    // as the other client calls, and a miss just keeps the last list until
     // the next tick.
     let send = tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -1996,17 +2300,33 @@ async fn live_children_count(
     let response = response
         .error_for_status()
         .context("the control plane returned an error")?;
-    let sessions: Vec<Session> = response
+    response
         .json()
         .await
-        .context("failed to parse session list")?;
-    Ok(sessions
+        .context("failed to parse session list")
+}
+
+/// Takes the session list's view of the tree: the crew's members, and the
+/// count of the opened session's direct children that are not stopped.
+/// Returns true when either changed, so the caller redraws.
+fn apply_session_list(app: &mut App, sessions: &[SessionView]) -> bool {
+    let default_persona = app
+        .personas
         .iter()
-        .filter(|session| {
-            session.parent_id.as_deref() == Some(session_id)
-                && session.state != SessionState::Stopped
+        .find(|persona| persona.default)
+        .map(|persona| persona.name.as_str());
+    let members = crew::crew_members(&app.state.crew.root_id, sessions, default_persona);
+    let live_children = sessions
+        .iter()
+        .filter(|view| {
+            view.session.parent_id.as_deref() == Some(app.session.id.as_str())
+                && view.session.state != SessionState::Stopped
         })
-        .count())
+        .count();
+    let changed = members != app.state.crew.members || live_children != app.live_children;
+    app.state.crew.set_members(members);
+    app.live_children = live_children;
+    changed
 }
 
 /// Renders the current frame.
@@ -2066,6 +2386,7 @@ mod tests {
 
         let tool = ActivityPhase::ToolStarted {
             name: "file_read".into(),
+            target: None,
         };
         assert_eq!(
             state_label(SessionState::Running, 0, Some(&tool), 7),
@@ -3050,6 +3371,7 @@ mod tests {
             (
                 ActivityPhase::ToolStarted {
                     name: "shell".into(),
+                    target: None,
                 },
                 "shell",
             ),
@@ -3396,6 +3718,8 @@ mod tests {
             name: name.into(),
             description: description.into(),
             default,
+            avatar_seed: name.to_string(),
+            picture_at_secs: None,
         }
     }
 
@@ -3659,6 +3983,8 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         let mut app = App::new(test_session());
+        // The transcript is the Log view; a root opens on the chat.
+        app.view = View::Log;
         for i in 0..50 {
             app.state.push_line(Line {
                 kind: LineKind::Assistant,
@@ -3698,6 +4024,7 @@ mod tests {
         // following has to land on its last row.
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         let mut app = App::new(test_session());
+        app.view = View::Log;
         app.state.push_line(Line {
             kind: LineKind::Assistant,
             text: "```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```".into(),
@@ -3954,5 +4281,330 @@ mod tests {
             app.follow,
             "sending a message must return to the newest rows"
         );
+    }
+
+    fn session_view(session: Session) -> SessionView {
+        SessionView {
+            session,
+            overview: Default::default(),
+        }
+    }
+
+    /// An open root `s1` with one builder child `c1`, as the session list
+    /// serves them.
+    fn crew_app() -> App {
+        let mut app = App::new(test_session());
+        let mut child = test_session();
+        child.id = "c1".into();
+        child.parent_id = Some("s1".into());
+        child.persona = Some("builder".into());
+        child.state = SessionState::Running;
+        let changed = apply_session_list(
+            &mut app,
+            &[session_view(test_session()), session_view(child)],
+        );
+        assert!(changed, "the first list fills the crew");
+        app
+    }
+
+    #[test]
+    fn the_session_list_fills_the_crew_and_the_live_children() {
+        let mut app = crew_app();
+        let names: Vec<&str> = app
+            .state
+            .crew
+            .members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Lead", "Builder"]);
+        assert_eq!(app.live_children, 1);
+        let mut child = test_session();
+        child.id = "c1".into();
+        child.parent_id = Some("s1".into());
+        child.persona = Some("builder".into());
+        child.state = SessionState::Running;
+        assert!(
+            !apply_session_list(
+                &mut app,
+                &[session_view(test_session()), session_view(child)]
+            ),
+            "the same list changes nothing"
+        );
+    }
+
+    #[test]
+    fn tree_frames_feed_the_crew_and_only_the_opened_sessions_feed_the_log() {
+        let mut app = crew_app();
+        let text = |role, text: &str| Event::Message {
+            at_ms: None,
+            message: Message {
+                role,
+                block: Block::Text { text: text.into() },
+            },
+        };
+        assert!(
+            app.state
+                .apply_frame(1, Some("c1"), &text(Role::Assistant, "built"))
+        );
+        assert!(
+            app.state
+                .apply_frame(2, Some("s1"), &text(Role::User, "go"))
+        );
+        assert!(
+            !app.state
+                .apply_frame(2, Some("c1"), &text(Role::Assistant, "again")),
+            "a replayed seq is skipped whichever session wrote it"
+        );
+        assert_eq!(app.state.crew.chat.len(), 2);
+        assert_eq!(
+            app.state.lines,
+            vec![Line {
+                kind: LineKind::User,
+                text: "go".into(),
+                at_ms: None,
+            }],
+            "the log holds the opened session's own rows"
+        );
+        assert_eq!(app.state.last_seq, 2);
+    }
+
+    #[test]
+    fn the_roots_delta_streams_into_the_chat_and_the_roots_log() {
+        let mut app = crew_app();
+        apply_sse(
+            &mut app.state,
+            &SseEvent {
+                event: None,
+                data: r#"{"delta":"hel","session_id":"s1"}"#.into(),
+            },
+        );
+        assert_eq!(app.state.crew.chat_delta.as_deref(), Some("hel"));
+        assert_eq!(app.state.pending_delta.as_deref(), Some("hel"));
+        apply_sse(
+            &mut app.state,
+            &SseEvent {
+                event: None,
+                data: r#"{"seq":3,"session_id":"c1","event":{"kind":"state","state":"waiting_for_input"}}"#.into(),
+            },
+        );
+        assert_eq!(
+            app.state.crew.members[1].state,
+            SessionState::WaitingForInput
+        );
+        assert!(
+            app.state.lines.is_empty(),
+            "a child's state is not the log's"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_keys_switch_views_and_a_bare_digit_is_typed_text() {
+        let client = reqwest::Client::new();
+        let mut app = crew_app();
+        assert_eq!(app.view, View::Chat, "a root opens on the chat");
+        let press = |code, modifiers| KeyEvent::new(code, modifiers);
+
+        handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            press(KeyCode::Char('2'), KeyModifiers::ALT),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.view, View::Tasks);
+        handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            press(KeyCode::F(3), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.view, View::Files);
+        handle_key(
+            &mut app,
+            &client,
+            "http://x",
+            "s1",
+            press(KeyCode::Char('4'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.view, View::Files, "a bare digit is not a view key");
+        assert_eq!(app.state.input, "4", "a message can start with a digit");
+
+        // A watched child has no input box, so a bare digit switches.
+        let mut child = App::new(child_test_session());
+        assert_eq!(child.view, View::Log, "a child opens on its log");
+        handle_key(
+            &mut child,
+            &client,
+            "http://x",
+            "child-1",
+            press(KeyCode::Char('1'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(child.view, View::Chat);
+    }
+
+    #[tokio::test]
+    async fn tab_cycles_the_chat_filter_through_the_crew_and_back() {
+        let client = reqwest::Client::new();
+        let mut app = crew_app();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            handle_key(&mut app, &client, "http://x", "s1", tab)
+                .await
+                .unwrap();
+            seen.push(app.chat_filter.clone());
+        }
+        assert_eq!(seen, vec![Some("s1".into()), Some("c1".into()), None]);
+    }
+
+    #[tokio::test]
+    async fn the_files_view_picks_a_file_and_shows_its_diff_until_esc() {
+        let client = reqwest::Client::new();
+        let mut app = crew_app();
+        let shell = Event::Message {
+            at_ms: None,
+            message: Message {
+                role: Role::User,
+                block: Block::ToolResult {
+                    id: "1".into(),
+                    name: "shell".into(),
+                    is_error: false,
+                    content: json!({"files": [{"path": "a", "op": "edited"}, {"path": "b", "op": "created"}]}),
+                },
+            },
+        };
+        app.state.apply_frame(1, Some("c1"), &shell);
+        app.show_view(View::Files);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for _ in 0..3 {
+            handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Down))
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.file_selected, 1, "the selection stops at the last file");
+        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Enter))
+            .await
+            .unwrap();
+        assert!(app.file_detail);
+        handle_key(&mut app, &client, "http://x", "s1", key(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert!(!app.file_detail, "Esc closes the diff");
+        assert!(
+            app.state.lines.is_empty(),
+            "Esc did not interrupt the session"
+        );
+    }
+
+    fn screen_text(
+        terminal: &Terminal<ratatui::backend::TestBackend>,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| buffer_row_text(buffer, y, width))
+            .collect()
+    }
+
+    #[test]
+    fn the_chat_follows_its_newest_line_when_long_lines_wrap() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = crew_app();
+        app.view = View::Chat;
+        for n in 0..12 {
+            // Emoji and CJK take two cells each, so a row cut by its
+            // character count is wider than the pane, and wraps when drawn.
+            let text = format!("post {n} {}", "✅ 完了 ".repeat(40));
+            let event = Event::Message {
+                at_ms: Some(1_700_000_000_000 + n),
+                message: Message {
+                    role: Role::Assistant,
+                    block: Block::Text { text },
+                },
+            };
+            app.state.apply_frame(n as i64 + 1, Some("s1"), &event);
+        }
+        let event = Event::Message {
+            at_ms: Some(1_700_000_001_000),
+            message: Message {
+                role: Role::Assistant,
+                block: Block::Text {
+                    text: "the newest line".into(),
+                },
+            },
+        };
+        app.state.apply_frame(100, Some("s1"), &event);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rows = screen_text(&terminal, 60, 20);
+        assert!(
+            rows.iter().any(|row| row.contains("the newest line")),
+            "wrapped lines must not push the newest one out of the window: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_terminal_puts_tasks_and_files_beside_the_chat() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = crew_app();
+        app.view = View::Tasks;
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rows = screen_text(&terminal, 160, 20);
+        assert!(app.wide);
+        assert_eq!(
+            app.main_view(),
+            View::Chat,
+            "Tasks moves out of the main pane"
+        );
+        assert!(
+            rows[1].starts_with("Ld waiting on 1  Bu working"),
+            "the crew line: {}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("chat") && rows[2].contains("tasks"),
+            "{}",
+            rows[2]
+        );
+        assert!(rows.iter().any(|row| row.contains("files")), "{rows:?}");
+        assert!(
+            rows[0].contains(" 1 Chat ") && !rows[0].contains("Tasks"),
+            "{}",
+            rows[0]
+        );
+
+        // The side-column keys do nothing while it is shown.
+        app.show_view(View::Files);
+        assert_eq!(app.view, View::Tasks);
+        app.show_view(View::Log);
+        assert_eq!(app.view, View::Log);
+
+        let mut narrow = crew_app();
+        narrow.view = View::Tasks;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut narrow)).unwrap();
+        let rows = screen_text(&terminal, 100, 20);
+        assert!(!narrow.wide);
+        assert_eq!(narrow.main_view(), View::Tasks);
+        assert!(
+            rows[2].contains("tasks") && !rows[2].contains("chat"),
+            "{}",
+            rows[2]
+        );
+        assert!(rows[0].contains(" 2 Tasks "), "{}", rows[0]);
     }
 }

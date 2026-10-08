@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 use tracing::warn;
 
+use crate::projects::ToolActivity;
 use crate::tunnel::TunnelError;
 use crate::tunnel::TunnelRegistry;
 
@@ -35,6 +36,9 @@ use crate::tunnel::TunnelRegistry;
 pub struct TunnelToolExecutor {
     pub tunnels: Arc<TunnelRegistry>,
     pub store: Store,
+    /// Told when each call starts and finishes, so the project map reads a
+    /// working copy again after a call that can change it. None tells nobody.
+    pub activity: Option<mpsc::UnboundedSender<ToolActivity>>,
 }
 
 impl ToolExecutor for TunnelToolExecutor {
@@ -48,10 +52,22 @@ impl ToolExecutor for TunnelToolExecutor {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutcome, ToolError>> + Send>> {
         let tunnels = self.tunnels.clone();
         let store = self.store.clone();
+        let activity = self.activity.clone();
         Box::pin(async move {
+            let report = |finished: bool| {
+                if let Some(activity) = &activity {
+                    let _ = activity.send(ToolActivity {
+                        session_id: session_id.clone(),
+                        tool: name.clone(),
+                        finished,
+                    });
+                }
+            };
+            report(false);
             let outcome =
-                call_tool(&tunnels, &store, &session_id, &run_id, &name, &args, &delta).await?;
-            Ok(outcome)
+                call_tool(&tunnels, &store, &session_id, &run_id, &name, &args, &delta).await;
+            report(true);
+            Ok(outcome?)
         })
     }
 
@@ -74,6 +90,20 @@ impl ToolExecutor for TunnelToolExecutor {
             Ok(())
         })
     }
+}
+
+/// Runs one executor operation for a session outside its loop, such as the
+/// project map's `git_state`. A shell run's output is dropped.
+pub async fn call_executor(
+    tunnels: &TunnelRegistry,
+    store: &Store,
+    session_id: &str,
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<ToolOutcome> {
+    let (delta, _) = mpsc::unbounded_channel();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    call_tool(tunnels, store, session_id, &run_id, name, args, &delta).await
 }
 
 async fn call_tool(
@@ -396,6 +426,7 @@ mod tests {
             TunnelToolExecutor {
                 tunnels: Arc::new(tunnels),
                 store,
+                activity: None,
             },
             session_id,
             node,
@@ -629,6 +660,7 @@ mod tests {
         let executor = TunnelToolExecutor {
             tunnels: Arc::new(TunnelRegistry::new()),
             store,
+            activity: None,
         };
         let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
 

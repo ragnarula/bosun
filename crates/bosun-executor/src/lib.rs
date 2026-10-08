@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+pub mod git_state;
 pub mod tools;
 
 use tools::ToolError;
@@ -321,7 +322,13 @@ pub async fn run_call(
                 tools::write_file(dir, &path, &content)
             })
             .await
-            .map(|()| json!({}))
+            .map(|change| {
+                json!({
+                    "created": change.created,
+                    "added": change.added,
+                    "removed": change.removed,
+                })
+            })
         }
         "edit" => {
             if permission != Permission::ReadWrite {
@@ -341,7 +348,13 @@ pub async fn run_call(
                 tools::edit(dir, &path, &old, &new)
             })
             .await
-            .map(|()| json!({ "replaced": true }))
+            .map(|change| {
+                json!({
+                    "replaced": true,
+                    "added": change.added,
+                    "removed": change.removed,
+                })
+            })
         }
         "grep" => {
             let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
@@ -426,6 +439,12 @@ pub async fn run_call(
                 .await
                 .map(|content| json!({ "content": content }))
         }
+        // The project map's read of the working copy. It is not a model tool:
+        // the control plane calls it, and the model is never offered it.
+        "git_state" => git_state::read_git_state(&state.session_dir)
+            .await
+            .map_err(ExecutorError::from)
+            .map(|state| serde_json::to_value(state).expect("git state serializes")),
         "repo_standards" => {
             run_blocking_infallible(&state.session_dir, tools::repo_standards_present)
                 .await
@@ -893,7 +912,11 @@ mod tests {
         )
         .await
         .expect("write should succeed");
-        assert!(matches!(outcome, CallOutcome::Result { content } if content == json!({})));
+        assert!(matches!(
+            outcome,
+            CallOutcome::Result { content }
+                if content == json!({ "created": true, "added": 1, "removed": 0 })
+        ));
 
         let outcome = call(&state, "run-2", "file_read", json!({ "path": "hello.txt" }))
             .await

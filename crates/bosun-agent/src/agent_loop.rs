@@ -520,7 +520,12 @@ pub fn spawn_loop(session_id: String, deps: Arc<LoopDeps>) -> LoopHandle {
             // is kept so a stopped session can still be woken by a parent
             // message.
             let mut pending: VecDeque<WakeKind> = VecDeque::new();
-            let mut state = LoopState::default();
+            // The task list lives on the session row, so a loop started after
+            // a restart carries on with the list the last one wrote.
+            let mut state = LoopState {
+                todos: deps.store.todos(&session_id).await?,
+                ..LoopState::default()
+            };
             // When a settled session's summary comes due: set as a wake ends,
             // cleared as the next one starts. An interrupt inside the wait
             // leaves it alone, so an ignored interrupt does not postpone the
@@ -1512,6 +1517,95 @@ fn announces_an_action(text: &str) -> bool {
 /// Whether the session's todo list holds work it never finished: at least one
 /// item whose status is not `done`, the status the `todowrite` schema defines
 /// for a finished item.
+/// The working copy's `git status --porcelain`, as path to two-letter status,
+/// read through the executor's `history_read`. None when the session's
+/// directory is not a git working copy, or the read fails: the shell result
+/// then simply names no files.
+async fn working_copy_status(
+    deps: &Arc<LoopDeps>,
+    session_id: &str,
+) -> Option<BTreeMap<String, String>> {
+    let (delta_tx, _delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
+    let outcome = deps
+        .tools
+        .call(
+            session_id.to_string(),
+            Uuid::new_v4().to_string(),
+            "history_read".into(),
+            json!({ "op": "status" }),
+            delta_tx,
+        )
+        .await
+        .ok()?;
+    if outcome.is_error || outcome.content["exit_code"].as_i64() != Some(0) {
+        return None;
+    }
+    Some(parse_porcelain(outcome.content["stdout"].as_str()?))
+}
+
+/// `git status --porcelain` output as path to its two-letter status.
+fn parse_porcelain(stdout: &str) -> BTreeMap<String, String> {
+    stdout
+        .lines()
+        .filter(|line| line.len() > 3 && line.is_char_boundary(2))
+        .map(|line| {
+            let (status, path) = line.split_at(2);
+            // A rename names `old -> new`; the file that now exists is new.
+            let path = path.trim_start();
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            (path.trim_matches('"').to_string(), status.to_string())
+        })
+        .collect()
+}
+
+/// The paths a command changed, from the working copy's status before and
+/// after it: each path whose status the run changed, as `created`, `edited`
+/// or `deleted`. A path that left the status list is not reported: a commit
+/// and a revert both remove a path, and neither is a change to the file.
+fn status_changes(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<Value> {
+    after
+        .iter()
+        .filter(|(path, status)| before.get(*path) != Some(status))
+        .map(|(path, status)| {
+            let op = if status.contains('D') {
+                "deleted"
+            } else if status == "??" || status.starts_with('A') {
+                "created"
+            } else {
+                "edited"
+            };
+            json!({ "path": path, "op": op })
+        })
+        .collect()
+}
+
+/// The longest target a `ToolStarted` carries. A command or a pattern can be
+/// any length, and the event is read by a caption one line wide.
+const TOOL_TARGET_MAX_CHARS: usize = 120;
+
+/// What a tool call works on, read from its arguments, for the activity event:
+/// a path, the first line of a command, a pattern, a URL, a skill, a persona,
+/// or a child. None for a tool with no such argument, such as an MCP tool.
+fn tool_target(name: &str, args: &Value) -> Option<String> {
+    let key = match name {
+        "file_read" | "file_write" | "edit" => "path",
+        "shell" => "command",
+        "grep" | "glob" => "pattern",
+        "webfetch" => "url",
+        "skill" => "name",
+        "spawn" => "persona",
+        "message_child" => "id",
+        "history_read" => "op",
+        _ => return None,
+    };
+    let text = args.get(key)?.as_str()?;
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    Some(line.chars().take(TOOL_TARGET_MAX_CHARS).collect())
+}
+
 fn has_open_todo(todos: &[Value]) -> bool {
     todos
         .iter()
@@ -1930,6 +2024,7 @@ async fn run_turn_inner(
         // The activity name is kept aside because each arm moves `name` into
         // the durable tool result before the finish event is appended.
         let tool_name = name.clone();
+        let target = tool_target(&name, &args);
         match name.as_str() {
             "" => {
                 warn!(
@@ -1961,6 +2056,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2102,6 +2198,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2130,7 +2227,10 @@ async fn run_turn_inner(
                     continue;
                 }
                 match args["items"].as_array() {
-                    Some(items) => state.todos = items.clone(),
+                    Some(items) => {
+                        state.todos = items.clone();
+                        deps.store.set_todos(session_id, items).await?;
+                    }
                     None => warn!(
                         msg = "todowrite items are not an array",
                         session_id = %session_id
@@ -2168,6 +2268,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2244,6 +2345,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2344,6 +2446,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2442,6 +2545,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2513,6 +2617,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2602,6 +2707,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2612,13 +2718,31 @@ async fn run_turn_inner(
                     tool = %name,
                     run_id = %run_id
                 );
-                let Some(outcome) =
+                // A shell command can change any file, and only the working
+                // copy can say which: its status before and after the run
+                // names the paths whose state the command changed.
+                let status_before = if name == "shell" {
+                    working_copy_status(deps, session_id).await
+                } else {
+                    None
+                };
+                let Some(mut outcome) =
                     run_tool_call(deps, session_id, &run_id, &name, args, signal).await?
                 else {
                     record_interrupted_call(deps, session_id, window, &id, &name, Some(started))
                         .await?;
                     return Ok(TurnOutcome::Interrupted);
                 };
+                if let Some(before) = status_before
+                    && let Some(after) = working_copy_status(deps, session_id).await
+                {
+                    let files = status_changes(&before, &after);
+                    if !files.is_empty()
+                        && let Some(content) = outcome.content.as_object_mut()
+                    {
+                        content.insert("files".into(), json!(files));
+                    }
+                }
                 deps.store
                     .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
                     .await?;
@@ -4112,6 +4236,9 @@ mod tests {
                 .cloned()
                 .or_else(|| plumbing_outcome(&name));
             let outcome = served.clone().unwrap_or_else(|| self.outcome.clone());
+            // The loop's own status reads around a shell call are not the call
+            // a test holds open, so they answer at once.
+            let status_read = name == "history_read";
             self.calls.lock().unwrap().push(CapturedToolCall {
                 session_id,
                 run_id,
@@ -4119,7 +4246,7 @@ mod tests {
                 args,
             });
             let delta_text = self.delta_text.clone();
-            let block = self.block && served.is_none();
+            let block = self.block && served.is_none() && !status_read;
             Box::pin(async move {
                 if let Some(text) = delta_text {
                     let _ = delta.send(ToolDelta { text });
@@ -4941,9 +5068,13 @@ mod tests {
         let started = phases
             .iter()
             .position(
-                |phase| matches!(phase, ActivityPhase::ToolStarted { name } if name == "shell"),
+                |phase| matches!(phase, ActivityPhase::ToolStarted { name, .. } if name == "shell"),
             )
             .expect("a tool_started for the shell call");
+        let ActivityPhase::ToolStarted { target, .. } = &phases[started] else {
+            unreachable!()
+        };
+        assert!(target.is_some(), "the start names the command it runs");
         let ActivityPhase::ToolFinished {
             name,
             ok,
@@ -5594,6 +5725,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_loop_started_after_a_restart_carries_on_with_the_stored_task_list() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-kept")).await.unwrap();
+        store
+            .set_todos(
+                "s-kept",
+                &[json!({ "id": "1", "content": "ship it", "status": "done" })],
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("done".into()),
+            stop(2, 1),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-kept".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { !provider.captured_calls().is_empty() }
+            }
+        })
+        .await;
+        assert!(
+            provider.captured_calls()[0]
+                .session_context
+                .contains("0. [done] ship it"),
+            "the first turn of a new loop reads the list the last one wrote"
+        );
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn todowrite_updates_the_todo_state() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -5676,6 +5850,17 @@ mod tests {
             }
         })
         .await;
+
+        let stored = store.todos("s-todo").await.unwrap();
+        assert_eq!(stored.len(), 2, "the list is kept on the session row");
+        assert_eq!(stored[1]["content"], "fix the bug");
+        let events = store.events_after("s-todo", 0).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| matches!(event, Event::Todos { items, .. } if items.len() == 2)),
+            "a client following the stream sees the new list"
+        );
 
         let messages = store.messages("s-todo", false).await.unwrap();
         let result = messages
@@ -10881,6 +11066,63 @@ mod tests {
             "a word that starts with a sequencing word is a different word"
         );
         assert!(!announces_an_action(""), "an empty reply announces nothing");
+    }
+
+    #[test]
+    fn a_commands_file_changes_are_the_paths_whose_status_it_changed() {
+        let before = parse_porcelain(" M src/kept.rs\n M src/edited.rs\n?? notes.txt\n");
+        let after = parse_porcelain(
+            " M src/kept.rs\nMM src/edited.rs\n?? new.txt\n D old.ps1\nR  a.rs -> b.rs\n",
+        );
+
+        let changes = status_changes(&before, &after);
+        assert_eq!(
+            changes,
+            [
+                json!({ "path": "b.rs", "op": "edited" }),
+                json!({ "path": "new.txt", "op": "created" }),
+                json!({ "path": "old.ps1", "op": "deleted" }),
+                json!({ "path": "src/edited.rs", "op": "edited" }),
+            ],
+            "an unchanged path and one that left the list (notes.txt) are not reported"
+        );
+    }
+
+    #[test]
+    fn a_tool_target_names_what_the_call_works_on() {
+        assert_eq!(
+            tool_target(
+                "edit",
+                &json!({ "path": "src/winsw.ts", "old": "a", "new": "b" })
+            ),
+            Some("src/winsw.ts".into())
+        );
+        assert_eq!(
+            tool_target(
+                "shell",
+                &json!({ "command": "\n  npm test -- winsw\nnpm run lint" })
+            ),
+            Some("npm test -- winsw".into()),
+            "a command's first line that holds anything, trimmed"
+        );
+        assert_eq!(
+            tool_target(
+                "spawn",
+                &json!({ "persona": "builder", "instructions": "go" })
+            ),
+            Some("builder".into())
+        );
+        assert_eq!(tool_target("ask", &json!({ "message": "which?" })), None);
+        assert_eq!(tool_target("mcp__scs__save", &json!({ "path": "x" })), None);
+        assert_eq!(tool_target("file_read", &json!({ "path": 3 })), None);
+        let long = "x".repeat(500);
+        assert_eq!(
+            tool_target("grep", &json!({ "pattern": long }))
+                .unwrap()
+                .chars()
+                .count(),
+            TOOL_TARGET_MAX_CHARS
+        );
     }
 
     #[test]

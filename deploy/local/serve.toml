@@ -1,0 +1,63 @@
+# Control-plane configuration for this machine. compose.override.yaml mounts
+# it in place of deploy/serve.toml. Fields: docs/developer/config.md.
+
+listen_addr = "0.0.0.0:8090"
+data_dir = "/var/lib/bosun/data"
+default_persona = "lead"
+# The MCP OAuth callback. The browser that signs in reaches the control plane
+# here, and the scs client is registered with this URL.
+oauth_redirect_uri = "http://192.168.1.18:8090/oauth/callback"
+
+# No thinking_budget_tokens: Opus 5.5 and Sonnet 5.5 reject budget_tokens and
+# think adaptively when the request leaves thinking out.
+[models.opus]
+provider = "anthropic"
+name = "claude-opus-5-5"
+api_key = "env:ANTHROPIC_API_KEY"
+price_input_per_mtok = 4
+price_output_per_mtok = 20
+
+[models.sonnet]
+provider = "anthropic"
+name = "claude-sonnet-5-5"
+api_key = "env:ANTHROPIC_API_KEY"
+price_input_per_mtok = 2
+price_output_per_mtok = 10
+
+# Each persona's role prompt is personas/<name>.md beside this file.
+
+[personas.lead]
+model = "opus"
+permission = "read_write"
+allowed_tools = "*"
+description = "Leads a piece of work with the user: frames it, plans it, and coordinates subagents. The default for a new session."
+
+[personas.architect]
+model = "opus"
+permission = "read_write"
+allowed_tools = "shell file_read file_write edit grep glob todowrite history_read webfetch skill ask clear_context"
+description = "Reasoning model that writes. Spawn it where a skill asks for a subagent on a reasoning model to write a problem, specification, design, task breakdown, or ADR."
+
+[personas.builder]
+model = "sonnet"
+permission = "read_write"
+allowed_tools = "shell file_read file_write edit grep glob todowrite history_read webfetch skill ask clear_context"
+description = "Implementation model. Spawn it to implement one task, or to fix review findings, in your working copy: test first, run the checks, commit."
+
+[personas.reviewer]
+model = "opus"
+permission = "read_only"
+allowed_tools = "file_read grep glob todowrite history_read webfetch skill ask"
+description = "Reasoning model that only reads. Spawn it to review an implementation, a specification, a design, or a task breakdown. It reports findings by severity and changes nothing."
+
+[personas.researcher]
+model = "sonnet"
+permission = "read_only"
+allowed_tools = "file_read grep glob todowrite history_read webfetch skill ask"
+description = "Search model that only reads. Spawn it to answer one research question from the code, the docs, and the web, with sources."
+
+[personas.designer]
+model = "sonnet"
+permission = "read_write"
+allowed_tools = "shell file_read file_write edit grep glob todowrite history_read webfetch skill ask clear_context"
+description = "Design model. Spawn it to design terminal CLI and web interfaces: layout, interaction, visuals, graphing, charts, and UX writing."

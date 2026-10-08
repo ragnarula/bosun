@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
@@ -38,14 +39,17 @@ use bosun_common::error::ErrorExt;
 use bosun_common::mcp::McpAuth;
 use bosun_common::mcp::McpServer;
 use bosun_common::mcp::McpServerSecret;
+use bosun_common::project::ProjectSummary;
+use bosun_common::project::ProjectView;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
-use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
+use bosun_common::session::SessionOverview;
 use bosun_common::session::SessionState;
+use bosun_common::session::SessionView;
 use bosun_common::skills::SkillRepo;
 use bosun_common::tunnel::Tunnel;
 use bosun_common::types::CloneRequest;
@@ -57,8 +61,11 @@ use bosun_common::types::NodeUpdateRequest;
 use bosun_common::types::PollRequest;
 use bosun_common::types::PollResponse;
 use bosun_common::types::StopRequest;
+use bosun_store::store::EventScope;
 use bosun_store::store::ModelCall;
+use bosun_store::store::PersonaAvatar;
 use bosun_store::store::RouteAnswer;
+use bosun_store::store::ScopedEvent;
 use bosun_store::store::Store;
 use bosun_store::store::StoreError;
 use futures_util::Stream;
@@ -70,17 +77,22 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
 
+use crate::avatars::AVATAR_UPLOAD_MAX_BYTES;
+use crate::avatars::AvatarError;
+use crate::avatars::normalize_picture;
 use crate::commands::CommandQueue;
 use crate::loops::AgentRegistry;
 use crate::mcp_manager::McpManager;
 use crate::mcp_oauth::McpOAuthContext;
 use crate::mcp_oauth::McpOAuthError;
 use crate::mcp_oauth::OAuthCallbackQuery;
+use crate::projects::ProjectHub;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
 use crate::skills_repos::GitHubClient;
@@ -112,6 +124,9 @@ pub enum ApiError {
 
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
+
+    #[error("project {id} was not found")]
+    ProjectNotFound { id: String },
 
     #[error(
         "session {id} is a child session and is watch-only; only its owner accepts user actions"
@@ -147,6 +162,12 @@ pub enum ApiError {
 
     #[error("persona {persona} references model {model} which is not configured")]
     PersonaModelNotFound { persona: String, model: String },
+
+    #[error("persona {persona} has no picture")]
+    AvatarNotFound { persona: String },
+
+    #[error(transparent)]
+    AvatarInvalid(#[from] AvatarError),
     #[error("skill repo {repo} already exists")]
     RepoAlreadyExists { repo: String },
     #[error("skill repo {repo} was not found")]
@@ -175,6 +196,8 @@ pub enum ApiError {
     },
     #[error("failed to fetch skill repo: {0}")]
     SkillRepoFetch(#[from] SkillsFetchError),
+    #[error(transparent)]
+    PushSubscriptionInvalid(#[from] crate::push::SubscriptionError),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -228,7 +251,12 @@ impl IntoResponse for ApiError {
             // what refuses a fork.
             ApiError::NotForkable { .. } => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
+            ApiError::AvatarInvalid(_) | ApiError::PushSubscriptionInvalid(_) => {
+                (StatusCode::BAD_REQUEST, Some(self.to_string()))
+            }
             ApiError::SessionNotFound { .. }
+            | ApiError::ProjectNotFound { .. }
+            | ApiError::AvatarNotFound { .. }
             | ApiError::RepoNotFound { .. }
             | ApiError::McpServerNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
             ApiError::McpServerUrlInvalid | ApiError::McpServerNameRequired => {
@@ -300,6 +328,8 @@ pub struct AppState {
     /// The shared MCP connections: the loops borrow them and the retry route
     /// asks them for an immediate attempt.
     pub mcp: Arc<McpManager>,
+    /// The project map the `/projects` routes serve.
+    pub projects: Arc<ProjectHub>,
 }
 
 impl AppState {
@@ -543,6 +573,10 @@ const RESERVED_PATHS: &[&str] = &[
     "/",
     "/ui",
     "/ui/mermaid.min.js",
+    "/manifest.webmanifest",
+    "/sw.js",
+    "/push/key",
+    "/push/subscriptions",
     "/viewport-report",
     "/poll",
     "/nodes",
@@ -553,6 +587,7 @@ const RESERVED_PATHS: &[&str] = &[
     "/stop",
     "/skills/repos",
     "/mcp/servers",
+    "/projects",
 ];
 
 /// The path prefixes the router serves dynamic routes below.
@@ -562,11 +597,13 @@ const RESERVED_PATH_PREFIXES: &[&str] = &[
     "/nodes/",
     "/skills/repos/",
     "/mcp/servers/",
+    "/personas/",
+    "/projects/",
 ];
 
 /// The parents the router serves any single segment below: `/ui/{asset}`
 /// matches `/ui/main.js` but not `/ui/oauth/callback`.
-const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/"];
+const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/", "/ui/fonts/", "/ui/icons/"];
 
 /// The `oauth_redirect_uri` names a path the control plane cannot serve as
 /// the OAuth callback.
@@ -620,6 +657,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(crate::ui::pane))
         .route("/ui/mermaid.min.js", get(crate::ui::mermaid_bundle))
         .route("/ui/{asset}", get(crate::ui::asset))
+        .route("/ui/fonts/{name}", get(crate::ui::font))
+        .route("/ui/icons/{name}", get(crate::ui::icon))
+        .route("/manifest.webmanifest", get(crate::ui::manifest))
+        .route("/sw.js", get(crate::ui::service_worker))
+        .route("/push/key", get(push_key))
+        .route(
+            "/push/subscriptions",
+            post(add_push_subscription).delete(remove_push_subscription),
+        )
         .route(
             "/viewport-report",
             post(crate::ui::viewport_report)
@@ -628,6 +674,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/poll", post(poll))
         .route("/nodes", get(nodes))
         .route("/personas", get(personas))
+        .route(
+            "/personas/{name}/avatar",
+            get(avatar_picture)
+                .put(upload_avatar)
+                .delete(remove_avatar)
+                .layer(DefaultBodyLimit::max(AVATAR_UPLOAD_MAX_BYTES)),
+        )
+        .route("/personas/{name}/avatar/shuffle", post(shuffle_avatar))
         .route("/sessions", get(sessions).post(create_session))
         .route("/sessions/{id}", get(session_detail))
         .route("/sessions/{id}/messages", post(add_message))
@@ -639,7 +693,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/persona", post(switch_persona))
         .route("/sessions/{id}/model-calls", get(session_model_calls))
         .route("/sessions/{id}/events", get(events))
+        .route("/sessions/{id}/tree-events", get(tree_events))
+        .route("/sessions/{id}/tree-history", get(tree_history))
         .route("/sessions/{id}/history", get(history))
+        .route("/projects", get(projects))
+        .route("/projects/{id}", get(project))
+        .route("/projects/{id}/events", get(project_events))
         .route("/clone", post(clone))
         .route("/dev", post(dev))
         .route("/nodes/{name}/dirs", get(dirs))
@@ -689,6 +748,48 @@ async fn not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+/// The public key a browser subscribes to push notifications with.
+#[instrument(skip(state))]
+async fn push_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = crate::push::PushKey::load(&state.store).await?;
+    Ok(Json(json!({ "public_key": key.public_key() })))
+}
+
+/// Keeps a browser's push subscription, so it gets the trees' notifications.
+/// The pane's origin becomes the contact the control plane signs each message
+/// with.
+#[instrument(skip_all)]
+async fn add_push_subscription(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::push::SubscriptionBody>,
+) -> Result<StatusCode, ApiError> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let subscription = crate::push::subscription(body, origin)?;
+    state.store.add_push_subscription(&subscription).await?;
+    tracing::info!(origin = %subscription.origin, "push subscription added");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PushEndpoint {
+    endpoint: String,
+}
+
+/// Forgets a browser's push subscription. Forgetting one that is not kept
+/// succeeds too: the browser has no subscription here either way.
+#[instrument(skip_all)]
+async fn remove_push_subscription(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PushEndpoint>,
+) -> Result<StatusCode, ApiError> {
+    state.store.remove_push_subscription(&body.endpoint).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The node's one outbound control request: it reports its heartbeat payload,
 /// delivers the previous command's result, and takes the next command.
 #[instrument(skip(state))]
@@ -718,51 +819,237 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
 }
 
 /// One configured persona as the clients need it: the name for the dropdown
-/// value, the description to show beside it, and whether it is the default.
+/// value, the description to show beside it, whether it is the default, and
+/// its avatar: the seed its robot is drawn from, and when a picture replaced
+/// the robot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaSummary {
     pub name: String,
     pub description: String,
     pub default: bool,
+    /// The seed the persona's robot is drawn from: its name until someone
+    /// shuffles it.
+    #[serde(default)]
+    pub avatar_seed: String,
+    /// When the persona's uploaded picture was stored, in unix seconds; a
+    /// client puts it in the picture's URL so a new picture is fetched. None
+    /// when the persona shows its robot.
+    #[serde(default)]
+    pub picture_at_secs: Option<i64>,
 }
 
 /// The configured personas for the persona dropdowns: the terminal attach
 /// and the web pane both render one option per persona, with the default
 /// persona marked.
 #[instrument(skip(state))]
-async fn personas(State(state): State<Arc<AppState>>) -> Json<Vec<PersonaSummary>> {
+async fn personas(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<PersonaSummary>>, ApiError> {
     let default = state.default_persona.as_deref();
+    let avatars: HashMap<String, PersonaAvatar> = state
+        .store
+        .persona_avatars()
+        .await?
+        .into_iter()
+        .map(|avatar| (avatar.persona.clone(), avatar))
+        .collect();
     let mut names: Vec<&String> = state.personas.keys().collect();
     names.sort();
-    Json(
+    Ok(Json(
         names
             .into_iter()
-            .map(|name| PersonaSummary {
-                name: name.clone(),
-                description: state.personas[name].description.clone(),
-                default: Some(name.as_str()) == default,
+            .map(|name| {
+                let avatar = avatars.get(name);
+                PersonaSummary {
+                    name: name.clone(),
+                    description: state.personas[name].description.clone(),
+                    default: Some(name.as_str()) == default,
+                    avatar_seed: avatar.map_or_else(|| name.clone(), |avatar| avatar.seed.clone()),
+                    picture_at_secs: avatar.and_then(|avatar| avatar.picture_at_secs),
+                }
             })
             .collect(),
+    ))
+}
+
+/// Refuses a persona the configuration does not name, so the avatar table
+/// holds rows for configured personas only.
+fn configured_persona(state: &AppState, name: &str) -> Result<(), ApiError> {
+    if state.personas.contains_key(name) {
+        Ok(())
+    } else {
+        Err(ApiError::PersonaNotFound {
+            persona: name.to_string(),
+        })
+    }
+}
+
+/// The persona's uploaded picture, as the PNG the control plane drew. The
+/// URL carries the picture's time, so the response may be kept.
+#[instrument(skip(state))]
+async fn avatar_picture(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    configured_persona(&state, &name)?;
+    let Some(png) = state.store.avatar_picture(&name).await? else {
+        return Err(ApiError::AvatarNotFound { persona: name });
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            ),
+        ],
+        png,
     )
+        .into_response())
+}
+
+/// Replaces the persona's robot with an uploaded PNG, JPEG or WebP picture,
+/// stored as a 256-pixel square PNG.
+#[instrument(skip(state, body))]
+async fn upload_avatar(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    configured_persona(&state, &name)?;
+    let png = tokio::task::spawn_blocking(move || normalize_picture(&body))
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))??;
+    state.store.set_avatar_picture(&name, png).await?;
+    info!(persona = %name, "stored an avatar picture");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes the persona's picture, so it shows its robot again.
+#[instrument(skip(state))]
+async fn remove_avatar(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    configured_persona(&state, &name)?;
+    state.store.clear_avatar_picture(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Draws the persona a new robot: a fresh random seed, answered so the
+/// client can draw it at once.
+#[instrument(skip(state))]
+async fn shuffle_avatar(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    configured_persona(&state, &name)?;
+    let seed = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    state.store.set_avatar_seed(&name, &seed).await?;
+    Ok(Json(json!({ "avatar_seed": seed })))
+}
+
+/// Every session with its overview: what each is doing, what it has cost,
+/// whether it is asking, and how far its task list has got.
+#[instrument(skip(state))]
+async fn sessions(State(state): State<Arc<AppState>>) -> Result<Json<Vec<SessionView>>, ApiError> {
+    let sessions = state.store.list_sessions().await?;
+    let mut views = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        views.push(session_view(&state, session).await?);
+    }
+    Ok(Json(views))
+}
+
+/// Every repository the sessions work in.
+#[instrument(skip(state))]
+async fn projects(State(state): State<Arc<AppState>>) -> Json<Vec<ProjectSummary>> {
+    Json(state.projects.summaries())
 }
 
 #[instrument(skip(state))]
-async fn sessions(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Session>>, ApiError> {
-    let sessions = state.store.list_sessions().await?;
-    Ok(Json(sessions))
+async fn project(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ProjectView>, ApiError> {
+    state
+        .projects
+        .view(&id)
+        .map(Json)
+        .ok_or(ApiError::ProjectNotFound { id })
+}
+
+/// The project's view now, then again each time it changes, as `project`
+/// frames. A `gone` frame ends the stream when the project's last session
+/// ends. A client that falls behind gets the newest view, never a backlog.
+#[instrument(skip(state))]
+async fn project_events(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let updates = state.projects.subscribe();
+    let first = state
+        .projects
+        .view(&id)
+        .ok_or_else(|| ApiError::ProjectNotFound { id: id.clone() })?;
+    let hub = state.projects.clone();
+    let frame = |view: &ProjectView| {
+        SseEvent::default()
+            .event("project")
+            .data(serde_json::to_string(view).expect("a project view serializes"))
+    };
+    let stream = stream::unfold(
+        (Some(first), updates, hub, id, false),
+        move |(first, mut updates, hub, id, done)| async move {
+            if done {
+                return None;
+            }
+            if let Some(view) = first {
+                return Some((Ok(frame(&view)), (None, updates, hub, id, false)));
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(changed) if changed != id => continue,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+                return Some(match hub.view(&id) {
+                    Some(view) => (Ok(frame(&view)), (None, updates, hub, id, false)),
+                    None => (
+                        Ok(SseEvent::default()
+                            .event("gone")
+                            .data(json!({ "id": id }).to_string())),
+                        (None, updates, hub, id, true),
+                    ),
+                });
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// A session with its overview. A session removed between the list and its
+/// overview is served with an empty one rather than failing the whole list.
+async fn session_view(state: &AppState, session: Session) -> Result<SessionView, ApiError> {
+    let overview = match state.store.session_overview(&session.id).await {
+        Ok(overview) => overview,
+        Err(StoreError::SessionNotFound { .. }) => SessionOverview::default(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(SessionView { session, overview })
 }
 
 #[instrument(skip(state))]
 async fn session_detail(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Session>, ApiError> {
+) -> Result<Json<SessionView>, ApiError> {
     let session = state
         .store
         .get_session(&id)
         .await?
         .ok_or_else(|| ApiError::SessionNotFound { id: id.clone() })?;
-    Ok(Json(session))
+    Ok(Json(session_view(&state, session).await?))
 }
 
 /// One session's recorded model calls, oldest first, with their aggregates.
@@ -2033,6 +2320,40 @@ async fn history(
     }))
 }
 
+/// The tree's events before `before`, a page of the crew's messages at a time,
+/// for a client that opened `tree-events` with `tail=` and is reading back.
+/// Each event names the session that wrote it.
+#[instrument(skip(state))]
+async fn tree_history(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryPage>, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id });
+    };
+    let messages = query
+        .messages
+        .unwrap_or(HISTORY_PAGE_DEFAULT)
+        .min(HISTORY_PAGE_MAX);
+    let page = state
+        .store
+        .scoped_events_page(
+            EventScope::Tree(session.owner_id),
+            Some(query.before),
+            messages,
+        )
+        .await?;
+    Ok(Json(HistoryPage {
+        events: page
+            .events
+            .into_iter()
+            .map(|event| json!({ "seq": event.seq, "session_id": event.session_id, "event": event.event }))
+            .collect(),
+        more: page.more,
+    }))
+}
+
 /// SSE stream for a session: durable store events replayed from `after`, then
 /// live text deltas from the loop's broadcast channel. While the stream is
 /// open the store is polled for new durable events, so a client that joined
@@ -2047,6 +2368,40 @@ async fn events(
     if state.store.get_session(&id).await?.is_none() {
         return Err(ApiError::SessionNotFound { id });
     }
+    scoped_stream(state, EventScope::Session(id.clone()), id, query, &headers).await
+}
+
+/// SSE stream for the whole tree the session belongs to: the same replay,
+/// polling and resume as one session's stream, over every session the tree's
+/// root owns. Each durable frame names the session that wrote it, and the
+/// root's live text deltas arrive with the root's id. A crew is followed on
+/// one connection, whatever members join it while the stream is open.
+#[instrument(skip(state))]
+async fn tree_events(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id });
+    };
+    let root = session.owner_id;
+    scoped_stream(state, EventScope::Tree(root.clone()), root, query, &headers).await
+}
+
+/// The stream `events` and `tree_events` serve: `scope`'s durable events,
+/// then live deltas from `live_id`'s loop.
+async fn scoped_stream(
+    state: Arc<AppState>,
+    scope: EventScope,
+    live_id: String,
+    query: EventsQuery,
+    headers: &HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>, ApiError> {
+    // A tree's frames name their session; one session's frames stay as they
+    // were before trees were streamed.
+    let tagged = matches!(scope, EventScope::Tree(_));
     // The explicit `after=` cursor wins; otherwise resume from the
     // `Last-Event-ID` header, which EventSource sends automatically on
     // reconnect with the seq of the last durable frame it received.
@@ -2063,22 +2418,29 @@ async fn events(
         (None, Some(tail)) => {
             let page = state
                 .store
-                .events_page(&id, None, tail.min(HISTORY_PAGE_MAX))
+                .scoped_events_page(scope.clone(), None, tail.min(HISTORY_PAGE_MAX))
                 .await?;
-            let before = page.events.first().map(|(seq, _)| *seq);
+            let before = page.events.first().map(|event| event.seq);
             (Some(history_frame(before, page.more)), page.events)
         }
         _ => (
             None,
-            state.store.events_after(&id, cursor.unwrap_or(0)).await?,
+            state
+                .store
+                .scoped_events_after(scope.clone(), cursor.unwrap_or(0))
+                .await?,
         ),
     };
     let last_seq = replayed
         .last()
-        .map(|(seq, _)| *seq)
+        .map(|event| event.seq)
         .unwrap_or(cursor.unwrap_or(0));
     let replay = stream::iter(history.into_iter().map(Ok))
-        .chain(stream::iter(replayed.into_iter().map(durable_frame)))
+        .chain(stream::iter(
+            replayed
+                .into_iter()
+                .map(move |event| durable_frame(event, tagged)),
+        ))
         .boxed();
 
     // Polls the store for durable events past the last emitted seq. Events
@@ -2086,34 +2448,41 @@ async fn events(
     // never duplicates a frame.
     let store = state.store.clone();
     let poll = stream::unfold(
-        (store, id.clone(), last_seq),
-        |(store, id, mut last_seq)| async move {
+        (store, scope, last_seq),
+        move |(store, scope, mut last_seq)| async move {
             tokio::time::sleep(EVENTS_POLL_INTERVAL).await;
-            let events = store.events_after(&id, last_seq).await.unwrap_or_default();
+            let events = store
+                .scoped_events_after(scope.clone(), last_seq)
+                .await
+                .unwrap_or_default();
             let mut frames = Vec::new();
-            for (seq, event) in events {
-                if seq <= last_seq {
+            for event in events {
+                if event.seq <= last_seq {
                     continue;
                 }
-                last_seq = seq;
-                frames.push(durable_frame((seq, event)));
+                last_seq = event.seq;
+                frames.push(durable_frame(event, tagged));
             }
-            Some((stream::iter(frames), (store, id, last_seq)))
+            Some((stream::iter(frames), (store, scope, last_seq)))
         },
     )
     .flatten()
     .boxed();
 
-    let live = match state.loops.subscribe(&id) {
-        Some(rx) => stream::unfold(rx, |mut rx| async move {
+    let live = match state.loops.subscribe(&live_id) {
+        Some(rx) => stream::unfold((rx, live_id), move |(mut rx, live_id)| async move {
             loop {
                 match rx.recv().await {
                     Ok(text) => {
-                        let payload = json!({ "delta": text });
+                        let payload = if tagged {
+                            json!({ "delta": text, "session_id": live_id })
+                        } else {
+                            json!({ "delta": text })
+                        };
                         let event = SseEvent::default()
                             .json_data(&payload)
                             .expect("serializing a json value cannot fail");
-                        return Some((Ok::<_, Infallible>(event), rx));
+                        return Some((Ok::<_, Infallible>(event), (rx, live_id)));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
@@ -2140,8 +2509,17 @@ fn history_frame(before: Option<i64>, more: bool) -> SseEvent {
 /// One durable frame: the seq in the SSE id and in the payload, so a client
 /// reconnecting with `after=` or `Last-Event-ID` resumes exactly where it
 /// left off.
-fn durable_frame((seq, event): (i64, Event)) -> Result<SseEvent, Infallible> {
-    let payload = json!({ "seq": seq, "event": event });
+fn durable_frame(event: ScopedEvent, tagged: bool) -> Result<SseEvent, Infallible> {
+    let ScopedEvent {
+        seq,
+        session_id,
+        event,
+    } = event;
+    let payload = if tagged {
+        json!({ "seq": seq, "session_id": session_id, "event": event })
+    } else {
+        json!({ "seq": seq, "event": event })
+    };
     Ok(SseEvent::default()
         .id(seq.to_string())
         .json_data(&payload)
@@ -2321,6 +2699,10 @@ mod tests {
     use bosun_agent::provider::StopReason;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
+    use bosun_common::project::DirtyFile;
+    use bosun_common::project::FileOp;
+    use bosun_common::project::GitState;
+    use bosun_common::session::Event;
     use bosun_common::tool::ToolMsg;
     use bosun_common::tool::ToolOp;
     use bosun_common::tool::read_tool_frame;
@@ -2437,6 +2819,7 @@ mod tests {
                 reqwest::Client::new(),
             )),
             mcp_oauth: oauth,
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -2627,6 +3010,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -2679,6 +3063,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -3744,6 +4129,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -3930,6 +4316,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -4062,6 +4449,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4361,6 +4749,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4547,6 +4936,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4721,6 +5111,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4945,6 +5336,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (state, store, root.id, child.id)
     }
@@ -5458,6 +5850,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (state, store, root.id, mid.id, leaf.id)
     }
@@ -5759,6 +6152,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -6232,6 +6626,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let store = state.store.clone();
         state.store.create_session(&session("s1")).await.unwrap();
@@ -6372,6 +6767,248 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_persona_avatar_is_shuffled_uploaded_served_and_removed() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &["m"], &[("builder", "m")], None);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let personas = |addr| async move {
+            reqwest::get(format!("http://{addr}/personas"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+
+        let listed = personas(addr).await;
+        assert_eq!(
+            listed[0]["avatar_seed"], "builder",
+            "the robot starts from the name"
+        );
+        assert_eq!(listed[0]["picture_at_secs"], serde_json::Value::Null);
+
+        let shuffled: serde_json::Value = client
+            .post(format!("http://{addr}/personas/builder/avatar/shuffle"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            personas(addr).await[0]["avatar_seed"],
+            shuffled["avatar_seed"]
+        );
+
+        let mut jpeg = Vec::new();
+        image::DynamicImage::new_rgb8(300, 200)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let response = client
+            .put(format!("http://{addr}/personas/builder/avatar"))
+            .body(jpeg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(personas(addr).await[0]["picture_at_secs"].is_i64());
+        let served = reqwest::get(format!("http://{addr}/personas/builder/avatar"))
+            .await
+            .unwrap();
+        assert_eq!(served.headers()["content-type"], "image/png");
+        let picture = image::load_from_memory(&served.bytes().await.unwrap()).unwrap();
+        assert_eq!((picture.width(), picture.height()), (256, 256));
+
+        let svg = client
+            .put(format!("http://{addr}/personas/builder/avatar"))
+            .body(r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(svg.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        client
+            .delete(format!("http://{addr}/personas/builder/avatar"))
+            .send()
+            .await
+            .unwrap();
+        let gone = reqwest::get(format!("http://{addr}/personas/builder/avatar"))
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            personas(addr).await[0]["avatar_seed"],
+            shuffled["avatar_seed"],
+            "removing the picture keeps the robot's seed"
+        );
+
+        let unknown = client
+            .post(format!("http://{addr}/personas/nobody/avatar/shuffle"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_session_list_and_detail_carry_each_sessions_overview() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_model_call(
+                "s1",
+                "m",
+                "p",
+                "completion",
+                Some(1),
+                None,
+                Some(1),
+                Some(0.5),
+            )
+            .await
+            .unwrap();
+        store
+            .set_todos(
+                "s1",
+                &[json!({ "id": "1", "content": "a", "status": "done" })],
+            )
+            .await
+            .unwrap();
+
+        let list: serde_json::Value = reqwest::get(format!("http://{addr}/sessions"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            list[0]["id"], "s1",
+            "the row's own fields stay at the top level"
+        );
+        assert_eq!(list[0]["cost"], 0.5);
+        assert_eq!(list[0]["asking"], false);
+        assert_eq!(
+            list[0]["tasks"],
+            json!({ "total": 1, "done": 1, "in_progress": 0 })
+        );
+
+        let detail: serde_json::Value = reqwest::get(format!("http://{addr}/sessions/s1"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["cost"], 0.5);
+        let parsed: Session = serde_json::from_value(detail).unwrap();
+        assert_eq!(
+            parsed.id, "s1",
+            "a client that reads a plain session still can"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_stream_replays_every_members_events_with_their_session() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        store.create_session(&session("other")).await.unwrap();
+        for (id, text) in [("root", "go"), ("other", "elsewhere"), ("kid", "done")] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: text.into() })
+                .await
+                .unwrap();
+        }
+
+        // Asked for from the child, the stream still covers the whole tree.
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/kid/tree-events"))
+                .send()
+                .await
+                .unwrap(),
+            |frames| frames.len() >= 2,
+        )
+        .await;
+        let read: Vec<(i64, &str)> = frames
+            .iter()
+            .map(|frame| {
+                (
+                    frame.data["seq"].as_i64().unwrap(),
+                    frame.data["session_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(read, [(1, "root"), (3, "kid")]);
+        assert_eq!(frames[1].id.as_deref(), Some("3"), "the sse id is the seq");
+
+        // A member that writes after the stream opened reaches it by the poll.
+        let response = client
+            .get(format!("http://{addr}/sessions/root/tree-events?after=3"))
+            .send()
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "kid",
+                Role::Assistant,
+                &Block::Text {
+                    text: "more".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let frames = read_sse_frames(response, |frames| !frames.is_empty()).await;
+        assert_eq!(frames[0].data["session_id"], "kid");
+        assert_eq!(frames[0].data["event"]["message"]["block"]["text"], "more");
+    }
+
+    #[tokio::test]
+    async fn tree_history_pages_the_crews_messages_back() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        for id in ["root", "kid", "root"] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: id.into() })
+                .await
+                .unwrap();
+        }
+
+        let page: serde_json::Value = reqwest::get(format!(
+            "http://{addr}/sessions/root/tree-history?before=3&messages=5"
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(page["more"], false);
+        assert_eq!(page["events"][0]["session_id"], "root");
+        assert_eq!(page["events"][1]["session_id"], "kid");
+        assert_eq!(page["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn events_stream_replays_and_polls_activity_events() {
         let dir = tempdir().unwrap();
         let state = test_state(&dir);
@@ -6487,6 +7124,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -7374,6 +8012,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (
             state,
@@ -7669,6 +8308,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (state, requests, bodies)
     }
@@ -9042,6 +9682,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -11022,5 +11663,213 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved, "srv-b,srv-a");
+    }
+
+    /// A working copy's git state, on branch `feature` of this repository.
+    fn feature_copy(dirty: Vec<DirtyFile>) -> GitState {
+        GitState {
+            root: "/tmp/x".into(),
+            common_dir: "/tmp/x/.git".into(),
+            origin: Some("git@github.com:ragnarula/bosun.git".into()),
+            main_ref: Some("origin/main".into()),
+            main: Vec::new(),
+            branch: Some("feature".into()),
+            head: Some("h1".into()),
+            fork: None,
+            ahead: 1,
+            behind: 0,
+            commits: Vec::new(),
+            changed: Vec::new(),
+            dirty,
+            remote_branches: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_browser_subscribes_to_push_with_the_served_key_and_unsubscribes() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let key: Value = client
+            .get(format!("http://{addr}/push/key"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let again: Value = client
+            .get(format!("http://{addr}/push/key"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(key, again, "every browser subscribes with the one key");
+        assert_eq!(key["public_key"].as_str().unwrap().len(), 87, "65 bytes");
+
+        let subscription = json!({
+            "endpoint": "https://push.example/send/abc",
+            "expirationTime": null,
+            "keys": { "p256dh": b64(&[[4u8].as_slice(), &[9u8; 64]].concat()), "auth": b64(&[1u8; 16]) },
+        });
+        let added = client
+            .post(format!("http://{addr}/push/subscriptions"))
+            .header("Origin", "https://pane.example")
+            .json(&subscription)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::NO_CONTENT);
+        let stored = state.store.push_subscriptions().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].origin, "https://pane.example");
+
+        let mut plain = subscription.clone();
+        plain["endpoint"] = json!("http://push.example/send/abc");
+        let refused = client
+            .post(format!("http://{addr}/push/subscriptions"))
+            .json(&plain)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let removed = client
+            .delete(format!("http://{addr}/push/subscriptions"))
+            .json(&json!({ "endpoint": "https://push.example/send/abc" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        assert!(state.store.push_subscriptions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_worker_and_the_manifest_are_served_at_the_root() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let worker = client
+            .get(format!("http://{addr}/sw.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(worker.status(), StatusCode::OK);
+        assert!(
+            worker.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript"),
+            "a browser registers a worker only from a JavaScript type"
+        );
+        let manifest = client
+            .get(format!("http://{addr}/manifest.webmanifest"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.headers()[header::CONTENT_TYPE],
+            "application/manifest+json"
+        );
+        let icon = client
+            .get(format!("http://{addr}/ui/icons/icon-512.png"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(icon.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(
+            oauth_callback_path("https://cp.example/sw.js").is_err()
+                && oauth_callback_path("https://cp.example/ui/icons/x").is_err()
+                && oauth_callback_path("https://cp.example/push/subscriptions").is_err(),
+            "the OAuth callback cannot take a path the pane is served at"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_is_listed_served_and_streamed_until_its_last_session_stops() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let hub = state.projects.clone();
+        let running = Session {
+            state: SessionState::Running,
+            ..session("s1")
+        };
+        hub.sync_sessions(std::slice::from_ref(&running));
+        let (touched, _) = hub.apply_read("n1:/tmp/x", Some(feature_copy(Vec::new())), None, 10);
+        let id = touched.into_iter().next().unwrap();
+
+        let list: Value = client
+            .get(format!("http://{addr}/projects"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list[0]["id"], id.as_str());
+        assert_eq!(list[0]["name"], "bosun");
+        assert_eq!(list[0]["sessions"], json!(["s1"]));
+        let view: Value = client
+            .get(format!("http://{addr}/projects/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(view["lanes"][0]["branch"], "feature");
+        let missing = client
+            .get(format!("http://{addr}/projects/nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let response = client
+            .get(format!("http://{addr}/projects/{id}/events"))
+            .send()
+            .await
+            .unwrap();
+        let edited = feature_copy(vec![DirtyFile {
+            path: "a.rs".into(),
+            op: FileOp::Edited,
+            added: 2,
+            removed: 0,
+        }]);
+        let stream_hub = hub.clone();
+        let stream_id = id.clone();
+        tokio::spawn(async move {
+            // After the first frame, the copy changes, then its session stops.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stream_hub.apply_read("n1:/tmp/x", Some(edited), None, 20);
+            stream_hub.publish(&stream_id);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stream_hub.sync_sessions(&[Session {
+                state: SessionState::Stopped,
+                ..running
+            }]);
+        });
+        let frames = read_sse_frames(response, |frames| frames.len() >= 3).await;
+        assert_eq!(frames[0].data["lanes"][0]["dirty"], json!([]));
+        assert_eq!(frames[1].data["lanes"][0]["dirty"][0]["path"], "a.rs");
+        assert_eq!(frames[1].data["feed"][0]["kind"], "edited");
+        assert_eq!(frames[2].data, json!({ "id": id }), "the gone frame");
+        let list: Value = client
+            .get(format!("http://{addr}/projects"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list, json!([]));
     }
 }

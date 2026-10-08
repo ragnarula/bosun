@@ -36,6 +36,8 @@ pub struct ControlConfig {
     /// a server that needs OAuth cannot be authorised until this is set, and
     /// a wrong value fails the flow with a clear error.
     pub oauth_redirect_uri: Option<String>,
+    /// How long the project map keeps a merged branch, in hours.
+    pub merged_branch_hours: u64,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -137,6 +139,7 @@ impl Default for ControlConfig {
             default_persona: None,
             github_token: None,
             oauth_redirect_uri: None,
+            merged_branch_hours: 24,
         }
     }
 }
@@ -341,6 +344,14 @@ mod tests {
         assert!(config.nudge);
         let config: ControlConfig = toml::from_str("nudge = false").unwrap();
         assert!(!config.nudge);
+    }
+
+    #[test]
+    fn merged_branch_hours_defaults_to_a_day() {
+        let config: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(config.merged_branch_hours, 24);
+        let config: ControlConfig = toml::from_str("merged_branch_hours = 168").unwrap();
+        assert_eq!(config.merged_branch_hours, 168);
     }
 
     #[test]

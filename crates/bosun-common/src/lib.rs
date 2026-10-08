@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod mcp;
+pub mod project;
 pub mod session;
 pub mod skills;
 pub mod target;

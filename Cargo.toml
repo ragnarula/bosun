@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.57"
+version = "0.9.58"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ragnarula/bosun"
@@ -20,6 +20,7 @@ repository = "https://github.com/ragnarula/bosun"
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 bosun-agent = { path = "crates/bosun-agent" }
 bosun-common = { path = "crates/bosun-common" }
 bosun-control = { path = "crates/bosun-control" }
@@ -37,12 +38,14 @@ http-body-util = "0.1"
 hyper = "1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "tls12", "http1", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
 dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
 lzma-rs = "0.3"
 mermaid-text = "0.57"
 rcgen = "0.13"
 regex = "1"
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 ratatui = "0.29"

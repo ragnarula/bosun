@@ -12,6 +12,8 @@ use anyhow::Context;
 use bosun_common::mcp::McpAuth;
 use bosun_common::mcp::McpServer;
 use bosun_common::mcp::McpServerSecret;
+use bosun_common::project::MergedLane;
+use bosun_common::session::ActivityAt;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
@@ -19,7 +21,9 @@ use bosun_common::session::Message;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
+use bosun_common::session::SessionOverview;
 use bosun_common::session::SessionState;
+use bosun_common::session::TaskCounts;
 use bosun_common::skills::SkillAd;
 use bosun_common::skills::SkillPackage;
 use bosun_common::skills::SkillRepo;
@@ -122,6 +126,69 @@ pub struct EventsPage {
     pub more: bool,
 }
 
+/// A persona's avatar as the store holds it: the seed its generated robot is
+/// drawn from, and when an uploaded picture replaced the robot, if one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaAvatar {
+    pub persona: String,
+    pub seed: String,
+    /// When the picture was stored, in unix seconds; None when the persona
+    /// has no picture and shows its robot.
+    pub picture_at_secs: Option<i64>,
+}
+
+/// A browser's push subscription: the push service's endpoint and the keys a
+/// message to it is encrypted with, base64url as the browser gives them, and
+/// the origin of the pane that subscribed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushSubscription {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub origin: String,
+}
+
+/// Which events a read covers: one session's, or every session's in one tree.
+#[derive(Debug, Clone)]
+pub enum EventScope {
+    /// The session with this id.
+    Session(String),
+    /// Every session whose `owner_id` is this root's id, the root included.
+    Tree(String),
+}
+
+impl EventScope {
+    /// The SQL condition on `events` that selects the scope, with the scope's
+    /// key bound as `?1`.
+    fn filter(&self) -> &'static str {
+        match self {
+            EventScope::Session(_) => "session_id = ?1",
+            EventScope::Tree(_) => "session_id IN (SELECT id FROM sessions WHERE owner_id = ?1)",
+        }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            EventScope::Session(id) | EventScope::Tree(id) => id,
+        }
+    }
+}
+
+/// One stored event with the session that wrote it.
+#[derive(Debug, Clone)]
+pub struct ScopedEvent {
+    pub seq: i64,
+    pub session_id: String,
+    pub event: Event,
+}
+
+/// A page of a scope's events, as `EventsPage` is for one session.
+#[derive(Debug, Clone)]
+pub struct ScopedEventsPage {
+    pub events: Vec<ScopedEvent>,
+    pub more: bool,
+}
+
 /// What routing a user's answer to a pending raised ask did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteAnswer {
@@ -161,7 +228,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   parent_id TEXT,
   owner_id TEXT NOT NULL,
   interrupt_cause TEXT,
-  summary TEXT
+  summary TEXT,
+  todos TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,6 +303,33 @@ CREATE TABLE IF NOT EXISTS skill_references (
   path TEXT NOT NULL,
   content TEXT NOT NULL,
   PRIMARY KEY (package, path)
+);
+CREATE TABLE IF NOT EXISTS persona_avatars (
+  persona TEXT PRIMARY KEY,
+  seed TEXT NOT NULL,
+  picture BLOB,
+  updated_at_secs INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_lanes (
+  project TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  head TEXT NOT NULL,
+  pr INTEGER,
+  title TEXT,
+  commits INTEGER NOT NULL,
+  merged_at_secs INTEGER NOT NULL,
+  PRIMARY KEY (project, branch, head)
+);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  endpoint TEXT PRIMARY KEY,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  added_at_secs INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_key (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  pkcs8 BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mcp_servers (
   name TEXT PRIMARY KEY,
@@ -317,6 +412,10 @@ impl Store {
         if !column_exists(&conn, "sessions", "summary")? {
             conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT", [])
                 .context("failed to add the summary column")?;
+        }
+        if !column_exists(&conn, "sessions", "todos")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN todos TEXT", [])
+                .context("failed to add the todos column")?;
         }
         if !column_exists(&conn, "pending_asks", "origin_leaf")? {
             // Rows written before the origin column held the origin leaf in
@@ -765,6 +864,54 @@ impl Store {
         .await
     }
 
+    /// Replaces the session's task list and appends the matching
+    /// `Event::Todos` in one transaction, so a client following the stream and
+    /// a loop reading the row back after a restart see the same list.
+    pub async fn set_todos(&self, id: &str, items: &[Value]) -> Result<(), StoreError> {
+        let items = items.to_vec();
+        self.with_session(id, move |conn, session_id| {
+            let tx = transaction(conn)?;
+            tx.execute(
+                "UPDATE sessions SET todos = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&items)?, session_id],
+            )
+            .context("failed to update the session task list")?;
+            append_event(
+                &tx,
+                session_id,
+                "todos",
+                &Event::Todos {
+                    at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
+                    items,
+                },
+            )?;
+            tx.commit().context("failed to commit the task list")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The session's task list as `todowrite` last replaced it; empty when it
+    /// never wrote one.
+    pub async fn todos(&self, id: &str) -> Result<Vec<Value>, StoreError> {
+        self.with_session(id, move |conn, session_id| {
+            let todos: Option<String> = conn
+                .query_row(
+                    "SELECT todos FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to read the session task list")?;
+            match todos {
+                Some(text) => {
+                    Ok(serde_json::from_str(&text).context("failed to parse the task list")?)
+                }
+                None => Ok(Vec::new()),
+            }
+        })
+        .await
+    }
+
     /// Appends the message and the matching `Event::Message` in one
     /// transaction, so the SSE stream and the transcript never diverge.
     pub async fn append_message(
@@ -799,25 +946,35 @@ impl Store {
         session_id: &str,
         after: i64,
     ) -> Result<Vec<(i64, Event)>, StoreError> {
-        let session_id = session_id.to_string();
+        let events = self
+            .scoped_events_after(EventScope::Session(session_id.to_string()), after)
+            .await?;
+        Ok(events
+            .into_iter()
+            .map(|event| (event.seq, event.event))
+            .collect())
+    }
+
+    /// The events `scope` covers past `after`, in seq order, each with the
+    /// session that wrote it. Seqs are global across sessions, so one cursor
+    /// orders a whole tree.
+    pub async fn scoped_events_after(
+        &self,
+        scope: EventScope,
+        after: i64,
+    ) -> Result<Vec<ScopedEvent>, StoreError> {
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT seq, payload FROM events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
-                )
+                .prepare(&format!(
+                    "SELECT seq, session_id, payload FROM events
+                     WHERE {} AND seq > ?2 ORDER BY seq",
+                    scope.filter()
+                ))
                 .context("failed to prepare event query")?;
             let mut rows = stmt
-                .query(params![session_id, after])
+                .query(params![scope.key(), after])
                 .context("failed to query events")?;
-            let mut events = Vec::new();
-            while let Some(row) = rows.next().context("failed to read event row")? {
-                let seq: i64 = row.get("seq")?;
-                let payload: String = row.get("payload")?;
-                let event: Event =
-                    serde_json::from_str(&payload).context("failed to parse event payload")?;
-                events.push((seq, event));
-            }
-            Ok(events)
+            read_scoped_events(&mut rows)
         })
         .await
     }
@@ -836,19 +993,48 @@ impl Store {
         before: Option<i64>,
         messages: usize,
     ) -> Result<EventsPage, StoreError> {
-        let session_id = session_id.to_string();
+        let page = self
+            .scoped_events_page(
+                EventScope::Session(session_id.to_string()),
+                before,
+                messages,
+            )
+            .await?;
+        Ok(EventsPage {
+            events: page
+                .events
+                .into_iter()
+                .map(|event| (event.seq, event.event))
+                .collect(),
+            more: page.more,
+        })
+    }
+
+    /// `events_page` over the events `scope` covers: for a tree, the messages
+    /// counted are every member's, so a page of a crew holds the newest
+    /// `messages` messages whoever wrote them.
+    pub async fn scoped_events_page(
+        &self,
+        scope: EventScope,
+        before: Option<i64>,
+        messages: usize,
+    ) -> Result<ScopedEventsPage, StoreError> {
         let before = before.unwrap_or(i64::MAX);
         let offset = i64::try_from(messages.max(1) - 1).unwrap_or(i64::MAX);
         self.with_conn(move |conn| {
-            // The page starts at the oldest message it holds. When the session
+            let filter = scope.filter();
+            let key = scope.key();
+            // The page starts at the oldest message it holds. When the scope
             // has fewer messages than the page, it starts at the first event.
             let start: Option<i64> = conn
                 .query_row(
-                    "SELECT seq FROM events
-                     WHERE session_id = ?1 AND seq < ?2
-                       AND json_extract(payload, '$.kind') = 'message'
-                     ORDER BY seq DESC LIMIT 1 OFFSET ?3",
-                    params![session_id, before, offset],
+                    &format!(
+                        "SELECT seq FROM events
+                         WHERE {filter} AND seq < ?2
+                           AND json_extract(payload, '$.kind') = 'message'
+                         ORDER BY seq DESC LIMIT 1 OFFSET ?3"
+                    ),
+                    params![key, before, offset],
                     |row| row.get(0),
                 )
                 .optional()
@@ -856,29 +1042,22 @@ impl Store {
             let start = start.unwrap_or(0);
             let more: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 AND seq < ?2)",
-                    params![session_id, start],
+                    &format!("SELECT EXISTS(SELECT 1 FROM events WHERE {filter} AND seq < ?2)"),
+                    params![key, start],
                     |row| row.get(0),
                 )
                 .context("failed to check for older events")?;
             let mut stmt = conn
-                .prepare(
-                    "SELECT seq, payload FROM events
-                     WHERE session_id = ?1 AND seq >= ?2 AND seq < ?3 ORDER BY seq",
-                )
+                .prepare(&format!(
+                    "SELECT seq, session_id, payload FROM events
+                     WHERE {filter} AND seq >= ?2 AND seq < ?3 ORDER BY seq"
+                ))
                 .context("failed to prepare event page query")?;
             let mut rows = stmt
-                .query(params![session_id, start, before])
+                .query(params![key, start, before])
                 .context("failed to query event page")?;
-            let mut events = Vec::new();
-            while let Some(row) = rows.next().context("failed to read event row")? {
-                let seq: i64 = row.get("seq")?;
-                let payload: String = row.get("payload")?;
-                let event: Event =
-                    serde_json::from_str(&payload).context("failed to parse event payload")?;
-                events.push((seq, event));
-            }
-            Ok(EventsPage { events, more })
+            let events = read_scoped_events(&mut rows)?;
+            Ok(ScopedEventsPage { events, more })
         })
         .await
     }
@@ -1226,6 +1405,337 @@ impl Store {
             let event: Event =
                 serde_json::from_str(&payload).context("failed to parse event payload")?;
             Ok(event.at_ms().map(|at_ms| (at_ms / 1000) as i64))
+        })
+        .await
+    }
+
+    /// What the session is doing, for the session list: its summed model-call
+    /// cost, its newest activity, whether its newest message is an unanswered
+    /// question, and its task list counted by status. Each part reads one row
+    /// or one aggregate, so a list of sessions costs a few small queries each.
+    pub async fn session_overview(&self, id: &str) -> Result<SessionOverview, StoreError> {
+        self.with_session(id, move |conn, session_id| {
+            let cost: f64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(cost), 0) FROM model_calls WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to sum the session's cost")?;
+            // The index walks back from the newest event to the first activity,
+            // and activity is most of what a working session writes.
+            let activity: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM events
+                     WHERE session_id = ?1 AND json_extract(payload, '$.kind') = 'activity'
+                     ORDER BY seq DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("failed to read the newest activity")?;
+            let activity = match activity {
+                Some(payload) => match serde_json::from_str(&payload)
+                    .context("failed to parse an activity event")?
+                {
+                    Event::Activity { at_ms, phase } => Some(ActivityAt { at_ms, phase }),
+                    _ => None,
+                },
+                None => None,
+            };
+            let newest: Option<String> = conn
+                .query_row(
+                    "SELECT block FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("failed to read the newest message")?;
+            let asking = match newest {
+                Some(block) => matches!(
+                    serde_json::from_str(&block).context("failed to parse a block")?,
+                    Block::Ask { answer: None, .. }
+                ),
+                None => false,
+            };
+            let todos: Option<String> = conn
+                .query_row(
+                    "SELECT todos FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to read the task list")?;
+            let items: Vec<Value> = match todos {
+                Some(text) => {
+                    serde_json::from_str(&text).context("failed to parse the task list")?
+                }
+                None => Vec::new(),
+            };
+            let status =
+                |wanted: &str| items.iter().filter(|item| item["status"] == wanted).count();
+            Ok(SessionOverview {
+                cost,
+                activity,
+                asking,
+                tasks: TaskCounts {
+                    total: items.len(),
+                    done: status("done"),
+                    in_progress: status("in_progress"),
+                },
+            })
+        })
+        .await
+    }
+
+    /// Every persona that has an avatar row: a seed someone shuffled, or a
+    /// picture someone uploaded. A persona without a row uses its own name as
+    /// its seed.
+    pub async fn persona_avatars(&self) -> Result<Vec<PersonaAvatar>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT persona, seed, CASE WHEN picture IS NULL THEN NULL ELSE updated_at_secs END
+                     FROM persona_avatars ORDER BY persona",
+                )
+                .context("failed to prepare the avatar query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PersonaAvatar {
+                        persona: row.get(0)?,
+                        seed: row.get(1)?,
+                        picture_at_secs: row.get(2)?,
+                    })
+                })
+                .context("failed to query avatars")?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Records a branch merged into a project's main branch, at the head it
+    /// had when it merged. A second record of the same head keeps the first.
+    pub async fn record_merged_lane(
+        &self,
+        project: &str,
+        head: &str,
+        lane: &MergedLane,
+    ) -> Result<(), StoreError> {
+        let (project, head, lane) = (project.to_string(), head.to_string(), lane.clone());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO merged_lanes
+                   (project, branch, head, pr, title, commits, merged_at_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    project,
+                    lane.branch,
+                    head,
+                    lane.pr.map(|pr| pr as i64),
+                    lane.title,
+                    lane.commits,
+                    lane.merged_at_secs
+                ],
+            )
+            .context("failed to record the merged branch")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The project's branches merged at or after `since_secs`, newest first.
+    pub async fn merged_lanes(
+        &self,
+        project: &str,
+        since_secs: i64,
+    ) -> Result<Vec<MergedLane>, StoreError> {
+        let project = project.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT branch, pr, title, commits, merged_at_secs FROM merged_lanes
+                     WHERE project = ?1 AND merged_at_secs >= ?2
+                     ORDER BY merged_at_secs DESC, branch",
+                )
+                .context("failed to prepare the merged branch query")?;
+            let rows = stmt
+                .query_map(params![project, since_secs], |row| {
+                    Ok(MergedLane {
+                        branch: row.get(0)?,
+                        pr: row.get::<_, Option<i64>>(1)?.map(|pr| pr as u64),
+                        title: row.get(2)?,
+                        commits: row.get(3)?,
+                        merged_at_secs: row.get(4)?,
+                    })
+                })
+                .context("failed to query merged branches")?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Removes every project's merged-branch records older than `before_secs`.
+    pub async fn prune_merged_lanes(&self, before_secs: i64) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM merged_lanes WHERE merged_at_secs < ?1",
+                params![before_secs],
+            )
+            .context("failed to prune merged branches")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stores `candidate` as the control plane's push signing key unless a key
+    /// is stored already, and returns the stored key. Two callers racing on an
+    /// empty store both get the key that won.
+    pub async fn keep_push_key(&self, candidate: Vec<u8>) -> Result<Vec<u8>, StoreError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO push_key (id, pkcs8) VALUES (1, ?1)",
+                params![candidate],
+            )
+            .context("failed to store the push key")?;
+            conn.query_row("SELECT pkcs8 FROM push_key WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .context("failed to read the push key")
+        })
+        .await
+    }
+
+    /// Adds a browser's subscription, or replaces the keys of one already
+    /// stored for the same endpoint.
+    pub async fn add_push_subscription(
+        &self,
+        subscription: &PushSubscription,
+    ) -> Result<(), StoreError> {
+        let subscription = subscription.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO push_subscriptions
+                   (endpoint, p256dh, auth, origin, added_at_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    subscription.endpoint,
+                    subscription.p256dh,
+                    subscription.auth,
+                    subscription.origin,
+                    bosun_common::time::unix_secs(SystemTime::now())
+                ],
+            )
+            .context("failed to store the push subscription")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes the subscription for `endpoint`. Returns whether one was stored.
+    pub async fn remove_push_subscription(&self, endpoint: &str) -> Result<bool, StoreError> {
+        let endpoint = endpoint.to_string();
+        self.with_conn(move |conn| {
+            let removed = conn
+                .execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint = ?1",
+                    params![endpoint],
+                )
+                .context("failed to remove the push subscription")?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+
+    /// Every stored subscription, oldest first.
+    pub async fn push_subscriptions(&self) -> Result<Vec<PushSubscription>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT endpoint, p256dh, auth, origin FROM push_subscriptions
+                     ORDER BY added_at_secs, endpoint",
+                )
+                .context("failed to prepare the push subscription query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PushSubscription {
+                        endpoint: row.get(0)?,
+                        p256dh: row.get(1)?,
+                        auth: row.get(2)?,
+                        origin: row.get(3)?,
+                    })
+                })
+                .context("failed to query push subscriptions")?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Gives the persona's robot a new seed, keeping any picture.
+    pub async fn set_avatar_seed(&self, persona: &str, seed: &str) -> Result<(), StoreError> {
+        let (persona, seed) = (persona.to_string(), seed.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO persona_avatars (persona, seed, picture, updated_at_secs)
+                 VALUES (?1, ?2, NULL, ?3)
+                 ON CONFLICT(persona) DO UPDATE SET seed = excluded.seed",
+                params![
+                    persona,
+                    seed,
+                    bosun_common::time::unix_secs(SystemTime::now())
+                ],
+            )
+            .context("failed to store the avatar seed")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stores `png` as the persona's picture. A persona with no row yet keeps
+    /// its name as its seed, so removing the picture brings back its robot.
+    pub async fn set_avatar_picture(&self, persona: &str, png: Vec<u8>) -> Result<(), StoreError> {
+        let persona = persona.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO persona_avatars (persona, seed, picture, updated_at_secs)
+                 VALUES (?1, ?1, ?2, ?3)
+                 ON CONFLICT(persona) DO UPDATE SET picture = excluded.picture,
+                   updated_at_secs = excluded.updated_at_secs",
+                params![
+                    persona,
+                    png,
+                    bosun_common::time::unix_secs(SystemTime::now())
+                ],
+            )
+            .context("failed to store the avatar picture")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes the persona's picture, so it shows its robot again.
+    pub async fn clear_avatar_picture(&self, persona: &str) -> Result<(), StoreError> {
+        let persona = persona.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE persona_avatars SET picture = NULL WHERE persona = ?1",
+                [persona],
+            )
+            .context("failed to remove the avatar picture")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The persona's stored picture, as PNG bytes.
+    pub async fn avatar_picture(&self, persona: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let persona = persona.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT picture FROM persona_avatars WHERE persona = ?1 AND picture IS NOT NULL",
+                [persona],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read the avatar picture")
         })
         .await
     }
@@ -2430,6 +2940,20 @@ fn ensure_mcp_server_exists(conn: &rusqlite::Connection, name: &str) -> Result<(
     }
 }
 
+/// Reads `seq, session_id, payload` rows into events.
+fn read_scoped_events(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<ScopedEvent>, anyhow::Error> {
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().context("failed to read event row")? {
+        let payload: String = row.get("payload")?;
+        events.push(ScopedEvent {
+            seq: row.get("seq")?,
+            session_id: row.get("session_id")?,
+            event: serde_json::from_str(&payload).context("failed to parse event payload")?,
+        });
+    }
+    Ok(events)
+}
+
 /// Whether `column` is one of `table`'s columns, for additive migrations.
 fn column_exists(
     conn: &rusqlite::Connection,
@@ -2545,6 +3069,7 @@ fn mcp_server_secret_from_row(row: &rusqlite::Row) -> Result<McpServerSecret, an
 mod tests {
     use std::time::UNIX_EPOCH;
 
+    use bosun_common::session::ActivityPhase;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2666,9 +3191,13 @@ mod tests {
             [
                 "events",
                 "mcp_servers",
+                "merged_lanes",
                 "messages",
                 "model_calls",
                 "pending_asks",
+                "persona_avatars",
+                "push_key",
+                "push_subscriptions",
                 "sessions",
                 "skill_packages",
                 "skill_references",
@@ -2678,6 +3207,108 @@ mod tests {
         );
 
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn the_first_push_key_stored_is_the_one_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        assert_eq!(store.keep_push_key(vec![1, 2]).await.unwrap(), vec![1, 2]);
+        assert_eq!(
+            store.keep_push_key(vec![3, 4]).await.unwrap(),
+            vec![1, 2],
+            "a second candidate must not replace the key browsers subscribed with"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_subscription_is_kept_once_per_endpoint_until_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let subscription = |endpoint: &str, auth: &str| PushSubscription {
+            endpoint: endpoint.into(),
+            p256dh: "key".into(),
+            auth: auth.into(),
+            origin: "https://pane.example".into(),
+        };
+        store
+            .add_push_subscription(&subscription("https://push.example/a", "old"))
+            .await
+            .unwrap();
+        store
+            .add_push_subscription(&subscription("https://push.example/a", "new"))
+            .await
+            .unwrap();
+        store
+            .add_push_subscription(&subscription("https://push.example/b", "b"))
+            .await
+            .unwrap();
+        let mut stored = store.push_subscriptions().await.unwrap();
+        stored.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        assert_eq!(
+            stored,
+            vec![
+                subscription("https://push.example/a", "new"),
+                subscription("https://push.example/b", "b"),
+            ]
+        );
+
+        assert!(
+            store
+                .remove_push_subscription("https://push.example/a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .remove_push_subscription("https://push.example/a")
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.push_subscriptions().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn merged_lanes_keep_one_record_per_head_and_age_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let lane = |branch: &str, at: i64| MergedLane {
+            branch: branch.into(),
+            pr: Some(60),
+            title: Some("Back off".into()),
+            commits: 2,
+            merged_at_secs: at,
+        };
+        store
+            .record_merged_lane("p", "aaa", &lane("fix", 100))
+            .await
+            .unwrap();
+        store
+            .record_merged_lane("p", "aaa", &lane("fix", 150))
+            .await
+            .unwrap();
+        store
+            .record_merged_lane("p", "bbb", &lane("docs", 200))
+            .await
+            .unwrap();
+        store
+            .record_merged_lane("q", "ccc", &lane("other", 200))
+            .await
+            .unwrap();
+
+        let merged = store.merged_lanes("p", 0).await.unwrap();
+        assert_eq!(merged, vec![lane("docs", 200), lane("fix", 100)]);
+        assert_eq!(
+            store.merged_lanes("p", 101).await.unwrap(),
+            vec![lane("docs", 200)]
+        );
+
+        store.prune_merged_lanes(150).await.unwrap();
+        assert_eq!(
+            store.merged_lanes("p", 0).await.unwrap(),
+            vec![lane("docs", 200)]
+        );
+        assert_eq!(store.merged_lanes("q", 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2987,6 +3618,177 @@ mod tests {
         let page = store.events_page("a", None, 5).await.unwrap();
         assert_eq!(page.events.len(), 1);
         assert!(!page.more);
+    }
+
+    #[tokio::test]
+    async fn a_tree_scope_reads_every_members_events_and_no_other_trees() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        store.create_session(&session("other")).await.unwrap();
+        for (id, text) in [("root", "go"), ("other", "elsewhere"), ("kid", "done")] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: text.into() })
+                .await
+                .unwrap();
+        }
+
+        let events = store
+            .scoped_events_after(EventScope::Tree("root".into()), 0)
+            .await
+            .unwrap();
+        let read: Vec<(i64, &str)> = events
+            .iter()
+            .map(|event| (event.seq, event.session_id.as_str()))
+            .collect();
+        assert_eq!(read, [(1, "root"), (3, "kid")]);
+
+        let after = store
+            .scoped_events_after(EventScope::Tree("root".into()), 1)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "the cursor is the global seq");
+        assert_eq!(after[0].session_id, "kid");
+    }
+
+    #[tokio::test]
+    async fn a_tree_page_counts_every_members_messages() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        for id in ["root", "kid", "root", "kid"] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: id.into() })
+                .await
+                .unwrap();
+        }
+
+        let page = store
+            .scoped_events_page(EventScope::Tree("root".into()), None, 3)
+            .await
+            .unwrap();
+        let read: Vec<(i64, &str)> = page
+            .events
+            .iter()
+            .map(|event| (event.seq, event.session_id.as_str()))
+            .collect();
+        assert_eq!(read, [(2, "kid"), (3, "root"), (4, "kid")]);
+        assert!(page.more, "the root's first message is older than the page");
+    }
+
+    #[tokio::test]
+    async fn a_task_list_is_kept_on_the_row_and_announced_on_the_stream() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        assert!(store.todos("s1").await.unwrap().is_empty());
+
+        let items =
+            [json!({ "id": "1", "content": "write it", "status": "todo", "kind": "build" })];
+        store.set_todos("s1", &items).await.unwrap();
+
+        assert_eq!(store.todos("s1").await.unwrap(), items);
+        let events = store.events_after("s1", 0).await.unwrap();
+        assert!(matches!(
+            &events[0].1,
+            Event::Todos { at_ms: Some(_), items: written } if written.as_slice() == items
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_overview_says_what_a_session_is_doing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        assert_eq!(
+            store.session_overview("s1").await.unwrap(),
+            SessionOverview::default(),
+            "a new session has done nothing"
+        );
+
+        for cost in [0.25, 0.5] {
+            store
+                .append_model_call(
+                    "s1",
+                    "m",
+                    "p",
+                    "completion",
+                    Some(1),
+                    None,
+                    Some(1),
+                    Some(cost),
+                )
+                .await
+                .unwrap();
+        }
+        let started = ActivityPhase::ToolStarted {
+            name: "edit".into(),
+            target: Some("src/winsw.ts".into()),
+        };
+        store
+            .append_event(
+                "s1",
+                &Event::Activity {
+                    at_ms: 42,
+                    phase: started.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_todos(
+                "s1",
+                &[
+                    json!({ "id": "1", "content": "a", "status": "done" }),
+                    json!({ "id": "2", "content": "b", "status": "in_progress" }),
+                    json!({ "id": "3", "content": "c", "status": "todo" }),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "s1",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "which?".into(),
+                    options: vec![],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let overview = store.session_overview("s1").await.unwrap();
+        assert_eq!(overview.cost, 0.75);
+        assert_eq!(
+            overview.activity,
+            Some(ActivityAt {
+                at_ms: 42,
+                phase: started
+            })
+        );
+        assert!(
+            overview.asking,
+            "the newest message is an unanswered question"
+        );
+        assert_eq!(
+            overview.tasks,
+            TaskCounts {
+                total: 3,
+                done: 1,
+                in_progress: 1
+            }
+        );
     }
 
     #[tokio::test]

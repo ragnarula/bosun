@@ -1,9 +1,12 @@
 pub mod api;
+pub mod avatars;
 pub mod commands;
 pub mod loops;
 pub mod mcp_client;
 pub mod mcp_manager;
 pub mod mcp_oauth;
+pub mod projects;
+pub mod push;
 pub mod registry;
 pub mod skills_repos;
 pub mod spawn;
