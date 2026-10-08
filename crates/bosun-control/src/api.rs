@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
@@ -60,6 +61,7 @@ use bosun_common::types::PollResponse;
 use bosun_common::types::StopRequest;
 use bosun_store::store::EventScope;
 use bosun_store::store::ModelCall;
+use bosun_store::store::PersonaAvatar;
 use bosun_store::store::RouteAnswer;
 use bosun_store::store::ScopedEvent;
 use bosun_store::store::Store;
@@ -78,6 +80,9 @@ use tracing::info;
 use tracing::instrument;
 use tracing::warn;
 
+use crate::avatars::AVATAR_UPLOAD_MAX_BYTES;
+use crate::avatars::AvatarError;
+use crate::avatars::normalize_picture;
 use crate::commands::CommandQueue;
 use crate::loops::AgentRegistry;
 use crate::mcp_manager::McpManager;
@@ -150,6 +155,12 @@ pub enum ApiError {
 
     #[error("persona {persona} references model {model} which is not configured")]
     PersonaModelNotFound { persona: String, model: String },
+
+    #[error("persona {persona} has no picture")]
+    AvatarNotFound { persona: String },
+
+    #[error(transparent)]
+    AvatarInvalid(#[from] AvatarError),
     #[error("skill repo {repo} already exists")]
     RepoAlreadyExists { repo: String },
     #[error("skill repo {repo} was not found")]
@@ -231,7 +242,9 @@ impl IntoResponse for ApiError {
             // what refuses a fork.
             ApiError::NotForkable { .. } => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
+            ApiError::AvatarInvalid(_) => (StatusCode::BAD_REQUEST, Some(self.to_string())),
             ApiError::SessionNotFound { .. }
+            | ApiError::AvatarNotFound { .. }
             | ApiError::RepoNotFound { .. }
             | ApiError::McpServerNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
             ApiError::McpServerUrlInvalid | ApiError::McpServerNameRequired => {
@@ -631,6 +644,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/poll", post(poll))
         .route("/nodes", get(nodes))
         .route("/personas", get(personas))
+        .route(
+            "/personas/{name}/avatar",
+            get(avatar_picture)
+                .put(upload_avatar)
+                .delete(remove_avatar)
+                .layer(DefaultBodyLimit::max(AVATAR_UPLOAD_MAX_BYTES)),
+        )
+        .route("/personas/{name}/avatar/shuffle", post(shuffle_avatar))
         .route("/sessions", get(sessions).post(create_session))
         .route("/sessions/{id}", get(session_detail))
         .route("/sessions/{id}/messages", post(add_message))
@@ -723,32 +744,134 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeHealth>> {
 }
 
 /// One configured persona as the clients need it: the name for the dropdown
-/// value, the description to show beside it, and whether it is the default.
+/// value, the description to show beside it, whether it is the default, and
+/// its avatar: the seed its robot is drawn from, and when a picture replaced
+/// the robot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaSummary {
     pub name: String,
     pub description: String,
     pub default: bool,
+    /// The seed the persona's robot is drawn from: its name until someone
+    /// shuffles it.
+    #[serde(default)]
+    pub avatar_seed: String,
+    /// When the persona's uploaded picture was stored, in unix seconds; a
+    /// client puts it in the picture's URL so a new picture is fetched. None
+    /// when the persona shows its robot.
+    #[serde(default)]
+    pub picture_at_secs: Option<i64>,
 }
 
 /// The configured personas for the persona dropdowns: the terminal attach
 /// and the web pane both render one option per persona, with the default
 /// persona marked.
 #[instrument(skip(state))]
-async fn personas(State(state): State<Arc<AppState>>) -> Json<Vec<PersonaSummary>> {
+async fn personas(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<PersonaSummary>>, ApiError> {
     let default = state.default_persona.as_deref();
+    let avatars: HashMap<String, PersonaAvatar> = state
+        .store
+        .persona_avatars()
+        .await?
+        .into_iter()
+        .map(|avatar| (avatar.persona.clone(), avatar))
+        .collect();
     let mut names: Vec<&String> = state.personas.keys().collect();
     names.sort();
-    Json(
+    Ok(Json(
         names
             .into_iter()
-            .map(|name| PersonaSummary {
-                name: name.clone(),
-                description: state.personas[name].description.clone(),
-                default: Some(name.as_str()) == default,
+            .map(|name| {
+                let avatar = avatars.get(name);
+                PersonaSummary {
+                    name: name.clone(),
+                    description: state.personas[name].description.clone(),
+                    default: Some(name.as_str()) == default,
+                    avatar_seed: avatar.map_or_else(|| name.clone(), |avatar| avatar.seed.clone()),
+                    picture_at_secs: avatar.and_then(|avatar| avatar.picture_at_secs),
+                }
             })
             .collect(),
+    ))
+}
+
+/// Refuses a persona the configuration does not name, so the avatar table
+/// holds rows for configured personas only.
+fn configured_persona(state: &AppState, name: &str) -> Result<(), ApiError> {
+    if state.personas.contains_key(name) {
+        Ok(())
+    } else {
+        Err(ApiError::PersonaNotFound {
+            persona: name.to_string(),
+        })
+    }
+}
+
+/// The persona's uploaded picture, as the PNG the control plane drew. The
+/// URL carries the picture's time, so the response may be kept.
+#[instrument(skip(state))]
+async fn avatar_picture(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    configured_persona(&state, &name)?;
+    let Some(png) = state.store.avatar_picture(&name).await? else {
+        return Err(ApiError::AvatarNotFound { persona: name });
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            ),
+        ],
+        png,
     )
+        .into_response())
+}
+
+/// Replaces the persona's robot with an uploaded PNG, JPEG or WebP picture,
+/// stored as a 256-pixel square PNG.
+#[instrument(skip(state, body))]
+async fn upload_avatar(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    configured_persona(&state, &name)?;
+    let png = tokio::task::spawn_blocking(move || normalize_picture(&body))
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))??;
+    state.store.set_avatar_picture(&name, png).await?;
+    info!(persona = %name, "stored an avatar picture");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes the persona's picture, so it shows its robot again.
+#[instrument(skip(state))]
+async fn remove_avatar(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    configured_persona(&state, &name)?;
+    state.store.clear_avatar_picture(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Draws the persona a new robot: a fresh random seed, answered so the
+/// client can draw it at once.
+#[instrument(skip(state))]
+async fn shuffle_avatar(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    configured_persona(&state, &name)?;
+    let seed = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    state.store.set_avatar_seed(&name, &seed).await?;
+    Ok(Json(json!({ "avatar_seed": seed })))
 }
 
 /// Every session with its overview: what each is doing, what it has cost,
@@ -6483,6 +6606,94 @@ mod tests {
         )
         .await;
         assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_persona_avatar_is_shuffled_uploaded_served_and_removed() {
+        let dir = tempdir().unwrap();
+        let state = state_with_personas(&dir, &["m"], &[("builder", "m")], None);
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        let personas = |addr| async move {
+            reqwest::get(format!("http://{addr}/personas"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+
+        let listed = personas(addr).await;
+        assert_eq!(
+            listed[0]["avatar_seed"], "builder",
+            "the robot starts from the name"
+        );
+        assert_eq!(listed[0]["picture_at_secs"], serde_json::Value::Null);
+
+        let shuffled: serde_json::Value = client
+            .post(format!("http://{addr}/personas/builder/avatar/shuffle"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            personas(addr).await[0]["avatar_seed"],
+            shuffled["avatar_seed"]
+        );
+
+        let mut jpeg = Vec::new();
+        image::DynamicImage::new_rgb8(300, 200)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let response = client
+            .put(format!("http://{addr}/personas/builder/avatar"))
+            .body(jpeg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(personas(addr).await[0]["picture_at_secs"].is_i64());
+        let served = reqwest::get(format!("http://{addr}/personas/builder/avatar"))
+            .await
+            .unwrap();
+        assert_eq!(served.headers()["content-type"], "image/png");
+        let picture = image::load_from_memory(&served.bytes().await.unwrap()).unwrap();
+        assert_eq!((picture.width(), picture.height()), (256, 256));
+
+        let svg = client
+            .put(format!("http://{addr}/personas/builder/avatar"))
+            .body(r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(svg.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        client
+            .delete(format!("http://{addr}/personas/builder/avatar"))
+            .send()
+            .await
+            .unwrap();
+        let gone = reqwest::get(format!("http://{addr}/personas/builder/avatar"))
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            personas(addr).await[0]["avatar_seed"],
+            shuffled["avatar_seed"],
+            "removing the picture keeps the robot's seed"
+        );
+
+        let unknown = client
+            .post(format!("http://{addr}/personas/nobody/avatar/shuffle"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

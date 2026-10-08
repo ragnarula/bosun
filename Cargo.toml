@@ -37,6 +37,7 @@ http-body-util = "0.1"
 hyper = "1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "tls12", "http1", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
 dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
 lzma-rs = "0.3"

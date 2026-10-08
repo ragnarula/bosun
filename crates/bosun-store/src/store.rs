@@ -125,6 +125,17 @@ pub struct EventsPage {
     pub more: bool,
 }
 
+/// A persona's avatar as the store holds it: the seed its generated robot is
+/// drawn from, and when an uploaded picture replaced the robot, if one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaAvatar {
+    pub persona: String,
+    pub seed: String,
+    /// When the picture was stored, in unix seconds; None when the persona
+    /// has no picture and shows its robot.
+    pub picture_at_secs: Option<i64>,
+}
+
 /// Which events a read covers: one session's, or every session's in one tree.
 #[derive(Debug, Clone)]
 pub enum EventScope {
@@ -280,6 +291,12 @@ CREATE TABLE IF NOT EXISTS skill_references (
   path TEXT NOT NULL,
   content TEXT NOT NULL,
   PRIMARY KEY (package, path)
+);
+CREATE TABLE IF NOT EXISTS persona_avatars (
+  persona TEXT PRIMARY KEY,
+  seed TEXT NOT NULL,
+  picture BLOB,
+  updated_at_secs INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mcp_servers (
   name TEXT PRIMARY KEY,
@@ -1433,6 +1450,102 @@ impl Store {
                     in_progress: status("in_progress"),
                 },
             })
+        })
+        .await
+    }
+
+    /// Every persona that has an avatar row: a seed someone shuffled, or a
+    /// picture someone uploaded. A persona without a row uses its own name as
+    /// its seed.
+    pub async fn persona_avatars(&self) -> Result<Vec<PersonaAvatar>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT persona, seed, CASE WHEN picture IS NULL THEN NULL ELSE updated_at_secs END
+                     FROM persona_avatars ORDER BY persona",
+                )
+                .context("failed to prepare the avatar query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PersonaAvatar {
+                        persona: row.get(0)?,
+                        seed: row.get(1)?,
+                        picture_at_secs: row.get(2)?,
+                    })
+                })
+                .context("failed to query avatars")?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Gives the persona's robot a new seed, keeping any picture.
+    pub async fn set_avatar_seed(&self, persona: &str, seed: &str) -> Result<(), StoreError> {
+        let (persona, seed) = (persona.to_string(), seed.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO persona_avatars (persona, seed, picture, updated_at_secs)
+                 VALUES (?1, ?2, NULL, ?3)
+                 ON CONFLICT(persona) DO UPDATE SET seed = excluded.seed",
+                params![
+                    persona,
+                    seed,
+                    bosun_common::time::unix_secs(SystemTime::now())
+                ],
+            )
+            .context("failed to store the avatar seed")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stores `png` as the persona's picture. A persona with no row yet keeps
+    /// its name as its seed, so removing the picture brings back its robot.
+    pub async fn set_avatar_picture(&self, persona: &str, png: Vec<u8>) -> Result<(), StoreError> {
+        let persona = persona.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO persona_avatars (persona, seed, picture, updated_at_secs)
+                 VALUES (?1, ?1, ?2, ?3)
+                 ON CONFLICT(persona) DO UPDATE SET picture = excluded.picture,
+                   updated_at_secs = excluded.updated_at_secs",
+                params![
+                    persona,
+                    png,
+                    bosun_common::time::unix_secs(SystemTime::now())
+                ],
+            )
+            .context("failed to store the avatar picture")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes the persona's picture, so it shows its robot again.
+    pub async fn clear_avatar_picture(&self, persona: &str) -> Result<(), StoreError> {
+        let persona = persona.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE persona_avatars SET picture = NULL WHERE persona = ?1",
+                [persona],
+            )
+            .context("failed to remove the avatar picture")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The persona's stored picture, as PNG bytes.
+    pub async fn avatar_picture(&self, persona: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let persona = persona.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT picture FROM persona_avatars WHERE persona = ?1 AND picture IS NOT NULL",
+                [persona],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read the avatar picture")
         })
         .await
     }
@@ -2891,6 +3004,7 @@ mod tests {
                 "messages",
                 "model_calls",
                 "pending_asks",
+                "persona_avatars",
                 "sessions",
                 "skill_packages",
                 "skill_references",

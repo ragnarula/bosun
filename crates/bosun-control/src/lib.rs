@@ -1,4 +1,5 @@
 pub mod api;
+pub mod avatars;
 pub mod commands;
 pub mod loops;
 pub mod mcp_client;

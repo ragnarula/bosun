@@ -3401,6 +3401,8 @@ mod tests {
             name: name.into(),
             description: description.into(),
             default,
+            avatar_seed: name.to_string(),
+            picture_at_secs: None,
         }
     }
 
