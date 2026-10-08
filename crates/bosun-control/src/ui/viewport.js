@@ -29,7 +29,12 @@ function syncVisualViewport() {
   // pans a zoomed page on purpose, so a zoomed page is left alone.
   const zoomed = Math.abs(viewport.scale - 1) > 0.01;
   if (!fieldFocused || zoomed) {
-    document.body.style.height = '';
+    // Clear the explicit height: on iOS the keyboard has gone and the
+    // body returns to its CSS height; on Android, where the layout
+    // viewport itself resizes, setting body height to the layout
+    // viewport's avoids a stale dynamic-viewport (dvh) value a keyboard
+    // dismissal can leave behind.
+    document.body.style.height = !fieldFocused && !zoomed ? window.innerHeight + 'px' : '';
   } else if (viewport.height > 0 && viewport.height <= window.innerHeight) {
     document.body.style.height = viewport.height + 'px';
   }

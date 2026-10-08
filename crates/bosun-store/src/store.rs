@@ -3196,6 +3196,8 @@ mod tests {
                 "model_calls",
                 "pending_asks",
                 "persona_avatars",
+                "push_key",
+                "push_subscriptions",
                 "sessions",
                 "skill_packages",
                 "skill_references",
