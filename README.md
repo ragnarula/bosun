@@ -62,6 +62,11 @@ Shipped so far:
   servers. The open session is one browser history entry addressed by a `#s=`
   fragment, so a phone's back gesture returns to the list, and a mermaid fence
   renders as a diagram in both clients.
+- **An installable pane.** A phone or desktop installs the pane as an app,
+  with its own icon and window. Served over HTTPS, it opens from a copy on the
+  device when the control plane cannot be reached, and its bell turns on
+  notifications for when a session tree asks a question or completes its
+  tasks.
 - **Updates.** Nodes converge on the control plane's version, and a deployment
   re-issues the call each working session had in flight, once. The CLI
   self-updates from GitHub Releases.
@@ -142,6 +147,13 @@ command with `--cp-url`, stored with `bosun config set cp-url`, or exported as
 The web pane is served at the control-plane root (`/` or `/ui`). Open it in a
 browser to see the node list, start a session, follow its live transcript, and
 manage skill repositories and MCP servers.
+
+To install the pane as an app and get notifications, serve it over HTTPS, for
+example with `tailscale serve`, or with `tls_cert` and `tls_key` and a
+certificate the phone trusts. A browser allows the offline copy and
+notifications only over HTTPS or on the control plane's own machine. Over plain
+HTTP to another machine the pane works as a page. On an iPhone, add the pane to
+the Home Screen before turning notifications on.
 
 ## Repository layout
 

@@ -2,7 +2,7 @@
 
 The web pane runs in a browser tab. On a phone, the browser's address bar and toolbar take space from the chat, the pane has no icon on the home screen, and the reader learns that a session needs them only by opening the tab. When the control plane is down or the phone is offline, the browser shows its own error page. This sprint makes the pane a Progressive Web App (PWA): a phone or desktop can install it with its own icon and window, and a service worker keeps a copy of the pane on the device and shows a notification when a session asks a question or finishes its tasks.
 
-Status: **planned**. The decisions are confirmed. No story has started.
+Status: **complete**. All seven stories are implemented and tested. The ADRs are `2026-10-08-pane-kept-by-a-service-worker.md` and `2026-10-08-push-notifications-from-the-control-plane.md`.
 
 ## Confirmed decisions
 
@@ -51,8 +51,8 @@ The icon is the Blue Peter, the International Code of Signals flag P, which the 
 With the network first, the worker does not make a normal load faster. It does four things:
 
 1. **Notifies when a session needs the reader.** This is the largest gain. See [Notifications](#notifications).
-2. **Opens when the control plane cannot be reached.** The pane opens from its cache and says that the control plane is not reachable, instead of the browser's error page. It shows the session list from the last answer it had, marked as not current.
-3. **Never mixes two builds.** The pane-as-modules ADR accepts that a control plane restarting between the page's fetch and its module fetches serves an old page with new modules. The worker reads the page's `X-Bosun-Version` header, and when a module from the network names another build, it answers with that module from the page's own build in its cache.
+2. **Opens when the control plane cannot be reached.** The pane opens from the worker's cache and says that the control plane is not reachable, instead of the browser's error page. It shows the last session list it read, which it keeps in `localStorage`, with the time it was read.
+3. **Never mixes two builds.** The pane-as-modules ADR accepts that a control plane restarting between the page's fetch and its module fetches serves an old page with new modules. The worker reads the page's `X-Bosun-Version` header, and when a module from the network names another build, it answers with the module of the page's build from its cache.
 4. **Puts a badge on the icon.** `navigator.setAppBadge(n)` shows the number of trees that need the reader. This works on desktop Chrome and Edge and on iOS 16.4 and later. Android Chrome does not support it, but Android shows a dot for an unread notification.
 
 Not in this sprint:
@@ -62,10 +62,10 @@ Not in this sprint:
 
 ## How the worker loads the pane
 
-- **Network first, with a time limit.** The worker sends each request for the page, a module, the stylesheet or a font to the control plane. A response is stored in the cache of the build it names and returned. When the request fails, or the control plane has not answered in 5 seconds, the worker returns the copy from the cache. Without the time limit, a phone on a link that connects but carries nothing would wait for the browser's own timeout, which is minutes.
-- **One cache per build.** The cache is named by the version. When a load's page names a new build, the worker deletes the caches of older builds once that load's files are all stored.
+- **Network first, with a time limit.** The worker sends each request for the page, a module, the stylesheet, a font or an icon to the control plane, and returns its answer. When the request fails, or the control plane has not answered in 5 seconds, the worker returns the copy from the cache. Without the time limit, a phone on a link that connects but carries nothing would wait for the browser's own timeout, which is minutes.
+- **One cache per build.** On install, the worker fetches every file of its own build into a cache named by the version, and fails the install if a file names another build. On activate, it deletes the caches of every other build.
 - **The mermaid bundle** is 5.5 MB and is cached for a day over HTTP. The worker stores it when the pane first loads it, not at install, so an update does not fetch 5.5 MB on a mobile link.
-- **The worker does not touch the API or the streams.** An `EventSource` request is a fetch, and a worker that answered it would break the resume by `Last-Event-ID`. The fetch handler answers only the page, the files in `ASSETS` and `FONTS`, the mermaid bundle and the icons. Every other request goes to the network as if no worker existed. The one exception is `GET /sessions`: the worker keeps its last answer, for the list shown when the control plane cannot be reached.
+- **The worker does not touch the API or the streams.** An `EventSource` request is a fetch, and a worker that answered it would break the resume by `Last-Event-ID`. The fetch handler answers only the page, the manifest, the files in `ASSETS`, `FONTS` and `ICONS`, and the mermaid bundle. Every other request goes to the network as if no worker existed. The pane keeps the last session list itself.
 - **The worker updates itself at once.** `sw.js` is served `no-cache` with the version in its body, so a new build changes its bytes and the browser installs it on the next load. The new worker calls `skipWaiting()` and `clients.claim()`. With the network first, the pane needs no "new version" message. A later build can serve a `sw.js` that unregisters itself and clears its caches, if a worker ever needs removing.
 
 ## Constraints from the code and the ADRs
@@ -88,12 +88,12 @@ The `control-plane-password` branch puts HTTP Basic on every route. Two things t
 Web Push needs:
 
 - **A VAPID key pair** on the control plane, made once and kept in the store. The public key goes to the pane so it can subscribe.
-- **A subscription per device.** The pane asks for permission when the reader taps the notifications control. A browser blocks a request that does not follow a tap, and iOS allows one only in an installed pane. The pane posts the `PushSubscription` (an endpoint URL and two keys) to a new route, `POST /push/subscriptions`, and the store keeps it in a new table. A `404` or `410` from the push service deletes the subscription.
-- **Sending.** The control plane encrypts the message to the subscription's keys (RFC 8291) and posts it to the endpoint with a VAPID signature (RFC 8292). The endpoint belongs to the browser's push service: Google for Chrome, Mozilla for Firefox, Apple for Safari. The control plane already reaches the internet for the model APIs. A crate such as `web-push-native` builds the request, and the existing `reqwest` client sends it. The push service sees when a message is sent and its size, but not its text.
+- **A subscription per device.** The pane asks for permission when the reader taps the bell in Home's header. A browser blocks a request that does not follow a tap, and iOS allows one only in an installed pane. The pane posts the `PushSubscription` (an endpoint URL and two keys) to a new route, `POST /push/subscriptions`, and the store keeps it in a new table. A `404` or `410` from the push service deletes the subscription.
+- **Sending.** The control plane encrypts the message to the subscription's keys (RFC 8291) and posts it to the endpoint with a VAPID signature (RFC 8292). The endpoint belongs to the browser's push service: Google for Chrome, Mozilla for Firefox, Apple for Safari. The control plane already reaches the internet for the model APIs. `ring`, already in the dependency tree, does the encryption and the signature, and the existing `reqwest` client sends it. The push service sees when a message is sent and its size, but not its text.
 - **The triggers.** The session overview already carries `asking` and `tasks` (`total`, `done`):
   - **A question.** A session in the tree changes `asking` from false to true. The notification names the persona and shows the question.
   - **All tasks complete.** The tree's tasks change from some open to `total > 0` and `done == total`. The notification shows the tree's summary.
-  - Each tree has one notification at a time. A new one replaces the last through the same `tag`, so a busy tree does not fill the phone. There is no notification while a pane on that device is visible.
+  - Each tree has one notification at a time. A new one replaces the last through the same `tag`, so a busy tree does not fill the phone. A notification always shows, because a browser penalizes a worker that receives a push and shows nothing, and the pane closes a tree's notifications when the reader opens the tree.
 - **The worker.** On `push`, it shows the notification. On `notificationclick`, it focuses an open pane and moves it to `#s=<id>`, or opens a new one there.
 
 Support: Chrome, Edge and Firefox on Android and desktop. Safari on macOS. Safari on iOS 16.4 and later, only for a pane added to the home screen.
@@ -106,13 +106,13 @@ Support: Chrome, Edge and Firefox on Android and desktop. Safari on macOS. Safar
 
 ## User stories in implementation order
 
-- [ ] **S1 — The manifest and the icon.** `/manifest.webmanifest`, the Blue Peter as SVG and PNG, the `apple-touch-icon` and `theme-color` tags. The pane can be installed from an HTTPS address and added to the home screen from an HTTP one.
-- [ ] **S2 — Polls follow visibility.** The pane stops polling while hidden and refreshes on return.
-- [ ] **S3 — The service worker.** `/sw.js`, registered only in a secure context. Network first with the 5-second limit, one cache per build, the build check, the mermaid bundle stored on first use. API and stream requests are not touched. The ADR.
-- [ ] **S4 — Opening without the control plane.** The pane opens from the cache, says it cannot reach the control plane, and shows the last session list it had.
-- [ ] **S5 — Notifications.** VAPID keys, the subscriptions table and route, the push sender, the two triggers, and the worker's `push` and `notificationclick` handlers. A control in the pane turns them on for the device, or says that they need HTTPS.
-- [ ] **S6 — The badge and the shortcuts.** `setAppBadge` with the number of trees that need the reader, and the manifest's `shortcuts`.
-- [ ] **S7 — The docs that own the current state say so.** CLAUDE.md, the README, and in the operator docs, that installing and notifications need HTTPS.
+- [x] **S1 — The manifest and the icon.** `/manifest.webmanifest`, the Blue Peter as SVG and PNG, the `apple-touch-icon` and `theme-color` tags. The pane can be installed from an HTTPS address and added to the home screen from an HTTP one.
+- [x] **S2 — Polls follow visibility.** The pane stops polling while hidden and refreshes on return.
+- [x] **S3 — The service worker.** `/sw.js`, registered only in a secure context. Network first with the 5-second limit, one cache per build, the build check, the mermaid bundle stored on first use. API and stream requests are not touched. The ADR.
+- [x] **S4 — Opening without the control plane.** The pane opens from the cache, says it cannot reach the control plane, and shows the last session list it had.
+- [x] **S5 — Notifications.** VAPID keys, the subscriptions table and route, the push sender, the two triggers, and the worker's `push` and `notificationclick` handlers. A control in the pane turns them on for the device, or says that they need HTTPS.
+- [x] **S6 — The badge and the shortcuts.** `setAppBadge` with the number of trees that need the reader, and the manifest's `shortcuts`.
+- [x] **S7 — The docs that own the current state say so.** CLAUDE.md, the README with what installing and notifications need, and the two ADRs.
 
 ## Out of scope
 
