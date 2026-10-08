@@ -34,7 +34,7 @@ Status: **in progress**.
 - [ ] **S7 — Bosun Signal in the pane.** Tokens, the three typefaces as embedded woff2, the flag, avatar and icon module, Night and Day.
 - [ ] **S8 — The session view.** Header with Stop in sight, crew strip, Chat, Tasks, Files, Log, the Session sheet; the subagent panel goes.
 - [ ] **S9 — Home and the desktop layout.** Session cards grouped by Needs you, Working, Idle; three columns from 900px; Machines, Skills, MCP and a Crew screen for avatars in the same language.
-- [ ] **S10 — The terminal client.** `bosun list` groups and flag tags; `bosun open` crew line and views 1 to 4.
+- [x] **S10 — The terminal client.** `bosun list` groups and flag tags; `bosun open` crew line and views 1 to 4.
 - [ ] **S11 — The docs that own the current state say so.** CLAUDE.md, README, the ADRs this sprint changes.
 
 ## Out of scope
