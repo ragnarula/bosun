@@ -1049,7 +1049,7 @@ fn phase_detail(phase: &ActivityPhase) -> String {
         ActivityPhase::RequestSent { model, provider } => format!("{model} via {provider}"),
         ActivityPhase::FirstToken { latency_ms } => format!("{latency_ms}ms"),
         ActivityPhase::ResponseComplete { stop_reason } => stop_reason.clone(),
-        ActivityPhase::ToolStarted { name } => name.clone(),
+        ActivityPhase::ToolStarted { name, .. } => name.clone(),
         ActivityPhase::ToolFinished {
             name,
             ok,
@@ -1168,7 +1168,7 @@ fn phase_label(phase: &ActivityPhase) -> Option<String> {
         ActivityPhase::RequestSent { .. } => "awaiting model".to_string(),
         ActivityPhase::FirstToken { .. } => "receiving reply".to_string(),
         ActivityPhase::ResponseComplete { .. } => "processing reply".to_string(),
-        ActivityPhase::ToolStarted { name } => format!("running tool {name}"),
+        ActivityPhase::ToolStarted { name, .. } => format!("running tool {name}"),
         ActivityPhase::ToolFinished { name, .. } => format!("ran tool {name}"),
         ActivityPhase::EmptyRetry { attempt, limit, .. } => {
             format!("retrying empty reply ({attempt}/{limit})")
@@ -2069,6 +2069,7 @@ mod tests {
 
         let tool = ActivityPhase::ToolStarted {
             name: "file_read".into(),
+            target: None,
         };
         assert_eq!(
             state_label(SessionState::Running, 0, Some(&tool), 7),
@@ -3053,6 +3054,7 @@ mod tests {
             (
                 ActivityPhase::ToolStarted {
                     name: "shell".into(),
+                    target: None,
                 },
                 "shell",
             ),

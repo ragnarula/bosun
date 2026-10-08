@@ -369,6 +369,13 @@ pub enum ActivityPhase {
     },
     ToolStarted {
         name: String,
+        /// What the call works on, read from its arguments: the path a file
+        /// tool reads or writes, the first line of a shell command, a search
+        /// pattern, a URL, a skill, a persona to spawn, or a child to message.
+        /// A client says "editing winsw.ts" from the event alone. Skipped when
+        /// None, so a call with no target serializes as it did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     ToolFinished {
         name: String,
@@ -391,6 +398,22 @@ pub enum ActivityPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_start_without_a_target_serializes_as_it_did_before_targets() {
+        let phase = ActivityPhase::ToolStarted {
+            name: "ask".into(),
+            target: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&phase).unwrap(),
+            serde_json::json!({ "phase": "tool_started", "name": "ask" })
+        );
+        let old: ActivityPhase =
+            serde_json::from_value(serde_json::json!({ "phase": "tool_started", "name": "ask" }))
+                .unwrap();
+        assert_eq!(old, phase, "a stored start with no target reads back");
+    }
 
     #[test]
     fn permission_parses_and_serializes_snake_case() {
@@ -683,6 +706,11 @@ mod tests {
             },
             ActivityPhase::ToolStarted {
                 name: "shell".into(),
+                target: None,
+            },
+            ActivityPhase::ToolStarted {
+                name: "edit".into(),
+                target: Some("src/main.rs".into()),
             },
             ActivityPhase::ToolFinished {
                 name: "shell".into(),

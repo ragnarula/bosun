@@ -1517,6 +1517,30 @@ fn announces_an_action(text: &str) -> bool {
 /// Whether the session's todo list holds work it never finished: at least one
 /// item whose status is not `done`, the status the `todowrite` schema defines
 /// for a finished item.
+/// The longest target a `ToolStarted` carries. A command or a pattern can be
+/// any length, and the event is read by a caption one line wide.
+const TOOL_TARGET_MAX_CHARS: usize = 120;
+
+/// What a tool call works on, read from its arguments, for the activity event:
+/// a path, the first line of a command, a pattern, a URL, a skill, a persona,
+/// or a child. None for a tool with no such argument, such as an MCP tool.
+fn tool_target(name: &str, args: &Value) -> Option<String> {
+    let key = match name {
+        "file_read" | "file_write" | "edit" => "path",
+        "shell" => "command",
+        "grep" | "glob" => "pattern",
+        "webfetch" => "url",
+        "skill" => "name",
+        "spawn" => "persona",
+        "message_child" => "id",
+        "history_read" => "op",
+        _ => return None,
+    };
+    let text = args.get(key)?.as_str()?;
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    Some(line.chars().take(TOOL_TARGET_MAX_CHARS).collect())
+}
+
 fn has_open_todo(todos: &[Value]) -> bool {
     todos
         .iter()
@@ -1935,6 +1959,7 @@ async fn run_turn_inner(
         // The activity name is kept aside because each arm moves `name` into
         // the durable tool result before the finish event is appended.
         let tool_name = name.clone();
+        let target = tool_target(&name, &args);
         match name.as_str() {
             "" => {
                 warn!(
@@ -1966,6 +1991,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2107,6 +2133,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2176,6 +2203,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2252,6 +2280,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2352,6 +2381,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2450,6 +2480,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2521,6 +2552,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -2610,6 +2642,7 @@ async fn run_turn_inner(
                     session_id,
                     ActivityPhase::ToolStarted {
                         name: tool_name.clone(),
+                        target: target.clone(),
                     },
                 )
                 .await?;
@@ -4949,9 +4982,13 @@ mod tests {
         let started = phases
             .iter()
             .position(
-                |phase| matches!(phase, ActivityPhase::ToolStarted { name } if name == "shell"),
+                |phase| matches!(phase, ActivityPhase::ToolStarted { name, .. } if name == "shell"),
             )
             .expect("a tool_started for the shell call");
+        let ActivityPhase::ToolStarted { target, .. } = &phases[started] else {
+            unreachable!()
+        };
+        assert!(target.is_some(), "the start names the command it runs");
         let ActivityPhase::ToolFinished {
             name,
             ok,
@@ -10943,6 +10980,43 @@ mod tests {
             "a word that starts with a sequencing word is a different word"
         );
         assert!(!announces_an_action(""), "an empty reply announces nothing");
+    }
+
+    #[test]
+    fn a_tool_target_names_what_the_call_works_on() {
+        assert_eq!(
+            tool_target(
+                "edit",
+                &json!({ "path": "src/winsw.ts", "old": "a", "new": "b" })
+            ),
+            Some("src/winsw.ts".into())
+        );
+        assert_eq!(
+            tool_target(
+                "shell",
+                &json!({ "command": "\n  npm test -- winsw\nnpm run lint" })
+            ),
+            Some("npm test -- winsw".into()),
+            "a command's first line that holds anything, trimmed"
+        );
+        assert_eq!(
+            tool_target(
+                "spawn",
+                &json!({ "persona": "builder", "instructions": "go" })
+            ),
+            Some("builder".into())
+        );
+        assert_eq!(tool_target("ask", &json!({ "message": "which?" })), None);
+        assert_eq!(tool_target("mcp__scs__save", &json!({ "path": "x" })), None);
+        assert_eq!(tool_target("file_read", &json!({ "path": 3 })), None);
+        let long = "x".repeat(500);
+        assert_eq!(
+            tool_target("grep", &json!({ "pattern": long }))
+                .unwrap()
+                .chars()
+                .count(),
+            TOOL_TARGET_MAX_CHARS
+        );
     }
 
     #[test]
