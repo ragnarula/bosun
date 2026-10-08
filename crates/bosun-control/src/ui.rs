@@ -69,6 +69,7 @@ pub(crate) const ASSETS: &[(&str, &str, &str)] = &[
     ("crew.js", JS, include_str!("ui/crew.js")),
     ("views.js", JS, include_str!("ui/views.js")),
     ("crew-screen.js", JS, include_str!("ui/crew-screen.js")),
+    ("project-map.js", JS, include_str!("ui/project-map.js")),
     ("main.js", JS, include_str!("ui/main.js")),
 ];
 
@@ -271,6 +272,7 @@ mod tests {
         include_str!("ui/crew.js"),
         include_str!("ui/views.js"),
         include_str!("ui/crew-screen.js"),
+        include_str!("ui/project-map.js"),
         include_str!("ui/main.js"),
         "\n</script>\n",
     );

@@ -2,7 +2,7 @@
 // seed draws, and the pane's line icons. Every one is built with
 // `createElementNS`, so the pane inserts no markup.
 
-export { avatar, flag, flagLetter, icon, memberName, personaLabel };
+export { avatar, flag, flagLetter, hullOf, icon, memberName, personaLabel };
 
 const NS = 'http://www.w3.org/2000/svg';
 
@@ -21,6 +21,12 @@ function hash(text) {
     h = Math.imul(h, 16777619) >>> 0;
   }
   return h >>> 0;
+}
+
+// The hull colour, 1 to 6, a name picks: a branch keeps one colour on every
+// screen.
+function hullOf(name) {
+  return 1 + (hash(String(name || '')) % 6);
 }
 
 // Each persona flies one International Code of Signals flag, drawn on a
@@ -214,6 +220,11 @@ const ICONS = {
   crew: ['M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M2.5 19a5.5 5.5 0 0 1 11 0', 'M10.5 19a5.5 5.5 0 0 1 11 0'],
   upload: ['M12 16V5', 'M7 9l5-5 5 5', 'M5 19h14'],
   shuffle: ['M4 7h4l8 10h4', 'M4 17h4l8-10h4', 'M18 5l2 2-2 2', 'M18 15l2 2-2 2'],
+  commit: ['M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z', 'M3 12h6', 'M15 12h6'],
+  push: ['M12 19V7', 'M7 11l5-5 5 5', 'M5 4h14'],
+  merge: ['M7 4v16', 'M17 4v4a6 6 0 0 1-6 6H7'],
+  pr: ['M6 4v16', 'M18 20V9a3 3 0 0 0-3-3h-4', 'M13 3.5 10.5 6l2.5 2.5'],
+  close: ['M6 6l12 12', 'M18 6 6 18'],
 };
 
 function icon(name) {

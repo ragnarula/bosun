@@ -87,6 +87,7 @@ export {
   newSessionForm,
   nodeChips,
   originEl,
+  projectsTab,
   personaChips,
   personaName,
   recentList,
@@ -196,6 +197,7 @@ const chipPersona = $('chip-persona');
 const chipPermission = $('chip-permission');
 const chipPermissionText = $('chip-permission-text');
 const crewTab = $('crew-tab');
+const projectsTab = $('projects-tab');
 
 const viewNode = $('view-node');
 const viewDir = $('view-dir');

@@ -148,7 +148,7 @@ struct Target {
 }
 
 /// A merge the store has to record.
-pub(crate) struct NewMerge {
+pub struct NewMerge {
     project: String,
     head: String,
     lane: MergedLane,
@@ -208,7 +208,7 @@ impl ProjectHub {
 
     /// Builds the project's view and announces it when it differs from the
     /// one announced last.
-    pub(crate) fn publish(&self, id: &str) {
+    pub fn publish(&self, id: &str) {
         let since = now_secs() - self.merged_retention_secs;
         let changed = {
             let mut state = self.state.lock().unwrap();
@@ -264,7 +264,7 @@ impl ProjectHub {
     /// still being created has no folder to read yet, and a stopped one has
     /// none left. A copy whose sessions are all gone leaves the map, and a
     /// project with no copies left goes with it; its stream hears so.
-    pub(crate) fn sync_sessions(&self, sessions: &[Session]) {
+    pub fn sync_sessions(&self, sessions: &[Session]) {
         let sessions: Vec<&Session> = sessions
             .iter()
             .filter(|session| {
@@ -362,7 +362,7 @@ impl ProjectHub {
 
     /// Takes a fresh read of one copy: records what changed in the feed and
     /// returns the projects to announce and the merges to record.
-    pub(crate) fn apply_read(
+    pub fn apply_read(
         &self,
         copy_key: &str,
         git: Option<GitState>,

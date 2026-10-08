@@ -14,6 +14,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bosun_common::project::CommitInfo;
+use bosun_common::project::DirtyFile;
+use bosun_common::project::FileOp;
+use bosun_common::project::GitState;
 use bosun_common::session::ActivityPhase;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
@@ -36,6 +40,9 @@ use bosun_store::store::RouteAnswer;
 use bosun_store::store::Store;
 use serde_json::json;
 
+/// A session in a worktree of the seeded sessions' repository, so the project
+/// map has two lanes.
+const MAP: &str = "map-session";
 /// The session with a long transcript. `pane.py` names the same ids.
 const LONG: &str = "long-session";
 /// The long session's child, which the child panel follows.
@@ -83,7 +90,9 @@ async fn the_pane_works_on_a_phone() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("sessions.db")).unwrap();
     seed(&store).await;
-    let addr = serve(store).await;
+    let projects = Arc::new(ProjectHub::new(Duration::from_secs(86_400), false));
+    seed_project(&store, &projects).await;
+    let addr = serve(store, projects).await;
 
     // `BOSUN_PANE_SCRIPT` runs another script against the same seeded server,
     // such as one that takes screenshots while the pane is being designed.
@@ -110,7 +119,7 @@ async fn the_pane_works_on_a_phone() {
 
 /// The real router over `store`, on a free port. Nothing is configured, so the
 /// routes that start work answer with an error; the pane only reads here.
-async fn serve(store: Store) -> SocketAddr {
+async fn serve(store: Store, projects: Arc<ProjectHub>) -> SocketAddr {
     let oauth = McpOAuthContext::new(reqwest::Client::new(), store.clone(), None);
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(30))),
@@ -133,7 +142,7 @@ async fn serve(store: Store) -> SocketAddr {
             reqwest::Client::new(),
         )),
         mcp_oauth: oauth,
-        projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
+        projects,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -645,4 +654,88 @@ async fn message(store: &Store, session: &str, role: Role, block: Block) {
 
 fn now_ms() -> u64 {
     bosun_common::time::unix_ms(std::time::SystemTime::now())
+}
+
+/// One project of two lanes, read as a node would read them: every seeded
+/// session shares `/work/repo` on branch `crew-view`, and the map session works
+/// in a worktree of it on `project-map`. Both change `api.rs`, and the map
+/// session's edit to `watch.rs` is in the feed. No loop reads the copies again,
+/// so the map stays as seeded.
+async fn seed_project(store: &Store, projects: &ProjectHub) {
+    let session = Session {
+        id: MAP.into(),
+        dir: "/work/repo-map".into(),
+        summary: Some("the map session".into()),
+        ..store.get_session(LONG).await.unwrap().unwrap()
+    };
+    store
+        .create_session(&Session {
+            owner_id: MAP.into(),
+            parent_id: None,
+            ..session
+        })
+        .await
+        .unwrap();
+    projects.sync_sessions(&store.list_sessions().await.unwrap());
+
+    let commit = |sha: &str, subject: &str, pushed: bool| CommitInfo {
+        sha: sha.into(),
+        subject: subject.into(),
+        author: "Ann".into(),
+        time_secs: 1_999_990,
+        pushed,
+    };
+    let dirty = |path: &str, op: FileOp, added: u32| DirtyFile {
+        path: path.into(),
+        op,
+        added,
+        removed: 1,
+    };
+    let copy = |root: &str, branch: &str| GitState {
+        root: root.into(),
+        common_dir: "/work/repo/.git".into(),
+        origin: Some("git@github.com:ragnarula/bosun.git".into()),
+        main_ref: Some("origin/main".into()),
+        main: vec![
+            commit("m3000000", "Third on main", false),
+            commit("m2000000", "Second on main", false),
+            commit("m1000000", "First on main", false),
+        ],
+        branch: Some(branch.into()),
+        head: Some(format!("{branch}-head")),
+        fork: Some("m2000000".into()),
+        ahead: 2,
+        behind: 1,
+        commits: vec![
+            commit(&format!("{branch}-head"), "Draw the lanes", false),
+            commit(&format!("{branch}-base"), "Read the copies", true),
+        ],
+        changed: vec!["api.rs".into()],
+        dirty: Vec::new(),
+        remote_branches: vec!["main".into(), "crew-view".into(), "old-idea".into()],
+    };
+    projects.apply_read(
+        "node-1:/work/repo",
+        Some(GitState {
+            dirty: vec![dirty("api.rs", FileOp::Edited, 3)],
+            ..copy("/work/repo", "crew-view")
+        }),
+        None,
+        1_999_990,
+    );
+    let map = copy("/work/repo-map", "project-map");
+    projects.apply_read("node-1:/work/repo-map", Some(map.clone()), None, 1_999_990);
+    let (touched, _) = projects.apply_read(
+        "node-1:/work/repo-map",
+        Some(GitState {
+            dirty: vec![dirty("watch.rs", FileOp::Created, 31)],
+            changed: vec!["api.rs".into(), "watch.rs".into()],
+            ..map
+        }),
+        Some(MAP),
+        1_999_995,
+    );
+    for id in touched {
+        projects.publish(&id);
+    }
 }

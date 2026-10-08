@@ -7,6 +7,7 @@ import { refreshSkillRepos } from './skills.js';
 import { refreshMcpServers } from './mcp.js';
 import { refreshPersonas } from './new-session.js';
 import { refreshSessions } from './session-list.js';
+import { refreshProjects } from './project-map.js';
 import { followHistory, startFromLink } from './history.js';
 import { icon } from './signal.js';
 import './views.js';
@@ -29,11 +30,13 @@ refreshSessions();
 refreshPersonas();
 refreshSkillRepos();
 refreshMcpServers();
+refreshProjects();
 setInterval(refreshNodes, 5000);
 setInterval(refreshSessions, 3000);
 setInterval(refreshPersonas, 30000);
 setInterval(refreshSkillRepos, 30000);
 setInterval(refreshMcpServers, 30000);
+setInterval(refreshProjects, 5000);
 // The pane starts on the entry the address bar names, and follows it from
 // there.
 window.addEventListener('popstate', followHistory);

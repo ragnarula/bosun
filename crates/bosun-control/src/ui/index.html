@@ -34,6 +34,7 @@
 <link rel="modulepreload" href="/ui/crew.js">
 <link rel="modulepreload" href="/ui/views.js">
 <link rel="modulepreload" href="/ui/crew-screen.js">
+<link rel="modulepreload" href="/ui/project-map.js">
 <script src="/ui/mermaid.min.js" id="mermaid-bundle" defer></script>
 <link rel="stylesheet" href="/ui/pane.css">
 </head>
@@ -96,6 +97,7 @@
 </main>
 <nav class="bs-tabbar home-tabs" aria-label="Screens">
   <button type="button" class="bs-tab" aria-selected="true" data-icon="chat">Sessions</button>
+  <button type="button" class="bs-tab" id="projects-strip" data-icon="branch">Projects</button>
   <button type="button" class="bs-tab" id="health-strip" data-icon="machines">Machines<span class="health-dot" id="health-dot"></span></button>
   <button type="button" class="bs-tab" id="skills-strip" data-icon="skills">Skills</button>
   <button type="button" class="bs-tab" id="mcp-strip" data-icon="plug">MCP</button>
@@ -179,6 +181,24 @@
   <input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp" hidden>
 </div>
 
+<div id="projects-tab" hidden>
+  <header class="bs-header projects-head">
+    <button type="button" id="btn-projects-back" class="bs-back" aria-label="Back" data-icon="back"></button>
+    <div class="bs-header__text"><div class="bs-header__title" id="project-title">Projects</div><div class="bs-header__sub" id="project-sub"></div></div>
+    <span class="live-dot" id="project-live" hidden>Live</span>
+  </header>
+  <div class="pm-seg" id="project-seg" hidden>
+    <button type="button" class="bs-chip" data-pm="branches" data-icon="branch">Branches</button>
+    <button type="button" class="bs-chip" data-pm="where" data-icon="machines">Where</button>
+    <button type="button" class="bs-chip pm-seg__live" data-pm="live" data-icon="log">Live</button>
+  </div>
+  <div class="pm-warn" id="project-warn" hidden></div>
+  <div id="project-body">
+    <div id="project-main"></div>
+    <aside id="project-side" aria-label="Live"></aside>
+  </div>
+</div>
+
 <div id="toast" hidden></div>
 
 <div id="session-view" hidden data-view="chat">
@@ -191,6 +211,7 @@
         <span class="view-waiting" id="view-waiting" hidden></span>
       </div>
     </div>
+    <button type="button" class="bs-chip project-link" id="btn-project" title="Open the project map" aria-label="Open the project map" data-icon="branch" hidden><span id="btn-project-text"></span></button>
     <button type="button" class="bs-chip header-chip" id="chip-persona" title="Switch persona"></button>
     <button type="button" class="bs-chip header-chip" id="chip-permission" title="Switch permission" data-icon="shield"><span id="chip-permission-text"></span></button>
     <button type="button" class="bs-btn btn-more" id="btn-more" title="Session actions">Session</button>

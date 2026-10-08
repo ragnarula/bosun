@@ -1,16 +1,17 @@
 // The pane's screens: the home column with the session list, an open session,
-// and the machines, skills, MCP and crew tabs. On a phone exactly one is in the
-// page at a time, in the body's normal flow; the others are hidden. From 900px
+// and the projects, machines, skills, MCP and crew tabs. On a phone exactly
+// one is in the page at a time, in the body's normal flow; the others are
+// hidden. From 900px
 // an open session keeps the home column beside it as a rail, so the reader
 // moves between sessions without leaving the one on screen.
 
-import { $, crewTab, isWide, machinesTab, mcpTab, skillsTab, view } from './dom.js';
+import { $, crewTab, isWide, machinesTab, mcpTab, projectsTab, skillsTab, view } from './dom.js';
 
 export { home, leaveScreen, showScreen };
 
 const home = $('home');
 const homeList = home.querySelector('main');
-const SCREENS = [home, view, machinesTab, skillsTab, mcpTab, crewTab];
+const SCREENS = [home, view, machinesTab, skillsTab, mcpTab, crewTab, projectsTab];
 
 let current = home;
 // The session list's scroll while another screen shows: a hidden box leaves

@@ -70,6 +70,7 @@ import {
 import { closeChildPanel } from './subagents.js';
 import { TAIL_MESSAGES, startEarlier } from './earlier.js';
 import { closeCrew, openCrew, personaChipContent, renderCrew } from './crew.js';
+import { updateProjectLink } from './project-map.js';
 
 export { closeSession, coarsePointer, opened, showSession };
 
@@ -147,6 +148,7 @@ function showSession(id) {
     updateHeader(session);
     openCrew(s, session.owner_id || session.id);
   }
+  updateProjectLink();
   fetchSession(s);
   // EventSource reconnects automatically; durable frames carry the event seq
   // as their SSE id, so the browser resumes with Last-Event-ID.

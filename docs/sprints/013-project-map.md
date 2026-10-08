@@ -2,7 +2,7 @@
 
 Crew View shows one session tree. A project often has several trees at once: one crew on a branch, another in a worktree of the same repository, a builder on another machine. Nothing shows them together, so two crews can change the same file for an hour before anyone sees it, and a branch's pull request state lives only on GitHub. This sprint adds the Project Map. It shows every branch that Bosun sessions work on in one repository: where each one is checked out, which crew works there, what is not committed yet, which commits are pushed, how far each branch is from main, the state of its pull request, and which files two branches both change. It updates while the crews work.
 
-Status: **in progress**. S1 to S4 are implemented and tested.
+Status: **in progress**. S1 to S6 are implemented and tested.
 
 ## Confirmed decisions
 
@@ -31,8 +31,8 @@ Status: **in progress**. S1 to S4 are implemented and tested.
 - [x] **S2 — Copies form projects.** `ProjectHub` groups session folders by origin, names each copy as a clone, folder or worktree, finds overlaps, writes the activity feed and records merges in `merged_lanes`.
 - [x] **S3 — The project routes.** `/projects`, `/projects/{id}` and `/projects/{id}/events`.
 - [x] **S4 — Pull requests.** GitHub polling, checks and reviews, a merged pull request recorded once.
-- [ ] **S5 — The map in the pane.** A Projects tab; on a desktop, the lanes drawn from main with their cards, and Live beside them.
-- [ ] **S6 — The map on a phone.** Branches, Where and the lane screen; the session header's link to its project.
+- [x] **S5 — The map in the pane.** A Projects tab that opens on the map when there is one project; on a desktop, the lanes drawn off main with their cards, and Live or the open lane beside them.
+- [x] **S6 — The map on a phone.** Branches, Where, Live and the lane screen; the session header's link opens the map on the session's lane.
 - [ ] **S7 — The terminal client.** `bosun map`.
 - [ ] **S8 — The docs that own the current state say so.** CLAUDE.md, the README and an ADR for how the map reads working copies.
 

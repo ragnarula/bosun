@@ -73,7 +73,7 @@ LANDSCAPE = (844, 390)
 HOME = '#home > main'
 # The pane's screens. Exactly one is in the page at a time.
 HOME_SCREEN = '#home'
-TAB_SCREENS = ['#machines-tab', '#skills-tab', '#mcp-tab']
+TAB_SCREENS = ['#machines-tab', '#skills-tab', '#mcp-tab', '#crew-tab', '#projects-tab']
 SESSION_ROW = '.session-row'
 VIEW = '#session-view'
 TRANSCRIPT = '#transcript'
@@ -1632,6 +1632,8 @@ def check_screens(browser, errors):
         ('#health-strip', '#machines-tab', '#btn-machines-back'),
         ('#skills-strip', '#skills-tab', '#btn-skills-back'),
         ('#mcp-strip', '#mcp-tab', '#btn-mcp-back'),
+        ('#crew-strip-btn', '#crew-tab', '#btn-crew-back'),
+        ('#projects-strip', '#projects-tab', '#btn-projects-back'),
     ]:
         page.tap(strip)
         page.wait_for_selector(tab, state='visible')
@@ -1655,6 +1657,79 @@ def check_screens(browser, errors):
     page.go_back()
     page.wait_for_selector(VIEW, state='hidden')
     check('back from it leaves the list as the only screen', list_showing(page), screens_shown(page))
+    page.context.close()
+
+
+def check_projects(browser, errors):
+    """The Projects tab opens on the one seeded project: two lanes off main,
+    the file both change, the branch only on GitHub, and why pull requests
+    are off. A lane opens on its files and commits, Live names who did what,
+    and a session's header opens the map on its own lane and returns to it.
+    From 900px the lanes are drawn off main, with Live beside them."""
+    page = new_page(browser, errors)
+    open_list(page)
+    page.tap('#projects-strip')
+    page.wait_for_selector('.pm-lane .pm-branch')
+    branches = texts(page, '.pm-lane .pm-branch')
+    check('one project opens on its map, a card per lane',
+          sorted(branches) == ['crew-view', 'project-map'], branches)
+    check('the title names the repository', page.inner_text('#project-title') == 'bosun')
+    warn = page.inner_text('#project-warn')
+    check('a file two lanes change is named above the lanes',
+          'api.rs is changing on crew-view and project-map' in warn, warn)
+    moving = page.locator('.bs-label', has_text='Moving').count()
+    check('the running session\'s lane is under Moving', moving == 1, moving)
+    main = page.inner_text('#project-main')
+    check('a branch only on GitHub is one quiet line', '1 more branch is only on GitHub' in main, main)
+    check('without a token the map says why it has no pull requests', 'no github_token' in main, main)
+    meta = page.locator('.pm-lane', has_text='project-map').locator('.pm-meta').inner_text()
+    check('a lane counts ahead, behind, not pushed and not committed',
+          all(part in meta for part in ['2 ahead', '1 behind', '1 not pushed', '1 not committed']), meta)
+
+    page.locator('.pm-lane', has_text='project-map').tap()
+    page.wait_for_selector('.pm-detail')
+    detail = page.eval_on_selector('#project-side', 'side => side.textContent')
+    check('a lane opens on its files not committed and its commits',
+          'Not committed · 1' in detail and 'watch.rs' in detail and 'Draw the lanes' in detail, detail)
+    check('the open lane takes the list\'s place on a phone', not page.is_visible('#project-main'))
+    page.tap('#btn-projects-back')
+    page.wait_for_selector('#project-main', state='visible')
+    page.tap('[data-pm="live"]')
+    page.wait_for_selector('.pm-event')
+    feed = texts(page, '.pm-event__text')
+    check('Live names the edit and who made it',
+          any('created watch.rs' in line for line in feed), feed)
+    check('Live names the overlap', any('api.rs is changing on two branches' in line for line in feed), feed)
+    page.tap('#btn-projects-back')
+    page.wait_for_selector('#projects-tab', state='hidden')
+    check('back from the map returns Home', list_showing(page), screens_shown(page))
+
+    open_from_list(page, 'the map session')
+    page.wait_for_selector('#btn-project', state='visible')
+    page.tap('#btn-project')
+    page.wait_for_selector('.pm-detail')
+    head = page.inner_text('.pm-detail__head')
+    check('the session\'s header opens the map on its own lane', 'project-map' in head, head)
+    page.tap('#btn-projects-back')
+    page.tap('#btn-projects-back')
+    page.wait_for_selector(VIEW, state='visible')
+    check('back from the map returns to the session', session_showing(page), screens_shown(page))
+    page.context.close()
+
+    page = new_page(browser, errors, size=(1280, 800), touch=False)
+    open_list(page)
+    page.click('#projects-strip')
+    page.wait_for_selector('.pm-map svg')
+    lanes = page.locator('.pm-map svg .m-lane').count()
+    check('from 900px the lanes are drawn off main', lanes >= 2, lanes)
+    check('the two lanes that share a file are joined', page.locator('.m-overlap').count() == 1)
+    check('Live stands beside the map', page.is_visible('#project-side .pm-event'))
+    page.locator('.pm-card', has_text='crew-view').click()
+    page.wait_for_selector('#project-side .pm-detail')
+    check('a lane opens beside the map, which stays', page.is_visible('.pm-map'))
+    page.click('.pm-detail__close')
+    page.wait_for_selector('#project-side .pm-event')
+    check('closing the lane brings Live back', True)
     page.context.close()
 
 
@@ -1978,6 +2053,7 @@ CHECKS = [
     check_clear,
     check_following,
     check_ask_records,
+    check_projects,
 ]
 
 
