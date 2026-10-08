@@ -44,7 +44,9 @@ use bosun_common::session::InterruptCause;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
+use bosun_common::session::SessionOverview;
 use bosun_common::session::SessionState;
+use bosun_common::session::SessionView;
 use bosun_common::skills::SkillRepo;
 use bosun_common::tunnel::Tunnel;
 use bosun_common::types::CloneRequest;
@@ -749,23 +751,40 @@ async fn personas(State(state): State<Arc<AppState>>) -> Json<Vec<PersonaSummary
     )
 }
 
+/// Every session with its overview: what each is doing, what it has cost,
+/// whether it is asking, and how far its task list has got.
 #[instrument(skip(state))]
-async fn sessions(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Session>>, ApiError> {
+async fn sessions(State(state): State<Arc<AppState>>) -> Result<Json<Vec<SessionView>>, ApiError> {
     let sessions = state.store.list_sessions().await?;
-    Ok(Json(sessions))
+    let mut views = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        views.push(session_view(&state, session).await?);
+    }
+    Ok(Json(views))
+}
+
+/// A session with its overview. A session removed between the list and its
+/// overview is served with an empty one rather than failing the whole list.
+async fn session_view(state: &AppState, session: Session) -> Result<SessionView, ApiError> {
+    let overview = match state.store.session_overview(&session.id).await {
+        Ok(overview) => overview,
+        Err(StoreError::SessionNotFound { .. }) => SessionOverview::default(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(SessionView { session, overview })
 }
 
 #[instrument(skip(state))]
 async fn session_detail(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Session>, ApiError> {
+) -> Result<Json<SessionView>, ApiError> {
     let session = state
         .store
         .get_session(&id)
         .await?
         .ok_or_else(|| ApiError::SessionNotFound { id: id.clone() })?;
-    Ok(Json(session))
+    Ok(Json(session_view(&state, session).await?))
 }
 
 /// One session's recorded model calls, oldest first, with their aggregates.
@@ -6464,6 +6483,65 @@ mod tests {
         )
         .await;
         assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_session_list_and_detail_carry_each_sessions_overview() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        store.create_session(&session("s1")).await.unwrap();
+        store
+            .append_model_call(
+                "s1",
+                "m",
+                "p",
+                "completion",
+                Some(1),
+                None,
+                Some(1),
+                Some(0.5),
+            )
+            .await
+            .unwrap();
+        store
+            .set_todos(
+                "s1",
+                &[json!({ "id": "1", "content": "a", "status": "done" })],
+            )
+            .await
+            .unwrap();
+
+        let list: serde_json::Value = reqwest::get(format!("http://{addr}/sessions"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            list[0]["id"], "s1",
+            "the row's own fields stay at the top level"
+        );
+        assert_eq!(list[0]["cost"], 0.5);
+        assert_eq!(list[0]["asking"], false);
+        assert_eq!(
+            list[0]["tasks"],
+            json!({ "total": 1, "done": 1, "in_progress": 0 })
+        );
+
+        let detail: serde_json::Value = reqwest::get(format!("http://{addr}/sessions/s1"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["cost"], 0.5);
+        let parsed: Session = serde_json::from_value(detail).unwrap();
+        assert_eq!(
+            parsed.id, "s1",
+            "a client that reads a plain session still can"
+        );
     }
 
     #[tokio::test]

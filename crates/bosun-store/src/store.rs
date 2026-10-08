@@ -12,6 +12,7 @@ use anyhow::Context;
 use bosun_common::mcp::McpAuth;
 use bosun_common::mcp::McpServer;
 use bosun_common::mcp::McpServerSecret;
+use bosun_common::session::ActivityAt;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
@@ -19,7 +20,9 @@ use bosun_common::session::Message;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
 use bosun_common::session::Session;
+use bosun_common::session::SessionOverview;
 use bosun_common::session::SessionState;
+use bosun_common::session::TaskCounts;
 use bosun_common::skills::SkillAd;
 use bosun_common::skills::SkillPackage;
 use bosun_common::skills::SkillRepo;
@@ -1356,6 +1359,84 @@ impl Store {
         .await
     }
 
+    /// What the session is doing, for the session list: its summed model-call
+    /// cost, its newest activity, whether its newest message is an unanswered
+    /// question, and its task list counted by status. Each part reads one row
+    /// or one aggregate, so a list of sessions costs a few small queries each.
+    pub async fn session_overview(&self, id: &str) -> Result<SessionOverview, StoreError> {
+        self.with_session(id, move |conn, session_id| {
+            let cost: f64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(cost), 0) FROM model_calls WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to sum the session's cost")?;
+            // The index walks back from the newest event to the first activity,
+            // and activity is most of what a working session writes.
+            let activity: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM events
+                     WHERE session_id = ?1 AND json_extract(payload, '$.kind') = 'activity'
+                     ORDER BY seq DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("failed to read the newest activity")?;
+            let activity = match activity {
+                Some(payload) => match serde_json::from_str(&payload)
+                    .context("failed to parse an activity event")?
+                {
+                    Event::Activity { at_ms, phase } => Some(ActivityAt { at_ms, phase }),
+                    _ => None,
+                },
+                None => None,
+            };
+            let newest: Option<String> = conn
+                .query_row(
+                    "SELECT block FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("failed to read the newest message")?;
+            let asking = match newest {
+                Some(block) => matches!(
+                    serde_json::from_str(&block).context("failed to parse a block")?,
+                    Block::Ask { answer: None, .. }
+                ),
+                None => false,
+            };
+            let todos: Option<String> = conn
+                .query_row(
+                    "SELECT todos FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to read the task list")?;
+            let items: Vec<Value> = match todos {
+                Some(text) => {
+                    serde_json::from_str(&text).context("failed to parse the task list")?
+                }
+                None => Vec::new(),
+            };
+            let status =
+                |wanted: &str| items.iter().filter(|item| item["status"] == wanted).count();
+            Ok(SessionOverview {
+                cost,
+                activity,
+                asking,
+                tasks: TaskCounts {
+                    total: items.len(),
+                    done: status("done"),
+                    in_progress: status("in_progress"),
+                },
+            })
+        })
+        .await
+    }
+
     /// The session's pending raised ask — the direct child whose question it
     /// surfaced, that question's origin leaf, and the surfaced Ask block's
     /// row — when one is.
@@ -2685,6 +2766,7 @@ fn mcp_server_secret_from_row(row: &rusqlite::Row) -> Result<McpServerSecret, an
 mod tests {
     use std::time::UNIX_EPOCH;
 
+    use bosun_common::session::ActivityPhase;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -3210,6 +3292,94 @@ mod tests {
             &events[0].1,
             Event::Todos { at_ms: Some(_), items: written } if written.as_slice() == items
         ));
+    }
+
+    #[tokio::test]
+    async fn an_overview_says_what_a_session_is_doing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        assert_eq!(
+            store.session_overview("s1").await.unwrap(),
+            SessionOverview::default(),
+            "a new session has done nothing"
+        );
+
+        for cost in [0.25, 0.5] {
+            store
+                .append_model_call(
+                    "s1",
+                    "m",
+                    "p",
+                    "completion",
+                    Some(1),
+                    None,
+                    Some(1),
+                    Some(cost),
+                )
+                .await
+                .unwrap();
+        }
+        let started = ActivityPhase::ToolStarted {
+            name: "edit".into(),
+            target: Some("src/winsw.ts".into()),
+        };
+        store
+            .append_event(
+                "s1",
+                &Event::Activity {
+                    at_ms: 42,
+                    phase: started.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_todos(
+                "s1",
+                &[
+                    json!({ "id": "1", "content": "a", "status": "done" }),
+                    json!({ "id": "2", "content": "b", "status": "in_progress" }),
+                    json!({ "id": "3", "content": "c", "status": "todo" }),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "s1",
+                Role::Assistant,
+                &Block::Ask {
+                    message: "which?".into(),
+                    options: vec![],
+                    child_id: None,
+                    answer: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let overview = store.session_overview("s1").await.unwrap();
+        assert_eq!(overview.cost, 0.75);
+        assert_eq!(
+            overview.activity,
+            Some(ActivityAt {
+                at_ms: 42,
+                phase: started
+            })
+        );
+        assert!(
+            overview.asking,
+            "the newest message is an unanswered question"
+        );
+        assert_eq!(
+            overview.tasks,
+            TaskCounts {
+                total: 3,
+                done: 1,
+                in_progress: 1
+            }
+        );
     }
 
     #[tokio::test]

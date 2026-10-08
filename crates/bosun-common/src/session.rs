@@ -82,6 +82,49 @@ pub struct Session {
     pub summary: Option<String>,
 }
 
+/// What a session is doing, served beside it in the session list so a client
+/// can draw the session without opening its stream.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionOverview {
+    /// The summed cost of the session's metered model calls.
+    #[serde(default)]
+    pub cost: f64,
+    /// The session's newest loop activity.
+    #[serde(default)]
+    pub activity: Option<ActivityAt>,
+    /// Whether the session's newest message is a question with no answer.
+    #[serde(default)]
+    pub asking: bool,
+    /// The session's task list, counted by status.
+    #[serde(default)]
+    pub tasks: TaskCounts,
+}
+
+/// One loop activity and when the loop recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityAt {
+    pub at_ms: u64,
+    #[serde(flatten)]
+    pub phase: ActivityPhase,
+}
+
+/// A task list counted by status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCounts {
+    pub total: usize,
+    pub done: usize,
+    pub in_progress: usize,
+}
+
+/// A session as the session list serves it: the row, then its overview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    #[serde(flatten)]
+    pub session: Session,
+    #[serde(flatten)]
+    pub overview: SessionOverview,
+}
+
 fn default_allowed_tools() -> String {
     ALL_TOOLS.into()
 }
