@@ -8,12 +8,21 @@ import { refreshMcpServers } from './mcp.js';
 import { refreshPersonas } from './new-session.js';
 import { refreshSessions } from './session-list.js';
 import { followHistory, startFromLink } from './history.js';
+import { icon } from './signal.js';
+import './views.js';
+import './crew-screen.js';
 // The report samples each viewport event before viewport.js answers it, so it
 // registers its listeners first.
 import './viewport-report.js';
 import './viewport.js';
 
 originEl.textContent = location.origin;
+
+// Controls in the page name their icon; the pane draws each one in front of
+// the control's label.
+for (const control of document.querySelectorAll('[data-icon]')) {
+  control.prepend(icon(control.dataset.icon));
+}
 
 refreshNodes();
 refreshSessions();

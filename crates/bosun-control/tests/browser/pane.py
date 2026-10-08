@@ -197,10 +197,14 @@ def view_covers_visible_part(page, timeout=3000):
 
 
 def view_covers_screen(page, timeout=3000):
-    """Whether the view comes to cover the whole layout viewport with the
-    composer at its bottom, as it does with no keyboard, and the box it has."""
+    """Whether the view comes to cover the whole layout viewport with its
+    bottom bars at its bottom, as it does with no keyboard, and the box it
+    has. With no field focused the view tabs sit under the composer, so the
+    lower of the two is the edge that must meet the screen's."""
     box = f"""() => {{ const r = document.querySelector('{VIEW}').getBoundingClientRect();
-      const c = document.querySelector('#input-row').getBoundingClientRect();
+      const composer = document.querySelector('#input-row').getBoundingClientRect();
+      const tabs = document.querySelector('#view-tabs').getBoundingClientRect();
+      const c = tabs.height ? tabs : composer;
       return {{ top: Math.round(r.top), height: Math.round(r.height), composerBottom: Math.round(c.bottom),
                screen: window.innerHeight }}; }}"""
     ok = until(page, f"() => {{ const b = ({box})(); return b.top === 0 && b.height === b.screen && b.composerBottom === b.screen; }}",
@@ -296,7 +300,11 @@ COUNT_STREAMS = """
   window.EventSource = class extends Real {
     constructor(...args) { super(...args); all.push(this); }
   };
-  window.__openStreams = () => all.filter(es => es.readyState !== Real.CLOSED).map(es => es.url);
+  // The crew's one tree stream is counted apart: the session and panel
+  // checks are about the per-session streams.
+  const open = () => all.filter(es => es.readyState !== Real.CLOSED).map(es => es.url);
+  window.__openStreams = () => open().filter(url => !url.includes('/tree-events'));
+  window.__openTreeStreams = () => open().filter(url => url.includes('/tree-events'));
 })();
 """
 
@@ -361,10 +369,12 @@ AT_BOTTOM = """
 
 
 def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewport=True,
-             touch=True, http_errors=False, **context_options):
+             touch=True, http_errors=False, view='log', **context_options):
     """A phone page. `touch=False` gives a desktop page with a fine pointer.
     `http_errors=True` is for a check whose routes answer with an error
-    status on purpose: the browser logs each such response to the console."""
+    status on purpose: the browser logs each such response to the console.
+    `view` is the session view the pane opens on: the transcript checks read
+    the Log view, which is the session's own transcript."""
     context = browser.new_context(
         viewport={'width': size[0], 'height': size[1]},
         is_mobile=touch,
@@ -374,6 +384,8 @@ def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewpor
     )
     context.add_init_script(NO_SCROLL_ANCHORING)
     context.add_init_script(COUNT_STREAMS)
+    context.add_init_script(
+        "try { localStorage.setItem('bosun.view', %s); } catch (error) {}" % json.dumps(view))
     if stub_viewport:
         context.add_init_script(VIEWPORT_STUB)
     if not visual_viewport:
@@ -934,30 +946,21 @@ def rect(page, selector):
 def check_list(browser, errors):
     page = new_page(browser, errors)
     open_list(page)
-    item = page.locator('.session-item', has=page.locator(SESSION_ROW, has_text=LONG_ROW)).first
-    lines = item.locator('.row-main > *')
-    lead = [lines.nth(0).inner_text(), lines.nth(1).inner_text()]
-    check('a summarized session row leads with its summary, with the node and directory under it',
-          lead == [LONG_ROW, 'node-1 / /work/repo'], lead)
-
-    toggle = item.locator('.children-toggle')
-    child_line = page.locator('#session-list .child-row', has_text=CHILD[:8])
-    toggle.tap()
+    card = page.locator('.bs-session', has_text=LONG_ROW).first
+    title = card.locator('.bs-session__title').inner_text()
+    check('a summarized tree\'s card leads with its summary', title == LONG_ROW, title)
+    faces = card.locator('.bs-avatars .bs-avatar').count()
+    check('a tree\'s card shows its crew, the child folded into it', faces == 2, faces)
+    check('a child has no card of its own on Home',
+          page.locator('.bs-session[data-session="%s"]' % CHILD).count() == 0)
+    groups = page.evaluate("() => [...document.querySelectorAll('.session-group')].map(e => e.textContent.split(' · ')[0])")
+    check('the groups read Needs you, Working, Idle, in that order, when present',
+          groups == [g for g in ['Needs you', 'Working', 'Idle'] if g in groups] and len(groups) > 0, groups)
+    asking = page.locator('.bs-session.is-needs-you').count()
+    check('a tree with an open question sits under Needs you with its border', asking >= 1, asking)
     polled = wait_for_poll(page)
-    check('an opened children group stays open when the list refreshes',
-          polled and child_line.is_visible() and toggle.inner_text() == 'hide children')
-    toggle.tap()
-    polled = wait_for_poll(page)
-    check('a closed children group stays closed when the list refreshes',
-          polled and child_line.is_hidden() and toggle.inner_text() == '1 child')
-
-    # The panel's child rows have rules of their own, which must not reach the
-    # session list's child lines. The wide screen has no narrow-screen minimum.
-    page.set_viewport_size({'width': LANDSCAPE[0], 'height': LANDSCAPE[1]})
-    toggle.tap()
-    look = child_line.evaluate('e => { const s = getComputedStyle(e); return [s.display, s.paddingLeft, s.minHeight]; }')
-    check('a child line in the session list keeps its own look, not the panel row\'s',
-          look[:2] == ['flex', '26px'] and look[2] in ('auto', '0px'), look)
+    check('the cards survive a refresh of the list',
+          polled and page.locator('.bs-session', has_text=LONG_ROW).count() == 1)
     page.context.close()
 
 
@@ -1387,7 +1390,7 @@ def check_leaving_clears_the_view(browser, errors):
 
     open_session(page, CHILD)
     page.wait_for_selector('#watch-banner', state='visible')
-    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-interrupt', 'row-stop']
+    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-clear', 'btn-interrupt', 'row-stop']
       .map(id => document.getElementById(id).hidden)""")
     check('a watch-only child has no chat box and no controls in its sheet', all(hidden), hidden)
     page.tap(MORE)
@@ -1402,7 +1405,7 @@ def check_leaving_clears_the_view(browser, errors):
           .map(id => $(id).textContent).join(''),
         waiting: $('view-waiting').hidden,
         footer: [$('input-row').hidden, $('watch-banner').hidden],
-        rows: ['row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-interrupt', 'row-stop'].map(id => $(id).hidden),
+        rows: ['row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-stop'].map(id => $(id).hidden),
         permission: $('btn-permission').textContent,
         dot: $('view-state-dot').className,
         persona: $('persona-name').value,
@@ -1410,7 +1413,7 @@ def check_leaving_clears_the_view(browser, errors):
     }""")
     check('leaving a session clears its header and sheet, closes its sheets and gives the footer back', state == {
         'sheets': [True, True], 'text': '', 'waiting': True, 'footer': [False, True],
-        'rows': [False] * 6, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
+        'rows': [False] * 5, 'permission': 'Switch to read-only', 'dot': 'dot', 'persona': '',
     }, state)
     page.context.close()
 
@@ -1761,7 +1764,7 @@ def check_clear(browser, errors):
     page.tap(MORE)
     page.wait_for_selector(SHEET, state='visible')
     check('a root session offers the clear control in its actions sheet',
-          page.is_visible(CLEAR_ROW) and page.inner_text(CLEAR_BTN) == 'Clear context',
+          page.is_visible(CLEAR_ROW) and page.inner_text(CLEAR_BTN).startswith('Clear context'),
           page.inner_text(CLEAR_BTN))
 
     # The pane draws nothing for a clear: the break is the marker's own durable

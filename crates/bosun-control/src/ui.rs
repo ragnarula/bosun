@@ -65,6 +65,10 @@ pub(crate) const ASSETS: &[(&str, &str, &str)] = &[
     ("markdown.js", JS, include_str!("ui/markdown.js")),
     ("subagents.js", JS, include_str!("ui/subagents.js")),
     ("earlier.js", JS, include_str!("ui/earlier.js")),
+    ("signal.js", JS, include_str!("ui/signal.js")),
+    ("crew.js", JS, include_str!("ui/crew.js")),
+    ("views.js", JS, include_str!("ui/views.js")),
+    ("crew-screen.js", JS, include_str!("ui/crew-screen.js")),
     ("main.js", JS, include_str!("ui/main.js")),
 ];
 
@@ -97,6 +101,37 @@ pub async fn mermaid_bundle() -> impl IntoResponse {
         ],
         include_str!("ui/mermaid.min.js"),
     )
+}
+
+/// The pane's three typefaces, Latin subsets as woff2, each under the SIL Open
+/// Font License beside it in `ui/fonts/`. Embedded like the pane, so the pane
+/// loads nothing from a font host and works offline.
+const FONTS: &[(&str, &[u8])] = &[
+    (
+        "bricolage-grotesque.woff2",
+        include_bytes!("ui/fonts/bricolage-grotesque.woff2"),
+    ),
+    ("geist.woff2", include_bytes!("ui/fonts/geist.woff2")),
+    (
+        "geist-mono.woff2",
+        include_bytes!("ui/fonts/geist-mono.woff2"),
+    ),
+];
+
+/// One of the pane's `FONTS`. A font file changes only with the control plane,
+/// so a phone keeps it for a day rather than fetch it on every load.
+pub async fn font(Path(name): Path<String>) -> Response {
+    match FONTS.iter().find(|(served, _)| *served == name) {
+        Some((_, body)) => (
+            [
+                (header::CONTENT_TYPE, "font/woff2"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            *body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// The largest viewport report body the control plane reads, in bytes. The
@@ -232,6 +267,10 @@ mod tests {
         include_str!("ui/markdown.js"),
         include_str!("ui/subagents.js"),
         include_str!("ui/earlier.js"),
+        include_str!("ui/signal.js"),
+        include_str!("ui/crew.js"),
+        include_str!("ui/views.js"),
+        include_str!("ui/crew-screen.js"),
         include_str!("ui/main.js"),
         "\n</script>\n",
     );
@@ -645,7 +684,7 @@ mod tests {
     fn the_pane_clears_the_context_from_the_actions_sheet() {
         assert!(
             PANE.contains(
-                "<div class=\"view-sheet-row\" id=\"row-clear\">\n    <button type=\"button\" id=\"btn-clear\">Clear context</button>\n    <span class=\"view-sheet-note\" id=\"view-clear\"></span>"
+                "<div class=\"view-sheet-row\" id=\"row-clear\">\n    <button type=\"button\" id=\"btn-clear\" class=\"bs-sheet__row\" data-icon=\"clear\">Clear context<small>The crew starts fresh from your next message</small></button>\n    <span class=\"view-sheet-note\" id=\"view-clear\"></span>"
             ),
             "the clear control lives in the session actions sheet, with its own row and its own note"
         );

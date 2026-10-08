@@ -578,11 +578,12 @@ const RESERVED_PATH_PREFIXES: &[&str] = &[
     "/nodes/",
     "/skills/repos/",
     "/mcp/servers/",
+    "/personas/",
 ];
 
 /// The parents the router serves any single segment below: `/ui/{asset}`
 /// matches `/ui/main.js` but not `/ui/oauth/callback`.
-const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/"];
+const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/", "/ui/fonts/"];
 
 /// The `oauth_redirect_uri` names a path the control plane cannot serve as
 /// the OAuth callback.
@@ -636,6 +637,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(crate::ui::pane))
         .route("/ui/mermaid.min.js", get(crate::ui::mermaid_bundle))
         .route("/ui/{asset}", get(crate::ui::asset))
+        .route("/ui/fonts/{name}", get(crate::ui::font))
         .route(
             "/viewport-report",
             post(crate::ui::viewport_report)

@@ -13,7 +13,14 @@ import { sessions } from './session-list.js';
 import { opened } from './session-view.js';
 import { clip, drawAssistant, drawBlock } from './transcript.js';
 
-export { childName, closeChildPanel, renderChildList, updateChildPanelDot, watchControl };
+export {
+  childName,
+  closeChildPanel,
+  followChild,
+  renderChildList,
+  updateChildPanelDot,
+  watchControl,
+};
 
 // ---- Subagent panel ----
 // One child at a time, followed on its own event stream while the session stays

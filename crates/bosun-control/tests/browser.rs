@@ -84,7 +84,11 @@ async fn the_pane_works_on_a_phone() {
     seed(&store).await;
     let addr = serve(store).await;
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/browser/pane.py");
+    // `BOSUN_PANE_SCRIPT` runs another script against the same seeded server,
+    // such as one that takes screenshots while the pane is being designed.
+    let script = std::env::var_os("BOSUN_PANE_SCRIPT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/browser/pane.py"));
     let mut checks = tokio::process::Command::new("python3")
         .arg(&script)
         .arg(format!("http://{addr}"))

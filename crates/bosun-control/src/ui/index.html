@@ -30,92 +30,92 @@
 <link rel="modulepreload" href="/ui/markdown.js">
 <link rel="modulepreload" href="/ui/subagents.js">
 <link rel="modulepreload" href="/ui/earlier.js">
+<link rel="modulepreload" href="/ui/signal.js">
+<link rel="modulepreload" href="/ui/crew.js">
+<link rel="modulepreload" href="/ui/views.js">
+<link rel="modulepreload" href="/ui/crew-screen.js">
 <script src="/ui/mermaid.min.js" id="mermaid-bundle" defer></script>
 <link rel="stylesheet" href="/ui/pane.css">
 </head>
 <body>
 <div id="home">
-<header class="top">
-  <h1>Bosun</h1>
-  <span class="origin" id="origin"></span>
+<header class="bs-header home-header">
+  <div class="bs-header__text">
+    <h1 class="bs-header__title home-title">Bosun</h1>
+    <div class="bs-header__sub"><span id="health-text">no machines yet</span><span class="origin" id="origin"></span></div>
+  </div>
+  <button id="btn-new-session" type="button" class="bs-btn bs-btn--primary" data-icon="plus">New</button>
 </header>
 <div id="status"></div>
-<div id="health-strip" role="button" tabindex="0">
-  <span class="health-dot" id="health-dot"></span>
-  <span class="health-text" id="health-text"></span>
-</div>
-<div id="skills-strip" role="button" tabindex="0">
-  <span class="skills-strip-icon">✦</span>
-  <span class="skills-strip-text" id="skills-strip-text">skill repos</span>
-</div>
-<div id="mcp-strip" role="button" tabindex="0">
-  <span class="mcp-strip-icon">⛓</span>
-  <span class="mcp-strip-text" id="mcp-strip-text">MCP servers</span>
-</div>
 <main>
-  <section class="panel">
-    <h2>Sessions <button id="btn-new-session" type="button">New session</button></h2>
-    <form id="new-session-form" hidden>
-      <div class="sheet-body">
-        <div id="recent-sessions" hidden></div>
-        <div class="composer" id="composer">
-          <div class="composer-row">
-            <span class="composer-label">Node</span>
-            <div class="chip-row" id="node-chips"></div>
-            <select id="form-node" hidden></select>
+  <form id="new-session-form" hidden>
+    <div class="sheet-body">
+      <div class="sheet-title">New session</div>
+      <div id="recent-sessions" hidden></div>
+      <div class="composer" id="composer">
+        <div class="composer-row">
+          <span class="composer-label">Node</span>
+          <div class="chip-row" id="node-chips"></div>
+          <select id="form-node" hidden></select>
+        </div>
+        <div class="composer-row">
+          <span class="composer-label">Directory</span>
+          <div class="dir-pick">
+            <span id="form-dir"></span>
+            <button type="button" id="btn-browse" class="bs-btn">Browse</button>
           </div>
-          <div class="composer-row">
-            <span class="composer-label">Directory</span>
-            <div class="dir-pick">
-              <span id="form-dir"></span>
-              <button type="button" id="btn-browse">Browse</button>
+          <div id="dir-browser" hidden>
+            <div class="dir-browser-head">
+              <span id="dir-path">browse roots</span>
+              <button type="button" id="btn-dir-close" class="dir-close bs-btn bs-btn--ghost">Close</button>
             </div>
-            <div id="dir-browser" hidden>
-              <div class="dir-browser-head">
-                <span id="dir-path">browse roots</span>
-                <button type="button" id="btn-dir-close" class="dir-close">Close</button>
-              </div>
-              <div id="dir-entries"></div>
-              <div class="dir-browser-actions">
-                <button type="button" id="btn-dir-up" disabled>Up</button>
-                <button type="button" id="btn-dir-use" disabled>Use this directory</button>
-              </div>
+            <div id="dir-entries"></div>
+            <div class="dir-browser-actions">
+              <button type="button" id="btn-dir-up" class="bs-btn" disabled>Up</button>
+              <button type="button" id="btn-dir-use" class="bs-btn bs-btn--primary" disabled>Use this directory</button>
             </div>
-          </div>
-          <div class="composer-row">
-            <span class="composer-label">Persona</span>
-            <div class="chip-row" id="persona-chips"></div>
-            <select id="form-persona" hidden></select>
-          </div>
-          <div class="composer-row">
-            <span class="composer-label">MCP servers</span>
-            <div class="chip-row" id="mcp-chips"></div>
           </div>
         </div>
+        <div class="composer-row">
+          <span class="composer-label">Persona</span>
+          <div class="chip-row" id="persona-chips"></div>
+          <select id="form-persona" hidden></select>
+        </div>
+        <div class="composer-row">
+          <span class="composer-label">MCP servers</span>
+          <div class="chip-row" id="mcp-chips"></div>
+        </div>
       </div>
-      <div class="sheet-actions">
-        <button type="submit" class="start">Start</button>
-        <button type="button" id="btn-cancel-new-session">Cancel</button>
-      </div>
-    </form>
-    <div id="session-list" hidden></div>
-  </section>
+    </div>
+    <div class="sheet-actions">
+      <button type="submit" class="start bs-btn bs-btn--primary">Start</button>
+      <button type="button" id="btn-cancel-new-session" class="bs-btn bs-btn--ghost">Cancel</button>
+    </div>
+  </form>
+  <div id="session-list" hidden></div>
 </main>
+<nav class="bs-tabbar home-tabs" aria-label="Screens">
+  <button type="button" class="bs-tab" aria-selected="true" data-icon="chat">Sessions</button>
+  <button type="button" class="bs-tab" id="health-strip" data-icon="machines">Machines<span class="health-dot" id="health-dot"></span></button>
+  <button type="button" class="bs-tab" id="skills-strip" data-icon="skills">Skills</button>
+  <button type="button" class="bs-tab" id="mcp-strip" data-icon="plug">MCP</button>
+  <button type="button" class="bs-tab" id="crew-strip-btn" data-icon="crew">Crew</button>
+</nav>
 </div>
 
 <div id="machines-tab" hidden>
-  <div class="machines-head">
-    <button type="button" id="btn-machines-back" title="Back to sessions">‹</button>
-    <span class="machines-title">Machines</span>
+  <div class="machines-head bs-header">
+    <button type="button" id="btn-machines-back" class="bs-back btn-machines-back" aria-label="Back to sessions" data-icon="back"></button>
+    <div class="bs-header__text"><div class="bs-header__title machines-title">Machines</div></div>
   </div>
   <div id="machines-list"></div>
 </div>
 
 <div id="skills-tab" hidden>
-  <div class="skills-head">
-    <button type="button" id="btn-skills-back" title="Back to sessions">‹</button>
-    <span class="skills-title">Skill repos</span>
-    <button type="button" id="btn-skills-add">Add repo</button>
+  <div class="skills-head bs-header">
+    <button type="button" id="btn-skills-back" class="bs-back btn-skills-back" aria-label="Back to sessions" data-icon="back"></button>
+    <div class="bs-header__text"><div class="bs-header__title skills-title">Skills</div><div class="bs-header__sub" id="skills-strip-text">no repositories yet</div></div>
+    <button type="button" id="btn-skills-add" class="bs-btn bs-btn--primary btn-skills-add" data-icon="plus">Add</button>
   </div>
   <div id="skills-add" hidden>
     <label>Repo
@@ -134,10 +134,10 @@
 </div>
 
 <div id="mcp-tab" hidden>
-  <div class="mcp-head">
-    <button type="button" id="btn-mcp-back" title="Back to sessions">‹</button>
-    <span class="mcp-title">MCP servers</span>
-    <button type="button" id="btn-mcp-add">Add server</button>
+  <div class="mcp-head bs-header">
+    <button type="button" id="btn-mcp-back" class="bs-back btn-mcp-back" aria-label="Back to sessions" data-icon="back"></button>
+    <div class="bs-header__text"><div class="bs-header__title mcp-title">MCP servers</div><div class="bs-header__sub" id="mcp-strip-text">none yet</div></div>
+    <button type="button" id="btn-mcp-add" class="bs-btn bs-btn--primary btn-mcp-add" data-icon="plus">Add</button>
   </div>
   <div id="mcp-add" hidden>
     <label>Name
@@ -170,96 +170,137 @@
   <div id="mcp-list"></div>
 </div>
 
+<div id="crew-tab" hidden>
+  <div class="bs-header crew-head">
+    <button type="button" id="btn-crew-back" class="bs-back" aria-label="Back to sessions" data-icon="back"></button>
+    <div class="bs-header__text"><div class="bs-header__title">Crew</div><div class="bs-header__sub">Each persona's face and flag</div></div>
+  </div>
+  <div id="crew-personas"></div>
+  <input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp" hidden>
+</div>
+
 <div id="toast" hidden></div>
 
-<div id="session-view" hidden>
-  <header class="view-header">
-    <button type="button" class="btn-back" id="btn-back" title="Back to sessions">‹</button>
-    <div class="view-title" id="view-title">
-      <span class="dot" id="view-state-dot"></span>
-      <span class="view-main" id="view-main">
-        <span class="view-node" id="view-node"></span><span class="view-dir" id="view-dir"></span>
+<div id="session-view" hidden data-view="chat">
+  <header class="bs-header view-header">
+    <button type="button" class="bs-back btn-back" id="btn-back" aria-label="Back to sessions" data-icon="back"></button>
+    <div class="bs-header__text view-title" id="view-title" title="Show the loop's activity">
+      <div class="bs-header__title" id="view-summary"></div>
+      <div class="bs-header__sub view-main" id="view-main">
+        <span class="dot" id="view-state-dot"></span><span class="view-node" id="view-node"></span><span class="view-dir" id="view-dir"></span>
         <span class="view-waiting" id="view-waiting" hidden></span>
-      </span>
+      </div>
     </div>
-    <button type="button" class="btn-more" id="btn-more" title="Session actions">⋯</button>
+    <button type="button" class="bs-chip header-chip" id="chip-persona" title="Switch persona"></button>
+    <button type="button" class="bs-chip header-chip" id="chip-permission" title="Switch permission" data-icon="shield"><span id="chip-permission-text"></span></button>
+    <button type="button" class="bs-btn btn-more" id="btn-more" title="Session actions">Session</button>
+    <button type="button" class="bs-btn bs-btn--danger" id="btn-interrupt" data-icon="stop" hidden>Stop</button>
   </header>
-  <div id="activity-log" hidden></div>
-  <div id="conversation">
-    <div id="transcript-wrap">
-      <div id="transcript"></div>
-      <button type="button" id="btn-bottom" hidden title="Back to the newest line">↓</button>
-    </div>
-    <div id="child-panel" hidden>
-      <div class="child-panel-head">
-        <span class="dot" id="child-panel-dot"></span>
-        <span class="child-panel-title" id="child-panel-title"></span>
-        <button type="button" id="btn-child-collapse" title="Collapse the panel">✕</button>
-      </div>
-      <div id="child-list"></div>
-      <div id="child-transcript"></div>
+  <div class="crew-row">
+    <div id="crew-strip" class="bs-crew" hidden></div>
+    <div class="view-switch" role="tablist" aria-label="Views">
+      <button type="button" class="bs-chip" data-view="chat" data-icon="chat">Chat</button>
+      <button type="button" class="bs-chip" data-view="log" data-icon="log">Log</button>
     </div>
   </div>
-  <div id="watch-banner" hidden>
-    <div class="watch-note">watching child session — it is read-only</div>
-    <button type="button" id="btn-watch-open">Open to act</button>
-  </div>
-  <div class="input-row" id="input-row">
-    <div id="ask-sheet" hidden>
-      <div class="ask-head">
-        <span class="ask-label">Question</span>
-        <button type="button" id="btn-ask-dismiss" class="ask-dismiss" title="Reject the question; your next message becomes an instruction">Dismiss</button>
+  <div id="session-body">
+    <div id="main-col">
+      <div id="activity-log" hidden></div>
+      <div id="chat-view">
+        <div id="chat-list" role="log"></div>
       </div>
-      <div class="ask-chips" id="ask-chips"></div>
-      <button type="button" id="btn-ask-type" class="ask-type-toggle" hidden>Answer in your own words</button>
-      <div class="ask-free" id="ask-free" hidden>
-        <textarea id="ask-input" rows="2" placeholder="Type your answer; Enter to send"></textarea>
-        <div class="ask-free-actions">
-          <button type="button" id="btn-ask-send" class="primary">Answer</button>
-          <button type="button" id="btn-ask-back">Back to options</button>
+      <div id="conversation">
+        <div id="transcript-wrap">
+          <div id="transcript"></div>
+          <button type="button" id="btn-bottom" hidden title="Back to the newest line">↓</button>
+        </div>
+        <div id="child-panel" hidden>
+          <div class="child-panel-head">
+            <span class="dot" id="child-panel-dot"></span>
+            <span class="child-panel-title" id="child-panel-title"></span>
+            <button type="button" id="btn-child-collapse" title="Collapse the panel">✕</button>
+          </div>
+          <div id="child-list"></div>
+          <div id="child-transcript"></div>
+        </div>
+      </div>
+      <div id="watch-banner" hidden>
+        <div class="watch-note">This is a crew member's own session. You follow it here; the lead's session takes your messages.</div>
+        <button type="button" id="btn-watch-open" class="bs-btn">Open the lead's session</button>
+      </div>
+      <div class="input-row" id="input-row">
+        <div id="ask-sheet" hidden>
+          <div class="ask-head">
+            <span class="ask-label">Question</span>
+            <button type="button" id="btn-ask-dismiss" class="ask-dismiss" title="Reject the question; your next message becomes an instruction">Dismiss</button>
+          </div>
+          <div class="ask-chips" id="ask-chips"></div>
+          <button type="button" id="btn-ask-type" class="ask-type-toggle" hidden>Answer in your own words</button>
+          <div class="ask-free" id="ask-free" hidden>
+            <textarea id="ask-input" rows="2" placeholder="Type your answer; Enter to send"></textarea>
+            <div class="ask-free-actions">
+              <button type="button" id="btn-ask-send" class="primary bs-btn bs-btn--primary">Answer</button>
+              <button type="button" id="btn-ask-back" class="bs-btn bs-btn--ghost">Back to options</button>
+            </div>
+          </div>
+        </div>
+        <div class="chat-row" id="chat-row">
+          <textarea id="input" rows="1" placeholder="Message the crew…"></textarea>
+          <button id="btn-send" type="button" class="bs-btn bs-btn--primary" aria-label="Send" data-icon="send"></button>
         </div>
       </div>
     </div>
-    <div class="chat-row" id="chat-row">
-      <textarea id="input" rows="3" placeholder="Message"></textarea>
-      <button id="btn-send" type="button">Send</button>
+    <div id="side-col">
+      <section id="tasks-view" aria-label="Tasks">
+        <div class="side-head"><span class="bs-label">Tasks</span><span class="side-count" id="tasks-count"></span></div>
+        <div class="bs-progress" id="tasks-progress" hidden></div>
+        <div id="tasks-list"></div>
+      </section>
+      <section id="files-view" aria-label="Files">
+        <div class="side-head"><span class="bs-label">Files</span><span class="side-count" id="files-count"></span></div>
+        <div id="files-now"></div>
+        <div id="files-list"></div>
+      </section>
     </div>
   </div>
+  <nav class="bs-tabbar" id="view-tabs" role="tablist" aria-label="Views">
+    <button type="button" class="bs-tab" role="tab" data-view="chat" data-icon="chat">Chat</button>
+    <button type="button" class="bs-tab" role="tab" data-view="tasks" data-icon="tasks">Tasks</button>
+    <button type="button" class="bs-tab" role="tab" data-view="files" data-icon="files">Files</button>
+    <button type="button" class="bs-tab" role="tab" data-view="log" data-icon="log">Log</button>
+  </nav>
 </div>
 
 <div id="view-sheet" hidden>
+  <div class="bs-sheet__grip"></div>
   <div class="view-sheet-head">
-    <span>Session actions</span>
-    <button type="button" id="btn-sheet-close" title="Close actions">✕</button>
+    <span>Session</span>
+    <button type="button" id="btn-sheet-close" title="Close" aria-label="Close" class="bs-btn bs-btn--ghost bs-btn--icon">✕</button>
   </div>
   <div class="view-sheet-row" id="row-permission">
     <span class="view-sheet-note" id="view-sheet-meta"></span>
-    <button type="button" id="btn-permission">Switch to read-only</button>
+    <button type="button" id="btn-permission" class="bs-btn">Switch to read-only</button>
     <span class="view-sheet-note" id="view-permission"></span>
   </div>
   <div class="view-sheet-row" id="row-persona">
     <select id="persona-name">
       <option value="">switch persona…</option>
     </select>
-    <button type="button" id="btn-persona">Switch persona</button>
-  </div>
-  <div class="view-sheet-row">
-    <span class="view-sheet-copy" id="view-id-copy" title="Session id"></span>
-    <button type="button" id="btn-copy-id">Copy session id</button>
+    <button type="button" id="btn-persona" class="bs-btn">Switch persona</button>
   </div>
   <div class="view-sheet-row" id="row-fork">
-    <button type="button" id="btn-fork">Fork session</button>
+    <button type="button" id="btn-fork" class="bs-sheet__row" data-icon="fork">Fork session<small>A new session with this conversation and its own clone</small></button>
     <span class="view-sheet-note" id="view-fork"></span>
   </div>
   <div class="view-sheet-row" id="row-clear">
-    <button type="button" id="btn-clear">Clear context</button>
+    <button type="button" id="btn-clear" class="bs-sheet__row" data-icon="clear">Clear context<small>The crew starts fresh from your next message</small></button>
     <span class="view-sheet-note" id="view-clear"></span>
   </div>
-  <div class="view-sheet-row" id="row-interrupt">
-    <button type="button" id="btn-interrupt">Interrupt</button>
+  <div class="view-sheet-row">
+    <button type="button" id="btn-copy-id" class="bs-sheet__row" data-icon="copy">Copy session id<small class="view-sheet-copy" id="view-id-copy"></small></button>
   </div>
   <div class="view-sheet-row" id="row-stop">
-    <button type="button" id="btn-stop" class="danger">Stop</button>
+    <button type="button" id="btn-stop" class="bs-sheet__row is-danger danger" data-icon="trash">End session<small>Stops every crew member and removes the clone</small></button>
   </div>
 </div>
 </body>

@@ -25,15 +25,15 @@ Status: **in progress**.
 
 ## User stories in implementation order
 
-- [ ] **S1 — One stream for a tree.** `tree-events` with replay, tail paging, polling and the root's live deltas; `tree-history` for read-back.
-- [ ] **S2 — Tasks survive a restart.** `sessions.todos`, `Store::set_todos`, `Event::Todos`, the loop rehydrates; `todowrite` items take an optional `kind` and `owner`.
-- [ ] **S3 — Activity names its target.** `ToolStarted.target`, filled at every call site from the call's arguments.
-- [ ] **S4 — File results carry facts.** Created and line counts from `file_write` and `edit`; shell runs report the paths whose git status changed.
-- [ ] **S5 — The session list carries the crew's state.** Cost, newest activity, pending question and task counts on each listed session.
-- [ ] **S6 — Personas have avatars.** A stored seed and an optional uploaded picture per persona; `PUT`/`DELETE /personas/{name}/avatar`, `GET` to serve it, `POST /personas/{name}/avatar/shuffle`.
-- [ ] **S7 — Bosun Signal in the pane.** Tokens, the three typefaces as embedded woff2, the flag, avatar and icon module, Night and Day.
-- [ ] **S8 — The session view.** Header with Stop in sight, crew strip, Chat, Tasks, Files, Log, the Session sheet; the subagent panel goes.
-- [ ] **S9 — Home and the desktop layout.** Session cards grouped by Needs you, Working, Idle; three columns from 900px; Machines, Skills, MCP and a Crew screen for avatars in the same language.
+- [x] **S1 — One stream for a tree.** `tree-events` with replay, tail paging, polling and the root's live deltas; `tree-history` for read-back.
+- [x] **S2 — Tasks survive a restart.** `sessions.todos`, `Store::set_todos`, `Event::Todos`, the loop rehydrates; `todowrite` items take an optional `kind` and `owner`.
+- [x] **S3 — Activity names its target.** `ToolStarted.target`, filled at every call site from the call's arguments.
+- [x] **S4 — File results carry facts.** Created and line counts from `file_write` and `edit`; shell runs report the paths whose git status changed.
+- [x] **S5 — The session list carries the crew's state.** Cost, newest activity, pending question and task counts on each listed session.
+- [x] **S6 — Personas have avatars.** A stored seed and an optional uploaded picture per persona; `PUT`/`DELETE /personas/{name}/avatar`, `GET` to serve it, `POST /personas/{name}/avatar/shuffle`.
+- [x] **S7 — Bosun Signal in the pane.** Tokens, the three typefaces as embedded woff2, the flag, avatar and icon module, Night and Day.
+- [x] **S8 — The session view.** Header with Stop in sight, crew strip, Chat, Tasks, Files, Log, the Session sheet; the subagent panel goes.
+- [x] **S9 — Home and the desktop layout.** Session cards grouped by Needs you, Working, Idle; three columns from 900px; Machines, Skills, MCP and a Crew screen for avatars in the same language.
 - [x] **S10 — The terminal client.** `bosun list` groups and flag tags; `bosun open` crew line and views 1 to 4.
 - [ ] **S11 — The docs that own the current state say so.** CLAUDE.md, README, the ADRs this sprint changes.
 

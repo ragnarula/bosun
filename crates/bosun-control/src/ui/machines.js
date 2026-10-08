@@ -26,10 +26,12 @@ function renderHealth() {
   healthDot.className = 'health-dot' + (down > 0 ? ' down' : '');
   renderMachines();
   if (nodes.length === 0) {
-    healthText.textContent = 'no nodes connected';
+    healthText.textContent = 'no machines connected';
     return;
   }
-  healthText.textContent = up + ' up · ' + down + ' down';
+  healthText.textContent = down > 0
+    ? down + ' of ' + nodes.length + (nodes.length === 1 ? ' machine' : ' machines') + ' down'
+    : up + (up === 1 ? ' machine' : ' machines') + ' up';
 }
 
 function openMachines() {

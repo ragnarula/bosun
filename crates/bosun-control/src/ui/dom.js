@@ -40,6 +40,10 @@ export {
   btnSkillsBack,
   btnStop,
   btnWatchOpen,
+  chipPermission,
+  chipPermissionText,
+  chipPersona,
+  crewTab,
   cancelNewSessionBtn,
   chatRow,
   childList,
@@ -67,6 +71,7 @@ export {
   input,
   inputRow,
   isNarrow,
+  isWide,
   machinesList,
   machinesTab,
   mcpAdd,
@@ -87,7 +92,6 @@ export {
   recentList,
   rowClear,
   rowFork,
-  rowInterrupt,
   rowPermission,
   rowPersona,
   rowStop,
@@ -111,6 +115,7 @@ export {
   viewSheet,
   viewSheetMeta,
   viewStateDot,
+  viewSummary,
   viewTitle,
   viewWaiting,
   watchBanner,
@@ -121,6 +126,10 @@ const $ = (id) => document.getElementById(id);
 // Thin-client narrow viewport check; the pane keeps the same sheets at any
 // width, only the focus/scroll behavior differs on small screens.
 const isNarrow = () => window.innerWidth <= 640;
+
+// From this width the pane shows the session list, the open session, and its
+// tasks and files side by side.
+const isWide = () => window.innerWidth >= 900;
 
 const originEl = $('origin');
 const statusEl = $('status');
@@ -182,6 +191,11 @@ const mcpChips = $('mcp-chips');
 const recentList = $('recent-sessions');
 const view = $('session-view');
 const viewStateDot = $('view-state-dot');
+const viewSummary = $('view-summary');
+const chipPersona = $('chip-persona');
+const chipPermission = $('chip-permission');
+const chipPermissionText = $('chip-permission-text');
+const crewTab = $('crew-tab');
 
 const viewNode = $('view-node');
 const viewDir = $('view-dir');
@@ -206,7 +220,6 @@ const viewFork = $('view-fork');
 const rowClear = $('row-clear');
 const btnClear = $('btn-clear');
 const viewClear = $('view-clear');
-const rowInterrupt = $('row-interrupt');
 const rowStop = $('row-stop');
 const inputRow = $('input-row');
 const btnInterrupt = $('btn-interrupt');
