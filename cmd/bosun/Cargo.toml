@@ -24,7 +24,7 @@ dialoguer.workspace = true
 futures-util.workspace = true
 hyper-util.workspace = true
 mermaid-text.workspace = true
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 reqwest.workspace = true
 semver.workspace = true
 serde.workspace = true

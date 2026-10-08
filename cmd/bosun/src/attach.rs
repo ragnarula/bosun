@@ -1104,7 +1104,13 @@ fn draw_main_pane(frame: &mut ratatui::Frame, app: &mut App, output: ratatui::la
         ),
     };
     app.viewport = inner.height;
-    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    // The pane wraps a line wider than itself, so the bottom is counted in the
+    // rows the wrapped lines take, not in lines: a long chat line counted as
+    // one row would push the newest rows below the window.
+    let rows = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width);
+    let max_scroll = rows.saturating_sub(inner.height as usize);
     app.max_scroll = max_scroll;
     let scroll = if app.follow {
         max_scroll
@@ -4509,6 +4515,44 @@ mod tests {
         (0..height)
             .map(|y| buffer_row_text(buffer, y, width))
             .collect()
+    }
+
+    #[test]
+    fn the_chat_follows_its_newest_line_when_long_lines_wrap() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = crew_app();
+        app.view = View::Chat;
+        for n in 0..12 {
+            // Emoji and CJK take two cells each, so a row cut by its
+            // character count is wider than the pane, and wraps when drawn.
+            let text = format!("post {n} {}", "✅ 完了 ".repeat(40));
+            let event = Event::Message {
+                at_ms: Some(1_700_000_000_000 + n),
+                message: Message {
+                    role: Role::Assistant,
+                    block: Block::Text { text },
+                },
+            };
+            app.state.apply_frame(n as i64 + 1, Some("s1"), &event);
+        }
+        let event = Event::Message {
+            at_ms: Some(1_700_000_001_000),
+            message: Message {
+                role: Role::Assistant,
+                block: Block::Text {
+                    text: "the newest line".into(),
+                },
+            },
+        };
+        app.state.apply_frame(100, Some("s1"), &event);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rows = screen_text(&terminal, 60, 20);
+        assert!(
+            rows.iter().any(|row| row.contains("the newest line")),
+            "wrapped lines must not push the newest one out of the window: {rows:?}"
+        );
     }
 
     #[test]
