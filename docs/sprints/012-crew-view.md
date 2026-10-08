@@ -2,7 +2,7 @@
 
 An open session is one scrolling transcript today, on the phone and in the terminal: every row has a clock time, every model call a cost line, every tool call and result a row of its own. The session's controls sit behind one menu, a child appears as `[child 3f2a… report]`, and nothing says at a glance who is working or what changed. This sprint shows the crew instead. Each agent in a session tree is a crew member with a robot avatar and its persona's signal flag; the session opens on a group chat of the whole tree, with views for the task list, the files the crew changed, and the full log. Home becomes one card per tree, saying who is doing what to which file. The pane and the terminal client both move to Bosun Signal, the design language this sprint adds.
 
-Status: **in progress**.
+Status: **complete**. All eleven stories are implemented and tested.
 
 ## Confirmed decisions
 
@@ -35,7 +35,7 @@ Status: **in progress**.
 - [x] **S8 — The session view.** Header with Stop in sight, crew strip, Chat, Tasks, Files, Log, the Session sheet; the subagent panel goes.
 - [x] **S9 — Home and the desktop layout.** Session cards grouped by Needs you, Working, Idle; three columns from 900px; Machines, Skills, MCP and a Crew screen for avatars in the same language.
 - [x] **S10 — The terminal client.** `bosun list` groups and flag tags; `bosun open` crew line and views 1 to 4.
-- [ ] **S11 — The docs that own the current state say so.** CLAUDE.md, README, the ADRs this sprint changes.
+- [x] **S11 — The docs that own the current state say so.** CLAUDE.md, README, the ADRs this sprint changes.
 
 ## Out of scope
 
