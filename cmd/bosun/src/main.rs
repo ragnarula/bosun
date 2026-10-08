@@ -68,6 +68,7 @@ use tracing::warn;
 
 mod attach;
 mod crew;
+mod map;
 mod markdown;
 mod update;
 
@@ -94,6 +95,8 @@ enum Command {
     List(ListArgs),
     /// Attach to a session interactively.
     Open(OpenArgs),
+    /// Show a project's branches as lanes off main, kept up to date.
+    Map(MapArgs),
     /// Manage the CLI config file.
     Config(ConfigArgs),
     /// Stop a session and remove it from the node.
@@ -186,6 +189,16 @@ struct ListArgs {
 }
 
 #[derive(Args)]
+struct MapArgs {
+    /// The project's name or id. Needed only when sessions work in more than
+    /// one repository.
+    project: Option<String>,
+    /// Control-plane base URL. Defaults to BOSUN_CP_URL, then the stored config, then http://127.0.0.1:8090.
+    #[arg(long)]
+    cp_url: Option<String>,
+}
+
+#[derive(Args)]
 struct OpenArgs {
     /// Session id to connect to. Picked from a list when omitted.
     session_id: Option<String>,
@@ -261,6 +274,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Dev(args) => run_dev(args).await,
         Command::List(args) => run_list(args).await,
         Command::Open(args) => run_open(args).await,
+        Command::Map(args) => {
+            let cp_url = resolve_cp_url(args.cp_url.as_deref())?;
+            map::run(&cp_url, args.project.as_deref()).await
+        }
         Command::Config(args) => run_config(args),
         Command::Stop(args) => run_stop(args).await,
         Command::Update(args) => run_update_cmd(args).await,

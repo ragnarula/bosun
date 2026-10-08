@@ -110,7 +110,7 @@ pub fn persona_flag(persona: &str) -> Flag {
 
 /// 32-bit FNV-1a: small, stable across platforms and Rust versions, which
 /// `std`'s hasher is not.
-fn fnv1a(bytes: &[u8]) -> u32 {
+pub fn fnv1a(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for byte in bytes {
         hash ^= u32::from(*byte);
