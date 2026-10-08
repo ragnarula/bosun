@@ -122,6 +122,47 @@ pub struct EventsPage {
     pub more: bool,
 }
 
+/// Which events a read covers: one session's, or every session's in one tree.
+#[derive(Debug, Clone)]
+pub enum EventScope {
+    /// The session with this id.
+    Session(String),
+    /// Every session whose `owner_id` is this root's id, the root included.
+    Tree(String),
+}
+
+impl EventScope {
+    /// The SQL condition on `events` that selects the scope, with the scope's
+    /// key bound as `?1`.
+    fn filter(&self) -> &'static str {
+        match self {
+            EventScope::Session(_) => "session_id = ?1",
+            EventScope::Tree(_) => "session_id IN (SELECT id FROM sessions WHERE owner_id = ?1)",
+        }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            EventScope::Session(id) | EventScope::Tree(id) => id,
+        }
+    }
+}
+
+/// One stored event with the session that wrote it.
+#[derive(Debug, Clone)]
+pub struct ScopedEvent {
+    pub seq: i64,
+    pub session_id: String,
+    pub event: Event,
+}
+
+/// A page of a scope's events, as `EventsPage` is for one session.
+#[derive(Debug, Clone)]
+pub struct ScopedEventsPage {
+    pub events: Vec<ScopedEvent>,
+    pub more: bool,
+}
+
 /// What routing a user's answer to a pending raised ask did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteAnswer {
@@ -799,25 +840,35 @@ impl Store {
         session_id: &str,
         after: i64,
     ) -> Result<Vec<(i64, Event)>, StoreError> {
-        let session_id = session_id.to_string();
+        let events = self
+            .scoped_events_after(EventScope::Session(session_id.to_string()), after)
+            .await?;
+        Ok(events
+            .into_iter()
+            .map(|event| (event.seq, event.event))
+            .collect())
+    }
+
+    /// The events `scope` covers past `after`, in seq order, each with the
+    /// session that wrote it. Seqs are global across sessions, so one cursor
+    /// orders a whole tree.
+    pub async fn scoped_events_after(
+        &self,
+        scope: EventScope,
+        after: i64,
+    ) -> Result<Vec<ScopedEvent>, StoreError> {
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT seq, payload FROM events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
-                )
+                .prepare(&format!(
+                    "SELECT seq, session_id, payload FROM events
+                     WHERE {} AND seq > ?2 ORDER BY seq",
+                    scope.filter()
+                ))
                 .context("failed to prepare event query")?;
             let mut rows = stmt
-                .query(params![session_id, after])
+                .query(params![scope.key(), after])
                 .context("failed to query events")?;
-            let mut events = Vec::new();
-            while let Some(row) = rows.next().context("failed to read event row")? {
-                let seq: i64 = row.get("seq")?;
-                let payload: String = row.get("payload")?;
-                let event: Event =
-                    serde_json::from_str(&payload).context("failed to parse event payload")?;
-                events.push((seq, event));
-            }
-            Ok(events)
+            read_scoped_events(&mut rows)
         })
         .await
     }
@@ -836,19 +887,48 @@ impl Store {
         before: Option<i64>,
         messages: usize,
     ) -> Result<EventsPage, StoreError> {
-        let session_id = session_id.to_string();
+        let page = self
+            .scoped_events_page(
+                EventScope::Session(session_id.to_string()),
+                before,
+                messages,
+            )
+            .await?;
+        Ok(EventsPage {
+            events: page
+                .events
+                .into_iter()
+                .map(|event| (event.seq, event.event))
+                .collect(),
+            more: page.more,
+        })
+    }
+
+    /// `events_page` over the events `scope` covers: for a tree, the messages
+    /// counted are every member's, so a page of a crew holds the newest
+    /// `messages` messages whoever wrote them.
+    pub async fn scoped_events_page(
+        &self,
+        scope: EventScope,
+        before: Option<i64>,
+        messages: usize,
+    ) -> Result<ScopedEventsPage, StoreError> {
         let before = before.unwrap_or(i64::MAX);
         let offset = i64::try_from(messages.max(1) - 1).unwrap_or(i64::MAX);
         self.with_conn(move |conn| {
-            // The page starts at the oldest message it holds. When the session
+            let filter = scope.filter();
+            let key = scope.key();
+            // The page starts at the oldest message it holds. When the scope
             // has fewer messages than the page, it starts at the first event.
             let start: Option<i64> = conn
                 .query_row(
-                    "SELECT seq FROM events
-                     WHERE session_id = ?1 AND seq < ?2
-                       AND json_extract(payload, '$.kind') = 'message'
-                     ORDER BY seq DESC LIMIT 1 OFFSET ?3",
-                    params![session_id, before, offset],
+                    &format!(
+                        "SELECT seq FROM events
+                         WHERE {filter} AND seq < ?2
+                           AND json_extract(payload, '$.kind') = 'message'
+                         ORDER BY seq DESC LIMIT 1 OFFSET ?3"
+                    ),
+                    params![key, before, offset],
                     |row| row.get(0),
                 )
                 .optional()
@@ -856,29 +936,22 @@ impl Store {
             let start = start.unwrap_or(0);
             let more: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 AND seq < ?2)",
-                    params![session_id, start],
+                    &format!("SELECT EXISTS(SELECT 1 FROM events WHERE {filter} AND seq < ?2)"),
+                    params![key, start],
                     |row| row.get(0),
                 )
                 .context("failed to check for older events")?;
             let mut stmt = conn
-                .prepare(
-                    "SELECT seq, payload FROM events
-                     WHERE session_id = ?1 AND seq >= ?2 AND seq < ?3 ORDER BY seq",
-                )
+                .prepare(&format!(
+                    "SELECT seq, session_id, payload FROM events
+                     WHERE {filter} AND seq >= ?2 AND seq < ?3 ORDER BY seq"
+                ))
                 .context("failed to prepare event page query")?;
             let mut rows = stmt
-                .query(params![session_id, start, before])
+                .query(params![key, start, before])
                 .context("failed to query event page")?;
-            let mut events = Vec::new();
-            while let Some(row) = rows.next().context("failed to read event row")? {
-                let seq: i64 = row.get("seq")?;
-                let payload: String = row.get("payload")?;
-                let event: Event =
-                    serde_json::from_str(&payload).context("failed to parse event payload")?;
-                events.push((seq, event));
-            }
-            Ok(EventsPage { events, more })
+            let events = read_scoped_events(&mut rows)?;
+            Ok(ScopedEventsPage { events, more })
         })
         .await
     }
@@ -2430,6 +2503,20 @@ fn ensure_mcp_server_exists(conn: &rusqlite::Connection, name: &str) -> Result<(
     }
 }
 
+/// Reads `seq, session_id, payload` rows into events.
+fn read_scoped_events(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<ScopedEvent>, anyhow::Error> {
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().context("failed to read event row")? {
+        let payload: String = row.get("payload")?;
+        events.push(ScopedEvent {
+            seq: row.get("seq")?,
+            session_id: row.get("session_id")?,
+            event: serde_json::from_str(&payload).context("failed to parse event payload")?,
+        });
+    }
+    Ok(events)
+}
+
 /// Whether `column` is one of `table`'s columns, for additive migrations.
 fn column_exists(
     conn: &rusqlite::Connection,
@@ -2987,6 +3074,70 @@ mod tests {
         let page = store.events_page("a", None, 5).await.unwrap();
         assert_eq!(page.events.len(), 1);
         assert!(!page.more);
+    }
+
+    #[tokio::test]
+    async fn a_tree_scope_reads_every_members_events_and_no_other_trees() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        store.create_session(&session("other")).await.unwrap();
+        for (id, text) in [("root", "go"), ("other", "elsewhere"), ("kid", "done")] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: text.into() })
+                .await
+                .unwrap();
+        }
+
+        let events = store
+            .scoped_events_after(EventScope::Tree("root".into()), 0)
+            .await
+            .unwrap();
+        let read: Vec<(i64, &str)> = events
+            .iter()
+            .map(|event| (event.seq, event.session_id.as_str()))
+            .collect();
+        assert_eq!(read, [(1, "root"), (3, "kid")]);
+
+        let after = store
+            .scoped_events_after(EventScope::Tree("root".into()), 1)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "the cursor is the global seq");
+        assert_eq!(after[0].session_id, "kid");
+    }
+
+    #[tokio::test]
+    async fn a_tree_page_counts_every_members_messages() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        for id in ["root", "kid", "root", "kid"] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: id.into() })
+                .await
+                .unwrap();
+        }
+
+        let page = store
+            .scoped_events_page(EventScope::Tree("root".into()), None, 3)
+            .await
+            .unwrap();
+        let read: Vec<(i64, &str)> = page
+            .events
+            .iter()
+            .map(|event| (event.seq, event.session_id.as_str()))
+            .collect();
+        assert_eq!(read, [(2, "kid"), (3, "root"), (4, "kid")]);
+        assert!(page.more, "the root's first message is older than the page");
     }
 
     #[tokio::test]

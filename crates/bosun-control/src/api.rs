@@ -40,7 +40,6 @@ use bosun_common::mcp::McpServer;
 use bosun_common::mcp::McpServerSecret;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
-use bosun_common::session::Event;
 use bosun_common::session::InterruptCause;
 use bosun_common::session::Permission;
 use bosun_common::session::Role;
@@ -57,8 +56,10 @@ use bosun_common::types::NodeUpdateRequest;
 use bosun_common::types::PollRequest;
 use bosun_common::types::PollResponse;
 use bosun_common::types::StopRequest;
+use bosun_store::store::EventScope;
 use bosun_store::store::ModelCall;
 use bosun_store::store::RouteAnswer;
+use bosun_store::store::ScopedEvent;
 use bosun_store::store::Store;
 use bosun_store::store::StoreError;
 use futures_util::Stream;
@@ -639,6 +640,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/persona", post(switch_persona))
         .route("/sessions/{id}/model-calls", get(session_model_calls))
         .route("/sessions/{id}/events", get(events))
+        .route("/sessions/{id}/tree-events", get(tree_events))
+        .route("/sessions/{id}/tree-history", get(tree_history))
         .route("/sessions/{id}/history", get(history))
         .route("/clone", post(clone))
         .route("/dev", post(dev))
@@ -2033,6 +2036,40 @@ async fn history(
     }))
 }
 
+/// The tree's events before `before`, a page of the crew's messages at a time,
+/// for a client that opened `tree-events` with `tail=` and is reading back.
+/// Each event names the session that wrote it.
+#[instrument(skip(state))]
+async fn tree_history(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryPage>, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id });
+    };
+    let messages = query
+        .messages
+        .unwrap_or(HISTORY_PAGE_DEFAULT)
+        .min(HISTORY_PAGE_MAX);
+    let page = state
+        .store
+        .scoped_events_page(
+            EventScope::Tree(session.owner_id),
+            Some(query.before),
+            messages,
+        )
+        .await?;
+    Ok(Json(HistoryPage {
+        events: page
+            .events
+            .into_iter()
+            .map(|event| json!({ "seq": event.seq, "session_id": event.session_id, "event": event.event }))
+            .collect(),
+        more: page.more,
+    }))
+}
+
 /// SSE stream for a session: durable store events replayed from `after`, then
 /// live text deltas from the loop's broadcast channel. While the stream is
 /// open the store is polled for new durable events, so a client that joined
@@ -2047,6 +2084,40 @@ async fn events(
     if state.store.get_session(&id).await?.is_none() {
         return Err(ApiError::SessionNotFound { id });
     }
+    scoped_stream(state, EventScope::Session(id.clone()), id, query, &headers).await
+}
+
+/// SSE stream for the whole tree the session belongs to: the same replay,
+/// polling and resume as one session's stream, over every session the tree's
+/// root owns. Each durable frame names the session that wrote it, and the
+/// root's live text deltas arrive with the root's id. A crew is followed on
+/// one connection, whatever members join it while the stream is open.
+#[instrument(skip(state))]
+async fn tree_events(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let Some(session) = state.store.get_session(&id).await? else {
+        return Err(ApiError::SessionNotFound { id });
+    };
+    let root = session.owner_id;
+    scoped_stream(state, EventScope::Tree(root.clone()), root, query, &headers).await
+}
+
+/// The stream `events` and `tree_events` serve: `scope`'s durable events,
+/// then live deltas from `live_id`'s loop.
+async fn scoped_stream(
+    state: Arc<AppState>,
+    scope: EventScope,
+    live_id: String,
+    query: EventsQuery,
+    headers: &HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>, ApiError> {
+    // A tree's frames name their session; one session's frames stay as they
+    // were before trees were streamed.
+    let tagged = matches!(scope, EventScope::Tree(_));
     // The explicit `after=` cursor wins; otherwise resume from the
     // `Last-Event-ID` header, which EventSource sends automatically on
     // reconnect with the seq of the last durable frame it received.
@@ -2063,22 +2134,29 @@ async fn events(
         (None, Some(tail)) => {
             let page = state
                 .store
-                .events_page(&id, None, tail.min(HISTORY_PAGE_MAX))
+                .scoped_events_page(scope.clone(), None, tail.min(HISTORY_PAGE_MAX))
                 .await?;
-            let before = page.events.first().map(|(seq, _)| *seq);
+            let before = page.events.first().map(|event| event.seq);
             (Some(history_frame(before, page.more)), page.events)
         }
         _ => (
             None,
-            state.store.events_after(&id, cursor.unwrap_or(0)).await?,
+            state
+                .store
+                .scoped_events_after(scope.clone(), cursor.unwrap_or(0))
+                .await?,
         ),
     };
     let last_seq = replayed
         .last()
-        .map(|(seq, _)| *seq)
+        .map(|event| event.seq)
         .unwrap_or(cursor.unwrap_or(0));
     let replay = stream::iter(history.into_iter().map(Ok))
-        .chain(stream::iter(replayed.into_iter().map(durable_frame)))
+        .chain(stream::iter(
+            replayed
+                .into_iter()
+                .map(move |event| durable_frame(event, tagged)),
+        ))
         .boxed();
 
     // Polls the store for durable events past the last emitted seq. Events
@@ -2086,34 +2164,41 @@ async fn events(
     // never duplicates a frame.
     let store = state.store.clone();
     let poll = stream::unfold(
-        (store, id.clone(), last_seq),
-        |(store, id, mut last_seq)| async move {
+        (store, scope, last_seq),
+        move |(store, scope, mut last_seq)| async move {
             tokio::time::sleep(EVENTS_POLL_INTERVAL).await;
-            let events = store.events_after(&id, last_seq).await.unwrap_or_default();
+            let events = store
+                .scoped_events_after(scope.clone(), last_seq)
+                .await
+                .unwrap_or_default();
             let mut frames = Vec::new();
-            for (seq, event) in events {
-                if seq <= last_seq {
+            for event in events {
+                if event.seq <= last_seq {
                     continue;
                 }
-                last_seq = seq;
-                frames.push(durable_frame((seq, event)));
+                last_seq = event.seq;
+                frames.push(durable_frame(event, tagged));
             }
-            Some((stream::iter(frames), (store, id, last_seq)))
+            Some((stream::iter(frames), (store, scope, last_seq)))
         },
     )
     .flatten()
     .boxed();
 
-    let live = match state.loops.subscribe(&id) {
-        Some(rx) => stream::unfold(rx, |mut rx| async move {
+    let live = match state.loops.subscribe(&live_id) {
+        Some(rx) => stream::unfold((rx, live_id), move |(mut rx, live_id)| async move {
             loop {
                 match rx.recv().await {
                     Ok(text) => {
-                        let payload = json!({ "delta": text });
+                        let payload = if tagged {
+                            json!({ "delta": text, "session_id": live_id })
+                        } else {
+                            json!({ "delta": text })
+                        };
                         let event = SseEvent::default()
                             .json_data(&payload)
                             .expect("serializing a json value cannot fail");
-                        return Some((Ok::<_, Infallible>(event), rx));
+                        return Some((Ok::<_, Infallible>(event), (rx, live_id)));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
@@ -2140,8 +2225,17 @@ fn history_frame(before: Option<i64>, more: bool) -> SseEvent {
 /// One durable frame: the seq in the SSE id and in the payload, so a client
 /// reconnecting with `after=` or `Last-Event-ID` resumes exactly where it
 /// left off.
-fn durable_frame((seq, event): (i64, Event)) -> Result<SseEvent, Infallible> {
-    let payload = json!({ "seq": seq, "event": event });
+fn durable_frame(event: ScopedEvent, tagged: bool) -> Result<SseEvent, Infallible> {
+    let ScopedEvent {
+        seq,
+        session_id,
+        event,
+    } = event;
+    let payload = if tagged {
+        json!({ "seq": seq, "session_id": session_id, "event": event })
+    } else {
+        json!({ "seq": seq, "event": event })
+    };
     Ok(SseEvent::default()
         .id(seq.to_string())
         .json_data(&payload)
@@ -2321,6 +2415,7 @@ mod tests {
     use bosun_agent::provider::StopReason;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
+    use bosun_common::session::Event;
     use bosun_common::tool::ToolMsg;
     use bosun_common::tool::ToolOp;
     use bosun_common::tool::read_tool_frame;
@@ -6369,6 +6464,101 @@ mod tests {
         )
         .await;
         assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tree_stream_replays_every_members_events_with_their_session() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        let client = reqwest::Client::new();
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        store.create_session(&session("other")).await.unwrap();
+        for (id, text) in [("root", "go"), ("other", "elsewhere"), ("kid", "done")] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: text.into() })
+                .await
+                .unwrap();
+        }
+
+        // Asked for from the child, the stream still covers the whole tree.
+        let frames = read_sse_frames(
+            client
+                .get(format!("http://{addr}/sessions/kid/tree-events"))
+                .send()
+                .await
+                .unwrap(),
+            |frames| frames.len() >= 2,
+        )
+        .await;
+        let read: Vec<(i64, &str)> = frames
+            .iter()
+            .map(|frame| {
+                (
+                    frame.data["seq"].as_i64().unwrap(),
+                    frame.data["session_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(read, [(1, "root"), (3, "kid")]);
+        assert_eq!(frames[1].id.as_deref(), Some("3"), "the sse id is the seq");
+
+        // A member that writes after the stream opened reaches it by the poll.
+        let response = client
+            .get(format!("http://{addr}/sessions/root/tree-events?after=3"))
+            .send()
+            .await
+            .unwrap();
+        store
+            .append_message(
+                "kid",
+                Role::Assistant,
+                &Block::Text {
+                    text: "more".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let frames = read_sse_frames(response, |frames| !frames.is_empty()).await;
+        assert_eq!(frames[0].data["session_id"], "kid");
+        assert_eq!(frames[0].data["event"]["message"]["block"]["text"], "more");
+    }
+
+    #[tokio::test]
+    async fn tree_history_pages_the_crews_messages_back() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.store.clone();
+        let addr = serve(state).await;
+        store.create_session(&session("root")).await.unwrap();
+        store
+            .create_session(&child_session("kid", "root"))
+            .await
+            .unwrap();
+        for id in ["root", "kid", "root"] {
+            store
+                .append_message(id, Role::User, &Block::Text { text: id.into() })
+                .await
+                .unwrap();
+        }
+
+        let page: serde_json::Value = reqwest::get(format!(
+            "http://{addr}/sessions/root/tree-history?before=3&messages=5"
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(page["more"], false);
+        assert_eq!(page["events"][0]["session_id"], "root");
+        assert_eq!(page["events"][1]["session_id"], "kid");
+        assert_eq!(page["events"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
