@@ -35,6 +35,7 @@ use bosun_control::api::AppState;
 use bosun_control::api::router;
 use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
+use bosun_control::projects::ProjectHub;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::skills_repos::GitHubClient;
 use bosun_control::tunnel::TunnelRegistry;
@@ -102,6 +103,7 @@ async fn control_plane() -> (SocketAddr, Store, Arc<TunnelRegistry>, tempfile::T
             store.clone(),
             None,
         ),
+        projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

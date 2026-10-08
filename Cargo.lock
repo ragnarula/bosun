@@ -292,6 +292,7 @@ dependencies = [
  "bosun-store",
  "bosun-test-support",
  "bytes",
+ "chrono",
  "futures-util",
  "http-body-util",
  "hyper",

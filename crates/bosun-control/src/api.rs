@@ -39,6 +39,8 @@ use bosun_common::error::ErrorExt;
 use bosun_common::mcp::McpAuth;
 use bosun_common::mcp::McpServer;
 use bosun_common::mcp::McpServerSecret;
+use bosun_common::project::ProjectSummary;
+use bosun_common::project::ProjectView;
 use bosun_common::session::Block;
 use bosun_common::session::ChildEventKind;
 use bosun_common::session::InterruptCause;
@@ -75,6 +77,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tracing::info;
 use tracing::instrument;
@@ -89,6 +92,7 @@ use crate::mcp_manager::McpManager;
 use crate::mcp_oauth::McpOAuthContext;
 use crate::mcp_oauth::McpOAuthError;
 use crate::mcp_oauth::OAuthCallbackQuery;
+use crate::projects::ProjectHub;
 use crate::registry::NodeHealth;
 use crate::registry::NodeRegistry;
 use crate::skills_repos::GitHubClient;
@@ -120,6 +124,9 @@ pub enum ApiError {
 
     #[error("session {id} was not found")]
     SessionNotFound { id: String },
+
+    #[error("project {id} was not found")]
+    ProjectNotFound { id: String },
 
     #[error(
         "session {id} is a child session and is watch-only; only its owner accepts user actions"
@@ -244,6 +251,7 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::AvatarInvalid(_) => (StatusCode::BAD_REQUEST, Some(self.to_string())),
             ApiError::SessionNotFound { .. }
+            | ApiError::ProjectNotFound { .. }
             | ApiError::AvatarNotFound { .. }
             | ApiError::RepoNotFound { .. }
             | ApiError::McpServerNotFound { .. } => (StatusCode::NOT_FOUND, Some(self.to_string())),
@@ -316,6 +324,8 @@ pub struct AppState {
     /// The shared MCP connections: the loops borrow them and the retry route
     /// asks them for an immediate attempt.
     pub mcp: Arc<McpManager>,
+    /// The project map the `/projects` routes serve.
+    pub projects: Arc<ProjectHub>,
 }
 
 impl AppState {
@@ -569,6 +579,7 @@ const RESERVED_PATHS: &[&str] = &[
     "/stop",
     "/skills/repos",
     "/mcp/servers",
+    "/projects",
 ];
 
 /// The path prefixes the router serves dynamic routes below.
@@ -579,6 +590,7 @@ const RESERVED_PATH_PREFIXES: &[&str] = &[
     "/skills/repos/",
     "/mcp/servers/",
     "/personas/",
+    "/projects/",
 ];
 
 /// The parents the router serves any single segment below: `/ui/{asset}`
@@ -668,6 +680,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/tree-events", get(tree_events))
         .route("/sessions/{id}/tree-history", get(tree_history))
         .route("/sessions/{id}/history", get(history))
+        .route("/projects", get(projects))
+        .route("/projects/{id}", get(project))
+        .route("/projects/{id}/events", get(project_events))
         .route("/clone", post(clone))
         .route("/dev", post(dev))
         .route("/nodes/{name}/dirs", get(dirs))
@@ -886,6 +901,73 @@ async fn sessions(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Session
         views.push(session_view(&state, session).await?);
     }
     Ok(Json(views))
+}
+
+/// Every repository the sessions work in.
+#[instrument(skip(state))]
+async fn projects(State(state): State<Arc<AppState>>) -> Json<Vec<ProjectSummary>> {
+    Json(state.projects.summaries())
+}
+
+#[instrument(skip(state))]
+async fn project(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ProjectView>, ApiError> {
+    state
+        .projects
+        .view(&id)
+        .map(Json)
+        .ok_or(ApiError::ProjectNotFound { id })
+}
+
+/// The project's view now, then again each time it changes, as `project`
+/// frames. A `gone` frame ends the stream when the project's last session
+/// ends. A client that falls behind gets the newest view, never a backlog.
+#[instrument(skip(state))]
+async fn project_events(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let updates = state.projects.subscribe();
+    let first = state
+        .projects
+        .view(&id)
+        .ok_or_else(|| ApiError::ProjectNotFound { id: id.clone() })?;
+    let hub = state.projects.clone();
+    let frame = |view: &ProjectView| {
+        SseEvent::default()
+            .event("project")
+            .data(serde_json::to_string(view).expect("a project view serializes"))
+    };
+    let stream = stream::unfold(
+        (Some(first), updates, hub, id, false),
+        move |(first, mut updates, hub, id, done)| async move {
+            if done {
+                return None;
+            }
+            if let Some(view) = first {
+                return Some((Ok(frame(&view)), (None, updates, hub, id, false)));
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(changed) if changed != id => continue,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+                return Some(match hub.view(&id) {
+                    Some(view) => (Ok(frame(&view)), (None, updates, hub, id, false)),
+                    None => (
+                        Ok(SseEvent::default()
+                            .event("gone")
+                            .data(json!({ "id": id }).to_string())),
+                        (None, updates, hub, id, true),
+                    ),
+                });
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 /// A session with its overview. A session removed between the list and its
@@ -2559,6 +2641,9 @@ mod tests {
     use bosun_agent::provider::StopReason;
     use bosun_agent::provider::StreamEvent;
     use bosun_common::config::ModelConfig;
+    use bosun_common::project::DirtyFile;
+    use bosun_common::project::FileOp;
+    use bosun_common::project::GitState;
     use bosun_common::session::Event;
     use bosun_common::tool::ToolMsg;
     use bosun_common::tool::ToolOp;
@@ -2676,6 +2761,7 @@ mod tests {
                 reqwest::Client::new(),
             )),
             mcp_oauth: oauth,
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -2866,6 +2952,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -2918,6 +3005,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -3983,6 +4071,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -4169,6 +4258,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -4301,6 +4391,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4600,6 +4691,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4786,6 +4878,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -4960,6 +5053,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         state.loops.attach_child_spawner(nodes, commands, tunnels);
 
@@ -5184,6 +5278,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (state, store, root.id, child.id)
     }
@@ -5697,6 +5792,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (state, store, root.id, mid.id, leaf.id)
     }
@@ -5998,6 +6094,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -6471,6 +6568,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let store = state.store.clone();
         state.store.create_session(&session("s1")).await.unwrap();
@@ -6968,6 +7066,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         let addr = serve(state).await;
         let client = reqwest::Client::new();
@@ -7855,6 +7954,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (
             state,
@@ -8150,6 +8250,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store.clone(), None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         });
         (state, requests, bodies)
     }
@@ -9523,6 +9624,7 @@ mod tests {
             oauth_redirect_uri: None,
             mcp: idle_mcp(&store),
             mcp_oauth: McpOAuthContext::new(reqwest::Client::new(), store, None),
+            projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
         })
     }
 
@@ -11503,5 +11605,107 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved, "srv-b,srv-a");
+    }
+
+    /// A working copy's git state, on branch `feature` of this repository.
+    fn feature_copy(dirty: Vec<DirtyFile>) -> GitState {
+        GitState {
+            root: "/tmp/x".into(),
+            common_dir: "/tmp/x/.git".into(),
+            origin: Some("git@github.com:ragnarula/bosun.git".into()),
+            main_ref: Some("origin/main".into()),
+            main: Vec::new(),
+            branch: Some("feature".into()),
+            head: Some("h1".into()),
+            fork: None,
+            ahead: 1,
+            behind: 0,
+            commits: Vec::new(),
+            changed: Vec::new(),
+            dirty,
+            remote_branches: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_is_listed_served_and_streamed_until_its_last_session_stops() {
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+        let hub = state.projects.clone();
+        let running = Session {
+            state: SessionState::Running,
+            ..session("s1")
+        };
+        hub.sync_sessions(std::slice::from_ref(&running));
+        let (touched, _) = hub.apply_read("n1:/tmp/x", Some(feature_copy(Vec::new())), None, 10);
+        let id = touched.into_iter().next().unwrap();
+
+        let list: Value = client
+            .get(format!("http://{addr}/projects"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list[0]["id"], id.as_str());
+        assert_eq!(list[0]["name"], "bosun");
+        assert_eq!(list[0]["sessions"], json!(["s1"]));
+        let view: Value = client
+            .get(format!("http://{addr}/projects/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(view["lanes"][0]["branch"], "feature");
+        let missing = client
+            .get(format!("http://{addr}/projects/nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let response = client
+            .get(format!("http://{addr}/projects/{id}/events"))
+            .send()
+            .await
+            .unwrap();
+        let edited = feature_copy(vec![DirtyFile {
+            path: "a.rs".into(),
+            op: FileOp::Edited,
+            added: 2,
+            removed: 0,
+        }]);
+        let stream_hub = hub.clone();
+        let stream_id = id.clone();
+        tokio::spawn(async move {
+            // After the first frame, the copy changes, then its session stops.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stream_hub.apply_read("n1:/tmp/x", Some(edited), None, 20);
+            stream_hub.publish(&stream_id);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stream_hub.sync_sessions(&[Session {
+                state: SessionState::Stopped,
+                ..running
+            }]);
+        });
+        let frames = read_sse_frames(response, |frames| frames.len() >= 3).await;
+        assert_eq!(frames[0].data["lanes"][0]["dirty"], json!([]));
+        assert_eq!(frames[1].data["lanes"][0]["dirty"][0]["path"], "a.rs");
+        assert_eq!(frames[1].data["feed"][0]["kind"], "edited");
+        assert_eq!(frames[2].data, json!({ "id": id }), "the gone frame");
+        let list: Value = client
+            .get(format!("http://{addr}/projects"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list, json!([]));
     }
 }

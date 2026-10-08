@@ -44,6 +44,7 @@ use bosun_control::api::AppState;
 use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
 use bosun_control::mcp_manager::McpManager;
+use bosun_control::projects::ProjectHub;
 use bosun_control::registry::NodeHealth;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::skills_repos::GitHubClient;
@@ -390,6 +391,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let mut loops = AgentRegistry::new(providers.clone(), config.personas.clone(), prices);
     loops.mcp = Some(mcp.clone());
     loops.nudge = config.nudge;
+    let (tool_activity, tool_activity_rx) = tokio::sync::mpsc::unbounded_channel();
+    loops.tool_activity = Some(tool_activity);
+    let github = GitHubClient::new(
+        "https://api.github.com",
+        "https://raw.githubusercontent.com",
+        github_token,
+    );
+    let projects = Arc::new(ProjectHub::new(
+        Duration::from_secs(config.merged_branch_hours * 3600),
+        github.has_token(),
+    ));
 
     let state = Arc::new(AppState {
         registry: Arc::new(NodeRegistry::new(Duration::from_secs(
@@ -400,17 +412,14 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         ))),
         tunnels: Arc::new(TunnelRegistry::new()),
         store,
-        github: GitHubClient::new(
-            "https://api.github.com",
-            "https://raw.githubusercontent.com",
-            github_token,
-        ),
+        github: github.clone(),
         loops: Arc::new(loops),
         providers,
         personas: config.personas,
         default_persona: config.default_persona,
         oauth_redirect_uri: config.oauth_redirect_uri,
         mcp_oauth,
+        projects: projects.clone(),
         mcp,
     });
     // The loops' `spawn` tool starts child sessions through the registry, so
@@ -421,6 +430,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         state.tunnels.clone(),
     );
     bosun_control::api::recover(&state).await;
+    tokio::spawn(bosun_control::projects::run(
+        projects.clone(),
+        state.store.clone(),
+        state.tunnels.clone(),
+        tool_activity_rx,
+    ));
+    tokio::spawn(bosun_control::projects::run_pull_requests(
+        projects,
+        state.store.clone(),
+        github,
+    ));
     let app = bosun_control::api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)

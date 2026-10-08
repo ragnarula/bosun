@@ -28,6 +28,7 @@ use bosun_control::commands::CommandQueue;
 use bosun_control::loops::AgentRegistry;
 use bosun_control::mcp_manager::McpManager;
 use bosun_control::mcp_oauth::McpOAuthContext;
+use bosun_control::projects::ProjectHub;
 use bosun_control::registry::NodeRegistry;
 use bosun_control::skills_repos::GitHubClient;
 use bosun_control::tunnel::TunnelRegistry;
@@ -132,6 +133,7 @@ async fn serve(store: Store) -> SocketAddr {
             reqwest::Client::new(),
         )),
         mcp_oauth: oauth,
+        projects: Arc::new(ProjectHub::new(Duration::from_secs(86_400), false)),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

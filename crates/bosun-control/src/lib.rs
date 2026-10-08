@@ -5,6 +5,7 @@ pub mod loops;
 pub mod mcp_client;
 pub mod mcp_manager;
 pub mod mcp_oauth;
+pub mod projects;
 pub mod registry;
 pub mod skills_repos;
 pub mod spawn;

@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+pub mod git_state;
 pub mod tools;
 
 use tools::ToolError;
@@ -438,6 +439,12 @@ pub async fn run_call(
                 .await
                 .map(|content| json!({ "content": content }))
         }
+        // The project map's read of the working copy. It is not a model tool:
+        // the control plane calls it, and the model is never offered it.
+        "git_state" => git_state::read_git_state(&state.session_dir)
+            .await
+            .map_err(ExecutorError::from)
+            .map(|state| serde_json::to_value(state).expect("git state serializes")),
         "repo_standards" => {
             run_blocking_infallible(&state.session_dir, tools::repo_standards_present)
                 .await

@@ -12,6 +12,7 @@ use anyhow::Context;
 use bosun_common::mcp::McpAuth;
 use bosun_common::mcp::McpServer;
 use bosun_common::mcp::McpServerSecret;
+use bosun_common::project::MergedLane;
 use bosun_common::session::ActivityAt;
 use bosun_common::session::Block;
 use bosun_common::session::Event;
@@ -297,6 +298,16 @@ CREATE TABLE IF NOT EXISTS persona_avatars (
   seed TEXT NOT NULL,
   picture BLOB,
   updated_at_secs INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_lanes (
+  project TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  head TEXT NOT NULL,
+  pr INTEGER,
+  title TEXT,
+  commits INTEGER NOT NULL,
+  merged_at_secs INTEGER NOT NULL,
+  PRIMARY KEY (project, branch, head)
 );
 CREATE TABLE IF NOT EXISTS mcp_servers (
   name TEXT PRIMARY KEY,
@@ -1475,6 +1486,80 @@ impl Store {
                 })
                 .context("failed to query avatars")?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Records a branch merged into a project's main branch, at the head it
+    /// had when it merged. A second record of the same head keeps the first.
+    pub async fn record_merged_lane(
+        &self,
+        project: &str,
+        head: &str,
+        lane: &MergedLane,
+    ) -> Result<(), StoreError> {
+        let (project, head, lane) = (project.to_string(), head.to_string(), lane.clone());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO merged_lanes
+                   (project, branch, head, pr, title, commits, merged_at_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    project,
+                    lane.branch,
+                    head,
+                    lane.pr.map(|pr| pr as i64),
+                    lane.title,
+                    lane.commits,
+                    lane.merged_at_secs
+                ],
+            )
+            .context("failed to record the merged branch")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The project's branches merged at or after `since_secs`, newest first.
+    pub async fn merged_lanes(
+        &self,
+        project: &str,
+        since_secs: i64,
+    ) -> Result<Vec<MergedLane>, StoreError> {
+        let project = project.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT branch, pr, title, commits, merged_at_secs FROM merged_lanes
+                     WHERE project = ?1 AND merged_at_secs >= ?2
+                     ORDER BY merged_at_secs DESC, branch",
+                )
+                .context("failed to prepare the merged branch query")?;
+            let rows = stmt
+                .query_map(params![project, since_secs], |row| {
+                    Ok(MergedLane {
+                        branch: row.get(0)?,
+                        pr: row.get::<_, Option<i64>>(1)?.map(|pr| pr as u64),
+                        title: row.get(2)?,
+                        commits: row.get(3)?,
+                        merged_at_secs: row.get(4)?,
+                    })
+                })
+                .context("failed to query merged branches")?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Removes every project's merged-branch records older than `before_secs`.
+    pub async fn prune_merged_lanes(&self, before_secs: i64) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM merged_lanes WHERE merged_at_secs < ?1",
+                params![before_secs],
+            )
+            .context("failed to prune merged branches")?;
+            Ok(())
         })
         .await
     }
@@ -3001,6 +3086,7 @@ mod tests {
             [
                 "events",
                 "mcp_servers",
+                "merged_lanes",
                 "messages",
                 "model_calls",
                 "pending_asks",
@@ -3014,6 +3100,49 @@ mod tests {
         );
 
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn merged_lanes_keep_one_record_per_head_and_age_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let lane = |branch: &str, at: i64| MergedLane {
+            branch: branch.into(),
+            pr: Some(60),
+            title: Some("Back off".into()),
+            commits: 2,
+            merged_at_secs: at,
+        };
+        store
+            .record_merged_lane("p", "aaa", &lane("fix", 100))
+            .await
+            .unwrap();
+        store
+            .record_merged_lane("p", "aaa", &lane("fix", 150))
+            .await
+            .unwrap();
+        store
+            .record_merged_lane("p", "bbb", &lane("docs", 200))
+            .await
+            .unwrap();
+        store
+            .record_merged_lane("q", "ccc", &lane("other", 200))
+            .await
+            .unwrap();
+
+        let merged = store.merged_lanes("p", 0).await.unwrap();
+        assert_eq!(merged, vec![lane("docs", 200), lane("fix", 100)]);
+        assert_eq!(
+            store.merged_lanes("p", 101).await.unwrap(),
+            vec![lane("docs", 200)]
+        );
+
+        store.prune_merged_lanes(150).await.unwrap();
+        assert_eq!(
+            store.merged_lanes("p", 0).await.unwrap(),
+            vec![lane("docs", 200)]
+        );
+        assert_eq!(store.merged_lanes("q", 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
