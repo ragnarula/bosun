@@ -520,7 +520,12 @@ pub fn spawn_loop(session_id: String, deps: Arc<LoopDeps>) -> LoopHandle {
             // is kept so a stopped session can still be woken by a parent
             // message.
             let mut pending: VecDeque<WakeKind> = VecDeque::new();
-            let mut state = LoopState::default();
+            // The task list lives on the session row, so a loop started after
+            // a restart carries on with the list the last one wrote.
+            let mut state = LoopState {
+                todos: deps.store.todos(&session_id).await?,
+                ..LoopState::default()
+            };
             // When a settled session's summary comes due: set as a wake ends,
             // cleared as the next one starts. An interrupt inside the wait
             // leaves it alone, so an ignored interrupt does not postpone the
@@ -2130,7 +2135,10 @@ async fn run_turn_inner(
                     continue;
                 }
                 match args["items"].as_array() {
-                    Some(items) => state.todos = items.clone(),
+                    Some(items) => {
+                        state.todos = items.clone();
+                        deps.store.set_todos(session_id, items).await?;
+                    }
                     None => warn!(
                         msg = "todowrite items are not an array",
                         session_id = %session_id
@@ -5594,6 +5602,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_loop_started_after_a_restart_carries_on_with_the_stored_task_list() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s-kept")).await.unwrap();
+        store
+            .set_todos(
+                "s-kept",
+                &[json!({ "id": "1", "content": "ship it", "status": "done" })],
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::TextDelta("done".into()),
+            stop(2, 1),
+        ]]));
+        let deps = Arc::new(test_deps(
+            &store,
+            provider.clone(),
+            Arc::new(MockTools::new(default_outcome())),
+            Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new())))),
+        ));
+        let handle = spawn_loop("s-kept".into(), deps);
+        handle.send(LoopEvent::Wake);
+
+        wait_for("the first turn", {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { !provider.captured_calls().is_empty() }
+            }
+        })
+        .await;
+        assert!(
+            provider.captured_calls()[0]
+                .session_context
+                .contains("0. [done] ship it"),
+            "the first turn of a new loop reads the list the last one wrote"
+        );
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn todowrite_updates_the_todo_state() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("sessions.db")).unwrap();
@@ -5676,6 +5727,17 @@ mod tests {
             }
         })
         .await;
+
+        let stored = store.todos("s-todo").await.unwrap();
+        assert_eq!(stored.len(), 2, "the list is kept on the session row");
+        assert_eq!(stored[1]["content"], "fix the bug");
+        let events = store.events_after("s-todo", 0).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| matches!(event, Event::Todos { items, .. } if items.len() == 2)),
+            "a client following the stream sees the new list"
+        );
 
         let messages = store.messages("s-todo", false).await.unwrap();
         let result = messages

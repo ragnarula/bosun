@@ -315,6 +315,13 @@ pub enum Event {
         #[serde(flatten)]
         phase: ActivityPhase,
     },
+    /// The root session's task list, as `todowrite` last replaced it. Each
+    /// item is the call's own object: `id`, `content`, `status`, and the
+    /// optional `kind` and `owner`.
+    Todos {
+        at_ms: Option<u64>,
+        items: Vec<Value>,
+    },
     /// A note the loop recorded for the user: something it handled that the
     /// user should see, such as a selected MCP server being unavailable.
     Warning {
@@ -333,7 +340,8 @@ impl Event {
             | Event::State { at_ms, .. }
             | Event::Permission { at_ms, .. }
             | Event::Persona { at_ms, .. }
-            | Event::ModelCall { at_ms, .. } => *at_ms,
+            | Event::ModelCall { at_ms, .. }
+            | Event::Todos { at_ms, .. } => *at_ms,
             Event::Activity { at_ms, .. } => Some(*at_ms),
             Event::Warning { .. } => None,
         }

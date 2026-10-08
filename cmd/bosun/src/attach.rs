@@ -421,6 +421,9 @@ fn event_lines(event: &Event) -> Vec<Line> {
             text: format!("persona: {persona}"),
             at_ms,
         }],
+        // The task list's own view draws it; the transcript already shows
+        // the `todowrite` call that replaced it.
+        Event::Todos { .. } => Vec::new(),
         Event::Warning { text } => vec![Line {
             kind: LineKind::Status,
             text: format!("warning: {text}"),

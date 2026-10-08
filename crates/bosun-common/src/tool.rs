@@ -221,8 +221,8 @@ pub fn canonical_tools(permission: Permission) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "todowrite".into(),
-            description: "Replace the session todo list.".into(),
-            schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["todo","in_progress","done"]}},"required":["id","content","status"]}}},"required":["items"]}),
+            description: "Replace the session todo list. The user sees it as the crew's task list: give each item its kind of work, and once a child session has it, that child's id as owner.".into(),
+            schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["todo","in_progress","done"]},"kind":{"type":"string","enum":["build","test","review","design","research","other"]},"owner":{"type":"string"}},"required":["id","content","status"]}}},"required":["items"]}),
         },
         // A read-only session keeps this one: it changes the session's own
         // context and nothing else, not a file, a machine or another session.

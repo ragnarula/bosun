@@ -202,7 +202,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   parent_id TEXT,
   owner_id TEXT NOT NULL,
   interrupt_cause TEXT,
-  summary TEXT
+  summary TEXT,
+  todos TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -358,6 +359,10 @@ impl Store {
         if !column_exists(&conn, "sessions", "summary")? {
             conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT", [])
                 .context("failed to add the summary column")?;
+        }
+        if !column_exists(&conn, "sessions", "todos")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN todos TEXT", [])
+                .context("failed to add the todos column")?;
         }
         if !column_exists(&conn, "pending_asks", "origin_leaf")? {
             // Rows written before the origin column held the origin leaf in
@@ -802,6 +807,54 @@ impl Store {
             )
             .context("failed to update the session summary")?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Replaces the session's task list and appends the matching
+    /// `Event::Todos` in one transaction, so a client following the stream and
+    /// a loop reading the row back after a restart see the same list.
+    pub async fn set_todos(&self, id: &str, items: &[Value]) -> Result<(), StoreError> {
+        let items = items.to_vec();
+        self.with_session(id, move |conn, session_id| {
+            let tx = transaction(conn)?;
+            tx.execute(
+                "UPDATE sessions SET todos = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&items)?, session_id],
+            )
+            .context("failed to update the session task list")?;
+            append_event(
+                &tx,
+                session_id,
+                "todos",
+                &Event::Todos {
+                    at_ms: Some(bosun_common::time::unix_ms(SystemTime::now())),
+                    items,
+                },
+            )?;
+            tx.commit().context("failed to commit the task list")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The session's task list as `todowrite` last replaced it; empty when it
+    /// never wrote one.
+    pub async fn todos(&self, id: &str) -> Result<Vec<Value>, StoreError> {
+        self.with_session(id, move |conn, session_id| {
+            let todos: Option<String> = conn
+                .query_row(
+                    "SELECT todos FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .context("failed to read the session task list")?;
+            match todos {
+                Some(text) => {
+                    Ok(serde_json::from_str(&text).context("failed to parse the task list")?)
+                }
+                None => Ok(Vec::new()),
+            }
         })
         .await
     }
@@ -3138,6 +3191,25 @@ mod tests {
             .collect();
         assert_eq!(read, [(2, "kid"), (3, "root"), (4, "kid")]);
         assert!(page.more, "the root's first message is older than the page");
+    }
+
+    #[tokio::test]
+    async fn a_task_list_is_kept_on_the_row_and_announced_on_the_stream() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_session(&session("s1")).await.unwrap();
+        assert!(store.todos("s1").await.unwrap().is_empty());
+
+        let items =
+            [json!({ "id": "1", "content": "write it", "status": "todo", "kind": "build" })];
+        store.set_todos("s1", &items).await.unwrap();
+
+        assert_eq!(store.todos("s1").await.unwrap(), items);
+        let events = store.events_after("s1", 0).await.unwrap();
+        assert!(matches!(
+            &events[0].1,
+            Event::Todos { at_ms: Some(_), items: written } if written.as_slice() == items
+        ));
     }
 
     #[tokio::test]
