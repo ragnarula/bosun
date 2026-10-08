@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fmt;
 use std::future::IntoFuture;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +28,8 @@ use bosun_common::config::save_cli_config;
 #[cfg(windows)]
 use bosun_common::error::ErrorExt;
 use bosun_common::session::Session;
+use bosun_common::session::SessionState;
+use bosun_common::session::SessionView;
 use bosun_common::telemetry::setup_logging;
 use bosun_common::types::CloneRequest;
 use bosun_common::types::DevRequest;
@@ -50,6 +54,11 @@ use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use dialoguer::FuzzySelect;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::text::Span;
 use reqwest::header::HeaderMap;
 #[cfg(windows)]
 use tracing::error;
@@ -890,7 +899,7 @@ async fn spawn_dev(
     Ok(())
 }
 
-async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<Session>> {
+async fn fetch_sessions(cp_url: &str) -> anyhow::Result<Vec<SessionView>> {
     let client = cp_client()?;
     let response = client
         .get(format!("{cp_url}/sessions"))
@@ -915,85 +924,285 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         println!("no sessions");
         return Ok(());
     }
-    for line in session_rows(&sessions) {
-        println!("{line}");
+    let terminal = std::io::stdout().is_terminal();
+    let colour = terminal && env::var_os("NO_COLOR").is_none();
+    let width = if terminal {
+        crossterm::terminal::size().map_or(LIST_WIDTH, |(columns, _)| columns as usize)
+    } else {
+        LIST_WIDTH
+    };
+    for line in list_lines(&sessions, width) {
+        println!("{}", ansi(&line, colour));
     }
     Ok(())
 }
 
-/// The `bosun list` table: roots in id order with the whole tree beneath each
-/// one. Sessions are grouped by parent, so children nest under the session
-/// that spawned them at any depth; the indent widens one level at a time and
-/// the id column is sized for the deepest row, so indenting never pushes the
-/// later columns out of line.
-fn session_rows(sessions: &[Session]) -> Vec<String> {
-    let by_id: HashMap<&str, &Session> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
-    let depth_of = |session: &Session| {
-        let mut depth = 0;
-        let mut current = session;
-        while let Some(parent_id) = current.parent_id.as_deref()
-            && let Some(parent) = by_id.get(parent_id)
-        {
-            depth += 1;
-            current = parent;
-        }
-        depth
-    };
-    let mut children_of: HashMap<&str, Vec<&Session>> = HashMap::new();
-    for session in sessions {
-        if let Some(parent_id) = session.parent_id.as_deref() {
-            children_of.entry(parent_id).or_default().push(session);
-        }
-    }
-    for children in children_of.values_mut() {
-        children.sort_by_key(|s| s.id.as_str());
-    }
-    let mut roots: Vec<&Session> = sessions.iter().filter(|s| s.parent_id.is_none()).collect();
-    roots.sort_by_key(|s| s.id.as_str());
-    // 36 characters fit a UUID; deeper rows add their indent on top.
-    let deepest = sessions.iter().map(depth_of).max().unwrap_or(0);
-    let id_width = 36 + 2 * (deepest + 1);
+/// The width `bosun list` lays its rows out to when stdout is not a terminal.
+const LIST_WIDTH: usize = 100;
+/// Cells in a tree's task bar.
+const LIST_TASK_BAR_CELLS: usize = 10;
 
-    let row = |session: &Session, indent: &str| {
-        let source = session
-            .repo_url
-            .clone()
-            .unwrap_or_else(|| session.dir.clone());
-        format!(
-            "{:<id_width$}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
-            format!("{indent}{}", session.id),
-            session.node,
-            source,
-            session.git_ref.as_deref().unwrap_or("-"),
-            session.persona.as_deref().unwrap_or("-"),
-            session.state.as_str()
-        )
-    };
-    let mut lines = vec![format!(
-        "{:<id_width$}  {:<10}  {:<28}  {:<12}  {:<12}  {:<6}",
-        "id", "node", "source", "ref", "persona", "status"
-    )];
-    fn push_children(
-        lines: &mut Vec<String>,
-        children_of: &HashMap<&str, Vec<&Session>>,
-        row: &dyn Fn(&Session, &str) -> String,
-        parent_id: &str,
-        depth: usize,
-    ) {
-        let indent = "  ".repeat(depth);
-        let Some(children) = children_of.get(parent_id) else {
-            return;
+/// The groups `bosun list` sorts session trees into, in the order it prints
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ListGroup {
+    NeedsYou,
+    Working,
+    Idle,
+}
+
+impl ListGroup {
+    fn heading(self) -> Span<'static> {
+        let (text, colour) = match self {
+            ListGroup::NeedsYou => ("NEEDS YOU", crew::NEEDS_YOU),
+            ListGroup::Working => ("WORKING", crew::WORKING),
+            ListGroup::Idle => ("IDLE", crew::MUTED),
         };
-        for child in children {
-            lines.push(row(child, &indent));
-            push_children(lines, children_of, row, &child.id, depth + 1);
+        Span::styled(
+            text,
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
+/// One session tree as `bosun list` shows it: its sessions with the root
+/// first, the crew they make, and the group the tree sorts into.
+struct ListedTree<'a> {
+    sessions: Vec<&'a SessionView>,
+    crew: Vec<crew::Member>,
+    group: ListGroup,
+}
+
+/// The session list as trees: every child folds into its root. A tree needs
+/// you when any member asks, works when any member runs, and is idle
+/// otherwise. Within a group the newest tree comes first.
+fn list_trees(sessions: &[SessionView]) -> Vec<ListedTree<'_>> {
+    let ids: HashSet<&str> = sessions
+        .iter()
+        .map(|view| view.session.id.as_str())
+        .collect();
+    let mut trees: Vec<ListedTree> = sessions
+        .iter()
+        .filter(|view| {
+            view.session.owner_id == view.session.id
+                || !ids.contains(view.session.owner_id.as_str())
+        })
+        .map(|root| {
+            let crew = crew::crew_members(&root.session.id, sessions, None);
+            let members: Vec<&SessionView> = crew
+                .iter()
+                .filter_map(|member| sessions.iter().find(|view| view.session.id == member.id))
+                .collect();
+            let group = if members.iter().any(|view| view.overview.asking) {
+                ListGroup::NeedsYou
+            } else if members.iter().any(|view| {
+                matches!(
+                    view.session.state,
+                    SessionState::Running | SessionState::Creating
+                )
+            }) {
+                ListGroup::Working
+            } else {
+                ListGroup::Idle
+            };
+            ListedTree {
+                sessions: members,
+                crew,
+                group,
+            }
+        })
+        .collect();
+    trees.sort_by(|a, b| {
+        let (a_root, b_root) = (&a.sessions[0].session, &b.sessions[0].session);
+        a.group
+            .cmp(&b.group)
+            .then(b_root.created_at_secs.cmp(&a_root.created_at_secs))
+            .then(a_root.id.cmp(&b_root.id))
+    });
+    trees
+}
+
+/// What is happening in a tree now: who asks, or who is doing what, or the
+/// root's state word when the tree is idle.
+fn now_spans(tree: &ListedTree) -> Vec<Span<'static>> {
+    let members = || tree.sessions.iter().zip(tree.crew.iter());
+    let name_of = |id: &str| {
+        tree.crew
+            .iter()
+            .find(|member| member.id == id)
+            .map_or_else(|| crew::short_id(id), |member| member.name.clone())
+    };
+    match tree.group {
+        ListGroup::NeedsYou => {
+            let Some((_, asker)) = members().find(|(view, _)| view.overview.asking) else {
+                return Vec::new();
+            };
+            // The list carries no question text, only that a question waits.
+            let text = match asker.parent_id.as_deref() {
+                None => format!("! {} asks you", asker.name),
+                Some(parent) => format!("! {} asks {}", asker.name, name_of(parent)),
+            };
+            vec![Span::styled(text, Style::default().fg(crew::NEEDS_YOU))]
+        }
+        ListGroup::Working => {
+            let running = || {
+                members().filter(|(view, _)| {
+                    matches!(
+                        view.session.state,
+                        SessionState::Running | SessionState::Creating
+                    )
+                })
+            };
+            let newest = running()
+                .filter_map(|(view, member)| view.overview.activity.as_ref().map(|a| (a, member)))
+                .max_by_key(|(activity, _)| activity.at_ms);
+            let (name, caption) = match newest {
+                Some((activity, member)) => (
+                    member.name.clone(),
+                    crew::activity_caption(&activity.phase, &tree.crew)
+                        .unwrap_or_else(|| "working".into()),
+                ),
+                None => match running().next() {
+                    Some((_, member)) => (member.name.clone(), "working".into()),
+                    None => return Vec::new(),
+                },
+            };
+            vec![
+                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(format!(" is {caption}")),
+            ]
+        }
+        ListGroup::Idle => {
+            let word = crew::state_word(&tree.crew[0]);
+            vec![Span::styled(
+                word.text().into_owned(),
+                Style::default().fg(crew::MUTED),
+            )]
         }
     }
-    for root in roots {
-        lines.push(row(root, ""));
-        push_children(&mut lines, &children_of, &row, &root.id, 1);
+}
+
+/// The last part of a repository URL or a directory, without `.git`.
+fn repo_name(session: &Session) -> String {
+    let source = session.repo_url.as_deref().unwrap_or(&session.dir);
+    let name = source
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(source);
+    name.trim_end_matches(".git").to_string()
+}
+
+/// `left` and `right` on one row `width` wide, `right` against the right
+/// edge. `left` is cut to leave room for `right`; `right` is dropped when it
+/// alone does not fit.
+fn fit_row(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let right_width: usize = right.iter().map(|span| span.content.chars().count()).sum();
+    if right_width + 2 > width {
+        return crew::clip_spans(left, width);
+    }
+    let mut line = crew::clip_spans(left, width - right_width - 2);
+    let left_width: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    line.spans
+        .push(Span::raw(" ".repeat(width - left_width - right_width)));
+    line.spans.extend(right);
+    line
+}
+
+/// The `bosun list` rows: a heading per group, then two rows per tree. The
+/// first names the crew as flag tags, the summary, and on the right the node,
+/// the repository and the tree's cost. The second says what is happening now
+/// with the root's task progress, and the root's id to open it with.
+fn list_lines(sessions: &[SessionView], width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(crew::MUTED);
+    let mut lines = Vec::new();
+    let mut group = None;
+    for tree in list_trees(sessions) {
+        if group != Some(tree.group) {
+            if group.is_some() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(tree.group.heading()));
+            group = Some(tree.group);
+        }
+        let root = tree.sessions[0];
+        let mut left = Vec::new();
+        for (index, member) in tree.crew.iter().enumerate() {
+            if index > 0 {
+                left.push(Span::raw(" "));
+            }
+            left.push(crew::tag_span(&member.persona));
+        }
+        let summary = root
+            .session
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("{} · {}", root.session.node, root.session.dir));
+        left.push(Span::raw(format!("  {summary}")));
+        let cost: f64 = tree.sessions.iter().map(|view| view.overview.cost).sum();
+        let right = vec![Span::styled(
+            format!(
+                "{} · {} · ${cost:.2}",
+                root.session.node,
+                repo_name(&root.session)
+            ),
+            dim,
+        )];
+        lines.push(fit_row(left, right, width));
+
+        let mut now = vec![Span::raw("   ")];
+        now.extend(now_spans(&tree));
+        let tasks = root.overview.tasks;
+        if tasks.total > 0 {
+            now.push(Span::raw("  "));
+            now.extend(crew::task_bar(
+                tasks.done,
+                tasks.in_progress,
+                tasks.total,
+                LIST_TASK_BAR_CELLS,
+            ));
+            now.push(Span::styled(
+                format!(" {} of {} tasks", tasks.done, tasks.total),
+                dim,
+            ));
+        }
+        lines.push(fit_row(
+            now,
+            vec![Span::styled(root.session.id.clone(), dim)],
+            width,
+        ));
     }
     lines
+}
+
+/// A row as text: with `colour`, each styled span in ANSI SGR codes;
+/// without, the plain letters, so a tag still reads as its two letters.
+fn ansi(line: &Line, colour: bool) -> String {
+    let mut out = String::new();
+    for span in &line.spans {
+        let mut codes = Vec::new();
+        if colour {
+            if span.style.add_modifier.contains(Modifier::BOLD) {
+                codes.push("1".to_string());
+            }
+            if let Some(Color::Rgb(r, g, b)) = span.style.fg {
+                codes.push(format!("38;2;{r};{g};{b}"));
+            }
+            if let Some(Color::Rgb(r, g, b)) = span.style.bg {
+                codes.push(format!("48;2;{r};{g};{b}"));
+            }
+        }
+        if codes.is_empty() {
+            out.push_str(&span.content);
+        } else {
+            out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), span.content));
+        }
+    }
+    out
 }
 
 async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
@@ -1001,7 +1210,7 @@ async fn run_open(args: OpenArgs) -> anyhow::Result<()> {
     let session_id = match args.session_id {
         Some(id) => {
             let sessions = fetch_sessions(&cp_url).await?;
-            if !sessions.iter().any(|s| s.id == id) {
+            if !sessions.iter().any(|view| view.session.id == id) {
                 return Err(anyhow::anyhow!("session {id} not found"));
             }
             id
@@ -1023,7 +1232,10 @@ async fn pick_session(cp_url: &str) -> anyhow::Result<Option<String>> {
     }
     let items: Vec<String> = sessions
         .iter()
-        .map(|s| format!("{}  {}  {}", s.id, s.node, s.state.as_str()))
+        .map(|view| {
+            let s = &view.session;
+            format!("{}  {}  {}", s.id, s.node, s.state.as_str())
+        })
         .collect();
     let selected = match FuzzySelect::new()
         .with_prompt("session")
@@ -1035,7 +1247,7 @@ async fn pick_session(cp_url: &str) -> anyhow::Result<Option<String>> {
         Ok(None) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    Ok(Some(sessions[selected].id.clone()))
+    Ok(Some(sessions[selected].session.id.clone()))
 }
 fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
     match args.command {
@@ -1160,8 +1372,10 @@ fn format_ago(now: SystemTime, unix_secs: u64) -> String {
 mod tests {
     use std::time::UNIX_EPOCH;
 
+    use bosun_common::session::ActivityAt;
+    use bosun_common::session::ActivityPhase;
     use bosun_common::session::Permission;
-    use bosun_common::session::SessionState;
+    use bosun_common::session::TaskCounts;
     use bosun_common::types::UpdateStatus;
 
     use super::*;
@@ -1397,175 +1611,145 @@ mod tests {
         }
     }
 
+    fn listed(session: Session) -> SessionView {
+        SessionView {
+            session,
+            overview: Default::default(),
+        }
+    }
+
+    fn texts(sessions: &[SessionView], width: usize) -> Vec<String> {
+        list_lines(sessions, width)
+            .iter()
+            .map(|line| ansi(line, false))
+            .collect()
+    }
+
     #[test]
-    fn session_rows_group_children_under_their_owner() {
-        let sessions = vec![
+    fn list_trees_fold_children_and_grandchildren_into_their_root() {
+        let mut grand = child_session("grand-1", "child-1");
+        grand.owner_id = "root-a".into();
+        let sessions: Vec<SessionView> = vec![
             root_session("root-b"),
+            child_session("child-1", "root-a"),
+            grand,
             root_session("root-a"),
-            child_session("child-b", "root-a"),
-            child_session("child-a", "root-a"),
-        ];
-        let rows = session_rows(&sessions);
-        assert_eq!(rows.len(), 5, "the header plus four sessions");
-        assert!(rows[0].starts_with("id"), "the header names the columns");
-
-        let text = rows.join("\n");
-        let root_a = text.find("root-a").expect("root-a is listed");
-        let child_a = text.find("child-a").expect("child-a is listed");
-        let child_b = text.find("child-b").expect("child-b is listed");
-        let root_b = text.find("root-b").expect("root-b is listed");
-        assert!(
-            root_a < child_a && child_a < child_b && child_b < root_b,
-            "children render directly under their owner, before the next root: {text}"
-        );
-    }
-
-    #[test]
-    fn session_rows_indent_children_and_show_their_persona() {
-        let sessions = vec![root_session("root-1"), child_session("child-1", "root-1")];
-        let rows = session_rows(&sessions);
-        let root = rows[1].to_string();
-        assert!(!root.starts_with("  "), "a root is not indented: {root}");
-        assert!(
-            root.contains("coder"),
-            "a root row shows its persona: {root}"
-        );
-
-        let child = rows[2].to_string();
-        assert!(child.starts_with("  "), "a child is indented: {child}");
-        assert!(
-            child.contains("child-1"),
-            "the child's id is on its row: {child}"
-        );
-        assert!(
-            child.contains("reviewer"),
-            "a child row shows its persona: {child}"
-        );
-    }
-
-    #[test]
-    fn session_rows_keep_columns_aligned_when_children_are_indented() {
-        // Ids as long as a UUID fill the id column, so a child row that
-        // shifts right would visibly break the table.
-        let root_id = "r".repeat(36);
-        let child_id = "c".repeat(36);
-        let mut root = root_session(&root_id);
-        root.node = "node-a".into();
-        let mut child = child_session(&child_id, &root_id);
-        child.node = "node-b".into();
-
-        let rows = session_rows(&[root, child]);
-        assert_eq!(rows.len(), 3);
-        let header_node = rows[0]
-            .find("node")
-            .expect("the header names the node column");
-        let root_node = rows[1]
-            .find("node-a")
-            .expect("the root's node is on its row");
-        let child_node = rows[2]
-            .find("node-b")
-            .expect("the child's node is on its row");
+        ]
+        .into_iter()
+        .map(listed)
+        .collect();
+        let trees = list_trees(&sessions);
+        let shape: Vec<(&str, Vec<&str>)> = trees
+            .iter()
+            .map(|tree| {
+                (
+                    tree.sessions[0].session.id.as_str(),
+                    tree.crew
+                        .iter()
+                        .map(|member| member.name.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
         assert_eq!(
-            (header_node, root_node),
-            (child_node, child_node),
-            "indenting a child id must not shift its later columns: {}",
-            rows.join("\n")
+            shape,
+            vec![
+                ("root-a", vec!["Coder", "Reviewer", "Reviewer 2"]),
+                ("root-b", vec!["Coder"]),
+            ],
+            "the working tree comes first; children fold into their root"
+        );
+        let rows = texts(&sessions, 100);
+        assert!(rows[1].starts_with("Co Rv Rv  n1 · /work"), "{}", rows[1]);
+    }
+
+    #[test]
+    fn list_groups_trees_under_needs_you_working_and_idle() {
+        let mut asking = listed(root_session("asking"));
+        asking.overview.asking = true;
+        let mut working = listed(root_session("working"));
+        working.session.state = SessionState::Running;
+        let idle = listed(root_session("idle"));
+        let rows = texts(&[idle, working, asking], 100);
+        let headings: Vec<&str> = rows
+            .iter()
+            .filter(|row| !row.is_empty() && !row.starts_with(' ') && row == &&row.to_uppercase())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(headings, vec!["NEEDS YOU", "WORKING", "IDLE"]);
+        assert!(rows[2].starts_with("   ! Coder asks you"), "{}", rows[2]);
+        assert!(
+            rows[2].ends_with("asking"),
+            "the id to open it with: {}",
+            rows[2]
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("   idle")),
+            "{rows:?}"
         );
     }
 
     #[test]
-    fn session_rows_without_children_match_the_flat_id_order() {
-        let sessions = vec![root_session("b"), root_session("a")];
-        let rows = session_rows(&sessions);
-        assert_eq!(rows.len(), 3);
-        let id_of = |row: &str| {
-            row.split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string()
+    fn the_now_line_names_who_asks_and_who_is_doing_what() {
+        let root = listed(root_session("root"));
+        let mut child = listed(child_session("child", "root"));
+        child.overview.asking = true;
+        let rows = texts(&[root.clone(), child.clone()], 100);
+        assert!(
+            rows[2].starts_with("   ! Reviewer asks Coder"),
+            "{}",
+            rows[2]
+        );
+
+        child.overview.asking = false;
+        child.overview.activity = Some(ActivityAt {
+            at_ms: 5,
+            phase: ActivityPhase::ToolStarted {
+                name: "edit".into(),
+                target: Some("src/winsw.ts".into()),
+            },
+        });
+        let mut root = root;
+        root.overview.tasks = TaskCounts {
+            total: 7,
+            done: 3,
+            in_progress: 1,
         };
-        assert_eq!(id_of(&rows[1]), "a");
-        assert_eq!(id_of(&rows[2]), "b");
+        root.overview.cost = 0.30;
+        child.overview.cost = 0.12;
+        let rows = texts(&[root, child], 100);
+        assert!(
+            rows[2].starts_with("   Reviewer is editing winsw.ts  ━━━━━━━━━━ 3 of 7 tasks"),
+            "{}",
+            rows[2]
+        );
+        assert!(rows[1].ends_with("n1 · work · $0.42"), "{}", rows[1]);
     }
 
     #[test]
-    fn session_rows_nest_grandchildren_under_the_session_that_spawned_them() {
-        // root-1 spawns child-1, which spawns grand-1; grand-2 is child-2's
-        // own child under the same root. Every level indents one step under
-        // its parent, not flat under the owner.
-        let mut child_1 = child_session("child-1", "root-1");
-        child_1.state = SessionState::Running;
-        let mut child_2 = child_session("child-2", "root-1");
-        child_2.state = SessionState::Running;
-        let mut grand_1 = child_session("grand-1", "child-1");
-        grand_1.parent_id = Some("child-1".into());
-        grand_1.owner_id = "root-1".into();
-        grand_1.state = SessionState::Running;
-        let mut grand_2 = child_session("grand-2", "child-2");
-        grand_2.parent_id = Some("child-2".into());
-        grand_2.owner_id = "root-1".into();
-        grand_2.state = SessionState::WaitingForInput;
-
-        let sessions = vec![child_1, child_2, root_session("root-1"), grand_1, grand_2];
-        let rows = session_rows(&sessions);
-        assert_eq!(rows.len(), 6, "the header plus all five sessions");
-        let root = rows[1].to_string();
-        let child_1_row = rows[2].to_string();
-        let grand_1_row = rows[3].to_string();
-        let child_2_row = rows[4].to_string();
-        let grand_2_row = rows[5].to_string();
-        assert!(!root.starts_with("  "), "a root is not indented: {root}");
-        assert!(
-            child_1_row.starts_with("  child-1"),
-            "a child indents one level: {child_1_row}"
-        );
-        assert!(
-            grand_1_row.starts_with("    grand-1"),
-            "a grandchild indents under its parent: {grand_1_row}"
-        );
-        assert!(
-            child_2_row.starts_with("  child-2"),
-            "the second branch indents under the same root: {child_2_row}"
-        );
-        assert!(
-            grand_2_row.starts_with("    grand-2"),
-            "each branch nests under its own parent: {grand_2_row}"
-        );
-        let text = rows.join("\n");
-        assert!(
-            text.find("root-1") < text.find("child-1")
-                && text.find("child-1") < text.find("grand-1")
-                && text.find("root-1") < text.find("child-2")
-                && text.find("child-2") < text.find("grand-2"),
-            "siblings and their descendants render in id order under the root: {text}"
-        );
+    fn list_rows_fill_the_width_and_keep_the_right_column_at_the_edge() {
+        let mut long = listed(root_session("root"));
+        long.session.summary = Some("x".repeat(200));
+        long.session.repo_url = Some("https://github.com/owner/bosun.git".into());
+        let rows = texts(&[long], 80);
+        assert_eq!(rows[1].chars().count(), 80, "{}", rows[1]);
+        assert!(rows[1].ends_with("n1 · bosun · $0.00"), "{}", rows[1]);
+        assert!(rows[1].contains('…'), "a long summary is cut: {}", rows[1]);
     }
 
     #[test]
-    fn session_rows_keep_columns_aligned_across_grandchild_indents() {
-        let root_id = "r".repeat(36);
-        let child_id = "c".repeat(36);
-        let grand_id = "g".repeat(36);
-        let mut root = root_session(&root_id);
-        root.node = "node-a".into();
-        let mut child = child_session(&child_id, &root_id);
-        child.node = "node-b".into();
-        let mut grand = child_session(&grand_id, &child_id);
-        grand.node = "node-c".into();
-        grand.owner_id = root_id.clone();
-
-        let rows = session_rows(&[root, child, grand]);
-        assert_eq!(rows.len(), 4);
-        let node_at = |row: &str| {
-            row.find("node")
-                .expect("the node column is present on every row")
-        };
-        assert_eq!(
-            (node_at(&rows[0]), node_at(&rows[1])),
-            (node_at(&rows[2]), node_at(&rows[3])),
-            "deep indents must not shift the later columns: {}",
-            rows.join("\n")
+    fn list_rows_read_without_colour_and_carry_ansi_codes_with_it() {
+        let sessions = vec![listed(root_session("root"))];
+        let line = &list_lines(&sessions, 100)[1];
+        let plain = ansi(line, false);
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        assert!(
+            plain.starts_with("Co  "),
+            "the tag keeps its letters: {plain:?}"
         );
+        let coloured = ansi(line, true);
+        assert!(coloured.contains("\x1b["), "{coloured:?}");
+        assert!(coloured.contains("Co"), "{coloured:?}");
     }
 
     #[test]
