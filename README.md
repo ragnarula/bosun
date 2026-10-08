@@ -36,6 +36,11 @@ Shipped so far:
   root session. The fork keeps the same model, persona, permission, MCP servers
   and thread, and gets its own clone of the same repository; the original is
   left as it was.
+- **Project map.** Every branch that sessions work on in one repository, as
+  lanes off the main branch: where each is checked out, which crew works
+  there, what is not committed or not pushed, the branch's pull request on
+  GitHub, and the files two branches both change. The pane's Projects tab and
+  `bosun map` keep it up to date while the crews work.
 - **Context control.** The transcript states the session's context size once a
   turn, from half the window up, so the session can see how close it is to
   compaction. A session can also clear its own context, giving a reason, and
@@ -74,7 +79,8 @@ The current sprint and the planned roadmap are tracked in
   working copy and permission.
 - **Clients** are one binary: `bosun clone` starts a session from a repository,
   `bosun dev` starts one in an existing directory on a node, `bosun list` shows
-  sessions, and `bosun open` attaches to a live session.
+  sessions, `bosun open` attaches to a live session, and `bosun map` shows a
+  project's branches.
 - **Sessions** hold their own transcript, store, and model calls. Tool output
   streams back to the client live; assistant text renders as markdown.
 - **Skills** are packages fetched from GitHub repositories the operator adds in
@@ -125,6 +131,7 @@ bosun dev --node node-1          # pick a directory interactively
 bosun clone --node node-1 https://github.com/you/repo.git   # clone a repo
 bosun list
 bosun open <session-id>          # attach to a live session
+bosun map                        # the project's branches, kept up to date
 bosun stop <session-id>
 ```
 

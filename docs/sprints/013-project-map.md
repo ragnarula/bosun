@@ -2,7 +2,7 @@
 
 Crew View shows one session tree. A project often has several trees at once: one crew on a branch, another in a worktree of the same repository, a builder on another machine. Nothing shows them together, so two crews can change the same file for an hour before anyone sees it, and a branch's pull request state lives only on GitHub. This sprint adds the Project Map. It shows every branch that Bosun sessions work on in one repository: where each one is checked out, which crew works there, what is not committed yet, which commits are pushed, how far each branch is from main, the state of its pull request, and which files two branches both change. It updates while the crews work.
 
-Status: **in progress**. S1 to S6 are implemented and tested.
+Status: **complete**. All eight stories are implemented and tested.
 
 ## Confirmed decisions
 
@@ -23,7 +23,7 @@ Status: **in progress**. S1 to S6 are implemented and tested.
 
 ## CLI surface
 
-- `bosun map [project]` draws the lanes and the newest activity and keeps them up to date. With no argument it picks the only project, or lists them.
+- `bosun map [project]` draws the lanes and the newest activity and keeps them up to date: `↑`/`↓` pick a lane, Enter opens its session, `1` and `2` switch between Branches and Where, `q` quits. With no argument it picks the only project, and names the choices when there are more. When stdout is not a terminal it prints the map once.
 
 ## User stories in implementation order
 
@@ -33,8 +33,8 @@ Status: **in progress**. S1 to S6 are implemented and tested.
 - [x] **S4 — Pull requests.** GitHub polling, checks and reviews, a merged pull request recorded once.
 - [x] **S5 — The map in the pane.** A Projects tab that opens on the map when there is one project; on a desktop, the lanes drawn off main with their cards, and Live or the open lane beside them.
 - [x] **S6 — The map on a phone.** Branches, Where, Live and the lane screen; the session header's link opens the map on the session's lane.
-- [ ] **S7 — The terminal client.** `bosun map`.
-- [ ] **S8 — The docs that own the current state say so.** CLAUDE.md, the README and an ADR for how the map reads working copies.
+- [x] **S7 — The terminal client.** `bosun map`.
+- [x] **S8 — The docs that own the current state say so.** CLAUDE.md, the README and an ADR for how the map reads working copies.
 
 ## Out of scope
 
