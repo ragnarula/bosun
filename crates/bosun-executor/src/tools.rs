@@ -272,7 +272,33 @@ pub fn repo_standards_present(session_dir: &Path) -> Vec<&'static str> {
         .collect()
 }
 
-pub fn write_file(session_dir: &Path, path: &str, content: &str) -> Result<(), ToolError> {
+/// What a write or an edit changed, for the call's result: whether the file
+/// is new, and the lines added and removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileChange {
+    pub created: bool,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// The lines `new` adds to `old` and removes from it, counted after the lines
+/// the two share at the start and at the end. That is exact for one change in
+/// one place, which is what an edit is, and an upper bound for a rewrite that
+/// changes several places; it takes one pass over each text, whatever its size.
+pub fn line_change(old: &str, new: &str) -> (usize, usize) {
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (new.len() - prefix - suffix, old.len() - prefix - suffix)
+}
+
+pub fn write_file(session_dir: &Path, path: &str, content: &str) -> Result<FileChange, ToolError> {
     let root = session_dir.canonicalize().with_context(|| {
         format!(
             "failed to canonicalize session dir {}",
@@ -284,9 +310,28 @@ pub fn write_file(session_dir: &Path, path: &str, content: &str) -> Result<(), T
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create dir {}", parent.display()))?;
     }
+    // The file being replaced is read only to count what the write changes,
+    // and only when it is small enough for an edit to have read it: a larger
+    // or unreadable file is counted as if it had been empty.
+    let created = !target.exists();
+    let previous = if created {
+        String::new()
+    } else {
+        match target.metadata() {
+            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES as u64 => {
+                std::fs::read_to_string(&target).unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    };
     std::fs::write(&target, content)
         .with_context(|| format!("failed to write {}", target.display()))?;
-    Ok(())
+    let (added, removed) = line_change(&previous, content);
+    Ok(FileChange {
+        created,
+        added,
+        removed,
+    })
 }
 
 /// Resolve a write target that does not exist yet, creating subdirectories.
@@ -347,7 +392,7 @@ fn nearest_existing_ancestor(path: &Path) -> &Path {
     current
 }
 
-pub fn edit(session_dir: &Path, path: &str, old: &str, new: &str) -> Result<(), ToolError> {
+pub fn edit(session_dir: &Path, path: &str, old: &str, new: &str) -> Result<FileChange, ToolError> {
     let resolved = resolve_path(session_dir, path)?;
     if !resolved.is_file() {
         return Err(ToolError::NotFound {
@@ -370,7 +415,12 @@ pub fn edit(session_dir: &Path, path: &str, old: &str, new: &str) -> Result<(), 
     let updated = content.replacen(old, new, 1);
     std::fs::write(&resolved, updated)
         .with_context(|| format!("failed to write {}", resolved.display()))?;
-    Ok(())
+    let (added, removed) = line_change(old, new);
+    Ok(FileChange {
+        created: false,
+        added,
+        removed,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -776,6 +826,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_all(dir.path(), "missing.txt").unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }));
+    }
+
+    #[test]
+    fn a_line_change_counts_what_differs_between_the_shared_ends() {
+        assert_eq!(line_change("", "a\nb\n"), (2, 0));
+        assert_eq!(line_change("a\nb\nc\n", "a\nB\nc\n"), (1, 1));
+        assert_eq!(line_change("a\nb\nc\n", "a\nc\n"), (0, 1));
+        assert_eq!(line_change("a\n", "a\n"), (0, 0));
+        assert_eq!(
+            line_change("x\nx\n", "x\nx\nx\n"),
+            (1, 0),
+            "shared ends never overlap"
+        );
+    }
+
+    #[test]
+    fn a_write_says_whether_it_created_the_file_and_what_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            write_file(root, "new.txt", "one\ntwo\n").unwrap(),
+            FileChange {
+                created: true,
+                added: 2,
+                removed: 0
+            }
+        );
+        assert_eq!(
+            write_file(root, "new.txt", "one\n2\n").unwrap(),
+            FileChange {
+                created: false,
+                added: 1,
+                removed: 1
+            }
+        );
+        assert_eq!(
+            edit(root, "new.txt", "2\n", "two\nthree\n").unwrap(),
+            FileChange {
+                created: false,
+                added: 2,
+                removed: 1
+            }
+        );
     }
 
     #[test]

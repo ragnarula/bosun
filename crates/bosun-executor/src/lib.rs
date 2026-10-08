@@ -321,7 +321,13 @@ pub async fn run_call(
                 tools::write_file(dir, &path, &content)
             })
             .await
-            .map(|()| json!({}))
+            .map(|change| {
+                json!({
+                    "created": change.created,
+                    "added": change.added,
+                    "removed": change.removed,
+                })
+            })
         }
         "edit" => {
             if permission != Permission::ReadWrite {
@@ -341,7 +347,13 @@ pub async fn run_call(
                 tools::edit(dir, &path, &old, &new)
             })
             .await
-            .map(|()| json!({ "replaced": true }))
+            .map(|change| {
+                json!({
+                    "replaced": true,
+                    "added": change.added,
+                    "removed": change.removed,
+                })
+            })
         }
         "grep" => {
             let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
@@ -893,7 +905,11 @@ mod tests {
         )
         .await
         .expect("write should succeed");
-        assert!(matches!(outcome, CallOutcome::Result { content } if content == json!({})));
+        assert!(matches!(
+            outcome,
+            CallOutcome::Result { content }
+                if content == json!({ "created": true, "added": 1, "removed": 0 })
+        ));
 
         let outcome = call(&state, "run-2", "file_read", json!({ "path": "hello.txt" }))
             .await

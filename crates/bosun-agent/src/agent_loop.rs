@@ -1517,6 +1517,71 @@ fn announces_an_action(text: &str) -> bool {
 /// Whether the session's todo list holds work it never finished: at least one
 /// item whose status is not `done`, the status the `todowrite` schema defines
 /// for a finished item.
+/// The working copy's `git status --porcelain`, as path to two-letter status,
+/// read through the executor's `history_read`. None when the session's
+/// directory is not a git working copy, or the read fails: the shell result
+/// then simply names no files.
+async fn working_copy_status(
+    deps: &Arc<LoopDeps>,
+    session_id: &str,
+) -> Option<BTreeMap<String, String>> {
+    let (delta_tx, _delta_rx) = mpsc::unbounded_channel::<ToolDelta>();
+    let outcome = deps
+        .tools
+        .call(
+            session_id.to_string(),
+            Uuid::new_v4().to_string(),
+            "history_read".into(),
+            json!({ "op": "status" }),
+            delta_tx,
+        )
+        .await
+        .ok()?;
+    if outcome.is_error || outcome.content["exit_code"].as_i64() != Some(0) {
+        return None;
+    }
+    Some(parse_porcelain(outcome.content["stdout"].as_str()?))
+}
+
+/// `git status --porcelain` output as path to its two-letter status.
+fn parse_porcelain(stdout: &str) -> BTreeMap<String, String> {
+    stdout
+        .lines()
+        .filter(|line| line.len() > 3 && line.is_char_boundary(2))
+        .map(|line| {
+            let (status, path) = line.split_at(2);
+            // A rename names `old -> new`; the file that now exists is new.
+            let path = path.trim_start();
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            (path.trim_matches('"').to_string(), status.to_string())
+        })
+        .collect()
+}
+
+/// The paths a command changed, from the working copy's status before and
+/// after it: each path whose status the run changed, as `created`, `edited`
+/// or `deleted`. A path that left the status list is not reported: a commit
+/// and a revert both remove a path, and neither is a change to the file.
+fn status_changes(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<Value> {
+    after
+        .iter()
+        .filter(|(path, status)| before.get(*path) != Some(status))
+        .map(|(path, status)| {
+            let op = if status.contains('D') {
+                "deleted"
+            } else if status == "??" || status.starts_with('A') {
+                "created"
+            } else {
+                "edited"
+            };
+            json!({ "path": path, "op": op })
+        })
+        .collect()
+}
+
 /// The longest target a `ToolStarted` carries. A command or a pattern can be
 /// any length, and the event is read by a caption one line wide.
 const TOOL_TARGET_MAX_CHARS: usize = 120;
@@ -2653,13 +2718,31 @@ async fn run_turn_inner(
                     tool = %name,
                     run_id = %run_id
                 );
-                let Some(outcome) =
+                // A shell command can change any file, and only the working
+                // copy can say which: its status before and after the run
+                // names the paths whose state the command changed.
+                let status_before = if name == "shell" {
+                    working_copy_status(deps, session_id).await
+                } else {
+                    None
+                };
+                let Some(mut outcome) =
                     run_tool_call(deps, session_id, &run_id, &name, args, signal).await?
                 else {
                     record_interrupted_call(deps, session_id, window, &id, &name, Some(started))
                         .await?;
                     return Ok(TurnOutcome::Interrupted);
                 };
+                if let Some(before) = status_before
+                    && let Some(after) = working_copy_status(deps, session_id).await
+                {
+                    let files = status_changes(&before, &after);
+                    if !files.is_empty()
+                        && let Some(content) = outcome.content.as_object_mut()
+                    {
+                        content.insert("files".into(), json!(files));
+                    }
+                }
                 deps.store
                     .complete_tool_call(session_id, &id, &outcome.content, outcome.is_error)
                     .await?;
@@ -4153,6 +4236,9 @@ mod tests {
                 .cloned()
                 .or_else(|| plumbing_outcome(&name));
             let outcome = served.clone().unwrap_or_else(|| self.outcome.clone());
+            // The loop's own status reads around a shell call are not the call
+            // a test holds open, so they answer at once.
+            let status_read = name == "history_read";
             self.calls.lock().unwrap().push(CapturedToolCall {
                 session_id,
                 run_id,
@@ -4160,7 +4246,7 @@ mod tests {
                 args,
             });
             let delta_text = self.delta_text.clone();
-            let block = self.block && served.is_none();
+            let block = self.block && served.is_none() && !status_read;
             Box::pin(async move {
                 if let Some(text) = delta_text {
                     let _ = delta.send(ToolDelta { text });
@@ -10980,6 +11066,26 @@ mod tests {
             "a word that starts with a sequencing word is a different word"
         );
         assert!(!announces_an_action(""), "an empty reply announces nothing");
+    }
+
+    #[test]
+    fn a_commands_file_changes_are_the_paths_whose_status_it_changed() {
+        let before = parse_porcelain(" M src/kept.rs\n M src/edited.rs\n?? notes.txt\n");
+        let after = parse_porcelain(
+            " M src/kept.rs\nMM src/edited.rs\n?? new.txt\n D old.ps1\nR  a.rs -> b.rs\n",
+        );
+
+        let changes = status_changes(&before, &after);
+        assert_eq!(
+            changes,
+            [
+                json!({ "path": "b.rs", "op": "edited" }),
+                json!({ "path": "new.txt", "op": "created" }),
+                json!({ "path": "old.ps1", "op": "deleted" }),
+                json!({ "path": "src/edited.rs", "op": "edited" }),
+            ],
+            "an unchanged path and one that left the list (notes.txt) are not reported"
+        );
     }
 
     #[test]
