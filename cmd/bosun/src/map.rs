@@ -48,8 +48,11 @@ use crate::crew;
 
 /// The width a branch name is padded to.
 const NAME: usize = 24;
-/// The width the lanes' graph is padded to.
-const GRAPH: usize = 30;
+/// The width the lanes' graph is padded to: wide enough for a lane that
+/// leaves main's newest commit with all its marks and the `◌`.
+fn graph_width(main_len: usize) -> usize {
+    main_len * 2 + LANE_MARKS * 2 + 3
+}
 /// The commits a lane draws before it folds the older ones into `┄`.
 const LANE_MARKS: usize = 10;
 /// The newest feed entries shown under the lanes.
@@ -194,7 +197,10 @@ fn lane_line(
             }),
         ),
         Span::styled(
-            pad(&lane_graph(lane, project.main.len()), GRAPH),
+            pad(
+                &lane_graph(lane, project.main.len()),
+                graph_width(project.main.len()),
+            ),
             Style::default().fg(colour),
         ),
     ];
@@ -435,7 +441,7 @@ fn branch_lines(
             pad(&project.main_branch, NAME),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(pad(&main_graph, GRAPH), dim()),
+        Span::styled(pad(&main_graph, graph_width(project.main.len())), dim()),
     ];
     if let Some(head) = project.main.first() {
         main.push(Span::styled(
@@ -454,7 +460,7 @@ fn branch_lines(
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(pad(&merged.branch, NAME), dim()),
-            Span::styled(pad("╰─╯", GRAPH), dim()),
+            Span::styled(pad("╰─╯", graph_width(project.main.len())), dim()),
             Span::styled(format!("{what} at {}", clock(merged.merged_at_secs)), dim()),
         ]));
     }
@@ -1024,6 +1030,16 @@ mod tests {
                 .any(|line| line.contains("You created watch.rs +31  project-map")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_lane_that_leaves_mains_newest_commit_is_drawn_whole() {
+        let mut project = project();
+        project.main = (0..12).map(|i| commit(&format!("m{i}"), false)).collect();
+        project.lanes[0].fork_index = Some(0);
+        let graph = lane_graph(&project.lanes[0], project.main.len());
+        let line = text(&lane_line(&project.lanes[0], &project, &[], false));
+        assert!(line.contains(&graph), "{line}");
     }
 
     #[test]
