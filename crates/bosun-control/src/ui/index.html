@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="bosun-version" content="{{BOSUN_VERSION}}">
 <title>Bosun</title>
+<!-- The installed app: its manifest, its icons, and the title bar's colour,
+     Night by default and Day under a light system setting. -->
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/ui/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/ui/icons/apple-touch-icon.png">
+<meta name="theme-color" content="#eef2f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a1220">
 <!-- The pane's module runs before the deferred mermaid bundle because it comes
      first: the module listens for the bundle's load event. The preload links
      fetch every module at once, where the imports alone are found one level
@@ -35,6 +42,7 @@
 <link rel="modulepreload" href="/ui/views.js">
 <link rel="modulepreload" href="/ui/crew-screen.js">
 <link rel="modulepreload" href="/ui/project-map.js">
+<link rel="modulepreload" href="/ui/device.js">
 <script src="/ui/mermaid.min.js" id="mermaid-bundle" defer></script>
 <link rel="stylesheet" href="/ui/pane.css">
 </head>
@@ -45,9 +53,11 @@
     <h1 class="bs-header__title home-title">Bosun</h1>
     <div class="bs-header__sub"><span id="health-text">no machines yet</span><span class="origin" id="origin"></span></div>
   </div>
+  <button id="btn-notify" type="button" class="bs-btn bs-btn--ghost bs-btn--icon" aria-label="Notifications" aria-pressed="false" title="Notifications off" data-icon="bell"></button>
   <button id="btn-new-session" type="button" class="bs-btn bs-btn--primary" data-icon="plus">New</button>
 </header>
 <div id="status"></div>
+<div id="offline" role="status" hidden></div>
 <main>
   <form id="new-session-form" hidden>
     <div class="sheet-body">

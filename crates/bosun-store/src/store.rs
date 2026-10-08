@@ -137,6 +137,17 @@ pub struct PersonaAvatar {
     pub picture_at_secs: Option<i64>,
 }
 
+/// A browser's push subscription: the push service's endpoint and the keys a
+/// message to it is encrypted with, base64url as the browser gives them, and
+/// the origin of the pane that subscribed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushSubscription {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub origin: String,
+}
+
 /// Which events a read covers: one session's, or every session's in one tree.
 #[derive(Debug, Clone)]
 pub enum EventScope {
@@ -308,6 +319,17 @@ CREATE TABLE IF NOT EXISTS merged_lanes (
   commits INTEGER NOT NULL,
   merged_at_secs INTEGER NOT NULL,
   PRIMARY KEY (project, branch, head)
+);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  endpoint TEXT PRIMARY KEY,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  added_at_secs INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_key (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  pkcs8 BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mcp_servers (
   name TEXT PRIMARY KEY,
@@ -1560,6 +1582,89 @@ impl Store {
             )
             .context("failed to prune merged branches")?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Stores `candidate` as the control plane's push signing key unless a key
+    /// is stored already, and returns the stored key. Two callers racing on an
+    /// empty store both get the key that won.
+    pub async fn keep_push_key(&self, candidate: Vec<u8>) -> Result<Vec<u8>, StoreError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO push_key (id, pkcs8) VALUES (1, ?1)",
+                params![candidate],
+            )
+            .context("failed to store the push key")?;
+            conn.query_row("SELECT pkcs8 FROM push_key WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .context("failed to read the push key")
+        })
+        .await
+    }
+
+    /// Adds a browser's subscription, or replaces the keys of one already
+    /// stored for the same endpoint.
+    pub async fn add_push_subscription(
+        &self,
+        subscription: &PushSubscription,
+    ) -> Result<(), StoreError> {
+        let subscription = subscription.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO push_subscriptions
+                   (endpoint, p256dh, auth, origin, added_at_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    subscription.endpoint,
+                    subscription.p256dh,
+                    subscription.auth,
+                    subscription.origin,
+                    bosun_common::time::unix_secs(SystemTime::now())
+                ],
+            )
+            .context("failed to store the push subscription")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes the subscription for `endpoint`. Returns whether one was stored.
+    pub async fn remove_push_subscription(&self, endpoint: &str) -> Result<bool, StoreError> {
+        let endpoint = endpoint.to_string();
+        self.with_conn(move |conn| {
+            let removed = conn
+                .execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint = ?1",
+                    params![endpoint],
+                )
+                .context("failed to remove the push subscription")?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+
+    /// Every stored subscription, oldest first.
+    pub async fn push_subscriptions(&self) -> Result<Vec<PushSubscription>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT endpoint, p256dh, auth, origin FROM push_subscriptions
+                     ORDER BY added_at_secs, endpoint",
+                )
+                .context("failed to prepare the push subscription query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PushSubscription {
+                        endpoint: row.get(0)?,
+                        p256dh: row.get(1)?,
+                        auth: row.get(2)?,
+                        origin: row.get(3)?,
+                    })
+                })
+                .context("failed to query push subscriptions")?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
     }
@@ -3100,6 +3205,65 @@ mod tests {
         );
 
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn the_first_push_key_stored_is_the_one_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        assert_eq!(store.keep_push_key(vec![1, 2]).await.unwrap(), vec![1, 2]);
+        assert_eq!(
+            store.keep_push_key(vec![3, 4]).await.unwrap(),
+            vec![1, 2],
+            "a second candidate must not replace the key browsers subscribed with"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_subscription_is_kept_once_per_endpoint_until_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sessions.db")).unwrap();
+        let subscription = |endpoint: &str, auth: &str| PushSubscription {
+            endpoint: endpoint.into(),
+            p256dh: "key".into(),
+            auth: auth.into(),
+            origin: "https://pane.example".into(),
+        };
+        store
+            .add_push_subscription(&subscription("https://push.example/a", "old"))
+            .await
+            .unwrap();
+        store
+            .add_push_subscription(&subscription("https://push.example/a", "new"))
+            .await
+            .unwrap();
+        store
+            .add_push_subscription(&subscription("https://push.example/b", "b"))
+            .await
+            .unwrap();
+        let mut stored = store.push_subscriptions().await.unwrap();
+        stored.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        assert_eq!(
+            stored,
+            vec![
+                subscription("https://push.example/a", "new"),
+                subscription("https://push.example/b", "b"),
+            ]
+        );
+
+        assert!(
+            store
+                .remove_push_subscription("https://push.example/a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .remove_push_subscription("https://push.example/a")
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.push_subscriptions().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

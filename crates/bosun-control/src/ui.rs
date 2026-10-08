@@ -70,6 +70,7 @@ pub(crate) const ASSETS: &[(&str, &str, &str)] = &[
     ("views.js", JS, include_str!("ui/views.js")),
     ("crew-screen.js", JS, include_str!("ui/crew-screen.js")),
     ("project-map.js", JS, include_str!("ui/project-map.js")),
+    ("device.js", JS, include_str!("ui/device.js")),
     ("main.js", JS, include_str!("ui/main.js")),
 ];
 
@@ -133,6 +134,95 @@ pub async fn font(Path(name): Path<String>) -> Response {
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// The pane's app icons: the Blue Peter as SVG, and the PNG sizes Android and
+/// iOS install with, drawn from the SVG. Served like the fonts.
+pub(crate) const ICONS: &[(&str, &str, &[u8])] = &[
+    (
+        "icon.svg",
+        "image/svg+xml",
+        include_bytes!("ui/icons/icon.svg"),
+    ),
+    (
+        "icon-192.png",
+        "image/png",
+        include_bytes!("ui/icons/icon-192.png"),
+    ),
+    (
+        "icon-512.png",
+        "image/png",
+        include_bytes!("ui/icons/icon-512.png"),
+    ),
+    (
+        "apple-touch-icon.png",
+        "image/png",
+        include_bytes!("ui/icons/apple-touch-icon.png"),
+    ),
+];
+
+/// One of the pane's `ICONS`, kept for a day like a font.
+pub async fn icon(Path(name): Path<String>) -> Response {
+    match ICONS.iter().find(|(served, _, _)| *served == name) {
+        Some((_, content_type, body)) => (
+            [
+                (header::CONTENT_TYPE, *content_type),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            *body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The web app manifest that lets a browser install the pane.
+pub async fn manifest() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/manifest+json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        include_str!("ui/manifest.webmanifest"),
+    )
+}
+
+/// The pane's service worker, with this build's version and the paths of
+/// its files written in. It is served at the root because a worker controls
+/// only the paths below its own, and the pane is served at `/`.
+pub async fn service_worker() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, JS),
+            // The browser compares this file with the installed worker's on
+            // each load, and a new build's file differs, so it is never kept.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        service_worker_js(),
+    )
+}
+
+fn service_worker_js() -> String {
+    let files = serde_json::to_string(&pane_files()).expect("a list of paths serializes");
+    include_str!("ui/sw.js")
+        .replace("{{BOSUN_VERSION}}", bosun_common::version::VERSION)
+        .replace("{{PANE_FILES}}", &files)
+}
+
+/// Every path the service worker keeps for a build: the page at both of its
+/// addresses, the manifest, and each stylesheet, module, font and icon. The
+/// mermaid bundle is left out: the worker keeps it when the pane first loads
+/// it, so a new build does not fetch 5.5 MB at once.
+fn pane_files() -> Vec<String> {
+    let mut files = vec![
+        "/".to_string(),
+        "/ui".to_string(),
+        "/manifest.webmanifest".to_string(),
+    ];
+    files.extend(ASSETS.iter().map(|(name, _, _)| format!("/ui/{name}")));
+    files.extend(FONTS.iter().map(|(name, _)| format!("/ui/fonts/{name}")));
+    files.extend(ICONS.iter().map(|(name, _, _)| format!("/ui/icons/{name}")));
+    files
 }
 
 /// The largest viewport report body the control plane reads, in bytes. The
@@ -273,6 +363,7 @@ mod tests {
         include_str!("ui/views.js"),
         include_str!("ui/crew-screen.js"),
         include_str!("ui/project-map.js"),
+        include_str!("ui/device.js"),
         include_str!("ui/main.js"),
         "\n</script>\n",
     );
@@ -380,8 +471,11 @@ mod tests {
         let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            // The service worker is served at `/sw.js`, not below `/ui/`.
             .filter(|name| {
-                (name.ends_with(".js") || name.ends_with(".css")) && name != "mermaid.min.js"
+                (name.ends_with(".js") || name.ends_with(".css"))
+                    && name != "mermaid.min.js"
+                    && name != "sw.js"
             })
             .collect();
         on_disk.sort();
@@ -400,6 +494,88 @@ mod tests {
                 "`{name}` must be in `PANE`, or the source checks do not read it"
             );
         }
+    }
+
+    #[test]
+    fn every_icon_in_the_icons_directory_is_served() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/icons");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        on_disk.sort();
+        let mut served: Vec<String> = super::ICONS
+            .iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect();
+        served.sort();
+        assert_eq!(served, on_disk);
+    }
+
+    #[test]
+    fn the_manifest_names_only_icons_the_control_plane_serves() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("ui/manifest.webmanifest")).unwrap();
+        let mut sources: Vec<&str> = manifest["icons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|icon| icon["src"].as_str().unwrap())
+            .collect();
+        for shortcut in manifest["shortcuts"].as_array().unwrap() {
+            sources.extend(
+                shortcut["icons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|icon| icon["src"].as_str().unwrap()),
+            );
+        }
+        for source in sources {
+            let name = source.strip_prefix("/ui/icons/").unwrap();
+            assert!(
+                super::ICONS.iter().any(|(served, _, _)| *served == name),
+                "{source} is not served, and a browser will not install the pane without its icons"
+            );
+        }
+        for purpose in ["any", "maskable"] {
+            assert!(
+                manifest["icons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|icon| icon["sizes"] == "512x512" && icon["purpose"] == purpose),
+                "Android installs from a 512 pixel icon of each purpose"
+            );
+        }
+    }
+
+    #[test]
+    fn the_service_worker_names_its_build_and_every_file_of_the_pane() {
+        let worker = super::service_worker_js();
+        assert!(!worker.contains("{{"), "every placeholder is written in");
+        assert!(worker.contains(&format!(
+            "const BUILD = '{}';",
+            bosun_common::version::VERSION
+        )));
+        let files = super::pane_files();
+        for path in [
+            "/",
+            "/ui",
+            "/manifest.webmanifest",
+            "/ui/main.js",
+            "/ui/pane.css",
+        ] {
+            assert!(files.iter().any(|file| file == path), "{path} is kept");
+        }
+        assert_eq!(
+            files.len(),
+            3 + super::ASSETS.len() + super::FONTS.len() + super::ICONS.len()
+        );
+        assert!(
+            !files.iter().any(|file| file == "/ui/mermaid.min.js"),
+            "the 5.5 MB bundle is kept on first use, not at install"
+        );
     }
 
     // The tests below read the pane's source text. They hold what a browser

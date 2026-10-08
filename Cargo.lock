@@ -286,6 +286,7 @@ version = "0.9.57"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bosun-agent",
  "bosun-common",
  "bosun-node",
@@ -299,6 +300,7 @@ dependencies = [
  "hyper-util",
  "image",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

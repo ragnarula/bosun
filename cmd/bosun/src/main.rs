@@ -458,6 +458,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         state.store.clone(),
         github,
     ));
+    tokio::spawn(bosun_control::push::run(state.store.clone()));
     let app = bosun_control::api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)

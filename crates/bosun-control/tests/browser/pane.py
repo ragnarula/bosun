@@ -369,17 +369,22 @@ AT_BOTTOM = """
 
 
 def new_page(browser, errors, size=PORTRAIT, stub_viewport=False, visual_viewport=True,
-             touch=True, http_errors=False, view='log', **context_options):
+             touch=True, http_errors=False, view='log', service_workers='block',
+             **context_options):
     """A phone page. `touch=False` gives a desktop page with a fine pointer.
     `http_errors=True` is for a check whose routes answer with an error
     status on purpose: the browser logs each such response to the console.
     `view` is the session view the pane opens on: the transcript checks read
-    the Log view, which is the session's own transcript."""
+    the Log view, which is the session's own transcript. The pane's service
+    worker is blocked unless `service_workers='allow'`: Playwright's routes do
+    not see a request the worker answers, and the checks hold and rewrite
+    requests through them."""
     context = browser.new_context(
         viewport={'width': size[0], 'height': size[1]},
         is_mobile=touch,
         has_touch=touch,
         device_scale_factor=3,
+        service_workers=service_workers,
         **context_options,
     )
     context.add_init_script(NO_SCROLL_ANCHORING)
@@ -2027,6 +2032,120 @@ def check_ask_records(browser, errors):
     page.context.close()
 
 
+# Lets a check hide and show the page: Chromium reports a page in a test as
+# visible whatever happens to it.
+VISIBILITY_SWITCH = """
+(() => {
+  let hidden = false;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true, get: () => (hidden ? 'hidden' : 'visible') });
+  window.setPageHidden = (value) => {
+    hidden = value;
+    document.dispatchEvent(new Event('visibilitychange'));
+  };
+})();
+"""
+
+
+def check_installable(browser, errors):
+    """The pane can be installed: its manifest names icons that load, its
+    worker keeps the build, and a pane opened with no network shows the last
+    list and says the control plane cannot be reached."""
+    # Offline, the browser logs each request that cannot leave.
+    page = new_page(browser, errors, service_workers='allow', http_errors=True)
+    open_list(page)
+    manifest = page.evaluate("""async () => {
+      const link = document.querySelector('link[rel=manifest]');
+      const manifest = await (await fetch(link.href)).json();
+      const icons = await Promise.all(manifest.icons.map(async (icon) => (await fetch(icon.src)).status));
+      return { name: manifest.name, display: manifest.display, icons };
+    }""")
+    check('the manifest names the app, a standalone window and icons that load',
+          manifest['name'] == 'Bosun' and manifest['display'] == 'standalone'
+          and manifest['icons'] and all(status == 200 for status in manifest['icons']), manifest)
+    build = page.get_attribute('meta[name=bosun-version]', 'content')
+    kept = page.evaluate("""async (build) => {
+      await navigator.serviceWorker.ready;
+      const cache = await caches.open('bosun-pane-' + build);
+      return (await cache.keys()).map((request) => new URL(request.url).pathname);
+    }""", build)
+    check('the worker keeps the page, its modules, its fonts and its icons',
+          all(path in kept for path in ['/', '/ui/main.js', '/ui/pane.css', '/ui/device.js',
+                                        '/ui/fonts/geist.woff2', '/ui/icons/icon-192.png']), kept)
+
+    # The worker controls the pages loaded after it activates.
+    page.reload()
+    page.wait_for_function('() => !!navigator.serviceWorker.controller')
+    page.wait_for_selector(SESSION_ROW)
+    page.context.set_offline(True)
+    page.reload()
+    page.wait_for_selector('#offline', state='visible')
+    rows = page.locator(SESSION_ROW).count()
+    note = page.text_content('#offline')
+    check('with no network the pane opens from the worker and shows the list it last had',
+          rows >= LIST_ROWS and 'Cannot reach the control plane' in note, (rows, note))
+    page.context.set_offline(False)
+    page.wait_for_selector('#offline', state='hidden', timeout=10000)
+    check('the note goes when the control plane answers again', True)
+    page.context.close()
+
+
+def check_polls_follow_visibility(browser, errors):
+    """A hidden pane polls nothing, and one that comes back reads the list at
+    once."""
+    page = new_page(browser, errors)
+    page.context.add_init_script(VISIBILITY_SWITCH)
+    reads = []
+    page.on('request', lambda request: reads.append(request.url)
+            if request.url.endswith('/sessions') and request.method == 'GET' else None)
+    open_list(page)
+    page.evaluate('setPageHidden(true)')
+    before = len(reads)
+    # Longer than the list's 3-second poll.
+    page.wait_for_timeout(4000)
+    check('a hidden pane does not poll the session list', len(reads) == before, len(reads) - before)
+    page.evaluate('setPageHidden(false)')
+    page.wait_for_timeout(500)
+    check('a pane that comes back reads the list at once', len(reads) > before, len(reads) - before)
+    page.context.close()
+
+
+def check_shortcuts(browser, errors):
+    """The installed app's shortcuts open the new-session sheet and the
+    Projects tab, and leave an address that reloads to the list."""
+    page = new_page(browser, errors)
+    page.goto(BASE + '/?open=new')
+    page.wait_for_selector('#new-session-form', state='visible')
+    check('the New session shortcut opens the sheet, with its query off the address',
+          'open=' not in page.url, page.url)
+    page.goto(BASE + '/?open=projects')
+    page.wait_for_selector('#projects-tab', state='visible')
+    check('the Projects shortcut opens the Projects tab', 'open=' not in page.url, page.url)
+    page.context.close()
+
+
+def check_plain_http(browser, errors):
+    """Over plain HTTP to another machine's name the pane is a page: it works,
+    registers no worker, and the notifications control says why it is off."""
+    other = browser.browser_type.launch(
+        args=['--host-resolver-rules=MAP bosun.test 127.0.0.1'])
+    try:
+        page = new_page(other, errors)
+        base = BASE.replace('127.0.0.1', 'bosun.test')
+        page.goto(base + '/')
+        page.wait_for_selector(SESSION_ROW)
+        secure = page.evaluate("() => [window.isSecureContext, 'serviceWorker' in navigator]")
+        check('a page on plain HTTP has no secure context and no worker', secure == [False, False], secure)
+        page.tap('#btn-notify')
+        page.wait_for_selector('#toast', state='visible')
+        check('the notifications control says it needs HTTPS',
+              'HTTPS' in page.text_content('#toast'), page.text_content('#toast'))
+        page.context.close()
+    finally:
+        other.close()
+
+
 CHECKS = [
     check_tail_and_read_back,
     check_ask_across_a_page_boundary,
@@ -2054,6 +2173,10 @@ CHECKS = [
     check_following,
     check_ask_records,
     check_projects,
+    check_installable,
+    check_polls_follow_visibility,
+    check_shortcuts,
+    check_plain_http,
 ]
 
 

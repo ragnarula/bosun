@@ -1,7 +1,7 @@
 // Home's session list, one card per session tree, and the poll that
 // refreshes it.
 
-import { sessionListEl, view, viewStateDot } from './dom.js';
+import { $, sessionListEl, view, viewStateDot } from './dom.js';
 import { ago, showStatus } from './common.js';
 import { updateStatusLabel } from './activity.js';
 import { markListEntry, openSession } from './history.js';
@@ -9,6 +9,7 @@ import { closeSession, opened } from './session-view.js';
 import { renderChildList, updateChildPanelDot } from './subagents.js';
 import { activityCaption, avatarOf, renderCrew, treeMembers } from './crew.js';
 import { memberName, personaLabel } from './signal.js';
+import { setBadge } from './device.js';
 
 export { refreshSessions, sessions };
 
@@ -150,15 +151,66 @@ function renderSessions() {
   }
 }
 
+// The newest list the control plane served, kept on the device so a pane
+// that opens while the control plane cannot be reached still shows it.
+const KEPT_LIST = 'bosun.sessions';
+const offlineEl = $('offline');
+
+function keepList(text) {
+  try {
+    localStorage.setItem(KEPT_LIST, JSON.stringify({ at_ms: Date.now(), text }));
+  } catch (error) {
+    // A browser that keeps nothing shows no list until it can reach the
+    // control plane.
+  }
+}
+
+// Shows the kept list, when the pane has drawn no list yet, and says that
+// the control plane cannot be reached.
+function showUnreachable() {
+  let kept = null;
+  let keptSessions = null;
+  try {
+    kept = JSON.parse(localStorage.getItem(KEPT_LIST) || 'null');
+    keptSessions = kept && JSON.parse(kept.text);
+  } catch (error) {
+    kept = null;
+  }
+  let note = 'Cannot reach the control plane.';
+  if (keptSessions && sessionListEl.hidden) {
+    sessions = keptSessions;
+    renderSessions();
+  }
+  if (kept && !sessionListEl.hidden) {
+    const at = new Date(kept.at_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    note += ' The list is from ' + at + '.';
+  }
+  offlineEl.textContent = note;
+  offlineEl.hidden = false;
+}
+
 let sessionsFetching = false;
 async function refreshSessions() {
   if (sessionsFetching) return;
   sessionsFetching = true;
+  let response;
   try {
-    const response = await fetch('/sessions');
+    response = await fetch('/sessions');
+  } catch (error) {
+    // fetch rejects only when no answer came: the control plane or the
+    // network is down.
+    showUnreachable();
+    sessionsFetching = false;
+    return;
+  }
+  try {
     if (!response.ok) throw new Error('HTTP ' + response.status);
-    sessions = await response.json();
+    const text = await response.text();
+    sessions = JSON.parse(text);
+    keepList(text);
+    offlineEl.hidden = true;
     renderSessions();
+    setBadge(sessions.filter((session) => !session.parent_id && session.asking).length);
     updateChildPanelDot();
     renderChildList();
     renderCrew();

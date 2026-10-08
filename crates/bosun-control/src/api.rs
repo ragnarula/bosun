@@ -196,6 +196,8 @@ pub enum ApiError {
     },
     #[error("failed to fetch skill repo: {0}")]
     SkillRepoFetch(#[from] SkillsFetchError),
+    #[error(transparent)]
+    PushSubscriptionInvalid(#[from] crate::push::SubscriptionError),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -249,7 +251,9 @@ impl IntoResponse for ApiError {
             // what refuses a fork.
             ApiError::NotForkable { .. } => (StatusCode::CONFLICT, Some(self.to_string())),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, Some(self.to_string())),
-            ApiError::AvatarInvalid(_) => (StatusCode::BAD_REQUEST, Some(self.to_string())),
+            ApiError::AvatarInvalid(_) | ApiError::PushSubscriptionInvalid(_) => {
+                (StatusCode::BAD_REQUEST, Some(self.to_string()))
+            }
             ApiError::SessionNotFound { .. }
             | ApiError::ProjectNotFound { .. }
             | ApiError::AvatarNotFound { .. }
@@ -569,6 +573,10 @@ const RESERVED_PATHS: &[&str] = &[
     "/",
     "/ui",
     "/ui/mermaid.min.js",
+    "/manifest.webmanifest",
+    "/sw.js",
+    "/push/key",
+    "/push/subscriptions",
     "/viewport-report",
     "/poll",
     "/nodes",
@@ -595,7 +603,7 @@ const RESERVED_PATH_PREFIXES: &[&str] = &[
 
 /// The parents the router serves any single segment below: `/ui/{asset}`
 /// matches `/ui/main.js` but not `/ui/oauth/callback`.
-const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/", "/ui/fonts/"];
+const RESERVED_SEGMENT_PARENTS: &[&str] = &["/ui/", "/ui/fonts/", "/ui/icons/"];
 
 /// The `oauth_redirect_uri` names a path the control plane cannot serve as
 /// the OAuth callback.
@@ -650,6 +658,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/mermaid.min.js", get(crate::ui::mermaid_bundle))
         .route("/ui/{asset}", get(crate::ui::asset))
         .route("/ui/fonts/{name}", get(crate::ui::font))
+        .route("/ui/icons/{name}", get(crate::ui::icon))
+        .route("/manifest.webmanifest", get(crate::ui::manifest))
+        .route("/sw.js", get(crate::ui::service_worker))
+        .route("/push/key", get(push_key))
+        .route(
+            "/push/subscriptions",
+            post(add_push_subscription).delete(remove_push_subscription),
+        )
         .route(
             "/viewport-report",
             post(crate::ui::viewport_report)
@@ -730,6 +746,48 @@ async fn add_version_header(request: Request<Body>, next: Next) -> Response {
 
 async fn not_found() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+/// The public key a browser subscribes to push notifications with.
+#[instrument(skip(state))]
+async fn push_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = crate::push::PushKey::load(&state.store).await?;
+    Ok(Json(json!({ "public_key": key.public_key() })))
+}
+
+/// Keeps a browser's push subscription, so it gets the trees' notifications.
+/// The pane's origin becomes the contact the control plane signs each message
+/// with.
+#[instrument(skip_all)]
+async fn add_push_subscription(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::push::SubscriptionBody>,
+) -> Result<StatusCode, ApiError> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let subscription = crate::push::subscription(body, origin)?;
+    state.store.add_push_subscription(&subscription).await?;
+    tracing::info!(origin = %subscription.origin, "push subscription added");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PushEndpoint {
+    endpoint: String,
+}
+
+/// Forgets a browser's push subscription. Forgetting one that is not kept
+/// succeeds too: the browser has no subscription here either way.
+#[instrument(skip_all)]
+async fn remove_push_subscription(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PushEndpoint>,
+) -> Result<StatusCode, ApiError> {
+    state.store.remove_push_subscription(&body.endpoint).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The node's one outbound control request: it reports its heartbeat payload,
@@ -11625,6 +11683,112 @@ mod tests {
             dirty,
             remote_branches: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_browser_subscribes_to_push_with_the_served_key_and_unsubscribes() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let addr = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let key: Value = client
+            .get(format!("http://{addr}/push/key"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let again: Value = client
+            .get(format!("http://{addr}/push/key"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(key, again, "every browser subscribes with the one key");
+        assert_eq!(key["public_key"].as_str().unwrap().len(), 87, "65 bytes");
+
+        let subscription = json!({
+            "endpoint": "https://push.example/send/abc",
+            "expirationTime": null,
+            "keys": { "p256dh": b64(&[[4u8].as_slice(), &[9u8; 64]].concat()), "auth": b64(&[1u8; 16]) },
+        });
+        let added = client
+            .post(format!("http://{addr}/push/subscriptions"))
+            .header("Origin", "https://pane.example")
+            .json(&subscription)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::NO_CONTENT);
+        let stored = state.store.push_subscriptions().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].origin, "https://pane.example");
+
+        let mut plain = subscription.clone();
+        plain["endpoint"] = json!("http://push.example/send/abc");
+        let refused = client
+            .post(format!("http://{addr}/push/subscriptions"))
+            .json(&plain)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let removed = client
+            .delete(format!("http://{addr}/push/subscriptions"))
+            .json(&json!({ "endpoint": "https://push.example/send/abc" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        assert!(state.store.push_subscriptions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_worker_and_the_manifest_are_served_at_the_root() {
+        let dir = tempdir().unwrap();
+        let addr = serve(test_state(&dir)).await;
+        let client = reqwest::Client::new();
+        let worker = client
+            .get(format!("http://{addr}/sw.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(worker.status(), StatusCode::OK);
+        assert!(
+            worker.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript"),
+            "a browser registers a worker only from a JavaScript type"
+        );
+        let manifest = client
+            .get(format!("http://{addr}/manifest.webmanifest"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.headers()[header::CONTENT_TYPE],
+            "application/manifest+json"
+        );
+        let icon = client
+            .get(format!("http://{addr}/ui/icons/icon-512.png"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(icon.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(
+            oauth_callback_path("https://cp.example/sw.js").is_err()
+                && oauth_callback_path("https://cp.example/ui/icons/x").is_err()
+                && oauth_callback_path("https://cp.example/push/subscriptions").is_err(),
+            "the OAuth callback cannot take a path the pane is served at"
+        );
     }
 
     #[tokio::test]
