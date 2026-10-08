@@ -57,6 +57,7 @@ use tracing::info;
 use tracing::warn;
 
 mod attach;
+mod crew;
 mod markdown;
 mod update;
 
