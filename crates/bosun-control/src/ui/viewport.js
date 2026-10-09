@@ -34,7 +34,7 @@ function syncVisualViewport() {
     // viewport itself resizes, setting body height to the layout
     // viewport's avoids a stale dynamic-viewport (dvh) value a keyboard
     // dismissal can leave behind.
-    document.body.style.height = !fieldFocused && !zoomed ? window.innerHeight + 'px' : '';
+    document.body.style.height = !fieldFocused && !zoomed ? (viewport ? viewport.height : window.innerHeight) + 'px' : '';
   } else if (viewport.height > 0 && viewport.height <= window.innerHeight) {
     document.body.style.height = viewport.height + 'px';
   }

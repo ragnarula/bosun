@@ -8,7 +8,7 @@ import { follow } from './scroll.js';
 
 export { VIEWS, currentView, setView };
 
-const VIEWS = ['chat', 'tasks', 'files', 'log'];
+const VIEWS = ['sessions', 'chat', 'tasks', 'files', 'log'];
 const VIEW_KEY = 'bosun.view';
 
 function savedView() {
@@ -26,6 +26,11 @@ function currentView() {
 
 function setView(name) {
   if (!VIEWS.includes(name)) return;
+  // The sessions tab navigates back; it is not a view to persist.
+  if (name === 'sessions') {
+    history.back();
+    return;
+  }
   view.dataset.view = name;
   for (const control of view.querySelectorAll('[data-view]')) {
     if (control === view) continue;
@@ -42,7 +47,13 @@ function setView(name) {
 }
 
 for (const control of view.querySelectorAll('button[data-view]')) {
-  control.addEventListener('click', () => setView(control.dataset.view));
+  control.addEventListener('click', () => {
+    if (control.dataset.view === 'sessions') {
+      history.back();
+      return;
+    }
+    setView(control.dataset.view);
+  });
 }
 
 setView(savedView());

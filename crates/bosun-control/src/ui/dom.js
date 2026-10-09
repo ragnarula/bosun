@@ -83,6 +83,7 @@ export {
   mcpStrip,
   mcpStripText,
   mcpTab,
+  needsYouPill,
   newSessionBtn,
   newSessionForm,
   nodeChips,
@@ -198,6 +199,7 @@ const chipPermission = $('chip-permission');
 const chipPermissionText = $('chip-permission-text');
 const crewTab = $('crew-tab');
 const projectsTab = $('projects-tab');
+const needsYouPill = $('needs-you-pill');
 
 const viewNode = $('view-node');
 const viewDir = $('view-dir');

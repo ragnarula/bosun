@@ -1,7 +1,7 @@
 // Home's session list, one card per session tree, and the poll that
 // refreshes it.
 
-import { $, sessionListEl, view, viewStateDot } from './dom.js';
+import { $, needsYouPill, sessionListEl, view, viewStateDot } from './dom.js';
 import { ago, showStatus } from './common.js';
 import { updateStatusLabel } from './activity.js';
 import { markListEntry, openSession } from './history.js';
@@ -210,6 +210,7 @@ async function refreshSessions() {
     keepList(text);
     offlineEl.hidden = true;
     renderSessions();
+    updateNeedsYouPill();
     setBadge(sessions.filter((session) => !session.parent_id && session.asking).length);
     updateChildPanelDot();
     renderChildList();
@@ -233,3 +234,32 @@ async function refreshSessions() {
     sessionsFetching = false;
   }
 }
+
+// The pill above the view tabs that names other trees that need the reader.
+function updateNeedsYouPill() {
+  if (!needsYouPill) return;
+  const roots = sessions.filter((session) => !session.parent_id);
+  const openRootId = opened
+    ? ((sessions.find((s) => s.id === opened.id) || {}).owner_id || opened.id)
+    : null;
+  const count = roots.filter((root) => root.asking && root.id !== openRootId).length;
+  if (count > 0) {
+    needsYouPill.hidden = false;
+    const label = ' ' + count + ' session' + (count !== 1 ? 's' : '')
+      + ' need' + (count === 1 ? 's' : '') + ' you';
+    // The first child is the bell icon (prepended by main.js). Replace the
+    // text node that follows it, or append one.
+    for (const child of needsYouPill.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        child.textContent = label;
+        return;
+      }
+    }
+    needsYouPill.appendChild(document.createTextNode(label));
+  } else {
+    needsYouPill.hidden = true;
+  }
+}
+
+// Tap the pill to go home: the \"Needs you\" group is at the top there.
+needsYouPill.addEventListener('click', () => history.back());

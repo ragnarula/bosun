@@ -1754,6 +1754,27 @@ main { padding: var(--space-3) var(--space-4) var(--space-4); }
 .bs-file { width: 100%; background: none; border: 0; text-align: left; color: inherit; cursor: pointer; }
 #view-tabs { flex: 0 0 auto; }
 
+/* A pill above the view tabs that says other sessions need the reader.
+   Hidden while a keyboard is up, above. */
+.needs-you-pill {
+  appearance: none;
+  border: 1px solid var(--needs-you);
+  background: var(--needs-you-wash);
+  color: var(--needs-you);
+  min-height: var(--touch-min-height);
+  padding: 0 var(--space-4);
+  margin: 0 var(--space-3) var(--space-2);
+  border-radius: var(--radius-pill);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font: 600 13px/18px var(--font-sans);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.needs-you-pill[hidden] { display: none; }
+.needs-you-pill .bs-icon { color: var(--needs-you); }
+
 /* A phone shows one view at a time. */
 #session-view[data-view="log"] #chat-view { display: none; }
 #session-view[data-view="log"] #conversation { display: flex; }
@@ -1795,7 +1816,7 @@ main { padding: var(--space-3) var(--space-4) var(--space-4); }
    the view tabs and the crew row step aside and come back with the screen.
    Focus alone does not hide them: a tap that moves the focus would move the
    layout under the finger before its click lands. */
-body.keyboard-up #view-tabs, body.keyboard-up .crew-row { display: none; }
+body.keyboard-up #view-tabs, body.keyboard-up .crew-row, body.keyboard-up .needs-you-pill { display: none; }
 .bs-session { min-width: 0; }
 .bs-session__title { overflow-wrap: anywhere; }
 #avatar-file { font-size: 16px; }
