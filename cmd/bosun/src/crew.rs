@@ -1,6 +1,6 @@
 //! The crew a session tree is drawn as in the terminal: each member's flag tag
-//! and state word, and the chat, task list and file list built from the tree
-//! stream. `bosun list` and `bosun open` both draw from here.
+//! and state word, and the threads, tree, flow, task list and file list built
+//! from the tree stream. `bosun list` and `bosun open` both draw from here.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -40,7 +40,8 @@ pub const ADDED: Color = Color::Rgb(0x4a, 0xde, 0x80);
 pub const REMOVED: Color = Color::Rgb(0xff, 0x8a, 0x8a);
 pub const BRASS: Color = Color::Rgb(0xd6, 0xa8, 0x5c);
 
-/// Chat entries kept in memory; the oldest drop when the cap is hit.
+/// Thread entries kept in memory across the whole tree; the oldest drop when
+/// the cap is hit.
 pub const MAX_CHAT_ENTRIES: usize = 5000;
 /// Changed paths kept for the Files view; the oldest change drops first.
 pub const MAX_FILES: usize = 500;
@@ -51,8 +52,8 @@ const MAX_PENDING_CALLS: usize = 256;
 pub const MAX_DIFF_LINES: usize = 6;
 /// Distinct kinds of call one folded line counts; further kinds are dropped.
 const MAX_FOLD_ITEMS: usize = 8;
-/// How far back a child's report looks for the post that already shows it.
-const REPORT_LOOKBACK: usize = 200;
+/// Rows a report, question or failure line shows before it is cut.
+const MAX_EVENT_ROWS: usize = 3;
 /// The longest shell command a folded line names.
 const FOLD_COMMAND_CHARS: usize = 40;
 /// Columns the body of a chat entry is indented under its head line.
@@ -235,6 +236,10 @@ pub fn crew_members(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateWord {
     NeedsYou,
+    /// The origin leaf of the question the root waits on.
+    AsksYou,
+    /// A session between the root and the leaf of the question it waits on.
+    Waiting,
     Working,
     WaitingOn(usize),
     /// A child that finished its turn: it has reported.
@@ -248,6 +253,8 @@ impl StateWord {
     pub fn text(self) -> Cow<'static, str> {
         match self {
             StateWord::NeedsYou => "needs you".into(),
+            StateWord::AsksYou => "asks you".into(),
+            StateWord::Waiting => "waiting".into(),
             StateWord::Working => "working".into(),
             StateWord::WaitingOn(count) => format!("waiting on {count}").into(),
             StateWord::Done => "done".into(),
@@ -258,9 +265,9 @@ impl StateWord {
 
     pub fn colour(self) -> Color {
         match self {
-            StateWord::NeedsYou => NEEDS_YOU,
+            StateWord::NeedsYou | StateWord::AsksYou => NEEDS_YOU,
             StateWord::Working | StateWord::WaitingOn(_) => WORKING,
-            StateWord::Done | StateWord::Idle => MUTED,
+            StateWord::Waiting | StateWord::Done | StateWord::Idle => MUTED,
             StateWord::Stopped => STOPPED,
         }
     }
@@ -344,14 +351,12 @@ pub fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// Who a chat entry or a task is addressed to.
+/// One side of an exchange between the reader and the agents of a tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Recipient {
+pub enum Party {
     You,
-    /// The parent of the member that wrote the entry.
-    Parent,
     Session(String),
-    /// A persona a spawn starts, before the child has an id.
+    /// A persona a spawn starts, before the result names the child.
     Persona(String),
 }
 
@@ -373,59 +378,90 @@ pub struct DiffLine {
     pub text: String,
 }
 
-/// One entry of the crew chat.
+/// How an order ended, read from the child's next event after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderOutcome {
+    Done,
+    Asked,
+    Failed,
+}
+
+impl From<ChildEventKind> for OrderOutcome {
+    fn from(kind: ChildEventKind) -> Self {
+        match kind {
+            ChildEventKind::Report => OrderOutcome::Done,
+            ChildEventKind::Ask => OrderOutcome::Asked,
+            ChildEventKind::Failure => OrderOutcome::Failed,
+        }
+    }
+}
+
+/// A `spawn` or `message_child` call: an order from a session to its child.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatEntry {
-    Post {
-        from: String,
-        to: Recipient,
-        text: String,
-        at_ms: Option<u64>,
-    },
-    You {
-        text: String,
-        at_ms: Option<u64>,
-    },
-    /// The tool calls one member made between messages, counted by kind.
-    Fold {
-        from: String,
-        items: Vec<(FoldItem, usize)>,
-    },
+pub struct Order {
+    pub call_id: String,
+    /// The child; None until the spawn's result names it.
+    pub child: Option<String>,
+    /// The persona a spawn starts.
+    pub persona: Option<String>,
+    pub text: String,
+    /// Set by the child's newest event after the order, or by a failed call.
+    pub outcome: Option<OrderOutcome>,
+}
+
+/// What one entry of a session's thread holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A user-role text: the reader's message in the root's thread, an order
+    /// from the parent in a child's.
+    Received(String),
+    /// The session's own text.
+    Text(String),
+    /// The tool calls the session made between messages, counted by kind.
+    Fold(Vec<(FoldItem, usize)>),
     Edit {
-        from: String,
         path: String,
         added: u64,
         removed: u64,
         diff: Vec<DiffLine>,
     },
+    Order(Order),
+    /// The session's own question. `raised_from` names the direct child whose
+    /// question it surfaces, and `origin` the leaf that first asked it.
     Ask {
-        from: String,
-        to: Recipient,
         message: String,
         options: Vec<String>,
+        raised_from: Option<String>,
+        origin: Option<String>,
         answer: Option<String>,
-        at_ms: Option<u64>,
     },
-    Failure {
-        from: String,
+    /// A child's report, question or failure to the session.
+    ChildEvent {
+        child: String,
+        kind: ChildEventKind,
+        text: String,
+        origin: Option<String>,
+    },
+    /// The reader's answer to a question in the root's thread, delivered to
+    /// `to`. Only the flow draws it: the thread draws the answer under its
+    /// question.
+    Answer {
+        to: String,
         text: String,
     },
     /// The reader rejected the question on screen.
     Rejected,
+    /// The session cleared its context, for the reason it gave.
+    Cleared(String),
 }
 
-impl ChatEntry {
-    /// The member that wrote the entry; None for the reader's own entries.
-    pub fn from(&self) -> Option<&str> {
-        match self {
-            ChatEntry::Post { from, .. }
-            | ChatEntry::Fold { from, .. }
-            | ChatEntry::Edit { from, .. }
-            | ChatEntry::Ask { from, .. }
-            | ChatEntry::Failure { from, .. } => Some(from),
-            ChatEntry::You { .. } | ChatEntry::Rejected => None,
-        }
-    }
+/// One entry of a session's thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The session whose thread holds the entry.
+    pub thread: String,
+    pub at_ms: Option<u64>,
+    pub kind: EntryKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,14 +566,16 @@ struct PendingCall {
     args: Value,
 }
 
-/// What the tree stream says about a crew: the chat, the task list, the files
-/// changed and each member's newest activity. Members and their states come
-/// from the session list, and the stream's state events keep them current.
+/// What the tree stream says about a crew: every member's thread, the task
+/// list, the files changed and each member's newest activity. Members and
+/// their states come from the session list, and the stream's state events
+/// keep them current.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Crew {
     pub root_id: String,
     pub members: Vec<Member>,
-    pub chat: Vec<ChatEntry>,
+    /// The entries of every thread in the tree, in stream order.
+    pub entries: Vec<Entry>,
     /// The root's streaming text, until the durable text replaces it.
     pub chat_delta: Option<String>,
     pub todos: Vec<TodoItem>,
@@ -545,6 +583,8 @@ pub struct Crew {
     pub files: Vec<FileChange>,
     pub now_edit: Option<NowEdit>,
     pub activity: HashMap<String, ActivityPhase>,
+    /// The leaf whose question the root's open surfaced ask carries.
+    question_leaf: Option<String>,
     pending: HashMap<String, PendingCall>,
 }
 
@@ -576,7 +616,12 @@ impl Crew {
                 if let Some(member) = self.members.iter_mut().find(|m| m.id == session_id) {
                     member.asking = matches!(message.block, Block::Ask { answer: None, .. });
                 }
-                self.apply_message(session_id, is_root, message, *at_ms);
+                // Any message of the root closes its open question; an open
+                // surfaced ask sets the leaf again below.
+                if is_root {
+                    self.question_leaf = None;
+                }
+                self.apply_message(session_id, message, *at_ms);
             }
             Event::Activity { phase, .. } => {
                 self.activity.insert(session_id.to_string(), phase.clone());
@@ -603,55 +648,34 @@ impl Crew {
             .push_str(text);
     }
 
-    fn apply_message(
-        &mut self,
-        session_id: &str,
-        is_root: bool,
-        message: &Message,
-        at_ms: Option<u64>,
-    ) {
-        let from = session_id.to_string();
-        let to = if is_root {
-            Recipient::You
-        } else {
-            Recipient::Parent
-        };
+    fn apply_message(&mut self, session_id: &str, message: &Message, at_ms: Option<u64>) {
+        let is_root = session_id == self.root_id;
         match (&message.role, &message.block) {
-            // A child's user text is its parent's instructions or a routed
-            // answer; the parent's call or the answered ask already shows it.
-            (Role::User, Block::Text { .. }) if !is_root => {}
-            (Role::User, Block::Text { text }) if text == USER_REJECTED_TEXT => {
-                self.push(ChatEntry::Rejected);
+            (Role::User, Block::Text { text }) if is_root && text == USER_REJECTED_TEXT => {
+                self.push(session_id, at_ms, EntryKind::Rejected);
             }
             (Role::User, Block::Text { text }) => {
-                // The reader's answer to the root's open question shows under it.
-                if let Some(ChatEntry::Ask { answer, from, .. }) = self
-                    .chat
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| !matches!(entry, ChatEntry::Fold { .. }))
-                    && answer.is_none()
-                    && *from == self.root_id
-                {
-                    *answer = Some(text.clone());
+                if self.answer_open_ask(session_id, text) {
+                    if is_root {
+                        self.push(
+                            session_id,
+                            at_ms,
+                            EntryKind::Answer {
+                                to: session_id.to_string(),
+                                text: text.clone(),
+                            },
+                        );
+                    }
                     return;
                 }
-                self.push(ChatEntry::You {
-                    text: text.clone(),
-                    at_ms,
-                });
+                self.push(session_id, at_ms, EntryKind::Received(text.clone()));
             }
             (Role::Assistant, Block::Text { text }) => {
                 if is_root {
                     self.chat_delta = None;
                 }
                 if !text.trim().is_empty() {
-                    self.push(ChatEntry::Post {
-                        from,
-                        to,
-                        text: text.clone(),
-                        at_ms,
-                    });
+                    self.push(session_id, at_ms, EntryKind::Text(text.clone()));
                 }
             }
             (_, Block::ToolCall { id, name, args, .. }) => {
@@ -671,67 +695,147 @@ impl Crew {
                 Block::Ask {
                     message,
                     options,
+                    child_id,
                     answer,
-                    ..
                 },
-            ) => {
-                if let Some(answer) = answer {
-                    // A routed answer appends the ask again with its answer.
-                    let open = self.chat.iter_mut().rev().find_map(|entry| match entry {
-                        ChatEntry::Ask {
-                            from: asker,
-                            message: asked,
-                            answer: slot @ None,
-                            ..
-                        } if *asker == from && *asked == *message => Some(slot),
-                        _ => None,
-                    });
-                    if let Some(slot) = open {
-                        *slot = Some(answer.clone());
-                        return;
-                    }
-                }
-                self.push(ChatEntry::Ask {
-                    from,
-                    to,
-                    message: message.clone(),
-                    options: options.clone(),
-                    answer: answer.clone(),
-                    at_ms,
-                });
-            }
+            ) => self.apply_ask(session_id, message, options, child_id, answer, at_ms),
             (
                 _,
                 Block::ChildEvent {
                     child_id,
                     kind,
                     text,
-                    ..
+                    origin,
                 },
-            ) => match kind {
-                ChildEventKind::Report => {
-                    let posted = self.chat.iter().rev().take(REPORT_LOOKBACK).any(|entry| {
-                        matches!(entry, ChatEntry::Post { from, text: posted, .. }
-                            if from == child_id && posted.trim() == text.trim())
-                    });
-                    if !posted {
-                        self.push(ChatEntry::Post {
-                            from: child_id.clone(),
-                            to: Recipient::Session(from),
-                            text: text.clone(),
-                            at_ms,
-                        });
+            ) => {
+                // The event follows every earlier order to the child in this
+                // thread, so each of them ends with it.
+                for entry in &mut self.entries {
+                    if let EntryKind::Order(order) = &mut entry.kind
+                        && entry.thread == session_id
+                        && order.child.as_deref() == Some(child_id.as_str())
+                    {
+                        order.outcome = Some((*kind).into());
                     }
                 }
-                // The child's own ask block shows the question.
-                ChildEventKind::Ask => {}
-                ChildEventKind::Failure => self.push(ChatEntry::Failure {
-                    from: child_id.clone(),
-                    text: text.clone(),
-                }),
-            },
+                self.push(
+                    session_id,
+                    at_ms,
+                    EntryKind::ChildEvent {
+                        child: child_id.clone(),
+                        kind: *kind,
+                        text: text.clone(),
+                        origin: origin.clone(),
+                    },
+                );
+            }
+            (_, Block::ContextCleared { reason, .. }) => {
+                self.push(session_id, at_ms, EntryKind::Cleared(reason.clone()));
+            }
             _ => {}
         }
+    }
+
+    /// Fills the thread's open question with `text` when the question is the
+    /// thread's newest entry and the session asked it itself. A surfaced
+    /// question is answered by the store, not by a text in this thread.
+    fn answer_open_ask(&mut self, thread: &str, text: &str) -> bool {
+        let newest = self
+            .entries
+            .iter_mut()
+            .rev()
+            .filter(|entry| entry.thread == thread)
+            .find(|entry| !matches!(entry.kind, EntryKind::Fold(_)));
+        let Some(Entry {
+            kind:
+                EntryKind::Ask {
+                    raised_from: None,
+                    answer: slot @ None,
+                    ..
+                },
+            ..
+        }) = newest
+        else {
+            return false;
+        };
+        *slot = Some(text.to_string());
+        true
+    }
+
+    fn apply_ask(
+        &mut self,
+        thread: &str,
+        message: &str,
+        options: &[String],
+        child_id: &Option<String>,
+        answer: &Option<String>,
+        at_ms: Option<u64>,
+    ) {
+        let is_root = thread == self.root_id;
+        if let Some(answer) = answer {
+            // The store records a routed answer by appending the answered ask
+            // again; it fills the open one.
+            let open = self
+                .entries
+                .iter_mut()
+                .rev()
+                .find_map(|entry| match &mut entry.kind {
+                    EntryKind::Ask {
+                        message: asked,
+                        answer: slot @ None,
+                        origin,
+                        ..
+                    } if entry.thread == thread && asked == message => Some((slot, origin.clone())),
+                    _ => None,
+                });
+            if let Some((slot, origin)) = open {
+                *slot = Some(answer.clone());
+                if is_root {
+                    self.push(
+                        thread,
+                        at_ms,
+                        EntryKind::Answer {
+                            to: origin.unwrap_or_else(|| thread.to_string()),
+                            text: answer.clone(),
+                        },
+                    );
+                }
+                return;
+            }
+        }
+        // A surfaced question carries the origin of the child's ask event
+        // that raised it.
+        let origin = child_id.as_ref().map(|child| {
+            self.entries
+                .iter()
+                .rev()
+                .find_map(|entry| match &entry.kind {
+                    EntryKind::ChildEvent {
+                        child: from,
+                        kind: ChildEventKind::Ask,
+                        origin,
+                        ..
+                    } if entry.thread == thread && from == child => {
+                        Some(origin.clone().unwrap_or_else(|| child.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| child.clone())
+        });
+        if is_root && answer.is_none() {
+            self.question_leaf = origin.clone();
+        }
+        self.push(
+            thread,
+            at_ms,
+            EntryKind::Ask {
+                message: message.to_string(),
+                options: options.to_vec(),
+                raised_from: child_id.clone(),
+                origin,
+                answer: answer.clone(),
+            },
+        );
     }
 
     fn apply_call(
@@ -742,21 +846,30 @@ impl Crew {
         args: &Value,
         at_ms: Option<u64>,
     ) {
-        let from = session_id.to_string();
         let text = |key: &str| args[key].as_str().unwrap_or_default().to_string();
         match name {
-            "spawn" => self.push(ChatEntry::Post {
-                from,
-                to: Recipient::Persona(text("persona")),
-                text: text("instructions"),
+            "spawn" => self.push(
+                session_id,
                 at_ms,
-            }),
-            "message_child" => self.push(ChatEntry::Post {
-                from,
-                to: Recipient::Session(text("id")),
-                text: text("text"),
+                EntryKind::Order(Order {
+                    call_id: id.to_string(),
+                    child: None,
+                    persona: Some(text("persona")),
+                    text: text("instructions"),
+                    outcome: None,
+                }),
+            ),
+            "message_child" => self.push(
+                session_id,
                 at_ms,
-            }),
+                EntryKind::Order(Order {
+                    call_id: id.to_string(),
+                    child: Some(text("id")),
+                    persona: None,
+                    text: text("text"),
+                    outcome: None,
+                }),
+            ),
             "edit" | "file_write" => {
                 let key = call_key(session_id, id);
                 let written = if name == "edit" {
@@ -765,7 +878,7 @@ impl Crew {
                     text("content")
                 };
                 self.now_edit = Some(NowEdit {
-                    by: from.clone(),
+                    by: session_id.to_string(),
                     path: text("path"),
                     tail: last_lines(&written, 2),
                     finished: false,
@@ -777,14 +890,14 @@ impl Crew {
                 self.pending.insert(
                     key,
                     PendingCall {
-                        by: from,
+                        by: session_id.to_string(),
                         name: name.to_string(),
                         args: args.clone(),
                     },
                 );
             }
             "ask" => {}
-            _ => self.fold(from, fold_item(name, args)),
+            _ => self.fold(session_id, fold_item(name, args)),
         }
     }
 
@@ -798,6 +911,30 @@ impl Crew {
         at_ms: Option<u64>,
     ) {
         match name {
+            // A spawn's result names the child its order went to; a failed
+            // call means the order never reached a child.
+            "spawn" | "message_child" => {
+                let order = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find_map(|entry| match &mut entry.kind {
+                        EntryKind::Order(order)
+                            if entry.thread == session_id && order.call_id == id =>
+                        {
+                            Some(order)
+                        }
+                        _ => None,
+                    });
+                let Some(order) = order else {
+                    return;
+                };
+                if is_error {
+                    order.outcome = Some(OrderOutcome::Failed);
+                } else if name == "spawn" {
+                    order.child = content["child_id"].as_str().map(str::to_string);
+                }
+            }
             "edit" | "file_write" => {
                 let key = call_key(session_id, id);
                 let Some(call) = self.pending.remove(&key) else {
@@ -823,13 +960,16 @@ impl Crew {
                 } else {
                     Vec::new()
                 };
-                self.push(ChatEntry::Edit {
-                    from: call.by.clone(),
-                    path: path.clone(),
-                    added,
-                    removed,
-                    diff: diff.clone(),
-                });
+                self.push(
+                    &call.by,
+                    at_ms,
+                    EntryKind::Edit {
+                        path: path.clone(),
+                        added,
+                        removed,
+                        diff: diff.clone(),
+                    },
+                );
                 self.record_file(FileChange {
                     path,
                     op: if created {
@@ -896,21 +1036,20 @@ impl Crew {
         self.files.truncate(MAX_FILES);
     }
 
-    /// Counts a tool call into the member's folded line. Only the folded
-    /// lines after the newest message are searched, so a message from anyone
-    /// starts a new line.
-    fn fold(&mut self, from: String, item: FoldItem) {
-        for entry in self.chat.iter_mut().rev() {
-            let ChatEntry::Fold {
-                from: folder,
-                items,
-            } = entry
-            else {
-                break;
-            };
-            if *folder != from {
-                continue;
-            }
+    /// Counts a tool call into the thread's folded line. Only a folded line
+    /// that is the thread's newest entry counts it, so any other entry of the
+    /// thread starts a new line.
+    fn fold(&mut self, thread: &str, item: FoldItem) {
+        let newest = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.thread == thread);
+        if let Some(Entry {
+            kind: EntryKind::Fold(items),
+            ..
+        }) = newest
+        {
             if let Some((_, count)) = items.iter_mut().find(|(kind, _)| *kind == item) {
                 *count += 1;
             } else if items.len() < MAX_FOLD_ITEMS {
@@ -918,18 +1057,290 @@ impl Crew {
             }
             return;
         }
-        self.push(ChatEntry::Fold {
-            from,
-            items: vec![(item, 1)],
-        });
+        self.push(thread, None, EntryKind::Fold(vec![(item, 1)]));
     }
 
-    fn push(&mut self, entry: ChatEntry) {
-        if self.chat.len() >= MAX_CHAT_ENTRIES {
-            self.chat.remove(0);
+    fn push(&mut self, thread: &str, at_ms: Option<u64>, kind: EntryKind) {
+        if self.entries.len() >= MAX_CHAT_ENTRIES {
+            self.entries.remove(0);
         }
-        self.chat.push(entry);
+        self.entries.push(Entry {
+            thread: thread.to_string(),
+            at_ms,
+            kind,
+        });
     }
+}
+
+/// Whether `entry` belongs in the thread of session `id`: the session's own
+/// entries, and its reports and failures, which sit in its parent's thread.
+/// Its questions are its own ask entries, so the parent's copy is left out.
+fn in_thread(id: &str, entry: &Entry) -> bool {
+    entry.thread == id
+        || matches!(&entry.kind, EntryKind::ChildEvent { child, kind, .. }
+            if child == id && *kind != ChildEventKind::Ask)
+}
+
+/// The entries the thread of session `id` draws, oldest first.
+pub fn thread_entries<'a>(crew: &'a Crew, id: &'a str) -> impl Iterator<Item = &'a Entry> {
+    crew.entries
+        .iter()
+        .filter(move |entry| in_thread(id, entry))
+}
+
+/// The sessions from `id` up its `parent_id` chain to the root, `id` first.
+/// A chain longer than the crew is cut there, so a loop in the list ends.
+pub fn path_to_root(members: &[Member], id: &str) -> Vec<String> {
+    let mut path = vec![id.to_string()];
+    while path.len() <= members.len() {
+        let current = path.last().map(String::as_str).unwrap_or_default();
+        let Some(parent) = members
+            .iter()
+            .find(|member| member.id == current)
+            .and_then(|member| member.parent_id.clone())
+        else {
+            break;
+        };
+        path.push(parent);
+    }
+    path
+}
+
+/// The sessions a surfaced question climbs while the root waits on it: the
+/// origin leaf first, the root last. Empty when the root waits on none.
+pub fn question_path(crew: &Crew) -> Vec<String> {
+    crew.question_leaf
+        .as_deref()
+        .map(|leaf| path_to_root(&crew.members, leaf))
+        .unwrap_or_default()
+}
+
+/// A member's state word in the tree. While the root waits on a surfaced
+/// question, its origin leaf asks you and each session between them waits.
+pub fn crew_word(crew: &Crew, member: &Member) -> StateWord {
+    let path = question_path(crew);
+    if path.len() > 1 {
+        if path[0] == member.id {
+            return StateWord::AsksYou;
+        }
+        if path[1..path.len() - 1].contains(&member.id) {
+            return StateWord::Waiting;
+        }
+    }
+    state_word(member)
+}
+
+/// What an order row shows after the child's tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderState {
+    /// A spawn whose child the session list does not show yet.
+    Starting,
+    /// The child's live state, until its next event.
+    Live(StateWord),
+    Ended(OrderOutcome),
+}
+
+impl OrderState {
+    pub fn text(self) -> Cow<'static, str> {
+        match self {
+            OrderState::Starting => "starting".into(),
+            OrderState::Live(word) => word.text(),
+            OrderState::Ended(OrderOutcome::Done) => "done".into(),
+            OrderState::Ended(OrderOutcome::Asked) => "asked".into(),
+            OrderState::Ended(OrderOutcome::Failed) => "failed".into(),
+        }
+    }
+
+    pub fn colour(self) -> Color {
+        match self {
+            OrderState::Starting => WORKING,
+            OrderState::Live(word) => word.colour(),
+            OrderState::Ended(OrderOutcome::Done) => MUTED,
+            OrderState::Ended(OrderOutcome::Asked) => NEEDS_YOU,
+            OrderState::Ended(OrderOutcome::Failed) => STOPPED,
+        }
+    }
+}
+
+pub fn order_state(crew: &Crew, order: &Order) -> OrderState {
+    if let Some(outcome) = order.outcome {
+        return OrderState::Ended(outcome);
+    }
+    match order.child.as_deref().and_then(|id| crew.member(id)) {
+        Some(member) => OrderState::Live(crew_word(crew, member)),
+        None => OrderState::Starting,
+    }
+}
+
+/// The child an order went to, or the persona a spawn starts.
+fn order_party(order: &Order) -> Party {
+    match (&order.child, &order.persona) {
+        (Some(child), _) => Party::Session(child.clone()),
+        (None, Some(persona)) => Party::Persona(persona.clone()),
+        (None, None) => Party::Persona("agent".into()),
+    }
+}
+
+/// What passes between two parties of a tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowKind {
+    Order,
+    Report,
+    /// A child's question to its parent.
+    Ask,
+    Failure,
+    /// The root's question to the reader.
+    Question,
+    Answer,
+}
+
+impl FlowKind {
+    fn label(self) -> &'static str {
+        match self {
+            FlowKind::Order => "order",
+            FlowKind::Report => "reported",
+            FlowKind::Ask => "asked",
+            FlowKind::Failure => "failed",
+            FlowKind::Question => "asks",
+            FlowKind::Answer => "answer",
+        }
+    }
+}
+
+impl From<ChildEventKind> for FlowKind {
+    fn from(kind: ChildEventKind) -> Self {
+        match kind {
+            ChildEventKind::Report => FlowKind::Report,
+            ChildEventKind::Ask => FlowKind::Ask,
+            ChildEventKind::Failure => FlowKind::Failure,
+        }
+    }
+}
+
+/// One order, report, question, answer or failure in a tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowItem<'a> {
+    pub from: Party,
+    pub to: Party,
+    pub kind: FlowKind,
+    pub text: &'a str,
+    pub at_ms: Option<u64>,
+}
+
+/// Everything that passed between the parties of the tree, newest first.
+pub fn flow(crew: &Crew) -> Vec<FlowItem<'_>> {
+    crew.entries
+        .iter()
+        .rev()
+        .filter_map(|entry| {
+            let owner = || Party::Session(entry.thread.clone());
+            let (from, to, kind, text) = match &entry.kind {
+                EntryKind::Order(order) => {
+                    (owner(), order_party(order), FlowKind::Order, &order.text)
+                }
+                EntryKind::ChildEvent {
+                    child, kind, text, ..
+                } => (Party::Session(child.clone()), owner(), (*kind).into(), text),
+                EntryKind::Ask { message, .. } if entry.thread == crew.root_id => {
+                    (owner(), Party::You, FlowKind::Question, message)
+                }
+                EntryKind::Answer { to, text } => (
+                    Party::You,
+                    Party::Session(to.clone()),
+                    FlowKind::Answer,
+                    text,
+                ),
+                _ => return None,
+            };
+            Some(FlowItem {
+                from,
+                to,
+                kind,
+                text: text.as_str(),
+                at_ms: entry.at_ms,
+            })
+        })
+        .collect()
+}
+
+/// The newest order a member received or report it sent; for the root, the
+/// reader's newest message.
+pub fn newest_exchange<'a>(crew: &'a Crew, id: &str) -> Option<(FlowKind, &'a str)> {
+    let is_root = id == crew.root_id;
+    crew.entries
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Order(order) if order.child.as_deref() == Some(id) => {
+                Some((FlowKind::Order, order.text.as_str()))
+            }
+            EntryKind::ChildEvent {
+                child, kind, text, ..
+            } if child == id => Some(((*kind).into(), text.as_str())),
+            EntryKind::Received(text) if is_root && entry.thread == id => {
+                Some((FlowKind::Order, text.as_str()))
+            }
+            _ => None,
+        })
+}
+
+/// One member's row in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNode {
+    pub id: String,
+    /// The root is at depth 0, under the reader.
+    pub depth: usize,
+    /// The connector lines before the member's tag.
+    pub lead: String,
+    /// The connector lines before the rows drawn under the member.
+    pub under: String,
+}
+
+/// The crew as a tree: the root, then each member under its `parent_id`,
+/// siblings in the order the crew lists them. A member whose parent is not in
+/// the crew hangs under the root. Empty until the session list names the root.
+pub fn tree_order(crew: &Crew) -> Vec<TreeNode> {
+    let Some(root) = crew.member(&crew.root_id) else {
+        return Vec::new();
+    };
+    let parent_of = |member: &Member| -> String {
+        match &member.parent_id {
+            Some(parent) if crew.member(parent).is_some() => parent.clone(),
+            _ => crew.root_id.clone(),
+        }
+    };
+    let mut nodes = Vec::new();
+    let mut seen = vec![root.id.clone()];
+    // Each frame is a member, its depth, the lines its ancestors draw, and
+    // whether it is the last of its siblings.
+    let mut stack: Vec<(&Member, usize, String, bool)> = vec![(root, 0, String::new(), true)];
+    while let Some((member, depth, ancestors, last)) = stack.pop() {
+        let (branch, rest) = if last {
+            ("└─ ", "   ")
+        } else {
+            ("├─ ", "│  ")
+        };
+        nodes.push(TreeNode {
+            id: member.id.clone(),
+            depth,
+            lead: format!("{ancestors}{branch}"),
+            under: format!("{ancestors}{rest}"),
+        });
+        let children: Vec<&Member> = crew
+            .members
+            .iter()
+            .filter(|child| child.id != crew.root_id && parent_of(child) == member.id)
+            .filter(|child| !seen.contains(&child.id))
+            .collect();
+        seen.extend(children.iter().map(|child| child.id.clone()));
+        let count = children.len();
+        let ancestors = format!("{ancestors}{rest}");
+        // Pushed in reverse so the first child is drawn first.
+        for (index, child) in children.into_iter().enumerate().rev() {
+            stack.push((child, depth + 1, ancestors.clone(), index + 1 == count));
+        }
+    }
+    nodes
 }
 
 /// Tool call ids come from the provider, so the session is part of the key.
@@ -1083,52 +1494,73 @@ fn who(crew: &Crew, id: &str) -> (String, String) {
     }
 }
 
-fn recipient_name(crew: &Crew, from: &str, to: &Recipient) -> String {
-    match to {
-        Recipient::You => "You".into(),
-        Recipient::Parent => crew
-            .member(from)
-            .and_then(|member| member.parent_id.as_deref())
-            .map_or_else(|| "parent".into(), |parent| who(crew, parent).1),
-        Recipient::Session(id) => who(crew, id).1,
-        Recipient::Persona(persona) => display_name(persona),
+fn party_name(crew: &Crew, party: &Party) -> String {
+    match party {
+        Party::You => "You".into(),
+        Party::Session(id) => who(crew, id).1,
+        Party::Persona(persona) => display_name(persona),
     }
+}
+
+/// A party's tag and name, or "You" for the reader.
+fn party_spans(crew: &Crew, party: &Party, colour: Option<Color>) -> Vec<Span<'static>> {
+    let bold = colour
+        .map_or_else(Style::default, |colour| Style::default().fg(colour))
+        .add_modifier(Modifier::BOLD);
+    match party {
+        Party::You => vec![Span::styled(
+            "You",
+            Style::default().fg(BRASS).add_modifier(Modifier::BOLD),
+        )],
+        Party::Session(id) => {
+            let (persona, name) = who(crew, id);
+            vec![tag_span(&persona), Span::raw(" "), Span::styled(name, bold)]
+        }
+        Party::Persona(persona) => vec![
+            tag_span(persona),
+            Span::raw(" "),
+            Span::styled(display_name(persona), bold),
+        ],
+    }
+}
+
+/// The party a session's questions and reports go to: the reader for the
+/// root, the parent for a child.
+fn upward(crew: &Crew, id: &str) -> Party {
+    if id == crew.root_id {
+        return Party::You;
+    }
+    crew.member(id)
+        .and_then(|member| member.parent_id.clone())
+        .map_or(Party::Persona("parent".into()), Party::Session)
+}
+
+/// The names from the root down to member `id`: "Lead › Builder".
+pub fn member_path(crew: &Crew, id: &str) -> String {
+    let mut path = path_to_root(&crew.members, id);
+    path.reverse();
+    path.iter()
+        .map(|id| who(crew, id).1)
+        .collect::<Vec<_>>()
+        .join(" › ")
 }
 
 fn dim() -> Style {
     Style::default().fg(MUTED)
 }
 
-/// `<tag> <Name> → <To> · HH:MM`.
+/// `<from> → <to> · HH:MM`, or `<from> · HH:MM` with no recipient.
 fn head_line(
     crew: &Crew,
-    from: &str,
-    to: &Recipient,
+    from: &Party,
+    to: Option<&Party>,
     at_ms: Option<u64>,
     colour: Option<Color>,
 ) -> TuiLine<'static> {
-    let (persona, name) = who(crew, from);
-    let name_style = colour.map_or_else(
-        || Style::default().add_modifier(Modifier::BOLD),
-        |colour| Style::default().fg(colour).add_modifier(Modifier::BOLD),
-    );
-    let mut spans = vec![
-        tag_span(&persona),
-        Span::raw(" "),
-        Span::styled(name, name_style),
-        Span::styled(format!(" → {}", recipient_name(crew, from, to)), dim()),
-    ];
-    if let Some(time) = at_ms.and_then(clock) {
-        spans.push(Span::styled(format!(" · {time}"), dim()));
+    let mut spans = party_spans(crew, from, colour);
+    if let Some(to) = to {
+        spans.push(Span::styled(format!(" → {}", party_name(crew, to)), dim()));
     }
-    TuiLine::from(spans)
-}
-
-fn you_head(at_ms: Option<u64>) -> TuiLine<'static> {
-    let mut spans = vec![Span::styled(
-        "You",
-        Style::default().fg(BRASS).add_modifier(Modifier::BOLD),
-    )];
     if let Some(time) = at_ms.and_then(clock) {
         spans.push(Span::styled(format!(" · {time}"), dim()));
     }
@@ -1141,6 +1573,34 @@ fn body_lines(text: &str, width: usize, style: Style) -> Vec<TuiLine<'static>> {
     wrap_text(text, inner)
         .into_iter()
         .map(|row| TuiLine::from(vec![Span::raw(CHAT_INDENT), Span::styled(row, style)]))
+        .collect()
+}
+
+/// `lead` and `text` on one line, wrapped to `width` and cut to
+/// `MAX_EVENT_ROWS` rows, the last cut row ending in '…'.
+fn short_lines(
+    lead: Vec<Span<'static>>,
+    text: &str,
+    width: usize,
+    style: Style,
+) -> Vec<TuiLine<'static>> {
+    let lead_width: usize = lead.iter().map(|span| span.content.chars().count()).sum();
+    let inner = width.saturating_sub(lead_width).max(1);
+    let mut rows = wrap_text(text, inner);
+    if rows.len() > MAX_EVENT_ROWS {
+        rows.truncate(MAX_EVENT_ROWS);
+        if let Some(last) = rows.last_mut() {
+            *last = format!("{}…", clip(last, inner.saturating_sub(1).max(1)));
+        }
+    }
+    let pad = " ".repeat(lead_width);
+    let mut lead = Some(lead);
+    rows.into_iter()
+        .map(|row| {
+            let mut spans = lead.take().unwrap_or_else(|| vec![Span::raw(pad.clone())]);
+            spans.push(Span::styled(row, style));
+            TuiLine::from(spans)
+        })
         .collect()
 }
 
@@ -1172,70 +1632,135 @@ fn counts_spans(added: u64, removed: u64) -> Vec<Span<'static>> {
     ]
 }
 
-/// The Chat view: every entry, or only `filter`'s when a member is picked,
-/// wrapped to `width`, with the root's streaming text last.
-pub fn chat_lines(crew: &Crew, filter: Option<&str>, width: usize) -> Vec<TuiLine<'static>> {
+/// The first non-blank line of `text`.
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+}
+
+/// One order row: `→ <tag> <Child>  <first line>  <state>`.
+fn order_line(crew: &Crew, order: &Order, width: usize) -> TuiLine<'static> {
+    let state = order_state(crew, order);
+    let mut spans = vec![Span::styled(format!("{CHAT_INDENT}→ "), dim())];
+    spans.extend(party_spans(crew, &order_party(order), None));
+    let state_text = state.text().into_owned();
+    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let room = width
+        .saturating_sub(used + state_text.chars().count() + 4)
+        .max(1);
+    spans.push(Span::raw(format!(
+        "  {}  ",
+        clip(first_line(&order.text), room)
+    )));
+    spans.push(Span::styled(
+        state_text,
+        Style::default().fg(state.colour()),
+    ));
+    clip_spans(spans, width)
+}
+
+/// The Chat view: the root's thread, with its streaming text last.
+pub fn chat_lines(crew: &Crew, width: usize) -> Vec<TuiLine<'static>> {
+    thread_lines(crew, &crew.root_id, width)
+}
+
+/// A session's thread, wrapped to `width`: the orders it received, its text,
+/// edits and folded tool calls, its questions with their answers, its orders
+/// to its children with their state, and the reports between it and them.
+/// The root's thread is the Chat: its received texts are the reader's.
+pub fn thread_lines(crew: &Crew, id: &str, width: usize) -> Vec<TuiLine<'static>> {
+    let is_root = id == crew.root_id;
+    let me = Party::Session(id.to_string());
+    let up = upward(crew, id);
     let mut lines = Vec::new();
-    let text_style = Style::default();
-    for entry in &crew.chat {
-        if let Some(filter) = filter
-            && entry.from() != Some(filter)
-        {
-            continue;
-        }
-        match entry {
-            ChatEntry::Post {
-                from,
-                to,
-                text,
-                at_ms,
-            } => {
+    for entry in thread_entries(crew, id) {
+        let at_ms = entry.at_ms;
+        match &entry.kind {
+            EntryKind::Received(text) => {
                 lines.push(TuiLine::default());
-                lines.push(head_line(crew, from, to, *at_ms, None));
-                lines.extend(body_lines(text, width, text_style));
+                let head = if is_root {
+                    head_line(crew, &Party::You, None, at_ms, None)
+                } else {
+                    head_line(crew, &up, Some(&me), at_ms, None)
+                };
+                lines.push(head);
+                lines.extend(body_lines(text, width, Style::default()));
             }
-            ChatEntry::You { text, at_ms } => {
+            EntryKind::Text(text) => {
                 lines.push(TuiLine::default());
-                lines.push(you_head(*at_ms));
-                lines.extend(body_lines(text, width, text_style));
+                lines.push(head_line(crew, &me, None, at_ms, None));
+                lines.extend(body_lines(text, width, Style::default()));
             }
-            ChatEntry::Fold { from, items } => {
-                let (persona, _) = who(crew, from);
-                let text = clip(&fold_text(items), width.saturating_sub(3).max(1));
+            EntryKind::Fold(items) => {
+                let text = clip(
+                    &fold_text(items),
+                    width.saturating_sub(CHAT_INDENT.len()).max(1),
+                );
                 lines.push(TuiLine::from(vec![
-                    tag_span(&persona),
-                    Span::raw(" "),
+                    Span::raw(CHAT_INDENT),
                     Span::styled(text, dim()),
                 ]));
             }
-            ChatEntry::Edit {
-                from,
+            EntryKind::Edit {
                 path,
                 added,
                 removed,
                 diff,
             } => {
-                let (persona, _) = who(crew, from);
                 let mut spans = vec![
-                    tag_span(&persona),
-                    Span::raw(" "),
+                    Span::raw(CHAT_INDENT),
                     Span::styled(format!("✎ {path}  "), Style::default().fg(ACCENT)),
                 ];
                 spans.extend(counts_spans(*added, *removed));
                 lines.push(TuiLine::from(spans));
                 lines.extend(diff_lines(diff, width));
             }
-            ChatEntry::Ask {
-                from,
-                to,
+            EntryKind::Order(order) => lines.push(order_line(crew, order, width)),
+            EntryKind::ChildEvent {
+                child, kind, text, ..
+            } => {
+                // In this thread a child reports to the session; in the
+                // child's own thread the session is the child.
+                let (from, to) = if entry.thread == id {
+                    (Party::Session(child.clone()), me.clone())
+                } else {
+                    (me.clone(), Party::Session(entry.thread.clone()))
+                };
+                let style = if *kind == ChildEventKind::Failure {
+                    Style::default().fg(STOPPED)
+                } else {
+                    dim()
+                };
+                let (persona, name) = match &from {
+                    Party::Session(from) => who(crew, from),
+                    _ => ("agent".into(), party_name(crew, &from)),
+                };
+                let verb = match kind {
+                    ChildEventKind::Report => {
+                        format!(" {name} reported to {}: ", party_name(crew, &to))
+                    }
+                    ChildEventKind::Ask => format!(" {name} asked {}: ", party_name(crew, &to)),
+                    ChildEventKind::Failure => format!(" {name} failed: "),
+                };
+                lines.extend(short_lines(
+                    vec![tag_span(&persona), Span::styled(verb, style)],
+                    text,
+                    width,
+                    style,
+                ));
+            }
+            EntryKind::Ask {
                 message,
                 options,
+                origin,
                 answer,
-                at_ms,
+                ..
             } => {
                 let amber = Style::default().fg(NEEDS_YOU);
                 lines.push(TuiLine::default());
-                lines.push(head_line(crew, from, to, *at_ms, Some(NEEDS_YOU)));
+                lines.push(head_line(crew, &me, Some(&up), at_ms, Some(NEEDS_YOU)));
                 lines.extend(body_lines(&format!("? {message}"), width, amber));
                 if !options.is_empty() {
                     let choices = options
@@ -1245,35 +1770,57 @@ pub fn chat_lines(crew: &Crew, filter: Option<&str>, width: usize) -> Vec<TuiLin
                         .join(" ");
                     lines.extend(body_lines(&choices, width, amber));
                 }
+                if let Some(leaf) = origin {
+                    let mut route: Vec<String> = path_to_root(&crew.members, leaf)
+                        .iter()
+                        .take_while(|step| *step != id)
+                        .map(|step| who(crew, step).1)
+                        .collect();
+                    route.push(who(crew, id).1);
+                    route.push(party_name(crew, &up));
+                    let leaf_name = who(crew, leaf).1;
+                    lines.extend(body_lines(
+                        &format!("asked by {leaf_name} · {}", route.join(" › ")),
+                        width,
+                        dim(),
+                    ));
+                    if is_root && answer.is_none() {
+                        lines.extend(body_lines(
+                            &format!("your answer goes to {leaf_name} word for word"),
+                            width,
+                            dim(),
+                        ));
+                    }
+                }
                 if let Some(answer) = answer {
-                    lines.push(you_head(None));
-                    lines.extend(body_lines(answer, width, text_style));
+                    let head = if is_root {
+                        head_line(crew, &Party::You, None, None, None)
+                    } else {
+                        TuiLine::from(Span::styled("Answer", dim().add_modifier(Modifier::BOLD)))
+                    };
+                    lines.push(head);
+                    lines.extend(body_lines(answer, width, Style::default()));
                 }
             }
-            ChatEntry::Failure { from, text } => {
-                let (persona, name) = who(crew, from);
-                let red = Style::default().fg(STOPPED);
-                lines.push(TuiLine::from(vec![
-                    tag_span(&persona),
-                    Span::raw(" "),
-                    Span::styled(format!("{name} failed"), red.add_modifier(Modifier::BOLD)),
-                ]));
-                lines.extend(body_lines(text, width, red));
-            }
-            ChatEntry::Rejected => {
+            EntryKind::Answer { .. } => {}
+            EntryKind::Rejected => {
                 lines.push(TuiLine::from(Span::styled(
                     "  ~ you rejected the question",
                     dim(),
                 )));
             }
+            EntryKind::Cleared(reason) => {
+                lines.push(TuiLine::from(Span::styled(
+                    clip(&format!("── context cleared: {reason}"), width.max(1)),
+                    dim(),
+                )));
+            }
         }
     }
-    if let Some(delta) = &crew.chat_delta
-        && filter.is_none_or(|filter| filter == crew.root_id)
-    {
+    if is_root && let Some(delta) = &crew.chat_delta {
         lines.push(TuiLine::default());
-        lines.push(head_line(crew, &crew.root_id, &Recipient::You, None, None));
-        lines.extend(body_lines(delta, width, text_style));
+        lines.push(head_line(crew, &me, None, None, None));
+        lines.extend(body_lines(delta, width, Style::default()));
     }
     if lines.first().is_some_and(|line| line.spans.is_empty()) {
         lines.remove(0);
@@ -1281,15 +1828,94 @@ pub fn chat_lines(crew: &Crew, filter: Option<&str>, width: usize) -> Vec<TuiLin
     lines
 }
 
+/// The Crew view: the tree under "You", each member as its tag, name, state
+/// word and caption with its newest order or report under it, `picked`
+/// marked; then the flow between the parties, newest first.
+pub fn crew_lines(crew: &Crew, picked: &str, width: usize) -> Vec<TuiLine<'static>> {
+    let heading = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let mut lines = vec![TuiLine::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "You",
+            Style::default().fg(BRASS).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    for node in tree_order(crew) {
+        let Some(member) = crew.member(&node.id) else {
+            continue;
+        };
+        let is_picked = node.id == picked;
+        let marker = if is_picked { "› " } else { "  " };
+        let mut spans = vec![
+            Span::styled(marker, Style::default().fg(ACCENT)),
+            Span::styled(node.lead.clone(), dim()),
+        ];
+        let name_style = if is_picked {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        spans.push(tag_span(&member.persona));
+        spans.push(Span::styled(format!(" {} ", member.name), name_style));
+        spans.extend(word_spans(crew, member, true));
+        lines.push(clip_spans(spans, width));
+        if let Some((kind, text)) = newest_exchange(crew, &node.id) {
+            lines.push(clip_spans(
+                vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{}   ", node.under), dim()),
+                    Span::styled(format!("{}: {}", kind.label(), first_line(text)), dim()),
+                ],
+                width,
+            ));
+        }
+    }
+    lines.push(TuiLine::default());
+    lines.push(TuiLine::from(Span::styled("FLOW", heading)));
+    let items = flow(crew);
+    if items.is_empty() {
+        lines.push(TuiLine::from(Span::styled(
+            "nothing between agents yet",
+            dim(),
+        )));
+    }
+    for item in items {
+        let style = match item.kind {
+            FlowKind::Failure => Style::default().fg(STOPPED),
+            FlowKind::Question | FlowKind::Ask => Style::default().fg(NEEDS_YOU),
+            _ => dim(),
+        };
+        let mut spans = party_spans(crew, &item.from, None);
+        spans.push(Span::styled(" → ", dim()));
+        spans.extend(party_spans(crew, &item.to, None));
+        if let Some(time) = item.at_ms.and_then(clock) {
+            spans.push(Span::styled(format!(" · {time}"), dim()));
+        }
+        spans.push(Span::styled(
+            format!("  {}: {}", item.kind.label(), first_line(item.text)),
+            style,
+        ));
+        lines.push(clip_spans(spans, width));
+    }
+    lines
+}
+
 /// A member's tag, state word and caption, as the crew line and the Tasks
 /// view show them.
 fn member_spans(crew: &Crew, member: &Member, caption: bool) -> Vec<Span<'static>> {
-    let word = state_word(member);
-    let mut spans = vec![
-        tag_span(&member.persona),
-        Span::raw(" "),
-        Span::styled(word.text().into_owned(), Style::default().fg(word.colour())),
-    ];
+    let mut spans = vec![tag_span(&member.persona), Span::raw(" ")];
+    spans.extend(word_spans(crew, member, caption));
+    spans
+}
+
+/// A member's state word in the tree, then what it is doing while it works
+/// when `caption` is set.
+fn word_spans(crew: &Crew, member: &Member, caption: bool) -> Vec<Span<'static>> {
+    let word = crew_word(crew, member);
+    let mut spans = vec![Span::styled(
+        word.text().into_owned(),
+        Style::default().fg(word.colour()),
+    )];
     if caption
         && word == StateWord::Working
         && let Some(text) = crew
@@ -1724,109 +2350,397 @@ mod tests {
         assert_eq!(activity_caption(&dropped, &members), None);
     }
 
+    fn child_event(child: &str, kind: ChildEventKind, text: &str, origin: Option<&str>) -> Event {
+        message(
+            Role::Assistant,
+            Block::ChildEvent {
+                child_id: child.into(),
+                kind,
+                text: text.into(),
+                origin: origin.map(str::to_string),
+            },
+        )
+    }
+
+    fn ask(text: &str, child_id: Option<&str>, answer: Option<&str>) -> Event {
+        message(
+            Role::Assistant,
+            Block::Ask {
+                message: text.into(),
+                options: vec!["yes".into(), "no".into()],
+                child_id: child_id.map(str::to_string),
+                answer: answer.map(str::to_string),
+            },
+        )
+    }
+
+    /// A crew three deep: lead `root`, builder `mid` under it, researcher
+    /// `leaf` under `mid`.
+    fn deep_crew() -> Crew {
+        let mut mid = view("mid", "root", Some("root"), "builder");
+        mid.session.created_at_secs = 1;
+        let mut leaf = view("leaf", "root", Some("mid"), "researcher");
+        leaf.session.created_at_secs = 2;
+        let mut crew = Crew::new("root");
+        crew.set_members(crew_members(
+            "root",
+            &[view("root", "root", None, "lead"), mid, leaf],
+            None,
+        ));
+        crew
+    }
+
+    fn kinds<'a>(entries: impl Iterator<Item = &'a Entry>) -> Vec<&'a EntryKind> {
+        entries.map(|entry| &entry.kind).collect()
+    }
+
+    fn orders(crew: &Crew) -> Vec<&Order> {
+        crew.entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Order(order) => Some(order),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_childs_user_text_is_never_in_the_chat() {
+    fn the_chat_holds_the_roots_thread_only() {
         let mut crew = crew();
-        crew.apply("child", &text(Role::User, "build the parser"));
         crew.apply("root", &text(Role::User, "please start"));
+        crew.apply("child", &text(Role::User, "build the parser"));
+        crew.apply("child", &text(Role::Assistant, "builder says"));
+        crew.apply("child", &call("1", "file_read", json!({"path": "a"})));
+        crew.apply("root", &text(Role::Assistant, "lead says"));
         assert_eq!(
-            crew.chat,
-            vec![ChatEntry::You {
-                text: "please start".into(),
-                at_ms: None,
-            }]
+            kinds(thread_entries(&crew, "root")),
+            vec![
+                &EntryKind::Received("please start".into()),
+                &EntryKind::Text("lead says".into()),
+            ]
+        );
+        let chat = texts(&chat_lines(&crew, 60)).join("\n");
+        assert!(chat.contains("lead says"), "{chat}");
+        assert!(
+            !chat.contains("builder says") && !chat.contains("build the parser"),
+            "a child's thread stays out of the chat: {chat}"
+        );
+        assert_eq!(
+            kinds(thread_entries(&crew, "child")),
+            vec![
+                &EntryKind::Received("build the parser".into()),
+                &EntryKind::Text("builder says".into()),
+                &EntryKind::Fold(vec![(FoldItem::Read, 1)]),
+            ]
         );
     }
 
     #[test]
-    fn a_spawn_and_a_message_to_a_child_are_directed_posts() {
+    fn an_order_shows_the_childs_live_state_until_its_next_event() {
         let mut crew = crew();
         crew.apply(
             "root",
             &call(
                 "1",
                 "spawn",
-                json!({"persona": "builder", "instructions": "build it"}),
+                json!({"persona": "builder", "instructions": "build it\nwith tests"}),
             ),
         );
+        assert_eq!(order_state(&crew, orders(&crew)[0]), OrderState::Starting);
+        crew.apply("root", &result("1", "spawn", json!({"child_id": "child"})));
+        assert_eq!(orders(&crew)[0].child.as_deref(), Some("child"));
+        assert_eq!(
+            order_state(&crew, orders(&crew)[0]),
+            OrderState::Live(StateWord::Working)
+        );
+
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Report, "built", None),
+        );
+        assert_eq!(
+            order_state(&crew, orders(&crew)[0]),
+            OrderState::Ended(OrderOutcome::Done)
+        );
+
+        // A later order is live again until the child's next event, which
+        // ends every order before it.
         crew.apply(
             "root",
             &call(
                 "2",
                 "message_child",
-                json!({"id": "child", "text": "status?"}),
+                json!({"id": "child", "text": "and docs"}),
             ),
         );
-        crew.apply("child", &text(Role::Assistant, "on it"));
-        let lines = texts(&chat_lines(&crew, None, 60));
         assert_eq!(
-            lines,
-            vec![
-                "Ld Lead → Builder",
-                "   build it",
-                "",
-                "Ld Lead → Builder",
-                "   status?",
-                "",
-                "Bu Builder → Lead",
-                "   on it",
-            ]
+            order_state(&crew, orders(&crew)[1]),
+            OrderState::Live(StateWord::Working)
         );
-    }
-
-    #[test]
-    fn a_report_already_posted_by_the_child_is_not_shown_again() {
-        let report = |text: &str| {
-            message(
-                Role::Assistant,
-                Block::ChildEvent {
-                    child_id: "child".into(),
-                    kind: ChildEventKind::Report,
-                    text: text.into(),
-                    origin: None,
-                },
-            )
-        };
-        let mut crew = crew();
-        crew.apply("child", &text(Role::Assistant, "parser done"));
-        crew.apply("root", &report("parser done"));
-        assert_eq!(crew.chat.len(), 1, "the child's own post shows the report");
-
-        // A report whose text the stream never carried is the child's post.
-        crew.apply("root", &report("tests pass"));
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Ask, "which docs?", Some("child")),
+        );
+        let states: Vec<OrderState> = orders(&crew)
+            .iter()
+            .map(|o| order_state(&crew, o))
+            .collect();
+        assert_eq!(states, vec![OrderState::Ended(OrderOutcome::Asked); 2]);
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Failure, "crashed", None),
+        );
         assert_eq!(
-            crew.chat.last(),
-            Some(&ChatEntry::Post {
-                from: "child".into(),
-                to: Recipient::Session("root".into()),
-                text: "tests pass".into(),
-                at_ms: None,
-            })
+            order_state(&crew, orders(&crew)[1]),
+            OrderState::Ended(OrderOutcome::Failed)
         );
 
+        // An order to another child is not ended by this child's events.
+        crew.apply(
+            "root",
+            &call("3", "message_child", json!({"id": "other", "text": "hi"})),
+        );
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Report, "ok", None),
+        );
+        assert_eq!(orders(&crew)[2].outcome, None);
+
+        // A spawn that fails never reaches a child.
+        crew.apply(
+            "root",
+            &call(
+                "4",
+                "spawn",
+                json!({"persona": "nobody", "instructions": "x"}),
+            ),
+        );
         crew.apply(
             "root",
             &message(
-                Role::Assistant,
-                Block::ChildEvent {
-                    child_id: "child".into(),
-                    kind: ChildEventKind::Failure,
-                    text: "crashed".into(),
-                    origin: None,
+                Role::User,
+                Block::ToolResult {
+                    id: "4".into(),
+                    name: "spawn".into(),
+                    is_error: true,
+                    content: json!({"error": "unknown persona"}),
                 },
             ),
         );
         assert_eq!(
-            crew.chat.last(),
-            Some(&ChatEntry::Failure {
-                from: "child".into(),
-                text: "crashed".into(),
-            })
+            order_state(&crew, orders(&crew)[3]),
+            OrderState::Ended(OrderOutcome::Failed)
         );
     }
 
     #[test]
-    fn tool_calls_between_messages_fold_into_one_line_per_member() {
+    fn a_surfaced_question_names_its_leaf_and_the_path_to_the_reader() {
+        let mut crew = deep_crew();
+        crew.apply("leaf", &ask("which db?", None, None));
+        crew.apply(
+            "mid",
+            &child_event("leaf", ChildEventKind::Ask, "which db?", Some("leaf")),
+        );
+        crew.apply("mid", &ask("which db?", Some("leaf"), None));
+        crew.apply(
+            "root",
+            &child_event("mid", ChildEventKind::Ask, "which db?", Some("leaf")),
+        );
+        crew.apply("root", &ask("which db?", Some("mid"), None));
+
+        let root_ask = thread_entries(&crew, "root")
+            .find_map(|entry| match &entry.kind {
+                EntryKind::Ask {
+                    origin,
+                    raised_from,
+                    ..
+                } => Some((origin.clone(), raised_from.clone())),
+                _ => None,
+            })
+            .expect("the root's question");
+        assert_eq!(root_ask, (Some("leaf".into()), Some("mid".into())));
+        assert_eq!(
+            path_to_root(&crew.members, "leaf"),
+            vec!["leaf", "mid", "root"]
+        );
+        assert_eq!(question_path(&crew), vec!["leaf", "mid", "root"]);
+
+        let words: Vec<StateWord> = crew.members.iter().map(|m| crew_word(&crew, m)).collect();
+        assert_eq!(
+            words,
+            vec![StateWord::NeedsYou, StateWord::Waiting, StateWord::AsksYou],
+            "root, mid, leaf"
+        );
+        let chat = texts(&chat_lines(&crew, 80)).join("\n");
+        assert!(chat.contains("Researcher › Builder › Lead › You"), "{chat}");
+
+        // The store routes the reader's answer to the leaf and appends the
+        // answered question to the root.
+        crew.apply("leaf", &text(Role::User, "postgres"));
+        crew.apply("root", &ask("which db?", Some("mid"), Some("postgres")));
+        assert!(question_path(&crew).is_empty(), "the root waits on nothing");
+        assert_ne!(crew_word(&crew, &crew.members[2]), StateWord::AsksYou);
+        let answers: Vec<(Option<&String>, &str)> = crew
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Ask { answer, .. } => Some((answer.as_ref(), entry.thread.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec![
+                (Some(&"postgres".to_string()), "leaf"),
+                (None, "mid"),
+                (Some(&"postgres".to_string()), "root"),
+            ],
+            "the leaf's own ask and the root's surfaced one are answered"
+        );
+        assert_eq!(flow(&crew)[0].kind, FlowKind::Answer);
+        assert_eq!(flow(&crew)[0].to, Party::Session("leaf".into()));
+    }
+
+    #[test]
+    fn an_ask_event_without_an_origin_names_its_child() {
+        let mut crew = crew();
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Ask, "push?", None),
+        );
+        crew.apply("root", &ask("push?", Some("child"), None));
+        assert_eq!(question_path(&crew), vec!["child", "root"]);
+        assert_eq!(crew_word(&crew, &crew.members[1]), StateWord::AsksYou);
+
+        // A redirect while the question is open is a message, not its answer.
+        crew.apply("root", &text(Role::User, "do something else"));
+        assert!(question_path(&crew).is_empty());
+        assert!(matches!(
+            crew.entries.last().map(|entry| &entry.kind),
+            Some(EntryKind::Received(text)) if text == "do something else"
+        ));
+    }
+
+    #[test]
+    fn the_tree_puts_each_member_under_its_parent_at_any_depth() {
+        let mut builder = view("b", "root", Some("root"), "builder");
+        builder.session.created_at_secs = 1;
+        let mut reviewer = view("r", "root", Some("root"), "reviewer");
+        reviewer.session.created_at_secs = 2;
+        let mut grandchild = view("g", "root", Some("b"), "researcher");
+        grandchild.session.created_at_secs = 3;
+        let mut orphan = view("o", "root", Some("gone"), "architect");
+        orphan.session.created_at_secs = 4;
+        let mut crew = Crew::new("root");
+        crew.set_members(crew_members(
+            "root",
+            &[
+                orphan,
+                grandchild,
+                reviewer,
+                builder,
+                view("root", "root", None, "lead"),
+            ],
+            None,
+        ));
+        let nodes: Vec<(&str, usize)> = tree_order(&crew)
+            .iter()
+            .map(|node| (crew.member(&node.id).unwrap().id.as_str(), node.depth))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            nodes,
+            vec![("root", 0), ("b", 1), ("g", 2), ("r", 1), ("o", 1)],
+            "a grandchild sits under its parent; a member whose parent left hangs under the root"
+        );
+        let order = tree_order(&crew);
+        // The grandchild's parent has siblings below it, so its line runs on.
+        assert_eq!(order[2].lead.chars().filter(|c| *c == '│').count(), 1);
+        assert!(order[4].lead.ends_with("└─ "), "the last sibling closes");
+        assert!(
+            tree_order(&Crew::new("root")).is_empty(),
+            "no root, no tree"
+        );
+    }
+
+    #[test]
+    fn the_flow_lists_what_passed_between_parties_newest_first() {
+        let mut crew = crew();
+        crew.apply(
+            "root",
+            &call(
+                "1",
+                "spawn",
+                json!({"persona": "builder", "instructions": "build"}),
+            ),
+        );
+        crew.apply("root", &result("1", "spawn", json!({"child_id": "child"})));
+        crew.apply("child", &text(Role::Assistant, "working on it"));
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Report, "built", None),
+        );
+        crew.apply("root", &ask("ship it?", None, None));
+        crew.apply("root", &text(Role::User, "yes"));
+        let items: Vec<(FlowKind, Party, Party)> = flow(&crew)
+            .into_iter()
+            .map(|item| (item.kind, item.from, item.to))
+            .collect();
+        let root = || Party::Session("root".into());
+        let child = || Party::Session("child".into());
+        assert_eq!(
+            items,
+            vec![
+                (FlowKind::Answer, Party::You, root()),
+                (FlowKind::Question, root(), Party::You),
+                (FlowKind::Report, child(), root()),
+                (FlowKind::Order, root(), child()),
+            ]
+        );
+        assert_eq!(
+            newest_exchange(&crew, "child"),
+            Some((FlowKind::Report, "built"))
+        );
+    }
+
+    #[test]
+    fn a_members_thread_holds_its_orders_text_asks_and_reports() {
+        let mut crew = crew();
+        crew.apply("child", &text(Role::User, "build it"));
+        crew.apply("child", &text(Role::Assistant, "built"));
+        crew.apply("child", &ask("push?", None, None));
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Ask, "push?", Some("child")),
+        );
+        crew.apply("child", &text(Role::User, "no"));
+        crew.apply(
+            "root",
+            &child_event("child", ChildEventKind::Report, "built", None),
+        );
+        let thread = kinds(thread_entries(&crew, "child"));
+        assert_eq!(thread.len(), 4, "{thread:?}");
+        assert!(matches!(thread[0], EntryKind::Received(_)));
+        assert!(matches!(thread[1], EntryKind::Text(_)));
+        assert!(
+            matches!(thread[2], EntryKind::Ask { answer: Some(answer), .. } if answer == "no"),
+            "the parent's answer fills the child's question"
+        );
+        assert!(
+            matches!(
+                thread[3],
+                EntryKind::ChildEvent {
+                    kind: ChildEventKind::Report,
+                    ..
+                }
+            ),
+            "its report to the parent is in its thread"
+        );
+    }
+
+    #[test]
+    fn tool_calls_between_messages_fold_into_one_line_per_thread() {
         let mut crew = crew();
         for id in ["1", "2", "3", "4"] {
             crew.apply("child", &call(id, "file_read", json!({"path": "a"})));
@@ -1836,57 +2750,45 @@ mod tests {
             "child",
             &call("6", "shell", json!({"command": "npm test\nnpm run lint"})),
         );
-        assert_eq!(crew.chat.len(), 2, "one folded line per member");
-        let lines = texts(&chat_lines(&crew, None, 80));
+        assert_eq!(crew.entries.len(), 2, "one folded line per thread");
         assert_eq!(
-            lines,
-            vec!["Bu read 4 files · ran npm test once", "Ld searched once"]
+            kinds(thread_entries(&crew, "child")),
+            vec![&EntryKind::Fold(vec![
+                (FoldItem::Read, 4),
+                (FoldItem::Run("npm test".into()), 1)
+            ])]
         );
 
         // A message starts a new folded line.
         crew.apply("child", &text(Role::Assistant, "read them"));
         crew.apply("child", &call("7", "file_read", json!({"path": "b"})));
-        assert_eq!(crew.chat.len(), 4);
+        assert_eq!(crew.entries.len(), 4);
     }
 
     #[test]
-    fn asks_show_their_options_and_the_answer_under_you() {
+    fn the_readers_answer_joins_the_roots_own_question() {
         let mut crew = crew();
-        let ask = |answer: Option<&str>| {
-            message(
-                Role::Assistant,
-                Block::Ask {
-                    message: "push?".into(),
-                    options: vec!["yes".into(), "no".into()],
-                    child_id: None,
-                    answer: answer.map(str::to_string),
-                },
-            )
-        };
-        crew.apply("root", &ask(None));
+        crew.apply("root", &ask("push?", None, None));
         assert!(crew.members[0].asking, "an open ask marks the member");
-        assert_eq!(
-            texts(&chat_lines(&crew, None, 60)),
-            vec!["Ld Lead → You", "   ? push?", "   [yes] [no]"]
+        assert!(
+            question_path(&crew).is_empty(),
+            "the root's own question has no leaf"
         );
         crew.apply("root", &text(Role::User, "yes"));
         assert!(!crew.members[0].asking);
-        assert_eq!(crew.chat.len(), 1, "the answer joins the ask");
-        assert_eq!(texts(&chat_lines(&crew, None, 60))[3..], ["You", "   yes"]);
-
-        // A routed answer appends the ask again; it fills the open one.
-        let mut crew = self::crew();
-        crew.apply("child", &ask(None));
-        crew.apply("child", &ask(Some("no")));
-        assert_eq!(crew.chat.len(), 1);
-        assert!(matches!(
-            &crew.chat[0],
-            ChatEntry::Ask { answer: Some(answer), to: Recipient::Parent, .. } if answer == "no"
-        ));
+        let thread = kinds(thread_entries(&crew, "root"));
+        assert!(
+            matches!(thread[0], EntryKind::Ask { answer: Some(answer), .. } if answer == "yes"),
+            "{thread:?}"
+        );
+        assert!(
+            matches!(thread[1], EntryKind::Answer { to, .. } if to == "root"),
+            "the flow records the answer"
+        );
     }
 
     #[test]
-    fn reasoning_and_context_rows_stay_out_of_the_chat() {
+    fn reasoning_and_context_rows_stay_out_of_the_threads() {
         let mut crew = crew();
         crew.apply(
             "root",
@@ -1912,17 +2814,8 @@ mod tests {
                 phase: ActivityPhase::WakeStarted,
             },
         );
-        assert!(crew.chat.is_empty());
+        assert!(crew.entries.is_empty());
         assert_eq!(crew.activity.get("root"), Some(&ActivityPhase::WakeStarted));
-    }
-
-    #[test]
-    fn the_filter_shows_only_one_members_posts() {
-        let mut crew = crew();
-        crew.apply("root", &text(Role::Assistant, "lead says"));
-        crew.apply("child", &text(Role::Assistant, "builder says"));
-        let lines = texts(&chat_lines(&crew, Some("child"), 60));
-        assert_eq!(lines, vec!["Bu Builder → Lead", "   builder says"]);
     }
 
     #[test]
@@ -1949,8 +2842,26 @@ mod tests {
         );
         assert!(crew.now_edit.as_ref().unwrap().finished);
         assert_eq!(
-            texts(&chat_lines(&crew, None, 60)),
-            vec!["Bu ✎ src/a.rs  +1 −1", "   − old line", "   + new line"]
+            kinds(thread_entries(&crew, "child")),
+            vec![&EntryKind::Edit {
+                path: "src/a.rs".into(),
+                added: 1,
+                removed: 1,
+                diff: vec![
+                    DiffLine {
+                        added: false,
+                        text: "old line".into()
+                    },
+                    DiffLine {
+                        added: true,
+                        text: "new line".into()
+                    },
+                ],
+            }]
+        );
+        assert!(
+            chat_lines(&crew, 60).is_empty(),
+            "a child's edit is not the chat's"
         );
     }
 
@@ -2073,7 +2984,7 @@ mod tests {
             ),
         );
         assert!(crew.files.is_empty());
-        assert!(crew.chat.is_empty());
+        assert!(crew.entries.is_empty());
         assert!(crew.now_edit.unwrap().finished);
     }
 
@@ -2172,11 +3083,12 @@ mod tests {
     }
 
     #[test]
-    fn the_chat_list_is_capped() {
+    fn the_entries_are_capped_across_the_tree() {
         let mut crew = crew();
         for index in 0..MAX_CHAT_ENTRIES + 3 {
-            crew.apply("root", &text(Role::User, &format!("m{index}")));
+            let thread = if index % 2 == 0 { "root" } else { "child" };
+            crew.apply(thread, &text(Role::User, &format!("m{index}")));
         }
-        assert_eq!(crew.chat.len(), MAX_CHAT_ENTRIES);
+        assert_eq!(crew.entries.len(), MAX_CHAT_ENTRIES);
     }
 }

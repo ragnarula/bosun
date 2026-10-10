@@ -16,20 +16,13 @@ import {
   btnPersona,
   btnSheetClose,
   btnStop,
-  btnWatchOpen,
   chatRow,
   chipPermission,
   chipPermissionText,
   chipPersona,
   input,
-  inputRow,
   isNarrow,
   personaName,
-  rowClear,
-  rowFork,
-  rowPermission,
-  rowPersona,
-  rowStop,
   transcript,
   view,
   viewClear,
@@ -44,7 +37,6 @@ import {
   viewSummary,
   viewTitle,
   viewWaiting,
-  watchBanner,
 } from './dom.js';
 import { post, showStatus, toastError, toastOk } from './common.js';
 import { personas } from './new-session.js';
@@ -56,7 +48,7 @@ import {
   updateStatusLabel,
 } from './activity.js';
 import { refreshSessions, sessions } from './session-list.js';
-import { markListEntry, openSession } from './history.js';
+import { markListEntry, openSession, openTreeAt } from './history.js';
 import { loadDraft, saveDraft, scheduleAskSync } from './composer.js';
 import { follow, syncBtnBottom } from './scroll.js';
 import { leaveScreen, showScreen } from './screens.js';
@@ -67,11 +59,11 @@ import {
   drawLiveParagraph,
   modelCallLine,
 } from './transcript.js';
-import { closeChildPanel } from './subagents.js';
 import { TAIL_MESSAGES, startEarlier } from './earlier.js';
 import { closeCrew, openCrew, personaChipContent, renderCrew } from './crew.js';
 import { updateProjectLink } from './project-map.js';
 import { closeNotifications } from './device.js';
+import { personaLabel } from './signal.js';
 
 export { closeSession, coarsePointer, opened, showSession };
 
@@ -112,20 +104,22 @@ function newSessionState(id) {
     // the next page ends before, whether the session has more, whether a read
     // is in flight, and the row at the transcript's top that asks for it.
     earlier: { before: null, more: false, loading: false, row: null },
-    // The child the subagent panel follows, or null while the panel is closed.
-    panel: null,
     // The crew: the session's whole tree on one stream, drawn in the Chat,
-    // Tasks and Files views; null until the session's tree root is known.
+    // Crew, Tasks and Files views; null until the session's tree root is
+    // known.
     crew: null,
+    // The crew member whose screen is open over the session, and the stream
+    // of that member's Log; null while no member's screen is open.
+    memberId: null,
+    memberLog: null,
   };
 }
 
 // Stops what the session's object started: its stream, its timers, and the
-// stream of the child its panel follows.
+// crew's streams.
 function stopSession(s) {
   if (s.es) s.es.close();
   closeCrew(s);
-  if (s.panel) s.panel.es.close();
   window.clearInterval(s.statusTick);
   window.clearTimeout(s.askSyncTimer);
 }
@@ -140,11 +134,17 @@ const coarsePointer = () => window.matchMedia('(pointer: coarse)').matches;
 // The view half of opening: the session's header, transcript and event stream,
 // with the previous session's teardown first.
 function showSession(id) {
+  const session = sessions.find((listed) => listed.id === id);
+  // A child takes no input of its own: its address opens its tree, with the
+  // child's screen over the root's session.
+  if (session && session.parent_id) {
+    openTreeAt(session.owner_id, id);
+    return;
+  }
   closeSession();
   const s = newSessionState(id);
   opened = s;
   showScreen(view);
-  const session = sessions.find((listed) => listed.id === id);
   if (session) {
     updateHeader(session);
     openCrew(s, session.owner_id || session.id);
@@ -178,7 +178,7 @@ function showSession(id) {
   input.value = loadDraft();
   // Opening a session asks for the composer whatever the pointer: this is the
   // path a phone had before, and the keyboard comes up with the session.
-  if (!inputRow.hidden) input.focus();
+  input.focus();
 }
 
 function closeSession() {
@@ -187,8 +187,6 @@ function closeSession() {
   activityLog.hidden = true;
   activityLog.textContent = '';
   transcript.textContent = '';
-  // The panel belongs to the session the pane is leaving: its lines go with it.
-  closeChildPanel();
   // The next session opens on its newest line, so the control that returns
   // there goes away with this one.
   syncBtnBottom();
@@ -205,10 +203,9 @@ function closeSession() {
   leaveScreen(view);
 }
 
-// The header and the ⋯ sheet carry the open session's identity, and the footer
-// and the sheet rows carry the shape a watch-only child gives the pane.
-// Clearing them returns the pane's no-session layout, so a session the pane
-// cannot read yet shows nothing of the session before it.
+// The header and the ⋯ sheet carry the open session's identity. Clearing them
+// returns the pane's no-session layout, so a session the pane cannot read yet
+// shows nothing of the session before it.
 function clearHeader() {
   viewStateDot.className = 'dot';
   viewSummary.textContent = '';
@@ -224,14 +221,7 @@ function clearHeader() {
   viewPermission.textContent = '';
   btnPermission.textContent = 'Switch to read-only';
   personaName.value = '';
-  inputRow.hidden = false;
-  watchBanner.hidden = true;
-  rowPermission.hidden = false;
-  rowPersona.hidden = false;
-  rowFork.hidden = false;
-  rowClear.hidden = false;
-  rowStop.hidden = false;
-  // The sheet's controls come back live with their rows: a request the reader
+  // The sheet's controls come back live: a request the reader
   // left behind is nobody's to answer, so it must not hold a control off, or
   // leave its note, on the session the pane shows next.
   btnFork.disabled = false;
@@ -259,6 +249,10 @@ async function fetchSession(s) {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const session = await response.json();
     if (opened !== s) return;
+    if (session.parent_id) {
+      openTreeAt(session.owner_id, session.id);
+      return;
+    }
     updateHeader(session);
     if (!s.crew) openCrew(s, session.owner_id || session.id);
   } catch (error) {
@@ -294,29 +288,17 @@ function updateHeader(session) {
   } else {
     personaName.value = '';
   }
-  // A child session is watch-only: its transcript and state render live, but
-  // the pane offers no input path and no user actions toward it. The input
-  // row is replaced by an "Open to act" banner, and the ⋯ sheet's control
-  // rows are disabled — the API would refuse them anyway, so they must not
-  // look actionable from a child.
-  const watchOnly = !!session.parent_id;
-  inputRow.hidden = watchOnly;
-  watchBanner.hidden = !watchOnly;
-  rowPermission.hidden = watchOnly;
-  rowPersona.hidden = watchOnly;
-  rowFork.hidden = watchOnly;
-  rowClear.hidden = watchOnly;
-  rowStop.hidden = watchOnly;
-  chipPersona.hidden = watchOnly || !session.persona;
-  chipPermission.hidden = watchOnly;
-  syncStopButton(session.state, watchOnly);
+  chipPersona.hidden = !session.persona;
+  // Every message goes to the root, which runs its crew.
+  input.placeholder = 'Message ' + (personaLabel(session.persona) || 'the lead') + '…';
+  syncStopButton(session.state);
 }
 
 // Stop is in the header while the crew works, where the thumb finds it at
 // once; with nothing running there is nothing to stop.
-function syncStopButton(state, watchOnly) {
+function syncStopButton(state) {
   const running = state === 'running' || state === 'creating';
-  btnInterrupt.hidden = !!watchOnly || !running;
+  btnInterrupt.hidden = !running;
 }
 
 function updatePermissionBadge(permission) {
@@ -503,14 +485,6 @@ btnCopyId.addEventListener('click', async () => {
   }
 });
 
-// A watch-only child can only be watched; acting on it means opening the
-// tree owner, which is the only session in the tree that accepts input.
-btnWatchOpen.addEventListener('click', () => {
-  const owner = sessions.find((session) => session.id === opened.id);
-  const ownerId = owner && owner.owner_id ? owner.owner_id : null;
-  openSession(ownerId || opened.id);
-});
-
 // One durable message of the open session. The session's own state moves with
 // it: the last message, the live paragraph it replaces, the ask record and the
 // ask composer.
@@ -565,7 +539,7 @@ function handleEvent(s, event) {
       viewStateDot.className = 'dot ' + event.state;
       s.state = event.state;
       updateStatusLabel({ id: s.id, state: event.state });
-      syncStopButton(event.state, !watchBanner.hidden);
+      syncStopButton(event.state);
       renderCrew();
       break;
     case 'permission':

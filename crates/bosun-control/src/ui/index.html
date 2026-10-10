@@ -35,7 +35,7 @@
 <link rel="modulepreload" href="/ui/transcript.js">
 <link rel="modulepreload" href="/ui/diagram.js">
 <link rel="modulepreload" href="/ui/markdown.js">
-<link rel="modulepreload" href="/ui/subagents.js">
+<link rel="modulepreload" href="/ui/member-log.js">
 <link rel="modulepreload" href="/ui/earlier.js">
 <link rel="modulepreload" href="/ui/signal.js">
 <link rel="modulepreload" href="/ui/crew.js">
@@ -228,7 +228,12 @@
     <button type="button" class="bs-btn bs-btn--danger" id="btn-interrupt" data-icon="stop" hidden>Stop</button>
   </header>
   <div class="crew-row">
-    <div id="crew-strip" class="bs-crew" hidden></div>
+    <button type="button" id="crew-bar" class="crew-bar" hidden>
+      <span class="bs-label">Crew</span>
+      <span class="crew-bar__faces" id="crew-bar-faces"></span>
+      <span class="crew-bar__text" id="crew-bar-text"></span>
+      <span class="crew-bar__go" data-icon="chevron"></span>
+    </button>
     <div class="view-switch" role="tablist" aria-label="Views">
       <button type="button" class="bs-chip" data-view="chat" data-icon="chat">Chat</button>
       <button type="button" class="bs-chip" data-view="log" data-icon="log">Log</button>
@@ -245,20 +250,30 @@
           <div id="transcript"></div>
           <button type="button" id="btn-bottom" hidden title="Back to the newest line">↓</button>
         </div>
-        <div id="child-panel" hidden>
-          <div class="child-panel-head">
-            <span class="dot" id="child-panel-dot"></span>
-            <span class="child-panel-title" id="child-panel-title"></span>
-            <button type="button" id="btn-child-collapse" title="Collapse the panel">✕</button>
+      </div>
+      <section id="member-view" hidden aria-label="Crew member" data-member-view="thread">
+        <header class="bs-header member-header">
+          <button type="button" class="bs-back" id="btn-member-back" aria-label="Back" data-icon="back"></button>
+          <span class="member-face" id="member-face"></span>
+          <div class="bs-header__text">
+            <div class="bs-header__title" id="member-title"></div>
+            <div class="bs-header__sub" id="member-sub"></div>
           </div>
-          <div id="child-list"></div>
-          <div id="child-transcript"></div>
+          <div class="member-switch" role="tablist" aria-label="Member views">
+            <button type="button" class="bs-chip" data-member-view="thread" data-icon="chat">Thread</button>
+            <button type="button" class="bs-chip" data-member-view="log" data-icon="log">Log</button>
+          </div>
+        </header>
+        <div id="member-scroll">
+          <div id="member-thread" role="log"></div>
+          <div id="member-crew"></div>
         </div>
-      </div>
-      <div id="watch-banner" hidden>
-        <div class="watch-note">This is a crew member's own session. You follow it here; the lead's session takes your messages.</div>
-        <button type="button" id="btn-watch-open" class="bs-btn">Open the lead's session</button>
-      </div>
+        <div id="member-log"></div>
+        <div class="member-foot">
+          <span class="member-foot__text" id="member-foot-text"></span>
+          <button type="button" class="bs-btn" id="btn-ask-lead"></button>
+        </div>
+      </section>
       <div class="input-row" id="input-row">
         <div id="ask-sheet" hidden>
           <div class="ask-head">
@@ -276,12 +291,29 @@
           </div>
         </div>
         <div class="chat-row" id="chat-row">
-          <textarea id="input" rows="1" placeholder="Message the crew…"></textarea>
+          <textarea id="input" rows="1" placeholder="Message the lead…"></textarea>
           <button id="btn-send" type="button" class="bs-btn bs-btn--primary" aria-label="Send" data-icon="send"></button>
         </div>
       </div>
     </div>
     <div id="side-col">
+      <div class="side-switch" role="tablist" aria-label="Crew, tasks and files">
+        <button type="button" class="bs-chip" data-side="crew">Crew</button>
+        <button type="button" class="bs-chip" data-side="tasks">Tasks</button>
+        <button type="button" class="bs-chip" data-side="files">Files</button>
+      </div>
+      <section id="crew-view" aria-label="Crew">
+        <div class="side-head"><span class="bs-label">Chain of command</span><span class="side-count" id="crew-count"></span></div>
+        <div id="crew-tree"></div>
+        <div class="side-head flow-head"><span class="bs-label">Flow</span></div>
+        <div class="flow-chips" id="flow-chips">
+          <button type="button" class="bs-chip" data-flow="all">All</button>
+          <button type="button" class="bs-chip" data-flow="order">Orders</button>
+          <button type="button" class="bs-chip" data-flow="report">Reports</button>
+          <button type="button" class="bs-chip" data-flow="question">Questions</button>
+        </div>
+        <div id="flow-list"></div>
+      </section>
       <section id="tasks-view" aria-label="Tasks">
         <div class="side-head"><span class="bs-label">Tasks</span><span class="side-count" id="tasks-count"></span></div>
         <div class="bs-progress" id="tasks-progress" hidden></div>
@@ -295,10 +327,10 @@
     </div>
   </div>
   <nav class="bs-tabbar" id="view-tabs" role="tablist" aria-label="Views">
-    <button type="button" class="bs-tab" role="tab" data-view="chat" data-icon="chat">Chat</button>
+    <button type="button" class="bs-tab" role="tab" data-view="chat" data-icon="chat">Chat<span class="bs-tab__dot" id="chat-dot" hidden></span></button>
+    <button type="button" class="bs-tab" role="tab" data-view="crew" data-icon="tree">Crew</button>
     <button type="button" class="bs-tab" role="tab" data-view="tasks" data-icon="tasks">Tasks</button>
     <button type="button" class="bs-tab" role="tab" data-view="files" data-icon="files">Files</button>
-    <button type="button" class="bs-tab" role="tab" data-view="log" data-icon="log">Log</button>
   </nav>
 </div>
 

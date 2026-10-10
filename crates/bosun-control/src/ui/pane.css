@@ -885,23 +885,6 @@
     -webkit-tap-highlight-color: transparent;
   }
   .view-sheet-head button:active { color: var(--accent); }
-  /* A watch-only child renders one banner in place of the input row: the
-     child cannot be driven, only opened in its own monitor. */
-  #watch-banner {
-    background: var(--panel);
-    border-top: 1px solid var(--border);
-    padding: 12px 16px;
-    display: grid;
-    gap: 8px;
-  }
-  #watch-banner[hidden] { display: none; }
-  #watch-banner .watch-note { color: var(--muted); font-size: 13px; }
-  #watch-banner button {
-    width: 100%;
-    min-height: var(--touch-min-height);
-    -webkit-tap-highlight-color: transparent;
-  }
-  #watch-banner button:active { background: var(--panel-2); border-color: var(--accent); }
   /* The debug console: a monospace activity log between the header and the
      transcript, closed by default and toggled from the status line. */
   #activity-log {
@@ -931,8 +914,8 @@
      height the composer takes. */
   /* The one guard every toggled overlay needs: the UA's `[hidden] { display:
      none }` loses to any author rule that sets `display` on the same element, so
-     an overlay the code believes is hidden can stay rendered — a full-screen
-     `#child-panel` at phone widths, above the session view, eating taps. The
+     an overlay the code believes is hidden can stay rendered, above the
+     session view, eating taps. The
      element-specific guards below it still name their own elements; this one
      holds whatever a later rule forgets. */
   [hidden] { display: none !important; }
@@ -975,102 +958,15 @@
     color: var(--muted);
     font-size: 13px;
   }
-  /* The session's transcript and the subagent panel beside it. The panel is a
-     second reader of a child's own stream, so it carries no composer and no
-     history of its own: following a child here is not opening it. */
+  /* The session's transcript. */
   #conversation {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: row;
   }
-  #child-panel {
-    flex: 0 0 auto;
-    width: 420px;
-    max-width: 45%;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    background: var(--panel);
-    border-left: 1px solid var(--border);
-  }
-  #child-panel[hidden] { display: none; }
-  #child-panel .child-panel-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 8px 6px 12px;
-    border-bottom: 1px solid var(--border);
-    font-size: 12px;
-  }
-  #child-panel .child-panel-title {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--font-mono);
-    color: var(--muted);
-  }
-  #child-panel .child-panel-head button {
-    min-height: var(--touch-min-height);
-    min-width: var(--touch-min-height);
-    background: none;
-    border: none;
-    font-size: 16px;
-    -webkit-tap-highlight-color: transparent;
-  }
-  #child-panel .child-panel-head button:active { color: var(--accent); }
-  /* The open session's children: one row each, the followed one marked. The
-     transcript below takes the rest of the panel. */
-  #child-list {
-    flex: 0 0 auto;
-    max-height: 40%;
-    overflow-y: auto;
-    border-bottom: 1px solid var(--border);
-  }
-  #child-list[hidden] { display: none; }
-  #child-list .child-row {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    min-height: var(--touch-min-height);
-    padding: 4px 10px;
-    background: none;
-    border: none;
-    border-left: 2px solid transparent;
-    text-align: left;
-    font-size: 12px;
-    color: var(--text);
-    -webkit-tap-highlight-color: transparent;
-  }
-  #child-list .child-row:active { background: var(--panel-2); }
-  #child-list .child-row.followed { border-left-color: var(--accent); background: var(--panel-2); }
-  #child-list .child-row .child-row-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  #child-list .child-row .child-row-id {
-    color: var(--muted);
-    font-family: var(--font-mono);
-    font-size: 11px;
-  }
-  #child-list .child-list-note { display: block; padding: 8px 10px; color: var(--muted); font-size: 12px; }
-  /* The child panel's transcript is the only transcript that is not the whole
-     view: it takes what the list leaves. */
-  #child-transcript {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
-    font-size: 13px;
-  }
-  /* The control on a child's line that follows it here: the child's id opens it
-     as the session view, as it always did. */
-  :is(#transcript, #child-transcript) .child-watch {
+  /* The control on a child's line that opens the child's screen. */
+  :is(#transcript, #member-log) .child-watch {
     min-height: var(--touch-min-height);
     padding: 0 8px;
     margin-left: 4px;
@@ -1081,47 +977,47 @@
     border-radius: 6px;
     -webkit-tap-highlight-color: transparent;
   }
-  :is(#transcript, #child-transcript) .child-watch:active { border-color: var(--accent); }
+  :is(#transcript, #member-log) .child-watch:active { border-color: var(--accent); }
   /* A stamped entry is one flex row: the time holds the leading gutter and the
      entry takes the rest of the width, so a block entry's first line shares
      the row with its time and still wraps on a narrow screen. */
-  :is(#transcript, #child-transcript) .stamp-row { display: flex; align-items: baseline; }
+  :is(#transcript, #member-log) .stamp-row { display: flex; align-items: baseline; }
   /* The time a durable entry landed, in the row's leading gutter. Tabular
      figures keep the times aligned down the transcript. */
-  :is(#transcript, #child-transcript) .stamp-row .ts {
+  :is(#transcript, #member-log) .stamp-row .ts {
     flex: 0 0 auto;
     color: var(--muted);
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     margin-right: 6px;
   }
-  :is(#transcript, #child-transcript) .stamp-row > :last-child { flex: 1; min-width: 0; }
-  :is(#transcript, #child-transcript) .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  :is(#transcript, #member-log) .stamp-row > :last-child { flex: 1; min-width: 0; }
+  :is(#transcript, #member-log) .msg { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* User and assistant messages carry a left accent gutter like opencode's
      message boxes: the user's is tinted with the user color, the assistant's
      with the plain panel border. */
-  :is(#transcript, #child-transcript) .msg.user {
+  :is(#transcript, #member-log) .msg.user {
     border-left: 3px solid var(--user);
     padding: 2px 0 2px 12px;
     color: var(--user);
   }
-  :is(#transcript, #child-transcript) .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
+  :is(#transcript, #member-log) .msg.assistant { border-left: 3px solid var(--border); padding: 2px 0 2px 12px; color: var(--text); }
   /* A rejected question leaves a durable note, not a typed message: muted and
      italic, so it never reads as words the user composed. */
-  :is(#transcript, #child-transcript) .msg.user.rejected {
+  :is(#transcript, #member-log) .msg.user.rejected {
     color: var(--muted);
     font-style: italic;
     border-left-color: var(--border);
   }
-  :is(#transcript, #child-transcript) .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  :is(#transcript, #member-log) .line { margin: 0 0 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   /* A durable note the loop recorded, such as an unavailable MCP server: meta,
      not conversation. */
-  :is(#transcript, #child-transcript) .line.warning { color: var(--warn); }
+  :is(#transcript, #member-log) .line.warning { color: var(--warn); }
   /* Tool traffic: one inline row per call, glyph + name + args, with the
      payload collapsed until clicked. The result nests under its call as a
      bordered block, so a call and its outcome read as one unit. Rows and
      clipped results are touch targets: feedback on :active, never hover. */
-  :is(#transcript, #child-transcript) .tool {
+  :is(#transcript, #member-log) .tool {
     background: var(--panel-2);
     border-radius: 6px;
     padding: 8px 10px;
@@ -1131,14 +1027,14 @@
     font-family: var(--font-mono);
     font-size: 13px;
   }
-  :is(#transcript, #child-transcript) .tool:active { background: var(--border); }
-  :is(#transcript, #child-transcript) .tool .glyph { color: var(--muted); margin-right: 6px; }
-  :is(#transcript, #child-transcript) .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
-  :is(#transcript, #child-transcript) .tool.open .toggle { color: var(--accent); }
+  :is(#transcript, #member-log) .tool:active { background: var(--border); }
+  :is(#transcript, #member-log) .tool .glyph { color: var(--muted); margin-right: 6px; }
+  :is(#transcript, #member-log) .tool .toggle { color: var(--muted); font-size: 11px; margin-right: 4px; }
+  :is(#transcript, #member-log) .tool.open .toggle { color: var(--accent); }
   /* Thinking reuses the tool strip's tap-to-open row, restyled as prose:
      muted and italic so it does not read as something the session said. */
-  :is(#transcript, #child-transcript) .reasoning { color: var(--muted); font-style: italic; }
-  :is(#transcript, #child-transcript) .reasoning .body {
+  :is(#transcript, #member-log) .reasoning { color: var(--muted); font-style: italic; }
+  :is(#transcript, #member-log) .reasoning .body {
     display: block;
     margin-top: 6px;
     padding-left: 10px;
@@ -1147,22 +1043,22 @@
     overflow-wrap: anywhere;
     font-style: normal;
   }
-  :is(#transcript, #child-transcript) .reasoning .body[hidden] { display: none; }
-  :is(#transcript, #child-transcript) .tool-result {
+  :is(#transcript, #member-log) .reasoning .body[hidden] { display: none; }
+  :is(#transcript, #member-log) .tool-result {
     margin: 0 0 6px 20px;
     border-left: 2px solid var(--border);
     padding: 4px 0 4px 10px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  :is(#transcript, #child-transcript) .tool-result.clipped {
+  :is(#transcript, #member-log) .tool-result.clipped {
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     color: var(--muted);
     border-left: 2px solid var(--accent);
   }
-  :is(#transcript, #child-transcript) .tool-result.clipped:active { color: var(--text); }
-  :is(#transcript, #child-transcript) .tool-result.clipped .expand-hint {
+  :is(#transcript, #member-log) .tool-result.clipped:active { color: var(--text); }
+  :is(#transcript, #member-log) .tool-result.clipped .expand-hint {
     color: var(--accent);
     font-family: var(--font-mono);
     font-size: 12px;
@@ -1171,19 +1067,19 @@
   }
   /* An error result stays red even when clipped; the muted affordance must
      not hide that the tool failed. */
-  :is(#transcript, #child-transcript) .tool-result.error { color: var(--error); }
-  :is(#transcript, #child-transcript) .tool-result.error:active { color: var(--error); }
-  :is(#transcript, #child-transcript) .tool-result.error .expand-hint { color: var(--error); }
-  :is(#transcript, #child-transcript) .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
-  :is(#transcript, #child-transcript) .mono { font-family: var(--font-mono); font-size: 13px; color: var(--mono); }
-  :is(#transcript, #child-transcript) .error { color: var(--error); }
-  :is(#transcript, #child-transcript) .state { color: var(--muted); font-size: 12px; }
-  :is(#transcript, #child-transcript) .context {
+  :is(#transcript, #member-log) .tool-result.error { color: var(--error); }
+  :is(#transcript, #member-log) .tool-result.error:active { color: var(--error); }
+  :is(#transcript, #member-log) .tool-result.error .expand-hint { color: var(--error); }
+  :is(#transcript, #member-log) .tool-result.error .error-label { color: var(--error); font-weight: 600; display: block; }
+  :is(#transcript, #member-log) .mono { font-family: var(--font-mono); font-size: 13px; color: var(--mono); }
+  :is(#transcript, #member-log) .error { color: var(--error); }
+  :is(#transcript, #member-log) .state { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #member-log) .context {
     color: var(--muted);
     text-align: center;
     font-size: 12px;
   }
-  :is(#transcript, #child-transcript) .summary {
+  :is(#transcript, #member-log) .summary {
     color: var(--muted);
     font-style: italic;
     text-align: center;
@@ -1194,7 +1090,7 @@
   }
   /* The break a cleared context made in the thread: a divider like a summary,
      in the accent so a reader can find where the session started over. */
-  :is(#transcript, #child-transcript) .cleared {
+  :is(#transcript, #member-log) .cleared {
     color: var(--accent);
     text-align: center;
     font-size: 12px;
@@ -1202,15 +1098,15 @@
     padding-top: 8px;
     margin-top: 10px;
   }
-  :is(#transcript, #child-transcript) .child-report { color: var(--muted); padding-left: 18px; }
-  :is(#transcript, #child-transcript) .child-link {
+  :is(#transcript, #member-log) .child-report { color: var(--muted); padding-left: 18px; }
+  :is(#transcript, #member-log) .child-link {
     color: var(--accent);
     cursor: pointer;
     text-decoration: underline;
     font-family: var(--font-mono);
   }
-  :is(#transcript, #child-transcript) .unknown { color: var(--muted); font-size: 12px; }
-  :is(#transcript, #child-transcript) .ask {
+  :is(#transcript, #member-log) .unknown { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #member-log) .ask {
     margin: 6px 0;
     padding: 10px 14px;
     border: 1px solid var(--accent);
@@ -1219,31 +1115,31 @@
     background: rgba(138, 169, 240, 0.10);
     overflow-wrap: anywhere;
   }
-  :is(#transcript, #child-transcript) .ask .options { margin: 6px 0 0; padding-left: 18px; }
-  :is(#transcript, #child-transcript) .ask .answer { margin-top: 6px; color: var(--ok); }
-  :is(#transcript, #child-transcript) .ask .ask-to { color: var(--muted); font-size: 12px; }
-  :is(#transcript, #child-transcript) h1, :is(#transcript, #child-transcript) h2, :is(#transcript, #child-transcript) h3, :is(#transcript, #child-transcript) h4, :is(#transcript, #child-transcript) h5, :is(#transcript, #child-transcript) h6 {
+  :is(#transcript, #member-log) .ask .options { margin: 6px 0 0; padding-left: 18px; }
+  :is(#transcript, #member-log) .ask .answer { margin-top: 6px; color: var(--ok); }
+  :is(#transcript, #member-log) .ask .ask-to { color: var(--muted); font-size: 12px; }
+  :is(#transcript, #member-log) h1, :is(#transcript, #member-log) h2, :is(#transcript, #member-log) h3, :is(#transcript, #member-log) h4, :is(#transcript, #member-log) h5, :is(#transcript, #member-log) h6 {
     margin: 12px 0 4px;
     font-weight: 700;
     line-height: 1.3;
   }
-  :is(#transcript, #child-transcript) h1 { font-size: 18px; }
-  :is(#transcript, #child-transcript) h2 { font-size: 16px; }
-  :is(#transcript, #child-transcript) h3 { font-size: 15px; }
-  :is(#transcript, #child-transcript) h4 { font-size: 14px; }
-  :is(#transcript, #child-transcript) h5, :is(#transcript, #child-transcript) h6 { font-size: 13px; color: var(--muted); }
-  :is(#transcript, #child-transcript) .msg p { margin: 0 0 6px; }
-  :is(#transcript, #child-transcript) .md-bold { font-weight: 700; }
-  :is(#transcript, #child-transcript) .md-italic { font-style: italic; }
-  :is(#transcript, #child-transcript) .md-code {
+  :is(#transcript, #member-log) h1 { font-size: 18px; }
+  :is(#transcript, #member-log) h2 { font-size: 16px; }
+  :is(#transcript, #member-log) h3 { font-size: 15px; }
+  :is(#transcript, #member-log) h4 { font-size: 14px; }
+  :is(#transcript, #member-log) h5, :is(#transcript, #member-log) h6 { font-size: 13px; color: var(--muted); }
+  :is(#transcript, #member-log) .msg p { margin: 0 0 6px; }
+  :is(#transcript, #member-log) .md-bold { font-weight: 700; }
+  :is(#transcript, #member-log) .md-italic { font-style: italic; }
+  :is(#transcript, #member-log) .md-code {
     padding: 0 4px;
     border-radius: 4px;
     background: var(--panel-2);
     font-family: var(--font-mono);
     font-size: 0.9em;
   }
-  :is(#transcript, #child-transcript) .md-link { color: var(--accent); text-decoration: underline; }
-  :is(#transcript, #child-transcript) pre.md-pre {
+  :is(#transcript, #member-log) .md-link { color: var(--accent); text-decoration: underline; }
+  :is(#transcript, #member-log) pre.md-pre {
     margin: 6px 0;
     padding: 10px 12px;
     overflow-x: auto;
@@ -1256,19 +1152,19 @@
     color: var(--mono);
     white-space: pre;
   }
-  :is(#transcript, #child-transcript) .md-mermaid { margin: 6px 0; overflow-x: auto; }
-  :is(#transcript, #child-transcript) .md-mermaid svg { display: block; }
+  :is(#transcript, #member-log) .md-mermaid { margin: 6px 0; overflow-x: auto; }
+  :is(#transcript, #member-log) .md-mermaid svg { display: block; }
   /* A markdown table: the holder scrolls sideways, as the diagram holder
      does, so a table wider than a phone stays readable instead of squeezing
      its columns or overflowing the transcript. */
-  :is(#transcript, #child-transcript) .md-table-wrap { margin: 6px 0; overflow-x: auto; }
-  :is(#transcript, #child-transcript) .md-table {
+  :is(#transcript, #member-log) .md-table-wrap { margin: 6px 0; overflow-x: auto; }
+  :is(#transcript, #member-log) .md-table {
     border-collapse: collapse;
     font-size: 13px;
     line-height: 1.4;
   }
-  :is(#transcript, #child-transcript) .md-table th,
-  :is(#transcript, #child-transcript) .md-table td {
+  :is(#transcript, #member-log) .md-table th,
+  :is(#transcript, #member-log) .md-table td {
     padding: 5px 10px;
     border: 1px solid var(--border);
     color: var(--text);
@@ -1276,23 +1172,23 @@
     /* A cell keeps its own line: the holder scrolls for a wide table. */
     white-space: nowrap;
   }
-  :is(#transcript, #child-transcript) .md-table th {
+  :is(#transcript, #member-log) .md-table th {
     background: var(--panel-2);
     color: var(--muted);
     font-weight: 600;
   }
-  :is(#transcript, #child-transcript) .md-table .md-align-right { text-align: right; }
-  :is(#transcript, #child-transcript) .md-table .md-align-center { text-align: center; }
-  :is(#transcript, #child-transcript) blockquote {
+  :is(#transcript, #member-log) .md-table .md-align-right { text-align: right; }
+  :is(#transcript, #member-log) .md-table .md-align-center { text-align: center; }
+  :is(#transcript, #member-log) blockquote {
     margin: 4px 0 8px;
     padding: 2px 0 2px 12px;
     border-left: 3px solid var(--border);
     color: var(--muted);
   }
-  :is(#transcript, #child-transcript) blockquote p { margin: 0; }
-  :is(#transcript, #child-transcript) hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
-  :is(#transcript, #child-transcript) .md-li { margin: 2px 0; }
-  :is(#transcript, #child-transcript) .md-marker { color: var(--muted); }
+  :is(#transcript, #member-log) blockquote p { margin: 0; }
+  :is(#transcript, #member-log) hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  :is(#transcript, #member-log) .md-li { margin: 2px 0; }
+  :is(#transcript, #member-log) .md-marker { color: var(--muted); }
   .input-row {
     display: grid;
     gap: 10px;
@@ -1435,19 +1331,6 @@
     /* The narrow row is tighter, and keeps the Home indicator's inset: this
        rule's shorthand would otherwise drop it where it matters most. */
     .input-row { padding: 12px 14px max(12px, env(safe-area-inset-bottom, 0px)); }
-    /* A side column does not fit a phone: the panel covers the view instead,
-       with the same header, which names the child and closes it. */
-    #child-panel {
-      position: absolute;
-      inset: 0;
-      width: auto;
-      max-width: none;
-      z-index: 11;
-      border-left: none;
-    }
-    /* The narrow padding is a shorthand: it would drop the base rule's inset,
-       which is the same mistake the harness caught on the composer's row. */
-    #child-transcript { padding: 12px 14px max(12px, env(safe-area-inset-bottom, 0px)); }
   }
   @media (max-width: 560px) {
     .view-header .view-title .view-dir { max-width: 40%; }
@@ -1553,13 +1436,6 @@
   .bs-avatar[data-state="working"]::before { animation: bs-breathe 2.4s ease-in-out infinite; }
   @keyframes bs-breathe { 50% { opacity: .4; } }
 }
-
-/* Crew strip */
-.bs-crew { display: flex; gap: var(--space-3); padding: var(--space-3) var(--space-4); overflow-x: auto; scrollbar-width: none; background: var(--sea-800); border-bottom: 1px solid var(--line); }
-.bs-member { display: grid; justify-items: center; gap: 4px; width: 64px; flex: 0 0 auto; text-align: center; }
-.bs-member__name { font: 600 12px/14px var(--font-sans); color: var(--ink); }
-.bs-member__now { font: 400 11px/14px var(--font-sans); color: var(--ink-muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bs-member.is-filtered .bs-member__name { color: var(--accent); }
 
 /* Chat message */
 .bs-msg { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: var(--space-3); }
@@ -1716,7 +1592,7 @@ main { padding: var(--space-3) var(--space-4) var(--space-4); }
 .crew-persona .is-danger { color: var(--stopped); }
 #crew-tab { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
 
-/* The open session: the header, the crew row, the body and the view tabs. */
+/* The open session: the header, the crew bar, the body and the view tabs. */
 .view-header .view-title { cursor: pointer; display: block; }
 .view-header .view-title .view-main { font-size: 12px; color: var(--ink-muted); }
 .view-header .view-title .view-dir::before { content: ' · '; }
@@ -1725,9 +1601,12 @@ main { padding: var(--space-3) var(--space-4) var(--space-4); }
 .view-header .header-chip { display: none; }
 .view-header .btn-more { min-height: 40px; }
 .crew-row { display: flex; align-items: center; background: var(--sea-800); border-bottom: 1px solid var(--line); }
-.crew-row .bs-crew { flex: 1; min-width: 0; border-bottom: none; }
-.view-switch { display: none; gap: var(--space-2); padding-right: var(--space-4); }
-.bs-member { appearance: none; background: none; border: 0; padding: 0; cursor: pointer; color: inherit; }
+.view-switch { display: none; gap: var(--space-2); padding-right: var(--space-4); margin-left: auto; }
+.crew-bar { appearance: none; flex: 1; min-width: 0; display: flex; align-items: center; gap: var(--space-3); min-height: 48px; padding: 6px var(--space-4); background: none; border: 0; border-radius: 0; color: var(--ink); text-align: left; cursor: pointer; font: 400 13px/18px var(--font-sans); }
+.crew-bar__faces { display: flex; gap: 4px; }
+.crew-bar__text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.crew-bar__ask { color: var(--needs-you); font-weight: 600; }
+.crew-bar__go { display: flex; color: var(--ink-muted); }
 #session-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 #main-col { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 #chat-view { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-4); }
@@ -1742,28 +1621,95 @@ main { padding: var(--space-3) var(--space-4) var(--space-4); }
 .bs-activity__call { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bs-ask__answer { color: var(--working); font-weight: 500; }
 .chat-note { text-align: center; font-size: 12px; color: var(--ink-muted); }
-.chat-note.error { color: var(--stopped); }
+.bs-orders { background: var(--sea-800); border-radius: var(--radius-md); padding: 4px var(--space-3) 6px; display: flex; flex-direction: column; }
+.bs-orders > .bs-label { padding: 8px 0 2px; }
+.bs-order { appearance: none; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 10px; align-items: center; width: 100%; min-height: 48px; padding: 0; background: none; border: 0; border-radius: 0; color: inherit; text-align: left; cursor: pointer; }
+.bs-order__face { display: flex; }
+.bs-order__body { min-width: 0; display: flex; flex-direction: column; }
+.bs-order__name { font: 600 14px/18px var(--font-sans); }
+.bs-order__text { font-size: 13px; line-height: 18px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bs-signal { display: flex; gap: var(--space-2); align-items: flex-start; margin-left: 40px; font-size: 13px; line-height: 18px; color: var(--ink-muted); }
+.bs-signal b { color: var(--ink); font-weight: 600; }
+.bs-signal.is-failure, .bs-signal.is-failure b { color: var(--stopped); }
+.bs-signal__text { min-width: 0; overflow-wrap: anywhere; cursor: pointer; }
+.bs-signal__text.is-clamped { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.bs-ask__path, .bs-ask__route { font-size: 12px; line-height: 16px; color: var(--ink-muted); }
 .is-live::after { content: '▍'; color: var(--accent); }
 #conversation { display: none; }
 #side-col { display: none; }
 .side-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2); }
 .side-count { font-size: 12px; color: var(--ink-muted); display: flex; gap: 6px; align-items: baseline; }
-#tasks-view, #files-view { display: grid; gap: var(--space-3); align-content: start; padding: var(--space-4); }
+#side-col { --tree-ground: var(--bg); }
+.side-switch { display: none; gap: var(--space-2); padding: var(--space-4) var(--space-4) 0; }
+#crew-view, #tasks-view, #files-view { display: grid; gap: var(--space-3); align-content: start; padding: var(--space-4); }
+
+/* Crew: the chain of command as a tree, then the flow between agents. */
+.tree-you { display: flex; align-items: center; gap: var(--space-3); min-height: 40px; }
+.you-badge { flex: 0 0 auto; width: 40px; height: 40px; border-radius: 30%; background: var(--you-wash); border: 1px solid var(--you); color: var(--you); display: grid; place-items: center; font: 600 12px/1 var(--font-sans); }
+.you-badge--xs { width: 20px; height: 20px; font-size: 7px; }
+.tree-you__text { font-size: 13px; color: var(--ink-muted); }
+.tree-node { position: relative; }
+.tree-kids { margin-left: 19px; padding: var(--space-2) 0 0 20px; border-left: 2px solid var(--line); display: flex; flex-direction: column; }
+.tree-kids > .tree-node::before { content: ""; position: absolute; left: -20px; top: 22px; width: 14px; border-top: 2px solid var(--line); }
+.tree-kids > .tree-node:last-child::after { content: ""; position: absolute; left: -23px; top: 24px; bottom: 0; width: 4px; background: var(--tree-ground); }
+.tree-row { appearance: none; display: flex; gap: var(--space-3); width: 100%; min-height: var(--touch); padding: 0 0 var(--space-3); background: none; border: 0; border-radius: 0; color: inherit; text-align: left; cursor: pointer; }
+.tree-row__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.tree-row__head { display: flex; align-items: center; gap: var(--space-2); }
+.tree-row__name { font: 600 15px/20px var(--font-sans); }
+.tree-row__line { font-size: 13px; line-height: 18px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tree-row__line b { color: var(--ink); font-weight: 500; }
+.flow-head { padding-top: var(--space-3); border-top: 1px solid var(--line); }
+.flow-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.flow-chips .bs-chip { min-height: 32px; }
+#flow-list { display: grid; gap: 2px; }
+.flow-row { appearance: none; display: grid; grid-template-columns: 40px 52px minmax(0, 1fr); gap: var(--space-2); align-items: start; width: 100%; min-height: var(--touch); padding: 6px 0; background: none; border: 0; border-radius: 0; color: inherit; text-align: left; cursor: pointer; }
+.flow-row__time { font: 400 12px/18px var(--font-mono); color: var(--ink-muted); font-variant-numeric: tabular-nums; }
+.flow-row__faces { display: flex; align-items: center; gap: 3px; }
+.flow-row__to { font-size: 11px; color: var(--ink-muted); }
+.flow-row__body { min-width: 0; display: flex; flex-direction: column; font-size: 13px; line-height: 18px; }
+.flow-row__head { color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flow-row__head b { color: var(--ink); font-weight: 600; }
+.flow-row[data-kind="question"] .flow-row__head b { color: var(--needs-you); }
+.flow-row[data-kind="failure"] .flow-row__head b { color: var(--stopped); }
+.flow-row__text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* A crew member's screen: its own header, its thread or its Log, and the bar
+   that sends the reader to the lead. */
+#member-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.member-face { display: inline-flex; padding: 0 4px; }
+.member-switch { display: flex; gap: var(--space-2); }
+#member-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-4); }
+#member-thread { display: grid; gap: var(--space-4); max-width: 720px; margin: 0 auto; align-content: start; }
+#member-crew { display: grid; gap: var(--space-2); max-width: 720px; margin: var(--space-6) auto 0; }
+#member-crew:empty { display: none; }
+#member-log { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 24px; line-height: 1.55; }
+#member-view[data-member-view="thread"] #member-log { display: none; }
+#member-view[data-member-view="log"] #member-scroll { display: none; }
+.member-foot { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4) max(var(--space-3), env(safe-area-inset-bottom, 0px)); background: var(--sea-800); border-top: 1px solid var(--line); }
+.member-foot__text { flex: 1; min-width: 0; font-size: 13px; color: var(--ink-muted); }
+#session-view[data-member] :is(#chat-view, #conversation, #activity-log, .input-row) { display: none !important; }
 #files-now { display: grid; gap: var(--space-2); }
 #files-now:empty { display: none; }
 .bs-file { width: 100%; background: none; border: 0; text-align: left; color: inherit; cursor: pointer; }
 #view-tabs { flex: 0 0 auto; }
 
-/* A phone shows one view at a time. */
+/* A phone shows one view at a time. A member's screen covers the session
+   view, with its own header. */
 #session-view[data-view="log"] #chat-view { display: none; }
 #session-view[data-view="log"] #conversation { display: flex; }
-#session-view:is([data-view="tasks"], [data-view="files"]) #main-col { display: none; }
-#session-view:is([data-view="tasks"], [data-view="files"]) #side-col { display: block; flex: 1; min-height: 0; overflow-y: auto; }
-#session-view[data-view="tasks"] #files-view { display: none; }
-#session-view[data-view="files"] #tasks-view { display: none; }
+#session-view:is([data-view="crew"], [data-view="tasks"], [data-view="files"]) #main-col { display: none; }
+#session-view:is([data-view="crew"], [data-view="tasks"], [data-view="files"]) #side-col { display: block; flex: 1; min-height: 0; overflow-y: auto; }
+#session-view:not([data-view="crew"]) #crew-view,
+#session-view:not([data-view="tasks"]) #tasks-view,
+#session-view:not([data-view="files"]) #files-view { display: none; }
+@media (max-width: 899.98px) {
+  .crew-row:has(> .crew-bar[hidden]) { display: none; }
+  #session-view[data-member] #main-col { display: flex; }
+  #session-view[data-member] :is(#side-col, .view-header, .crew-row) { display: none; }
+}
 
-/* From 900px: the session list as a rail, the open session, and its tasks and
-   files in their own column. Only Chat and Log switch. */
+/* From 900px: the session list as a rail, the open session, and its crew,
+   tasks and files in their own column. Only Chat and Log switch. */
 @media (min-width: 900px) {
   body.with-rail { flex-direction: row; }
   body.with-rail #home { flex: 0 0 300px; border-right: 1px solid var(--line); }
@@ -1774,8 +1720,14 @@ main { padding: var(--space-3) var(--space-4) var(--space-4); }
   #view-tabs { display: none; }
   #session-body { flex-direction: row; }
   #main-col { display: flex !important; min-width: 0; }
-  #side-col { display: block !important; flex: 0 0 340px; overflow-y: auto; background: var(--sea-800); border-left: 1px solid var(--line); }
-  #tasks-view, #files-view { display: grid !important; }
+  #side-col { display: block !important; flex: 0 0 340px; overflow-y: auto; background: var(--sea-800); border-left: 1px solid var(--line); --tree-ground: var(--sea-800); }
+  .side-switch { display: flex; }
+  #session-view[data-side="crew"] #crew-view,
+  #session-view[data-side="tasks"] #tasks-view,
+  #session-view[data-side="files"] #files-view { display: grid; }
+  #session-view:not([data-side="crew"]) #crew-view,
+  #session-view:not([data-side="tasks"]) #tasks-view,
+  #session-view:not([data-side="files"]) #files-view { display: none; }
   #session-view:not([data-view="log"]) #chat-view { display: block; }
   #session-view:not([data-view="log"]) #conversation { display: none; }
 }

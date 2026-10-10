@@ -6,7 +6,6 @@ import { ago, showStatus } from './common.js';
 import { updateStatusLabel } from './activity.js';
 import { markListEntry, openSession } from './history.js';
 import { closeSession, opened } from './session-view.js';
-import { renderChildList, updateChildPanelDot } from './subagents.js';
 import { activityCaption, avatarOf, renderCrew, treeMembers } from './crew.js';
 import { memberName, personaLabel } from './signal.js';
 import { setBadge } from './device.js';
@@ -211,8 +210,6 @@ async function refreshSessions() {
     offlineEl.hidden = true;
     renderSessions();
     setBadge(sessions.filter((session) => !session.parent_id && session.asking).length);
-    updateChildPanelDot();
-    renderChildList();
     renderCrew();
     // The waiting label follows the freshest list too: a child's state
     // changes without a state event for the open session, so the event

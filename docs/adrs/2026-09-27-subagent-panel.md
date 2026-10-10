@@ -3,6 +3,8 @@
 **Date:** 2026-09-27
 **Author:** Raghav
 
+> Superseded by `2026-10-10-reader-talks-to-the-lead.md`: a child is read on its own screen over the root's session, on a history entry of its own, with Thread and Log views. The Log follows the child's own `/events` stream as the panel did, in `member-log.js`.
+
 ## Context
 
 The web pane shows one session at a time. A child session appears in its parent's transcript as one line — a `ChildEvent` block, `[child <id> report] …` — whose id is a link that opens the child as the session view. Following a subagent therefore costs the parent's place: the transcript is replaced, the event stream switches, and the reader has to find their way back.

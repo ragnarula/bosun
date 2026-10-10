@@ -3,6 +3,8 @@
 **Date:** 2026-10-08
 **Author:** Pete
 
+> Superseded in part by `2026-10-10-reader-talks-to-the-lead.md`: Chat draws the root's thread only, with the root's orders as cards and its children's reports as lines, not a group chat of the whole tree. The crew strip and its filter are replaced by a crew bar that opens a new Crew view, the chain of command and the flow between agents. The views are Chat, Crew, Tasks and Files, with Log on each member's screen, and the subagent panel is gone. Bosun Signal, Home, the actions sheet and Stop in the header stand.
+
 ## Context
 
 The web pane showed an open session as one transcript: every block a row, every model call a cost line, every control but Send behind one `⋯` sheet, and a child as `[child 3f2a… report]`. Home was one row per session with children under a toggle. The control plane now serves one stream per session tree (`2026-10-08-one-stream-per-tree.md`), the crew's state with the session list (`2026-10-08-crew-state-for-clients.md`), and persona avatars (`2026-10-08-persona-avatars.md`). Earlier pane ADRs hold one screen in the page at a time (`2026-09-29-one-screen-in-the-document.md`), follow one child in a panel (`2026-09-27-subagent-panel.md`), and keep the session actions in a sheet.

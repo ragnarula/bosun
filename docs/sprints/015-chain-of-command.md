@@ -29,7 +29,7 @@ Today's pane and terminal client draw the tree flat: `treeMembers` lists every s
 - **The leaf of a question shows that it asks the reader.** While the root waits on a surfaced question, its origin leaf shows "asks you" with the needs-you ring, and each session between them shows "waiting". Today only the root shows it.
 - **A crew member has a read-only screen.** It opens from Crew, an Orders row, or Flow. Its header shows the path ("Lead › Builder") and two views, Thread and Log. Thread draws the orders the member received, its own text, diff cards and folded tool lines, its questions with their answers, its reports, and its own orders to its children as Orders cards. Below the thread, the member's crew lists its children. Log is today's transcript of that session.
 - **No message box for a child.** The member screen ends with a bar: "Builder takes orders from Lead. To change its work, tell Lead." and an **Ask Lead** button. The button opens Chat with "About Builder: " in the message box. This keeps the agent-tree rule that the reader steers a child only through the root.
-- **Log moves to the member screen.** The phone tab bar becomes Sessions, Chat, Crew, Tasks and Files. The root's Log opens from the root's node in Crew, which opens its member screen on Log, because the root's thread is Chat. The child panel goes: the member screen's Log replaces it.
+- **Log moves to the member screen.** The phone tab bar becomes Chat, Crew, Tasks and Files. The root's node in Crew opens the session's Log view, because the root's thread is Chat. The child panel goes: the member screen's Log replaces it.
 - **A child's link opens its tree.** Opening a child's id, from `#s=<id>` or a notification, opens the root's session on that member's screen. The watch banner goes. Opening a member screen adds a history entry, so back returns to where the reader came from.
 - **From 900px** the right column shows Crew, Tasks and Files, switched by chips, with Crew first. The header keeps the Chat and Log chips, and Log there is the root's.
 - **The terminal client follows the same rules.** See [CLI surface](#cli-surface).
@@ -57,7 +57,7 @@ Today's pane and terminal client draw the tree flat: `treeMembers` lists every s
 - [ ] **S2 — Crew shows the chain of command.** The tree from `parent_id` with connector lines, each node's state word, caption and newest order or report, and "asks you" on the origin leaf with "waiting" on the path to it.
 - [ ] **S3 — Flow under the tree.** Every order, report, question, answer and failure in the tree, newest first, with the four chips.
 - [ ] **S4 — A crew member's screen.** Thread and Log, the member's crew, the Ask Lead bar and its prefilled message. A child's link opens it, a history entry backs out of it, and the child panel and the watch banner go.
-- [ ] **S5 — Tabs and the desktop.** The tab bar becomes Sessions, Chat, Crew, Tasks and Files, with the needs-you dot on Chat. From 900px the right column switches Crew, Tasks and Files.
+- [ ] **S5 — Tabs and the desktop.** The tab bar becomes Chat, Crew, Tasks and Files, with the needs-you dot on Chat. From 900px the right column switches Crew, Tasks and Files.
 - [ ] **S6 — The terminal client.** Chat on the same rules, Crew with the tree, flow and member picking, Log on Alt+5 and F5, and `bosun open <child id>` on the member's thread.
 - [ ] **S7 — The docs that own the current state say so.** CLAUDE.md, the README, and the new ADR with the superseded notes on the three it changes.
 

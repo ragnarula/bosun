@@ -15,7 +15,6 @@ export {
   btnBack,
   btnBottom,
   btnBrowse,
-  btnChildCollapse,
   btnClear,
   btnCopyId,
   btnDirClose,
@@ -39,18 +38,12 @@ export {
   btnSkillsAdd,
   btnSkillsBack,
   btnStop,
-  btnWatchOpen,
   chipPermission,
   chipPermissionText,
   chipPersona,
   crewTab,
   cancelNewSessionBtn,
   chatRow,
-  childList,
-  childPanel,
-  childPanelDot,
-  childPanelTitle,
-  childTranscript,
   dirBrowser,
   dirEntries,
   dirPathEl,
@@ -91,11 +84,6 @@ export {
   personaChips,
   personaName,
   recentList,
-  rowClear,
-  rowFork,
-  rowPermission,
-  rowPersona,
-  rowStop,
   sessionListEl,
   skillRefLabel,
   skillsAdd,
@@ -119,7 +107,6 @@ export {
   viewSummary,
   viewTitle,
   viewWaiting,
-  watchBanner,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -210,19 +197,12 @@ const btnMore = $('btn-more');
 const btnSheetClose = $('btn-sheet-close');
 const btnCopyId = $('btn-copy-id');
 const viewIdCopy = $('view-id-copy');
-const watchBanner = $('watch-banner');
-const btnWatchOpen = $('btn-watch-open');
 const viewPermission = $('view-permission');
 const viewSheetMeta = $('view-sheet-meta');
-const rowPermission = $('row-permission');
-const rowPersona = $('row-persona');
-const rowFork = $('row-fork');
 const btnFork = $('btn-fork');
 const viewFork = $('view-fork');
-const rowClear = $('row-clear');
 const btnClear = $('btn-clear');
 const viewClear = $('view-clear');
-const rowStop = $('row-stop');
 const inputRow = $('input-row');
 const btnInterrupt = $('btn-interrupt');
 const btnPermission = $('btn-permission');
@@ -231,12 +211,6 @@ const btnPersona = $('btn-persona');
 const btnStop = $('btn-stop');
 const transcript = $('transcript');
 const btnBottom = $('btn-bottom');
-const childPanel = $('child-panel');
-const childTranscript = $('child-transcript');
-const childPanelTitle = $('child-panel-title');
-const childList = $('child-list');
-const childPanelDot = $('child-panel-dot');
-const btnChildCollapse = $('btn-child-collapse');
 const input = $('input');
 const chatRow = $('chat-row');
 const btnSend = $('btn-send');

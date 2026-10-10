@@ -6,13 +6,13 @@
 // the most recent question, which the durable answered-ask event updates in
 // place instead of drawing the question twice; and `callArgs`, the arguments of
 // the `message_child` calls drawn in it, by call id. The session's transcript,
-// the subagent panel's and a page read back each pass their own.
+// a crew member's Log and a page read back each pass their own.
 
 import { sessions } from './session-list.js';
-import { openSession } from './history.js';
+import { openMember } from './history.js';
 import { USER_REJECTED_TEXT } from './composer.js';
 import { renderMarkdown } from './markdown.js';
-import { childName, watchControl } from './subagents.js';
+import { childName, watchControl } from './member-log.js';
 
 export { clip, drawAssistant, drawBlock, drawLine, drawLiveParagraph, modelCallLine };
 
@@ -420,8 +420,8 @@ function drawBlock(message, atMs, record) {
         atMs
       );
     case 'child_event': {
-      // Child activity renders as one line whose child id expands into that
-      // child's own thread (watch-only): clicking it attaches the view.
+      // Child activity renders as one line whose name and watch control open
+      // the child's screen.
       const line = document.createElement('div');
       line.className = 'line child-report';
       const head = document.createElement('span');
@@ -431,11 +431,9 @@ function drawBlock(message, atMs, record) {
       const link = document.createElement('span');
       link.className = 'child-link';
       link.textContent = childName(child) || block.child_id;
-      link.title = block.child_id + ' (opens the child as the session view)';
-      link.addEventListener('click', () => openSession(block.child_id));
+      link.title = block.child_id;
+      link.addEventListener('click', () => openMember(block.child_id));
       line.appendChild(link);
-      // Beside the name, which opens the child as the session view: this
-      // follows it in the panel, without leaving the parent's place.
       line.appendChild(watchControl(block.child_id));
       const tail = document.createElement('span');
       tail.textContent = ' ' + (block.event_kind || 'report') + '] ' + block.text;

@@ -29,9 +29,11 @@ Shipped so far:
   its node, so closing the terminal or the browser does not stop it, and
   `bosun open` reattaches to a live one.
 - **Sessions in a tree.** A session spawns children and names the node and
-  directory each one runs on. A child reports to its parent by ending its turn,
-  and the pane watches a child in a panel beside the session, on its own event
-  stream.
+  directory each one runs on, and a child can spawn its own. A child reports to
+  its parent by ending its turn. The reader talks to the root only: the pane
+  and `bosun open` show a chat with the root, a Crew view with the tree as a
+  chain of command and the orders, reports and questions between agents, and a
+  read-only screen for each agent with its own thread and log.
 - **Forks.** The pane's actions sheet forks a session's conversation into a new
   root session. The fork keeps the same model, persona, permission, MCP servers
   and thread, and gets its own clone of the same repository; the original is

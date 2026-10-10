@@ -1,16 +1,22 @@
 // The crew: every session in the open session's tree, followed on one stream.
-// It draws the crew strip, and the Chat, Tasks and Files views. The Log view
-// is the open session's own transcript, which session-view.js draws.
+// The reader talks to the lead, the tree's root, and the lead runs the crew.
+// Chat draws the lead's conversation, Crew draws the chain of command and the
+// flow of orders, reports and questions between agents, a member's screen
+// draws one agent's own thread, and Tasks and Files draw what the whole crew
+// does. The Log view is the open session's own transcript, which
+// session-view.js draws.
 
-import { $ } from './dom.js';
+import { $, input, view } from './dom.js';
 import { ago, showStatus } from './common.js';
 import { sessions } from './session-list.js';
 import { personas } from './new-session.js';
 import { opened } from './session-view.js';
+import { closeMember, openMember } from './history.js';
 import { renderMarkdown } from './markdown.js';
 import { avatar, flag, icon, memberName, personaLabel } from './signal.js';
 import { USER_REJECTED_TEXT } from './composer.js';
-import { closeChildPanel, followChild } from './subagents.js';
+import { closeMemberLog, followMemberLog } from './member-log.js';
+import { setView } from './views.js';
 import { follow } from './scroll.js';
 
 export {
@@ -18,14 +24,34 @@ export {
   avatarOf,
   closeCrew,
   crewState,
+  hideMember,
   openCrew,
   renderCrew,
+  showMember,
+  shownMember,
   treeMembers,
 };
 
-const crewStrip = $('crew-strip');
+const crewBar = $('crew-bar');
+const crewBarFaces = $('crew-bar-faces');
+const crewBarText = $('crew-bar-text');
+const chatDot = $('chat-dot');
 const chatList = $('chat-list');
 const chatView = $('chat-view');
+const crewTree = $('crew-tree');
+const crewCount = $('crew-count');
+const flowChips = $('flow-chips');
+const flowList = $('flow-list');
+const memberView = $('member-view');
+const memberFace = $('member-face');
+const memberTitle = $('member-title');
+const memberSub = $('member-sub');
+const memberScroll = $('member-scroll');
+const memberThread = $('member-thread');
+const memberCrew = $('member-crew');
+const memberFootText = $('member-foot-text');
+const btnAskLead = $('btn-ask-lead');
+const btnMemberBack = $('btn-member-back');
 const tasksList = $('tasks-list');
 const tasksProgress = $('tasks-progress');
 const tasksCount = $('tasks-count');
@@ -33,13 +59,23 @@ const filesNow = $('files-now');
 const filesList = $('files-list');
 const filesCount = $('files-count');
 
-// How many chat items the view keeps. The store holds everything, and the Log
-// view reads it back; the chat is the crew's recent conversation.
-const MAX_CHAT_ITEMS = 600;
+// How many items a thread keeps on screen. The store holds everything, and the
+// Log reads it back; a thread is the recent conversation.
+const MAX_THREAD_ITEMS = 600;
 // How many diff lines a chat card shows before the reader taps for the rest.
 const CARD_LINES = 6;
-// How many messages the tree stream replays when the crew opens.
-const TREE_TAIL = 120;
+// How many messages the tree stream replays when the crew opens. The tail
+// counts every member's messages, and Chat draws only the lead's.
+const TREE_TAIL = 300;
+// How many messages the pane keeps per member, to draw a member's thread when
+// its screen opens.
+const MAX_MEMBER_MESSAGES = 400;
+// How many orders, reports and questions Flow keeps, and how many it draws.
+const MAX_SIGNALS = 300;
+const FLOW_ROWS = 80;
+
+// The Flow filter the reader chose, kept across sessions for this page load.
+let flowFilter = 'all';
 
 // ---- The crew's members ----
 
@@ -65,9 +101,9 @@ function avatarOf(session, size, state) {
   return avatar({ seed, persona: session.persona, state, size, src });
 }
 
-// What a member's ring shows. A question waiting on the user is the root's;
-// a working loop, a parent waiting on its children, a crash and a member with
-// nothing to do each have their own.
+// What a member's ring shows from the session list alone. A question waiting
+// on the user is the root's; a working loop, a parent waiting on its
+// children, a crash and a member with nothing to do each have their own.
 function crewState(session) {
   if (session.state === 'interrupted' && session.interrupt_cause === 'crash') return 'stopped';
   if (session.asking && !session.parent_id) return 'needs-you';
@@ -78,6 +114,69 @@ function crewState(session) {
 
 function liveChildren(session) {
   return sessions.filter((each) => each.parent_id === session.id && each.state !== 'stopped').length;
+}
+
+// Whether `ancestorId` is above `id` in the tree.
+function isAbove(ancestorId, id) {
+  let session = sessionOf(id);
+  while (session.parent_id) {
+    if (session.parent_id === ancestorId) return true;
+    session = sessionOf(session.parent_id);
+  }
+  return false;
+}
+
+// What a member's ring shows in the open crew. While the root waits on a
+// question it surfaced, the member that asked it waits on the reader, and
+// each member between them waits on the question.
+function memberState(crew, session) {
+  const question = crew.question;
+  if (question && question.leaf !== crew.rootId && sessionOf(crew.rootId).asking) {
+    if (session.id === question.leaf) return 'needs-you';
+    if (session.id !== crew.rootId && isAbove(session.id, question.leaf)) return 'waiting';
+  }
+  return crewState(session);
+}
+
+// The word a state pill prints for a member.
+function stateWord(session, state) {
+  switch (state) {
+    case 'needs-you': return session.parent_id ? 'asks you' : 'needs you';
+    case 'working': return 'working';
+    case 'waiting': return 'waiting';
+    case 'stopped': return 'stopped';
+    default: return session.parent_id ? 'done' : 'ready';
+  }
+}
+
+function statePill(session, state) {
+  const pill = document.createElement('span');
+  pill.className = 'bs-status';
+  pill.dataset.state = state === 'idle' ? (session.parent_id ? 'done' : 'idle') : state;
+  pill.textContent = stateWord(session, state);
+  return pill;
+}
+
+// The sessions under `id`, in the order they were created. A member whose
+// parent the list no longer holds stays in the tree under the root.
+function childrenOf(members, id, rootId) {
+  const known = new Set(members.map((member) => member.id));
+  return members.filter((member) =>
+    member.id !== rootId
+    && (member.parent_id === id || (id === rootId && !known.has(member.parent_id)))
+  );
+}
+
+// The names from `id` up to the root, root first: "Lead › Builder".
+function pathNames(crew, id) {
+  const names = [];
+  let session = sessionOf(id);
+  for (;;) {
+    names.unshift(nameOf(crew, session.id));
+    if (!session.parent_id || session.id === crew.rootId) break;
+    session = sessionOf(session.parent_id);
+  }
+  return names;
 }
 
 // The verb a tool's activity reads as, in a crew caption.
@@ -132,12 +231,18 @@ function activityCaption(activity) {
   }
 }
 
-// One line for a member under its face.
-function memberCaption(session, state, crew) {
+// One line saying what a member is doing now.
+function memberCaption(crew, session, state) {
   switch (state) {
     case 'stopped': return 'stopped';
-    case 'needs-you': return 'asks you';
-    case 'waiting': return 'waiting on ' + liveChildren(session);
+    case 'needs-you':
+      return session.id === crew.rootId && crew.question && crew.question.leaf !== crew.rootId
+        ? 'passed a question from ' + nameOf(crew, crew.question.leaf) + ' to you'
+        : 'asks you';
+    case 'waiting': {
+      const live = liveChildren(session);
+      return live ? 'waiting on ' + live : 'waiting for your answer';
+    }
     case 'working': {
       const activity = crew.activity.get(session.id) || session.activity;
       return activityCaption(activity) || 'working';
@@ -149,15 +254,58 @@ function memberCaption(session, state, crew) {
 
 // ---- Opening and closing ----
 
+// A thread draws one member's conversation into `list`: Chat is the root's
+// thread, and a member's screen is that member's.
+function newThread(list, scroller, memberId) {
+  return {
+    list,
+    scroller,
+    memberId,
+    // The last post a post by the same author joins, the open fold of tool
+    // calls, the Orders card the next order joins, and each call's card or
+    // order row by call id.
+    last: null,
+    fold: null,
+    orders: null,
+    calls: new Map(),
+    // The root's reply as it streams, which the durable text replaces.
+    live: null,
+    // Whether the thread follows its newest item.
+    stick: true,
+    // The order rows still waiting on a report, by the child they name.
+    openRows: new Map(),
+    // The newest question card, which its answered copy fills in place.
+    askCard: null,
+    // A child's own question that its next instruction answers.
+    pendingAsk: null,
+    // Each child's question to this member, by child: a question the member
+    // passes on to the reader replaces it.
+    askLines: new Map(),
+  };
+}
+
 function newCrew(rootId) {
   return {
     rootId,
     es: null,
     // Each member's newest activity from the stream, by session id.
     activity: new Map(),
-    // The chat's state: the last item a post can join, the open fold of tool
-    // calls, and each call's card or line by call id.
-    chat: { last: null, fold: null, calls: new Map(), live: null, stick: true },
+    // Each member's recent messages, by session id, to draw its thread when
+    // its screen opens.
+    messages: new Map(),
+    chat: newThread(chatList, chatView, rootId),
+    // The open member screen's thread, or null.
+    member: null,
+    // Every order, report and question between agents, oldest first.
+    signals: [],
+    // The spawn calls whose result has not named their child yet.
+    spawns: new Map(),
+    // The origin of each child's newest question to the root, by child.
+    askOrigins: new Map(),
+    // The question the root put to the reader and the member that asked it.
+    question: null,
+    // The edit and write calls whose result has not arrived, by call id.
+    fileCalls: new Map(),
     // The task list, as the root's newest `todos` event wrote it.
     tasks: [],
     // Each changed file by path: what happened to it, its lines, who, when,
@@ -165,8 +313,7 @@ function newCrew(rootId) {
     files: new Map(),
     // The newest file change, for the Files view's "now" block.
     latest: null,
-    // The member whose posts the chat shows, or null for everyone.
-    filter: null,
+    renderTimer: null,
   };
 }
 
@@ -195,94 +342,444 @@ function openCrew(s, rootId) {
   crew.es.onerror = () => {
     if (opened === s && s.crew === crew) showStatus('crew: stream lost, reconnecting');
   };
+  if (s.memberId) buildMember(crew, s.memberId);
   renderCrew();
 }
 
 function closeCrew(s) {
   if (s && s.crew) {
     if (s.crew.es) s.crew.es.close();
+    window.clearTimeout(s.crew.renderTimer);
     s.crew = null;
   }
-  crewStrip.textContent = '';
+  hideMember();
+  crewBar.hidden = true;
+  crewBarFaces.textContent = '';
   chatList.textContent = '';
+  crewTree.textContent = '';
+  flowList.textContent = '';
   tasksList.textContent = '';
   filesList.textContent = '';
   filesNow.textContent = '';
 }
 
-// ---- The crew strip ----
+// ---- Drawing what names members ----
 
-// Redraws the strip and the views that name members, from the newest session
-// list. The session poll calls this every few seconds, and the stream calls
-// it when a member's activity changes.
+// Redraws everything that names members, from the newest session list. The
+// session poll calls this every few seconds.
 function renderCrew() {
   const s = opened;
   if (!s || !s.crew) return;
   const crew = s.crew;
-  const members = treeMembers(crew.rootId);
-  crewStrip.textContent = '';
-  crewStrip.hidden = members.length === 0;
-  for (const session of members) {
-    const state = crewState(session);
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'bs-member' + (crew.filter === session.id ? ' is-filtered' : '');
-    button.dataset.member = session.id;
-    button.appendChild(avatarOf(session, 'md', state));
-    const name = document.createElement('span');
-    name.className = 'bs-member__name';
-    name.textContent = memberName(session, members);
-    button.appendChild(name);
-    const now = document.createElement('span');
-    now.className = 'bs-member__now';
-    now.textContent = memberCaption(session, state, crew);
-    button.appendChild(now);
-    button.addEventListener('click', () => focusMember(crew, session));
-    crewStrip.appendChild(button);
-  }
+  renderMembers(crew);
   renderTasks(crew);
   renderFiles(crew);
-  // The strip can change height as members join, which moves the bottom of
-  // the transcript and the chat; a reader at the newest line stays there.
+  // The crew bar can appear as members join, which moves the bottom of the
+  // transcript and the chat; a reader at the newest line stays there.
   follow();
-  followChat(crew);
+  followThread(crew.chat);
 }
 
-// A tap on a member shows only that member's part of the chat, and in the Log
-// view follows a child's own transcript in the panel. A second tap shows the
-// whole crew again.
-function focusMember(crew, session) {
-  crew.filter = crew.filter === session.id ? null : session.id;
-  applyFilter(crew);
-  if (document.getElementById('session-view').dataset.view === 'log') {
-    if (session.parent_id && crew.filter) followChild(session.id);
-    else closeChildPanel();
-  }
-  renderCrew();
+// The stream changes members' states and adds signals many times a second
+// while it replays, so their views redraw once per burst.
+function scheduleRender(crew) {
+  if (crew.renderTimer) return;
+  crew.renderTimer = window.setTimeout(() => {
+    crew.renderTimer = null;
+    if (opened && opened.crew === crew) renderMembers(crew);
+  }, 0);
 }
 
-function applyFilter(crew) {
-  for (const item of chatList.children) {
-    item.hidden = !!crew.filter
-      && item.dataset.member !== crew.filter
-      && item.dataset.to !== crew.filter;
+function renderMembers(crew) {
+  const members = treeMembers(crew.rootId);
+  renderBar(crew, members);
+  renderTree(crew, members);
+  renderFlow(crew);
+  refreshRows(crew, crew.chat);
+  if (crew.member) {
+    renderMemberHead(crew, crew.member.memberId, members);
+    refreshRows(crew, crew.member);
+  }
+  chatDot.hidden = !sessionOf(crew.rootId).asking;
+}
+
+// The crew bar under the header of Chat: the children's faces and who works
+// or asks the reader. A tap opens Crew.
+function renderBar(crew, members) {
+  const children = members.filter((member) => member.id !== crew.rootId);
+  crewBar.hidden = children.length === 0;
+  crewBarFaces.textContent = '';
+  crewBarText.textContent = '';
+  if (!children.length) return;
+  for (const child of children.slice(0, 5)) crewBarFaces.appendChild(avatarOf(child, 'xs'));
+  const states = children.map((child) => memberState(crew, child));
+  const working = states.filter((state) => state === 'working').length;
+  const asking = states.filter((state) => state === 'needs-you').length;
+  const parts = [];
+  if (working) parts.push(document.createTextNode(working + ' working'));
+  if (asking) {
+    const ask = document.createElement('span');
+    ask.className = 'crew-bar__ask';
+    ask.textContent = asking + ' asks you';
+    parts.push(ask);
+  }
+  if (!parts.length) parts.push(document.createTextNode(children.length + (children.length === 1 ? ' agent' : ' agents')));
+  parts.forEach((part, index) => {
+    if (index) crewBarText.appendChild(document.createTextNode(' · '));
+    crewBarText.appendChild(part);
+  });
+}
+
+crewBar.addEventListener('click', () => setView('crew'));
+
+// ---- Crew: the chain of command ----
+
+function renderTree(crew, members) {
+  crewTree.textContent = '';
+  crewCount.textContent = members.length > 1 ? 'crew of ' + members.length : '';
+  if (!members.length) return;
+  const you = document.createElement('div');
+  you.className = 'tree-node';
+  const youRow = document.createElement('div');
+  youRow.className = 'tree-you';
+  const badge = document.createElement('span');
+  badge.className = 'you-badge';
+  badge.textContent = 'You';
+  youRow.appendChild(badge);
+  const youText = document.createElement('span');
+  youText.className = 'tree-you__text';
+  youText.textContent = 'You give orders to ' + nameOf(crew, crew.rootId) + ' only.';
+  youRow.appendChild(youText);
+  you.appendChild(youRow);
+  const kids = document.createElement('div');
+  kids.className = 'tree-kids';
+  kids.appendChild(treeNode(crew, members, sessionOf(crew.rootId)));
+  you.appendChild(kids);
+  crewTree.appendChild(you);
+}
+
+function treeNode(crew, members, session) {
+  const node = document.createElement('div');
+  node.className = 'tree-node';
+  const state = memberState(crew, session);
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'tree-row';
+  row.dataset.member = session.id;
+  row.appendChild(avatarOf(session, 'md', state));
+  const body = document.createElement('span');
+  body.className = 'tree-row__body';
+  const head = document.createElement('span');
+  head.className = 'tree-row__head';
+  const name = document.createElement('span');
+  name.className = 'tree-row__name';
+  name.textContent = nameOf(crew, session.id);
+  head.appendChild(name);
+  head.appendChild(statePill(session, state));
+  body.appendChild(head);
+  const now = document.createElement('span');
+  now.className = 'tree-row__line';
+  now.textContent = memberCaption(crew, session, state);
+  body.appendChild(now);
+  const signal = newestSignal(crew, session.id);
+  if (signal) {
+    const line = document.createElement('span');
+    line.className = 'tree-row__line';
+    const kind = document.createElement('b');
+    kind.textContent = SIGNAL_WORDS[signal.kind];
+    line.appendChild(kind);
+    line.appendChild(document.createTextNode(' · ' + firstLine(signal.text)));
+    body.appendChild(line);
+  }
+  row.appendChild(body);
+  // The root's thread is Chat, so its node opens its Log.
+  row.addEventListener('click', () => {
+    if (session.id === crew.rootId) setView('log');
+    else openMember(session.id);
+  });
+  node.appendChild(row);
+  const children = childrenOf(members, session.id, crew.rootId);
+  if (children.length) {
+    const kids = document.createElement('div');
+    kids.className = 'tree-kids';
+    for (const child of children) kids.appendChild(treeNode(crew, members, child));
+    node.appendChild(kids);
+  }
+  return node;
+}
+
+// The newest order a member received or report it sent.
+function newestSignal(crew, id) {
+  for (let i = crew.signals.length - 1; i >= 0; i--) {
+    const signal = crew.signals[i];
+    if (signal.kind === 'order' && signal.to === id) return signal;
+    if (['report', 'ask', 'failure'].includes(signal.kind) && signal.from === id) return signal;
+  }
+  return null;
+}
+
+// ---- Crew: the flow ----
+
+const SIGNAL_WORDS = {
+  order: 'Order',
+  report: 'Report',
+  ask: 'Asked',
+  failure: 'Failed',
+  question: 'Question',
+  answer: 'Answer',
+};
+
+const FLOW_KINDS = {
+  all: null,
+  order: ['order'],
+  report: ['report', 'failure'],
+  question: ['ask', 'question', 'answer'],
+};
+
+function addSignal(crew, signal) {
+  crew.signals.push(signal);
+  if (crew.signals.length > MAX_SIGNALS) crew.signals.shift();
+}
+
+function renderFlow(crew) {
+  for (const chip of flowChips.querySelectorAll('[data-flow]')) {
+    chip.setAttribute('aria-pressed', String(chip.dataset.flow === flowFilter));
+  }
+  flowList.textContent = '';
+  const kinds = FLOW_KINDS[flowFilter];
+  const shown = [];
+  for (let i = crew.signals.length - 1; i >= 0 && shown.length < FLOW_ROWS; i--) {
+    const signal = crew.signals[i];
+    if (!kinds || kinds.includes(signal.kind)) shown.push(signal);
+  }
+  if (!shown.length) {
+    flowList.appendChild(emptyNote('No orders or reports yet.'));
+    return;
+  }
+  for (const signal of shown) flowList.appendChild(flowRow(crew, signal));
+}
+
+function flowRow(crew, signal) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'flow-row';
+  row.dataset.kind = signal.kind;
+  const time = document.createElement('span');
+  time.className = 'flow-row__time';
+  time.textContent = clockTime(signal.atMs);
+  row.appendChild(time);
+  const faces = document.createElement('span');
+  faces.className = 'flow-row__faces';
+  faces.appendChild(faceOf(signal.from));
+  const arrow = document.createElement('span');
+  arrow.className = 'flow-row__to';
+  arrow.textContent = '›';
+  arrow.setAttribute('aria-label', 'to');
+  faces.appendChild(arrow);
+  faces.appendChild(faceOf(signal.to));
+  row.appendChild(faces);
+  const body = document.createElement('span');
+  body.className = 'flow-row__body';
+  const head = document.createElement('span');
+  head.className = 'flow-row__head';
+  const kind = document.createElement('b');
+  kind.textContent = SIGNAL_WORDS[signal.kind];
+  head.appendChild(kind);
+  head.appendChild(document.createTextNode(' ' + whoName(crew, signal.from) + ' › ' + whoName(crew, signal.to)));
+  body.appendChild(head);
+  const text = document.createElement('span');
+  text.className = 'flow-row__text';
+  text.textContent = firstLine(signal.text);
+  body.appendChild(text);
+  row.appendChild(body);
+  // A tap opens the agent the signal is about: the child, not the reader or
+  // the root.
+  const target = [signal.from, signal.to].find((id) => id !== 'you' && id !== crew.rootId);
+  row.addEventListener('click', () => {
+    if (target) openMember(target);
+  });
+  return row;
+}
+
+function faceOf(id) {
+  if (id === 'you') {
+    const badge = document.createElement('span');
+    badge.className = 'you-badge you-badge--xs';
+    badge.textContent = 'You';
+    return badge;
+  }
+  return avatarOf(sessionOf(id), 'xs');
+}
+
+function whoName(crew, id) {
+  return id === 'you' ? 'You' : nameOf(crew, id);
+}
+
+for (const chip of flowChips.querySelectorAll('[data-flow]')) {
+  chip.addEventListener('click', () => {
+    flowFilter = chip.dataset.flow;
+    if (opened && opened.crew) renderFlow(opened.crew);
+  });
+}
+
+function firstLine(text) {
+  return String(text || '').split('\n').map((line) => line.trim()).find((line) => line) || '';
+}
+
+// ---- A crew member's screen ----
+
+function shownMember() {
+  return opened ? opened.memberId || null : null;
+}
+
+// Shows `id`'s screen over the open session. The root's thread is Chat, so a
+// screen for the root opens the root's Log instead.
+function showMember(id) {
+  const s = opened;
+  if (!s) return;
+  const rootId = s.crew ? s.crew.rootId : s.id;
+  if (id === rootId) {
+    hideMember();
+    setView('log');
+    return;
+  }
+  if (s.memberId === id && s.crew && s.crew.member) return;
+  s.memberId = id;
+  if (s.crew) buildMember(s.crew, id);
+}
+
+function buildMember(crew, id) {
+  closeMemberLog();
+  memberThread.textContent = '';
+  memberCrew.textContent = '';
+  crew.member = newThread(memberThread, memberScroll, id);
+  for (const { message, atMs } of crew.messages.get(id) || []) {
+    drawThreadMessage(crew, crew.member, message, atMs);
+  }
+  setMemberView('thread');
+  view.dataset.member = id;
+  memberView.hidden = false;
+  renderMemberHead(crew, id, treeMembers(crew.rootId));
+  crew.member.stick = true;
+  followThread(crew.member);
+}
+
+function hideMember() {
+  if (opened) {
+    opened.memberId = null;
+    if (opened.crew) opened.crew.member = null;
+  }
+  closeMemberLog();
+  delete view.dataset.member;
+  memberView.hidden = true;
+  memberThread.textContent = '';
+  memberCrew.textContent = '';
+}
+
+function renderMemberHead(crew, id, members) {
+  const session = sessionOf(id);
+  const state = memberState(crew, session);
+  memberFace.textContent = '';
+  memberFace.appendChild(avatarOf(session, 'md', state));
+  const name = nameOf(crew, id);
+  memberTitle.textContent = name;
+  memberSub.textContent = [pathNames(crew, id).join(' › '), stateWord(session, state), session.node]
+    .filter(Boolean)
+    .join(' · ');
+  const parent = session.parent_id ? nameOf(crew, session.parent_id) : null;
+  const lead = nameOf(crew, crew.rootId);
+  memberFootText.textContent = parent
+    ? name + ' takes orders from ' + parent + '. To change its work, tell ' + lead + '.'
+    : '';
+  btnAskLead.textContent = 'Ask ' + lead;
+  memberCrew.textContent = '';
+  const children = childrenOf(members, id, crew.rootId);
+  if (!children.length) return;
+  const label = document.createElement('div');
+  label.className = 'bs-label';
+  label.textContent = name + '’s crew';
+  memberCrew.appendChild(label);
+  for (const child of children) {
+    const childState = memberState(crew, child);
+    const signal = newestSignal(crew, child.id);
+    memberCrew.appendChild(memberRow(crew, child, childState, signal ? firstLine(signal.text) : ''));
   }
 }
+
+// A row naming a member: its face, its name, a line of text and its state.
+// A tap opens its screen.
+function memberRow(crew, session, state, text) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'bs-order';
+  row.dataset.member = session.id;
+  row.appendChild(avatarOf(session, 'sm'));
+  const body = document.createElement('span');
+  body.className = 'bs-order__body';
+  const name = document.createElement('span');
+  name.className = 'bs-order__name';
+  name.textContent = nameOf(crew, session.id);
+  body.appendChild(name);
+  const line = document.createElement('span');
+  line.className = 'bs-order__text';
+  line.textContent = text;
+  body.appendChild(line);
+  row.appendChild(body);
+  row.appendChild(statePill(session, state));
+  row.addEventListener('click', () => openMember(session.id));
+  return row;
+}
+
+function setMemberView(name) {
+  memberView.dataset.memberView = name;
+  for (const chip of memberView.querySelectorAll('.member-switch [data-member-view]')) {
+    chip.setAttribute('aria-pressed', String(chip.dataset.memberView === name));
+  }
+  if (name === 'log' && opened && opened.memberId) followMemberLog(opened.memberId);
+}
+
+for (const chip of memberView.querySelectorAll('.member-switch [data-member-view]')) {
+  chip.addEventListener('click', () => setMemberView(chip.dataset.memberView));
+}
+
+btnMemberBack.addEventListener('click', () => closeMember());
+
+// The reader steers a child only through the lead: the button opens Chat with
+// the child named in the message box.
+btnAskLead.addEventListener('click', () => {
+  const crew = opened && opened.crew;
+  const id = shownMember();
+  if (!crew || !id) return;
+  const name = nameOf(crew, id);
+  closeMember();
+  setView('chat');
+  if (!input.value.trim()) input.value = 'About ' + name + ': ';
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+});
 
 // ---- The tree stream ----
 
 function handleTreeFrame(crew, frame) {
   if (Object.prototype.hasOwnProperty.call(frame, 'delta')) {
-    drawDelta(crew, frame.session_id, frame.delta);
+    if (frame.session_id === crew.rootId) drawDelta(crew.chat, frame.delta);
     return;
   }
   if (!frame.event) return;
   const event = frame.event;
   const member = frame.session_id;
   switch (event.kind) {
-    case 'message':
-      drawChatMessage(crew, member, event.message, event.at_ms);
+    case 'message': {
+      const message = event.message;
+      keepMessage(crew, member, message, event.at_ms);
+      track(crew, member, message, event.at_ms);
+      if (member === crew.rootId) drawThreadMessage(crew, crew.chat, message, event.at_ms);
+      if (crew.member && crew.member.memberId === member) {
+        drawThreadMessage(crew, crew.member, message, event.at_ms);
+      }
+      scheduleRender(crew);
       break;
+    }
     case 'todos':
       if (member === crew.rootId) {
         crew.tasks = Array.isArray(event.items) ? event.items : [];
@@ -291,7 +788,7 @@ function handleTreeFrame(crew, frame) {
       break;
     case 'activity': {
       crew.activity.set(member, event);
-      if (event.phase === 'tool_started' || event.phase === 'tool_finished') renderCrew();
+      if (event.phase === 'tool_started' || event.phase === 'tool_finished') scheduleRender(crew);
       break;
     }
     default:
@@ -299,7 +796,99 @@ function handleTreeFrame(crew, frame) {
   }
 }
 
-// ---- The chat ----
+function keepMessage(crew, member, message, atMs) {
+  let kept = crew.messages.get(member);
+  if (!kept) {
+    kept = [];
+    crew.messages.set(member, kept);
+  }
+  kept.push({ message, atMs });
+  if (kept.length > MAX_MEMBER_MESSAGES) kept.shift();
+}
+
+// What one message tells the whole crew, whoever's thread is on screen: the
+// orders, reports and questions between agents, the question the reader
+// holds, and the files the crew changed.
+function track(crew, member, message, atMs) {
+  const block = message.block;
+  const isRoot = member === crew.rootId;
+  if (message.role === 'assistant') {
+    if (block.kind === 'tool_call') {
+      const args = block.args || {};
+      if (block.name === 'spawn') {
+        crew.spawns.set(block.id, { from: member, text: String(args.instructions || ''), atMs });
+      } else if (block.name === 'message_child') {
+        addSignal(crew, { kind: 'order', from: member, to: args.id, text: String(args.text || ''), atMs });
+      } else if (block.name === 'edit' || block.name === 'file_write') {
+        const path = String(args.path || '');
+        crew.fileCalls.set(block.id, { name: block.name, path, memberId: member, atMs });
+        noteFileChange(crew, member, path, block.name === 'file_write' ? 'written' : 'edited', null, null, atMs, diffLines(block.name, args));
+      }
+    } else if (block.kind === 'ask' && isRoot) {
+      const leaf = block.child_id ? crew.askOrigins.get(block.child_id) || block.child_id : crew.rootId;
+      if (block.answer) {
+        if (crew.question && crew.question.message === block.message) {
+          addSignal(crew, { kind: 'answer', from: 'you', to: leaf, text: block.answer, atMs });
+          crew.question = null;
+        }
+      } else {
+        addSignal(crew, { kind: 'question', from: leaf, to: 'you', text: block.message, atMs });
+        crew.question = { leaf, message: block.message };
+      }
+    }
+    return;
+  }
+  switch (block.kind) {
+    case 'text':
+      if (!isRoot || block.text === USER_REJECTED_TEXT) {
+        if (isRoot) crew.question = null;
+        return;
+      }
+      // The reader's message answers the root's own question, or is an order.
+      if (crew.question && crew.question.leaf === crew.rootId) {
+        addSignal(crew, { kind: 'answer', from: 'you', to: crew.rootId, text: block.text, atMs });
+      } else {
+        addSignal(crew, { kind: 'order', from: 'you', to: crew.rootId, text: block.text, atMs });
+      }
+      crew.question = null;
+      return;
+    case 'child_event': {
+      const kind = block.event_kind === 'failure' ? 'failure' : block.event_kind === 'ask' ? 'ask' : 'report';
+      addSignal(crew, { kind, from: block.child_id, to: member, text: block.text, atMs });
+      if (kind === 'ask' && isRoot) crew.askOrigins.set(block.child_id, block.origin || block.child_id);
+      return;
+    }
+    case 'tool_result': {
+      const content = block.content || {};
+      const spawn = crew.spawns.get(block.id);
+      if (spawn) {
+        crew.spawns.delete(block.id);
+        if (!block.is_error && content.child_id) {
+          addSignal(crew, { kind: 'order', from: spawn.from, to: content.child_id, text: spawn.text, atMs: spawn.atMs });
+        }
+        return;
+      }
+      const call = crew.fileCalls.get(block.id);
+      if (call) {
+        crew.fileCalls.delete(block.id);
+        if (block.is_error) return;
+        const op = call.name === 'file_write' && content.created ? 'created' : 'edited';
+        noteFileChange(crew, call.memberId, call.path, op, content.added, content.removed, call.atMs, null);
+        return;
+      }
+      // A shell command names the files its run changed.
+      const files = Array.isArray(content.files) ? content.files : [];
+      for (const file of files) {
+        noteFileChange(crew, member, file.path, file.op, null, null, atMs, null, true);
+      }
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+// ---- Threads ----
 
 function sessionOf(id) {
   return sessions.find((session) => session.id === id) || { id, persona: null };
@@ -316,52 +905,55 @@ function clockTime(atMs) {
   return new Date(atMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 }
 
-// Adds an item to the chat, dropping the oldest past the cap, and keeps the
+// Adds an item to a thread, dropping the oldest past the cap, and keeps the
 // newest in view for a reader who is at the bottom.
-function appendItem(crew, item) {
-  chatList.appendChild(item);
-  while (chatList.children.length > MAX_CHAT_ITEMS) chatList.removeChild(chatList.firstChild);
-  if (crew.filter) {
-    item.hidden = item.dataset.member !== crew.filter && item.dataset.to !== crew.filter;
-  }
-  followChat(crew);
+function appendItem(thread, item) {
+  thread.list.appendChild(item);
+  thread.orders = null;
+  while (thread.list.children.length > MAX_THREAD_ITEMS) thread.list.removeChild(thread.list.firstChild);
+  followThread(thread);
 }
 
-function followChat(crew) {
-  if (crew.chat.stick) chatView.scrollTop = chatView.scrollHeight;
+function followThread(thread) {
+  if (thread.stick) thread.scroller.scrollTop = thread.scroller.scrollHeight;
 }
 
-chatView.addEventListener('scroll', () => {
-  const crew = opened && opened.crew;
-  if (!crew) return;
-  crew.chat.stick = chatView.scrollTop + chatView.clientHeight >= chatView.scrollHeight - 40;
-});
+for (const [scroller, threadOf] of [
+  [chatView, (crew) => crew.chat],
+  [memberScroll, (crew) => crew.member],
+]) {
+  scroller.addEventListener('scroll', () => {
+    const thread = opened && opened.crew && threadOf(opened.crew);
+    if (!thread) return;
+    thread.stick = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 40;
+  });
+}
 
-// A post by a member: avatar, a head naming the member and whom the post is
-// to, and the body. A post by the member who wrote the item above joins that
-// item instead of repeating the head.
-function post(crew, memberId, atMs, body, to) {
-  const last = crew.chat.last;
-  if (last && last.memberId === memberId && last.to === to && !crew.chat.fold) {
+// A post by a member: avatar, a head naming the member, a word saying what
+// the post is, and the body. A post by the author of the item above, of the
+// same kind, joins that item instead of repeating the head.
+function post(crew, thread, authorId, atMs, body, label) {
+  const last = thread.last;
+  thread.orders = null;
+  if (last && last.authorId === authorId && last.label === label && !thread.fold) {
     last.body.appendChild(body);
-    followChat(crew);
+    followThread(thread);
     return last;
   }
   const item = document.createElement('div');
   item.className = 'bs-msg';
-  item.dataset.member = memberId;
-  if (to) item.dataset.to = to;
-  item.appendChild(avatarOf(sessionOf(memberId), 'sm'));
+  item.dataset.member = authorId;
+  item.appendChild(avatarOf(sessionOf(authorId), 'sm'));
   const column = document.createElement('div');
   column.className = 'bs-msg__column';
   const head = document.createElement('div');
   head.className = 'bs-msg__head';
-  head.appendChild(document.createTextNode(nameOf(crew, memberId)));
-  if (to) {
-    const toEl = document.createElement('span');
-    toEl.className = 'bs-msg__to';
-    toEl.textContent = '→ ' + to;
-    head.appendChild(toEl);
+  head.appendChild(document.createTextNode(nameOf(crew, authorId)));
+  if (label) {
+    const labelEl = document.createElement('span');
+    labelEl.className = 'bs-msg__to';
+    labelEl.textContent = label;
+    head.appendChild(labelEl);
   }
   const time = document.createElement('span');
   time.className = 'bs-msg__time';
@@ -373,10 +965,10 @@ function post(crew, memberId, atMs, body, to) {
   bodyEl.appendChild(body);
   column.appendChild(bodyEl);
   item.appendChild(column);
-  appendItem(crew, item);
-  crew.chat.last = { memberId, to, body: bodyEl };
-  crew.chat.fold = null;
-  return crew.chat.last;
+  appendItem(thread, item);
+  thread.last = { authorId, label, body: bodyEl };
+  thread.fold = null;
+  return thread.last;
 }
 
 function markdown(text) {
@@ -394,7 +986,7 @@ function plain(text) {
 }
 
 // Your own message: the only bubble in the chat.
-function yourMessage(crew, text, atMs) {
+function yourMessage(thread, text, atMs) {
   const item = document.createElement('div');
   item.className = 'bs-msg bs-msg--you';
   item.dataset.member = 'you';
@@ -405,20 +997,19 @@ function yourMessage(crew, text, atMs) {
   body.title = clockTime(atMs);
   column.appendChild(body);
   item.appendChild(column);
-  appendItem(crew, item);
-  crew.chat.last = null;
-  crew.chat.fold = null;
+  appendItem(thread, item);
+  thread.last = null;
+  thread.fold = null;
 }
 
-// A note across the chat: a cleared context, a summary, a failure.
-function note(crew, text, kind, memberId) {
+// A note across a thread: a cleared context, a summary.
+function note(thread, text, kind) {
   const item = document.createElement('div');
   item.className = 'chat-note' + (kind ? ' ' + kind : '');
-  if (memberId) item.dataset.member = memberId;
   item.textContent = text;
-  appendItem(crew, item);
-  crew.chat.last = null;
-  crew.chat.fold = null;
+  appendItem(thread, item);
+  thread.last = null;
+  thread.fold = null;
 }
 
 // The words a folded line uses for each kind of call.
@@ -463,14 +1054,13 @@ function foldText(counts) {
   return parts.join(' · ');
 }
 
-// A tool call that is neither a message nor a file change joins the member's
+// A tool call that is neither an order nor a file change joins the thread's
 // folded line: one quiet line per run of calls. A tap lists them.
-function foldCall(crew, memberId, name, args) {
-  let fold = crew.chat.fold;
-  if (!fold || fold.memberId !== memberId) {
+function foldCall(thread, name, args) {
+  let fold = thread.fold;
+  if (!fold) {
     const item = document.createElement('div');
     item.className = 'bs-activity-wrap';
-    item.dataset.member = memberId;
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'bs-activity';
@@ -485,10 +1075,10 @@ function foldCall(crew, memberId, name, args) {
     });
     item.appendChild(button);
     item.appendChild(list);
-    appendItem(crew, item);
-    fold = { memberId, counts: {}, label, list };
-    crew.chat.fold = fold;
-    crew.chat.last = null;
+    appendItem(thread, item);
+    fold = { counts: {}, label, list };
+    thread.fold = fold;
+    thread.last = null;
   }
   const kind = foldKind(name);
   fold.counts[kind] = (fold.counts[kind] || 0) + 1;
@@ -576,28 +1166,34 @@ function diffCard(path, lines, open) {
   return { card, counts };
 }
 
-// A message from the tree, by the member that wrote it. The chat shows the
-// conversation and the file changes; the Log view keeps everything else.
-function drawChatMessage(crew, memberId, message, atMs) {
+// One message of the member a thread draws. Chat is the root's thread: the
+// reader's messages, the root's text, file changes and questions, its orders
+// as cards and its children's reports as lines. A child's thread draws its
+// parent's orders as posts by the parent. Everything else is in the Log.
+function drawThreadMessage(crew, thread, message, atMs) {
   const block = message.block;
-  const isRoot = memberId === crew.rootId;
+  const self = thread.memberId;
+  const isRoot = self === crew.rootId;
   if (message.role === 'user') {
     switch (block.kind) {
       case 'text':
-        // A child's user-role text is always its parent's instructions or an
-        // answer routed down to it, and the parent's call or the answered
-        // question already shows it.
-        if (!isRoot) return;
-        if (block.text === USER_REJECTED_TEXT) note(crew, 'You dismissed the question', 'muted');
-        else yourMessage(crew, block.text, atMs);
+        if (isRoot) {
+          if (block.text === USER_REJECTED_TEXT) note(thread, 'You dismissed the question', 'muted');
+          else yourMessage(thread, block.text, atMs);
+        } else if (thread.pendingAsk) {
+          // The text that follows a child's own question answers it.
+          answerAsk(thread.pendingAsk, 'Answer: ' + block.text);
+          thread.pendingAsk = null;
+        } else {
+          const parent = sessionOf(self).parent_id || self;
+          post(crew, thread, parent, atMs, markdown(block.text), 'order');
+        }
         return;
       case 'tool_result':
-        drawResult(crew, memberId, block, atMs);
+        drawResult(crew, thread, block);
         return;
       case 'child_event':
-        if (block.event_kind === 'failure') {
-          note(crew, nameOf(crew, block.child_id) + ' failed: ' + block.text, 'error', block.child_id);
-        }
+        drawChildEvent(crew, thread, block, atMs);
         return;
       default:
         return;
@@ -606,135 +1202,291 @@ function drawChatMessage(crew, memberId, message, atMs) {
   switch (block.kind) {
     case 'text': {
       if (!block.text) return;
-      const live = crew.chat.live;
-      if (live && live.memberId === memberId) {
+      const live = thread.live;
+      if (live) {
         live.body.replaceWith(markdown(block.text));
-        crew.chat.live = null;
+        thread.live = null;
         return;
       }
-      post(crew, memberId, atMs, markdown(block.text));
+      post(crew, thread, self, atMs, markdown(block.text));
       return;
     }
     case 'tool_call':
-      drawCall(crew, memberId, block, atMs);
+      drawCall(crew, thread, block, atMs);
       return;
     case 'ask':
-      drawAsk(crew, memberId, block, atMs);
+      drawAsk(crew, thread, block, atMs);
       return;
     case 'summary':
-      note(crew, nameOf(crew, memberId) + ' compacted its notes', 'muted', memberId);
+      note(thread, nameOf(crew, self) + ' compacted its notes', 'muted');
       return;
     case 'context_cleared':
-      note(crew, nameOf(crew, memberId) + ' started fresh: ' + (block.reason || ''), 'muted', memberId);
+      note(thread, nameOf(crew, self) + ' started fresh: ' + (block.reason || ''), 'muted');
       return;
     default:
       return;
   }
 }
 
-function drawCall(crew, memberId, block, atMs) {
+function drawCall(crew, thread, block, atMs) {
   const args = block.args || {};
+  const self = thread.memberId;
   switch (block.name) {
     case 'spawn': {
-      const to = personaLabel(args.persona) || 'Agent';
-      post(crew, memberId, atMs, markdown(String(args.instructions || '')), to);
+      const row = orderRow(crew, thread, atMs, null, args.persona, String(args.instructions || ''));
+      thread.calls.set(block.id, { name: 'spawn', row });
       return;
     }
-    case 'message_child': {
-      const to = nameOf(crew, args.id);
-      const entry = post(crew, memberId, atMs, markdown(String(args.text || '')), to);
-      if (entry) entry.toId = args.id;
+    case 'message_child':
+      orderRow(crew, thread, atMs, args.id, null, String(args.text || ''));
       return;
-    }
     case 'edit':
     case 'file_write': {
       const path = String(args.path || '');
       const { card, counts } = diffCard(path, diffLines(block.name, args), false);
-      const last = crew.chat.last;
-      if (last && last.memberId === memberId && !last.to && !crew.chat.fold) {
-        last.body.appendChild(card);
-        followChat(crew);
-      } else {
-        post(crew, memberId, atMs, card);
-      }
-      crew.chat.calls.set(block.id, { name: block.name, path, args, counts, memberId, atMs });
-      noteFileChange(crew, memberId, path, block.name === 'file_write' ? 'written' : 'edited', null, null, atMs, diffLines(block.name, args));
+      post(crew, thread, self, atMs, card);
+      thread.calls.set(block.id, { name: block.name, counts });
       return;
     }
     case 'ask':
       // The question itself arrives as its own message.
       return;
     default:
-      foldCall(crew, memberId, block.name, args);
+      foldCall(thread, block.name, args);
   }
 }
 
-function drawResult(crew, memberId, block, atMs) {
-  const call = crew.chat.calls.get(block.id);
-  if (call) {
-    crew.chat.calls.delete(block.id);
-    const content = block.content || {};
-    if (block.is_error) {
-      call.counts.className = 'bs-count error';
-      call.counts.textContent = 'failed';
-      return;
-    }
-    call.counts.replaceWith(countEl(content.added, content.removed));
-    const op = call.name === 'file_write' && content.created ? 'created' : 'edited';
-    noteFileChange(crew, call.memberId, call.path, op, content.added, content.removed, call.atMs, null);
+function drawResult(crew, thread, block) {
+  const call = thread.calls.get(block.id);
+  if (!call) return;
+  thread.calls.delete(block.id);
+  const content = block.content || {};
+  if (call.name === 'spawn') {
+    if (block.is_error || !content.child_id) setOutcome(call.row, 'failed');
+    else bindRow(crew, thread, call.row, content.child_id);
     return;
   }
-  // A shell command names the files its run changed.
-  const files = block.content && Array.isArray(block.content.files) ? block.content.files : [];
-  for (const file of files) {
-    noteFileChange(crew, memberId, file.path, file.op, null, null, atMs, null, true);
+  if (block.is_error) {
+    call.counts.className = 'bs-count error';
+    call.counts.textContent = 'failed';
+    return;
+  }
+  call.counts.replaceWith(countEl(content.added, content.removed));
+}
+
+// ---- Orders ----
+
+const OUTCOMES = {
+  done: ['done', 'done'],
+  asked: ['waiting', 'asked'],
+  failed: ['stopped', 'failed'],
+};
+
+// One order in the thread's Orders card: the orders a member gives in a row
+// are one card under its text, a row per child. The row shows the child's
+// live state until the child reports, asks or fails, then that outcome.
+function orderRow(crew, thread, atMs, childId, persona, text) {
+  if (!thread.orders) {
+    const card = document.createElement('div');
+    card.className = 'bs-orders';
+    const label = document.createElement('div');
+    label.className = 'bs-label';
+    card.appendChild(label);
+    post(crew, thread, thread.memberId, atMs, card);
+    thread.orders = { card, label, count: 0 };
+  }
+  const orders = thread.orders;
+  orders.count += 1;
+  orders.label.textContent = orders.count === 1 ? 'Order' : 'Orders · ' + orders.count;
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'bs-order';
+  const row = { el, childId: null, persona, face: null, name: null, pill: null, outcome: null };
+  row.face = document.createElement('span');
+  row.face.className = 'bs-order__face';
+  el.appendChild(row.face);
+  const body = document.createElement('span');
+  body.className = 'bs-order__body';
+  row.name = document.createElement('span');
+  row.name.className = 'bs-order__name';
+  body.appendChild(row.name);
+  const line = document.createElement('span');
+  line.className = 'bs-order__text';
+  line.textContent = firstLine(text);
+  body.appendChild(line);
+  el.appendChild(body);
+  row.pill = document.createElement('span');
+  el.appendChild(row.pill);
+  el.addEventListener('click', () => {
+    if (row.childId) openMember(row.childId);
+  });
+  orders.card.appendChild(el);
+  if (childId) bindRow(crew, thread, row, childId);
+  else drawRow(crew, row);
+  followThread(thread);
+  return row;
+}
+
+function bindRow(crew, thread, row, childId) {
+  row.childId = childId;
+  row.el.dataset.member = childId;
+  const open = thread.openRows.get(childId) || [];
+  open.push(row);
+  thread.openRows.set(childId, open);
+  drawRow(crew, row);
+}
+
+function drawRow(crew, row) {
+  const session = row.childId ? sessionOf(row.childId) : { id: '', persona: row.persona, parent_id: 'x' };
+  row.face.textContent = '';
+  row.face.appendChild(row.childId ? avatarOf(session, 'sm') : avatar({ seed: row.persona, persona: row.persona, size: 'sm' }));
+  row.name.textContent = row.childId ? nameOf(crew, row.childId) : personaLabel(row.persona) || 'Agent';
+  if (row.outcome) {
+    const [state, word] = OUTCOMES[row.outcome];
+    row.pill.className = 'bs-status';
+    row.pill.dataset.state = state;
+    row.pill.textContent = word;
+    return;
+  }
+  const state = row.childId ? memberState(crew, session) : 'working';
+  row.pill.replaceWith(statePill(session, state));
+  row.pill = row.el.lastChild;
+}
+
+function setOutcome(row, outcome) {
+  row.outcome = outcome;
+  const [state, word] = OUTCOMES[outcome];
+  row.pill.className = 'bs-status';
+  row.pill.dataset.state = state;
+  row.pill.textContent = word;
+}
+
+// A child's report, question or failure closes the rows of the orders it
+// answers.
+function closeRows(thread, childId, outcome) {
+  for (const row of thread.openRows.get(childId) || []) setOutcome(row, outcome);
+  thread.openRows.delete(childId);
+}
+
+// The open rows follow their child's live state as the session list moves.
+function refreshRows(crew, thread) {
+  for (const rows of thread.openRows.values()) {
+    for (const row of rows) drawRow(crew, row);
   }
 }
 
-function drawAsk(crew, memberId, block, atMs) {
-  const isRoot = memberId === crew.rootId;
-  if (!isRoot) {
-    // A child asks its parent: the question is a message to the parent.
-    const parent = sessionOf(memberId).parent_id;
-    post(crew, memberId, atMs, plain(block.message), parent ? nameOf(crew, parent) : null);
+// ---- Reports and questions ----
+
+const EVENT_VERBS = {
+  report: 'reported to',
+  ask: 'asked',
+};
+
+// A child's report, question or failure, as one line in its parent's thread.
+// A long text shows its first lines until the reader taps it.
+function drawChildEvent(crew, thread, block, atMs) {
+  const kind = block.event_kind === 'failure' ? 'failure' : block.event_kind === 'ask' ? 'ask' : 'report';
+  closeRows(thread, block.child_id, kind === 'report' ? 'done' : kind === 'ask' ? 'asked' : 'failed');
+  const line = document.createElement('div');
+  line.className = 'bs-signal' + (kind === 'failure' ? ' is-failure' : '');
+  line.dataset.member = block.child_id;
+  line.appendChild(avatarOf(sessionOf(block.child_id), 'xs'));
+  const text = document.createElement('span');
+  text.className = 'bs-signal__text is-clamped';
+  text.title = clockTime(atMs);
+  const who = document.createElement('b');
+  who.textContent = nameOf(crew, block.child_id);
+  text.appendChild(who);
+  const verb = kind === 'failure'
+    ? ' failed: '
+    : ' ' + EVENT_VERBS[kind] + ' ' + nameOf(crew, thread.memberId) + ': ';
+  text.appendChild(document.createTextNode(verb + block.text));
+  text.addEventListener('click', () => text.classList.toggle('is-clamped'));
+  line.appendChild(text);
+  appendItem(thread, line);
+  thread.last = null;
+  thread.fold = null;
+  if (kind === 'ask') thread.askLines.set(block.child_id, line);
+}
+
+function drawAsk(crew, thread, block, atMs) {
+  const card = thread.askCard;
+  // The answered copy of the question on screen fills it in place.
+  if (block.answer && card && !card.answered && card.message === block.message) {
+    answerAsk(card, 'You answered: ' + block.answer);
+    card.answered = true;
     return;
+  }
+  if (thread.memberId !== crew.rootId) {
+    // A child asks its parent; the next instruction it receives answers it.
+    const parent = sessionOf(thread.memberId).parent_id;
+    const asked = post(crew, thread, thread.memberId, atMs, plain(block.message), 'asked ' + (parent ? nameOf(crew, parent) : ''));
+    thread.pendingAsk = { body: asked.body };
+    thread.last = null;
+    return;
+  }
+  // The root asks the reader: its own question, or one a child raised to it,
+  // which names the member that first asked it and the way it came up.
+  const leaf = block.child_id ? crew.askOrigins.get(block.child_id) || block.child_id : crew.rootId;
+  const raised = block.child_id ? thread.askLines.get(block.child_id) : null;
+  if (raised) {
+    raised.remove();
+    thread.askLines.delete(block.child_id);
   }
   const item = document.createElement('div');
   item.className = 'bs-ask';
-  item.dataset.member = block.child_id || memberId;
+  item.dataset.member = leaf;
   const who = document.createElement('div');
   who.className = 'bs-ask__who';
-  const asker = block.child_id || memberId;
-  who.appendChild(avatarOf(sessionOf(asker), 'xs'));
-  who.appendChild(document.createTextNode(nameOf(crew, asker) + ' asks you'));
+  who.appendChild(avatarOf(sessionOf(leaf), 'xs'));
+  who.appendChild(document.createTextNode(nameOf(crew, leaf) + ' asks you'));
   item.appendChild(who);
+  if (leaf !== crew.rootId) {
+    const path = document.createElement('div');
+    path.className = 'bs-ask__path';
+    path.textContent = pathNames(crew, leaf).reverse().concat('You').join(' › ');
+    item.appendChild(path);
+  }
   const question = document.createElement('div');
   question.className = 'bs-ask__q';
   question.textContent = block.message;
   item.appendChild(question);
+  const next = { body: item, message: block.message, answered: !!block.answer };
   if (block.answer) {
-    const answer = document.createElement('div');
-    answer.className = 'bs-ask__answer';
-    answer.textContent = 'You answered: ' + block.answer;
-    item.appendChild(answer);
+    answerAsk(next, 'You answered: ' + block.answer);
+  } else if (leaf !== crew.rootId) {
+    const route = document.createElement('div');
+    route.className = 'bs-ask__route';
+    route.textContent = 'Your answer goes to ' + nameOf(crew, leaf) + ' word for word.';
+    item.appendChild(route);
   }
-  appendItem(crew, item);
-  crew.chat.last = null;
-  crew.chat.fold = null;
+  appendItem(thread, item);
+  thread.askCard = next;
+  thread.last = null;
+  thread.fold = null;
+}
+
+function answerAsk(card, text) {
+  const route = card.body.querySelector('.bs-ask__route');
+  if (route) route.remove();
+  const answer = document.createElement('div');
+  answer.className = 'bs-ask__answer';
+  answer.textContent = text;
+  card.body.appendChild(answer);
 }
 
 // The root's reply as it streams: a post that the durable text replaces.
-function drawDelta(crew, memberId, text) {
-  let live = crew.chat.live;
-  if (!live || live.memberId !== memberId) {
+function drawDelta(thread, text) {
+  let live = thread.live;
+  if (!live) {
     const body = plain('');
     body.classList.add('is-live');
-    post(crew, memberId, Date.now(), body);
-    live = { memberId, body };
-    crew.chat.live = live;
+    post(opened.crew, thread, thread.memberId, Date.now(), body);
+    live = { body };
+    thread.live = live;
   }
   live.body.textContent += text;
-  followChat(crew);
+  followThread(thread);
 }
 
 // ---- Tasks ----

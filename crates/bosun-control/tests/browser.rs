@@ -45,7 +45,7 @@ use serde_json::json;
 const MAP: &str = "map-session";
 /// The session with a long transcript. `pane.py` names the same ids.
 const LONG: &str = "long-session";
-/// The long session's child, which the child panel follows.
+/// The long session's child, whose screen its watch control opens.
 const CHILD: &str = "child-session";
 /// A session whose question and its answered copy sit on either side of the
 /// first page boundary.
@@ -69,6 +69,12 @@ const KINDS: &str = "kinds-session";
 const REUSE: &str = "reuse-session";
 /// A session whose last message is a question with no options to tap.
 const OPEN_ASK: &str = "open-ask-session";
+/// A tree three deep: the lead orders a reviewer and a builder, the builder
+/// orders a researcher, and the researcher's question climbs to the reader.
+const CHAIN: &str = "chain-session";
+const CHAIN_REVIEWER: &str = "chain-reviewer";
+const CHAIN_BUILDER: &str = "chain-builder";
+const CHAIN_RESEARCHER: &str = "chain-researcher";
 /// The call id the kinds session leaves unanswered and the reuse session
 /// answers.
 const UNANSWERED_CALL: &str = "message-child-open";
@@ -163,6 +169,7 @@ async fn seed(store: &Store) {
     seed_kinds_session(store).await;
     seed_reuse_session(store).await;
     seed_open_ask_session(store).await;
+    seed_chain_session(store).await;
     for i in 0..FILLER_SESSIONS {
         // A summary with no break in it is what a model writes for a path or
         // an identifier, and the list row must still fit the screen.
@@ -586,6 +593,184 @@ async fn seed_open_ask_session(store: &Store) {
     .await;
 }
 
+/// Written in the order a running tree records it, so the tree stream replays
+/// each order before the child's first message and each question before the
+/// parent passes it on.
+async fn seed_chain_session(store: &Store) {
+    member(
+        store,
+        CHAIN,
+        None,
+        "lead",
+        Some("the chain session"),
+        1_999_986,
+    )
+    .await;
+    text(store, CHAIN, Role::User, "Build the Windows service").await;
+    text(store, CHAIN, Role::Assistant, "I split the work two ways.").await;
+    let review = "Review task 2 when it lands";
+    call(
+        store,
+        CHAIN,
+        "spawn-reviewer",
+        "spawn",
+        json!({ "persona": "reviewer", "instructions": review }),
+    )
+    .await;
+    member(
+        store,
+        CHAIN_REVIEWER,
+        Some(CHAIN),
+        "reviewer",
+        None,
+        2_000_101,
+    )
+    .await;
+    text(store, CHAIN_REVIEWER, Role::User, review).await;
+    result(
+        store,
+        CHAIN,
+        "spawn-reviewer",
+        "spawn",
+        false,
+        json!({ "child_id": CHAIN_REVIEWER }),
+    )
+    .await;
+    let build = "Tasks 1 to 3. Start with the exit codes.";
+    call(
+        store,
+        CHAIN,
+        "spawn-builder",
+        "spawn",
+        json!({ "persona": "builder", "instructions": build }),
+    )
+    .await;
+    member(
+        store,
+        CHAIN_BUILDER,
+        Some(CHAIN),
+        "builder",
+        None,
+        2_000_102,
+    )
+    .await;
+    text(store, CHAIN_BUILDER, Role::User, build).await;
+    result(
+        store,
+        CHAIN,
+        "spawn-builder",
+        "spawn",
+        false,
+        json!({ "child_id": CHAIN_BUILDER }),
+    )
+    .await;
+    let passes = "Task 2 passes. One P2 on the log line.";
+    text(store, CHAIN_REVIEWER, Role::Assistant, passes).await;
+    child_event(
+        store,
+        CHAIN,
+        CHAIN_REVIEWER,
+        ChildEventKind::Report,
+        passes,
+        None,
+    )
+    .await;
+    text(
+        store,
+        CHAIN_BUILDER,
+        Role::Assistant,
+        "builder is mapping the shutdown reason",
+    )
+    .await;
+    let research = "Find out how WinSW 3 stops a service.";
+    call(
+        store,
+        CHAIN_BUILDER,
+        "spawn-researcher",
+        "spawn",
+        json!({ "persona": "researcher", "instructions": research }),
+    )
+    .await;
+    member(
+        store,
+        CHAIN_RESEARCHER,
+        Some(CHAIN_BUILDER),
+        "researcher",
+        None,
+        2_000_103,
+    )
+    .await;
+    text(store, CHAIN_RESEARCHER, Role::User, research).await;
+    result(
+        store,
+        CHAIN_BUILDER,
+        "spawn-researcher",
+        "spawn",
+        false,
+        json!({ "child_id": CHAIN_RESEARCHER }),
+    )
+    .await;
+    let question = "Pin WinSW 2.12, or move to 3?";
+    ask(store, CHAIN_RESEARCHER, question, None).await;
+    child_event(
+        store,
+        CHAIN_BUILDER,
+        CHAIN_RESEARCHER,
+        ChildEventKind::Ask,
+        question,
+        Some(CHAIN_RESEARCHER),
+    )
+    .await;
+    ask(store, CHAIN_BUILDER, question, Some(CHAIN_RESEARCHER)).await;
+    child_event(
+        store,
+        CHAIN,
+        CHAIN_BUILDER,
+        ChildEventKind::Ask,
+        question,
+        Some(CHAIN_RESEARCHER),
+    )
+    .await;
+    let ask_id = ask(store, CHAIN, question, Some(CHAIN_BUILDER)).await;
+    store
+        .set_pending_ask(CHAIN, CHAIN_BUILDER, CHAIN_RESEARCHER, question, ask_id)
+        .await
+        .unwrap();
+}
+
+async fn ask(store: &Store, session: &str, question: &str, child: Option<&str>) -> i64 {
+    store
+        .append_message(
+            session,
+            Role::Assistant,
+            &Block::Ask {
+                message: question.into(),
+                options: vec!["Pin 2.12".into(), "Move to 3".into()],
+                child_id: child.map(str::to_string),
+                answer: None,
+            },
+        )
+        .await
+        .unwrap()
+}
+
+async fn child_event(
+    store: &Store,
+    session: &str,
+    child: &str,
+    kind: ChildEventKind,
+    text: &str,
+    origin: Option<&str>,
+) {
+    let block = Block::ChildEvent {
+        child_id: child.into(),
+        kind,
+        text: text.into(),
+        origin: origin.map(str::to_string),
+    };
+    message(store, session, Role::User, block).await;
+}
+
 async fn call(store: &Store, session: &str, id: &str, name: &str, args: serde_json::Value) {
     let block = Block::ToolCall {
         id: id.into(),
@@ -611,6 +796,51 @@ async fn result(
         content,
     };
     message(store, session, Role::User, block).await;
+}
+
+/// A session of a tree with its persona: a child belongs to its parent's
+/// tree, whose root owns every member.
+async fn member(
+    store: &Store,
+    id: &str,
+    parent: Option<&str>,
+    persona: &str,
+    summary: Option<&str>,
+    created_at_secs: i64,
+) {
+    let owner = match parent {
+        Some(parent) => {
+            store
+                .get_session(parent)
+                .await
+                .unwrap()
+                .expect("a parent is created before its child")
+                .owner_id
+        }
+        None => id.to_string(),
+    };
+    store
+        .create_session(&Session {
+            id: id.into(),
+            node: "node-1".into(),
+            repo_url: None,
+            git_ref: None,
+            dir: "/work/repo".into(),
+            model: "test-model".into(),
+            persona: Some(persona.into()),
+            parent_id: parent.map(str::to_string),
+            owner_id: owner,
+            permission: Permission::ReadWrite,
+            allowed_tools: "*".into(),
+            mcp_servers: "".into(),
+            state: SessionState::WaitingForInput,
+            interrupt_cause: None,
+            created_at_secs,
+            prompt: None,
+            summary: summary.map(str::to_string),
+        })
+        .await
+        .unwrap();
 }
 
 async fn create(

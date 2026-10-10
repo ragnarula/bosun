@@ -63,7 +63,7 @@ pub(crate) const ASSETS: &[(&str, &str, &str)] = &[
     ("transcript.js", JS, include_str!("ui/transcript.js")),
     ("diagram.js", JS, include_str!("ui/diagram.js")),
     ("markdown.js", JS, include_str!("ui/markdown.js")),
-    ("subagents.js", JS, include_str!("ui/subagents.js")),
+    ("member-log.js", JS, include_str!("ui/member-log.js")),
     ("earlier.js", JS, include_str!("ui/earlier.js")),
     ("signal.js", JS, include_str!("ui/signal.js")),
     ("crew.js", JS, include_str!("ui/crew.js")),
@@ -356,7 +356,7 @@ mod tests {
         include_str!("ui/transcript.js"),
         include_str!("ui/diagram.js"),
         include_str!("ui/markdown.js"),
-        include_str!("ui/subagents.js"),
+        include_str!("ui/member-log.js"),
         include_str!("ui/earlier.js"),
         include_str!("ui/signal.js"),
         include_str!("ui/crew.js"),
@@ -821,7 +821,7 @@ mod tests {
                 let subject = group.split_whitespace().last().unwrap_or_default();
                 [
                     ".input-row",
-                    "#child-transcript",
+                    ".member-foot",
                     ".sheet-actions",
                     "#skills-list",
                     "#mcp-list",
@@ -840,7 +840,7 @@ mod tests {
             );
         }
         assert!(
-            read >= 7,
+            read >= 6,
             "the walk must read every rule that pads one of the six rows, the narrow-screen ones included: read {read}"
         );
         assert!(
@@ -855,8 +855,8 @@ mod tests {
 
     // The clear control is a row of the actions sheet. What the row does when
     // it is pressed is checked in a browser (`tests/browser.rs`); this reads the
-    // source a browser check cannot: the markup row, the URL the handler posts
-    // to, and the watch-only token that keeps the row off a child.
+    // source a browser check cannot: the markup row and the URL the handler
+    // posts to.
 
     #[test]
     fn the_pane_clears_the_context_from_the_actions_sheet() {
@@ -870,10 +870,6 @@ mod tests {
         assert!(
             handler.contains(&squeezed("encodeURIComponent(started.id) + '/clear'")),
             "the control posts to the clear route for the session it was clicked in"
-        );
-        assert!(
-            PANE.contains("rowClear.hidden = watchOnly;"),
-            "the row is hidden for a watch-only child, like the sheet's other controls"
         );
     }
 }

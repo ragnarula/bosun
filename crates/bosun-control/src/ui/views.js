@@ -1,22 +1,34 @@
-// The open session's four views: Chat, Tasks, Files and Log. The tab bar at the
-// bottom switches them on a phone; from 900px Tasks and Files stand in their
-// own column, and the switch at the end of the crew row moves between Chat and
-// Log. The pane remembers the view the reader last chose.
+// The open session's views: Chat, Crew, Tasks and Files on the tab bar, and
+// Log, which the lead's node in Crew opens. From 900px Crew, Tasks and Files
+// share their own column, switched by chips, and the switch at the end of the
+// crew row moves between Chat and Log. The pane remembers the views the reader
+// last chose.
 
 import { view } from './dom.js';
 import { follow } from './scroll.js';
+import { closeMember } from './history.js';
 
 export { VIEWS, currentView, setView };
 
-const VIEWS = ['chat', 'tasks', 'files', 'log'];
+const VIEWS = ['chat', 'crew', 'tasks', 'files', 'log'];
 const VIEW_KEY = 'bosun.view';
+const SIDES = ['crew', 'tasks', 'files'];
+const SIDE_KEY = 'bosun.side';
 
-function savedView() {
+function saved(key, choices, fallback) {
   try {
-    const saved = localStorage.getItem(VIEW_KEY);
-    return VIEWS.includes(saved) ? saved : 'chat';
+    const value = localStorage.getItem(key);
+    return choices.includes(value) ? value : fallback;
   } catch (error) {
-    return 'chat';
+    return fallback;
+  }
+}
+
+function save(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    // Private mode: the choice lasts for this page load.
   }
 }
 
@@ -26,6 +38,13 @@ function currentView() {
 
 function setView(name) {
   if (!VIEWS.includes(name)) return;
+  markView(name);
+  if (name === 'log') follow();
+}
+
+// The view's controls and the saved choice, without scrolling: the pane's
+// first view is marked while the other modules are still loading.
+function markView(name) {
   view.dataset.view = name;
   for (const control of view.querySelectorAll('[data-view]')) {
     if (control === view) continue;
@@ -33,19 +52,34 @@ function setView(name) {
     if (control.getAttribute('role') === 'tab') control.setAttribute('aria-selected', String(on));
     else control.setAttribute('aria-pressed', String(on));
   }
-  try {
-    localStorage.setItem(VIEW_KEY, name);
-  } catch (error) {
-    // Private mode: the choice lasts for this page load.
+  save(VIEW_KEY, name);
+  // Crew, Tasks or Files picked on a phone is the column a wide screen shows.
+  if (SIDES.includes(name)) setSide(name);
+}
+
+function setSide(name) {
+  view.dataset.side = name;
+  for (const control of view.querySelectorAll('[data-side]')) {
+    if (control === view) continue;
+    control.setAttribute('aria-pressed', String(control.dataset.side === name));
   }
-  if (name === 'log') follow();
+  save(SIDE_KEY, name);
 }
 
+// A view picked while a member's screen covers the session leaves the screen.
 for (const control of view.querySelectorAll('button[data-view]')) {
-  control.addEventListener('click', () => setView(control.dataset.view));
+  control.addEventListener('click', () => {
+    if (view.dataset.member) closeMember();
+    setView(control.dataset.view);
+  });
 }
 
-setView(savedView());
+for (const control of view.querySelectorAll('button[data-side]')) {
+  control.addEventListener('click', () => setSide(control.dataset.side));
+}
+
+setSide(saved(SIDE_KEY, SIDES, 'crew'));
+markView(saved(VIEW_KEY, VIEWS, 'chat'));
 
 // Whether a keyboard holds part of the screen: a text field has the focus and
 // the visual viewport is clearly shorter than the layout viewport.

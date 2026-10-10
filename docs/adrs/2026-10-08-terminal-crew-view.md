@@ -3,6 +3,8 @@
 **Date:** 2026-10-08
 **Author:** Pete
 
+> Superseded in part by `2026-10-10-reader-talks-to-the-lead.md`: Chat draws the root's thread only, the views are Chat, Crew, Tasks and Files on Alt+1 to Alt+4 and F1 to F4 with a member's Log on Alt+5 and F5, Tab no longer cycles the chat through members, and `bosun open <child id>` opens the root's tree on the child's thread instead of the child on Log. The single tree stream, the flags and tags, `bosun list` and the wide layout stand.
+
 ## Context
 
 `bosun open` attaches to one session: it replays and follows `GET /sessions/{id}/events`, draws the session's transcript, and polls `GET /sessions` every two seconds to count the session's live children. `bosun list` prints one table row per session, children indented under their root. Neither says who in a tree is working, on what, which files changed, how far the task list has got, or which tree needs the user.

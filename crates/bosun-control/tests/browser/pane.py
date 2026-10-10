@@ -59,6 +59,12 @@ KINDS = 'kinds-session'
 KINDS_ROW = 'the kinds session'
 REUSE_ROW = 'the reuse session'
 OPEN_ASK = 'open-ask-session'
+# A tree three deep: Lead orders Reviewer and Builder, Builder orders
+# Researcher, and Researcher's question waits on the reader.
+CHAIN = 'chain-session'
+CHAIN_ROW = 'the chain session'
+CHAIN_BUILDER = 'chain-builder'
+CHAIN_RESEARCHER = 'chain-researcher'
 # A child's name when it has no summary: the first line of its instructions.
 CHILD_NAME = 'look around'
 ASK_BEFORE = 100
@@ -96,9 +102,12 @@ CLEAR_ROW = '#row-clear'
 CLEAR_BTN = '#btn-clear'
 CLEAR_NOTE = '#view-clear'
 WATCH_CHILD = '#transcript .child-watch'
-CHILD_PANEL = '#child-panel'
-CHILD_LINE = '#child-transcript .msg'
-CHILD_CLOSE = '#btn-child-collapse'
+MEMBER = '#member-view'
+MEMBER_THREAD = '#member-thread'
+MEMBER_LOG = '#member-view [data-member-view="log"]'
+MEMBER_LOG_LINE = '#member-log .msg'
+MEMBER_BACK = '#btn-member-back'
+CHAT = '#chat-list'
 VIEW_TITLE = '#view-title'
 STATUS_LABEL = '#view-waiting'
 ACTIVITY_ROW = '#activity-log .activity-row'
@@ -629,12 +638,16 @@ def check_widths(browser, errors):
         check(f'the session view with wide lines fits the screen at {label}', fits(result), result)
 
         page.tap(WATCH_CHILD)
-        page.wait_for_selector(CHILD_LINE)
+        page.wait_for_selector(f'{MEMBER_THREAD} >> text=child reply 4')
         result = overflow(page)
-        check(f'the child panel fits the screen at {label}',
-              page.is_visible(CHILD_PANEL) and fits(result), result)
-        page.tap(CHILD_CLOSE)
-        page.wait_for_selector(CHILD_PANEL, state='hidden')
+        check(f'a crew member\'s screen fits the screen at {label}',
+              page.is_visible(MEMBER) and fits(result), result)
+        page.tap(MEMBER_LOG)
+        page.wait_for_selector(MEMBER_LOG_LINE)
+        result = overflow(page)
+        check(f'a crew member\'s Log fits the screen at {label}', fits(result), result)
+        page.tap(MEMBER_BACK)
+        page.wait_for_selector(MEMBER, state='hidden')
 
         page.tap(MORE)
         page.wait_for_selector(SHEET, state='visible')
@@ -1111,103 +1124,59 @@ def check_kinds(browser, errors):
     page.context.close()
 
 
-def check_panel(browser, errors):
-    page = new_page(browser, errors, size=LANDSCAPE)
+def check_member(browser, errors):
+    page = new_page(browser, errors)
     open_session(page, LONG)
-    check('the panel is closed until a child is followed', page.is_hidden(CHILD_PANEL))
-    entries = page.evaluate('[history.length, location.hash]')
+    check('no crew member\'s screen is open until one is chosen', page.is_hidden(MEMBER))
+    length = page.evaluate('history.length')
     page.tap(WATCH_CHILD)
-    page.wait_for_selector(CHILD_LINE)
+    page.wait_for_selector(MEMBER, state='visible')
+    check('a child\'s watch control opens its screen on an entry of its own, named in the address',
+          page.evaluate('location.hash') == f'#s={quote(LONG)}&m={quote(CHILD)}'
+          and page.evaluate('history.length') == length + 1, page.evaluate('location.hash'))
+    page.wait_for_selector(f'{MEMBER_THREAD} >> text=child reply 4')
+    labels = page.eval_on_selector_all(f'{MEMBER_THREAD} .bs-msg',
+                                       "els => els.map(m => (m.querySelector('.bs-msg__to') || {}).textContent || '')")
+    check('a child\'s thread draws its parent\'s instructions as orders and its own replies as posts',
+          labels.count('order') == 5 and labels.count('') == 5, labels)
+    covered = page.evaluate("""() => ({
+      member: document.querySelector('#member-view').checkVisibility(),
+      header: document.querySelector('.view-header').checkVisibility(),
+      composer: document.querySelector('#input-row').checkVisibility(),
+      foot: document.querySelector('#member-foot-text').textContent })""")
+    check('on a phone the screen covers the session view, with no message box and a bar that sends the reader to the lead',
+          covered['member'] and not covered['header'] and not covered['composer']
+          and 'takes orders from' in covered['foot'], covered)
+    page.tap(MEMBER_LOG)
+    page.wait_for_selector(MEMBER_LOG_LINE)
     streams = page.evaluate('window.__openStreams()')
-    check('following a child opens its own stream beside the session\'s',
+    check('the member\'s Log follows its own stream beside the session\'s',
           len(streams) == 2 and any(url.endswith(f'/sessions/{CHILD}/events') for url in streams), streams)
-    check('following a child writes no history entry', page.evaluate('[history.length, location.hash]') == entries)
-    rows = page.evaluate("""() => [...document.querySelectorAll('#child-list .child-row')].map(r => ({
-      followed: r.classList.contains('followed'), dot: r.querySelector('.dot').className,
-      name: r.querySelector('.child-row-name').textContent, id: r.querySelector('.child-row-id').textContent,
-      title: r.title }))""")
-    check('the panel lists the session\'s children with their state, name and short id, the followed one marked',
-          rows == [{'followed': True, 'dot': 'dot waiting_for_input', 'name': CHILD_NAME,
-                    'id': CHILD[:8], 'title': CHILD}], rows)
-    box = page.evaluate("""() => {
-      const r = (sel) => document.querySelector(sel).getBoundingClientRect();
-      const panel = r('#child-panel'), wrap = r('#transcript-wrap'), row = r('#conversation');
-      return { panelLeft: panel.left, panelWidth: panel.width, wrapRight: wrap.right,
-               wrapWidth: wrap.width, rowWidth: row.width };
-    }""")
-    check('on a wide screen the panel is a column beside the transcript, at most 420px and 45% wide',
-          box['panelLeft'] >= box['wrapRight'] - 1 and box['wrapWidth'] > 0
-          and box['panelWidth'] <= 420.5 and box['panelWidth'] <= box['rowWidth'] * 0.45 + 0.5, box)
-    check('the panel follows its child\'s newest line', until(page, AT_BOTTOM, '#child-transcript'))
-    # The panel sets a smaller type size on its transcript, so a line whose
-    # size follows its transcript's is compared as a share of it.
-    diffs = page.evaluate("""() => {
-      const props = ['color', 'fontFamily', 'fontStyle', 'paddingTop', 'paddingLeft', 'marginTop',
-                     'borderTopStyle', 'backgroundColor', 'whiteSpace', 'textAlign', 'display'];
-      const size = (e, box) => (parseFloat(getComputedStyle(e).fontSize) / parseFloat(getComputedStyle(box).fontSize)).toFixed(3);
-      const session = document.querySelector('#transcript'), panel = document.querySelector('#child-transcript');
-      const diffs = [];
-      for (const sel of ['.msg.user', '.msg.assistant', '.stamp-row', '.ts', 'pre']) {
-        const a = session.querySelector(sel), b = panel.querySelector(sel);
-        if (!a || !b) { diffs.push(sel + ' missing'); continue; }
-        const sa = getComputedStyle(a), sb = getComputedStyle(b);
-        for (const p of props) if (sa[p] !== sb[p]) diffs.push(`${sel} ${p}: ${sa[p]} / ${sb[p]}`);
-        if (sa.fontSize !== sb.fontSize && size(a, session) !== size(b, panel)) diffs.push(`${sel} size: ${size(a, session)} / ${size(b, panel)}`);
-      }
-      return diffs;
-    }""")
-    check('a line in the panel draws like the same line in the session\'s transcript', not diffs, diffs)
-
-    page.set_viewport_size({'width': PORTRAIT[0], 'height': PORTRAIT[1]})
-    check('on a phone the panel covers the view as a sheet',
-          rect(page, CHILD_PANEL) == [0, 0, PORTRAIT[0], PORTRAIT[1]], rect(page, CHILD_PANEL))
-    page.tap(CHILD_CLOSE)
-    page.wait_for_selector(CHILD_PANEL, state='hidden')
+    page.go_back()
+    page.wait_for_selector(MEMBER, state='hidden')
     streams = page.evaluate('window.__openStreams()')
-    check('collapsing the panel closes the child\'s stream and keeps the session\'s',
-          len(streams) == 1 and not any(CHILD in url for url in streams), streams)
-
+    check('back closes the member\'s screen and its stream and leaves the session open',
+          session_showing(page) and page.evaluate('location.hash') == '#s=' + quote(LONG)
+          and len(streams) == 1 and not any(CHILD in url for url in streams), streams)
     page.tap(WATCH_CHILD)
-    page.wait_for_selector(CHILD_LINE)
-    # The panel covers the view on a phone, so the browser's back leaves.
+    page.wait_for_selector(MEMBER, state='visible')
+    page.tap(MEMBER_BACK)
+    page.wait_for_selector(MEMBER, state='hidden')
+    check('the member\'s ‹ takes the same step back', page.evaluate('location.hash') == '#s=' + quote(LONG))
+    page.context.close()
+
+    page = new_page(browser, errors)
+    page.goto(f'{BASE}/#s={quote(CHILD)}')
+    page.wait_for_selector(MEMBER, state='visible')
+    check('a child\'s address opens its tree\'s session with the child\'s screen over it',
+          until(page, "(hash) => location.hash === hash", f'#s={quote(LONG)}&m={quote(CHILD)}'),
+          page.evaluate('location.hash'))
     page.go_back()
     page.wait_for_selector(VIEW, state='hidden')
-    streams = page.evaluate('window.__openStreams()')
-    open_from_list(page, LONG_ROW)
-    page.wait_for_selector(TRANSCRIPT_LINE)
-    check('leaving a session closes its panel and the child\'s stream',
-          streams == [] and page.is_hidden(CHILD_PANEL) and not page.locator(CHILD_LINE).count(), streams)
-
-    # One child at a time: the kinds session names two. The panel is a column
-    # here, so the transcript's controls stay in reach.
-    page.set_viewport_size({'width': LANDSCAPE[0], 'height': LANDSCAPE[1]})
-    leave_session(page)
-    open_from_list(page, KINDS_ROW)
-    page.wait_for_selector(f'{REPLY_LINE} >> text=kinds end')
-    page.tap('#transcript .line.child-report .child-watch')
-    page.wait_for_selector(CHILD_LINE)
-    page.locator('#transcript .tool-result .child-watch').first.tap()
-    replaced = until(page, "(id) => document.querySelector('#child-panel-title').title === id", ASK_CHILD)
-    streams = page.evaluate('window.__openStreams()')
-    check('following another child replaces the one followed, on one stream',
-          replaced and len(streams) == 2 and any(url.endswith(f'/sessions/{ASK_CHILD}/events') for url in streams)
-          and not page.locator(CHILD_LINE).count(), streams)
-
-    # The child's name opens it as the session view, which takes the session's
-    # entry: back goes to the list.
-    page.tap(CHILD_CLOSE)
-    page.tap('#transcript .child-link')
-    opened = until(page, "(hash) => location.hash === hash", '#s=' + quote(CHILD))
-    page.wait_for_selector('#watch-banner', state='visible')
-    check('a child\'s name in the transcript opens it as the session view, watch-only', opened)
-    page.go_back()
-    page.wait_for_selector(VIEW, state='hidden')
-    check('back from a session opened from a session lands on the list',
+    check('back from a child opened by its address lands on the list',
           list_showing(page) and page.evaluate('location.hash') == '')
     page.context.close()
 
-
-def check_panel_frames(browser, errors):
     page = new_page(browser, errors)
     route_stream(page, CHILD,
                  {'event': {'kind': 'state', 'state': 'running', 'at_ms': 1}},
@@ -1216,53 +1185,117 @@ def check_panel_frames(browser, errors):
                  message_frame('assistant', {'kind': 'ask', 'message': 'Child question?', 'options': ['a', 'b'],
                                              'answer': 'a'}, 2))
     open_session(page, LONG)
-    page.tap(VIEW_TITLE)
-    page.wait_for_selector('#activity-log', state='visible')
     before = page.evaluate(f"""() => [document.querySelector('#view-state-dot').className,
       document.querySelector('{STATUS_LABEL}').textContent,
-      document.querySelectorAll('{ACTIVITY_ROW}').length,
       document.querySelectorAll('#transcript > *').length]""")
     page.tap(WATCH_CHILD)
-    page.wait_for_selector('#child-transcript .ask .answer')
-    asks = page.eval_on_selector_all('#child-transcript .ask', 'els => els.map(e => e.querySelectorAll(".answer").length)')
-    check('a child\'s question and its answered copy are one box in the panel', asks == [1], asks)
+    page.wait_for_selector(MEMBER, state='visible')
+    page.tap(MEMBER_LOG)
+    page.wait_for_selector('#member-log .ask .answer')
+    asks = page.eval_on_selector_all('#member-log .ask', 'els => els.map(e => e.querySelectorAll(".answer").length)')
+    check('a child\'s question and its answered copy are one box in its Log', asks == [1], asks)
     after = page.evaluate(f"""() => [document.querySelector('#view-state-dot').className,
       document.querySelector('{STATUS_LABEL}').textContent,
-      document.querySelectorAll('{ACTIVITY_ROW}').length,
       document.querySelectorAll('#transcript > *').length]""")
-    check('a child\'s frames leave the session\'s header, console and transcript alone', after == before,
-          [before, after])
+    check('a child\'s frames leave the session\'s header and transcript alone', after == before, [before, after])
     page.context.close()
 
-    page = new_page(browser, errors)
-    naming = {}
 
-    def rename(route):
-        response = route.fetch()
-        listed = response.json()
-        for session in listed:
-            if session['id'] == CHILD:
-                session.update(naming)
-        route.fulfill(response=response, json=listed)
-    page.route('**/sessions', rename)
-    open_session(page, LONG)
-    page.tap(WATCH_CHILD)
-    page.wait_for_selector(CHILD_LINE)
-    for rule, given, name in [
-        ('by its summary', {'summary': 'the child summary'}, 'the child summary'),
-        ('by its summary, cut to one row', {'summary': 'x' * 80}, 'x' * 60 + '…'),
-        ('without one, by the first line of its instructions that is not blank',
-         {'summary': None, 'prompt': '\n   \n  first line  \nsecond line'}, 'first line'),
-        ('with neither, by its id', {'summary': None, 'prompt': None}, CHILD),
-    ]:
-        naming.clear()
-        naming.update(given)
-        named = until(page, "(name) => document.querySelector('#child-panel-title').textContent === name", name,
-                      timeout=7000)
-        check(f'a child is named {rule}',
-              named and page.eval_on_selector('#child-panel-title', 'e => e.title') == CHILD,
-              page.inner_text('#child-panel-title'))
-    page.unroute('**/sessions')
+def tree_rows(page):
+    """Each Crew row's name, state word, and the name of the row it hangs under."""
+    return page.eval_on_selector_all('#crew-tree .tree-row', """rows => rows.map(row => {
+      const kids = row.parentElement.parentElement;
+      const above = kids.classList.contains('tree-kids')
+        ? kids.parentElement.querySelector(':scope > .tree-row .tree-row__name') : null;
+      return [row.querySelector('.tree-row__name').textContent,
+              row.querySelector('.bs-status').textContent,
+              above ? above.textContent : null];
+    })""")
+
+
+def check_chain(browser, errors):
+    page = new_page(browser, errors, view='chat')
+    page.goto(f'{BASE}/#s={quote(CHAIN)}')
+    page.wait_for_selector(f'{CHAT} .bs-ask')
+    chat = page.inner_text(CHAT)
+    check('Chat holds the lead\'s conversation and none of a child\'s own text',
+          'Build the Windows service' in chat and 'I split the work two ways.' in chat
+          and 'builder is mapping' not in chat, chat)
+    rows = page.eval_on_selector_all(f'{CHAT} .bs-order', """rows => rows.map(r => [
+      r.querySelector('.bs-order__name').textContent, r.querySelector('.bs-status').textContent])""")
+    check('the lead\'s orders are one card, each row ending on what its child did with it',
+          rows == [['Reviewer', 'done'], ['Builder', 'asked']], rows)
+    lines = texts(page, f'{CHAT} .bs-signal')
+    check('a child\'s report to the lead is one line, and a question the lead passed on leaves no line',
+          lines == ['Reviewer reported to Lead: Task 2 passes. One P2 on the log line.'], lines)
+    card = page.evaluate(f"""() => {{
+      const card = document.querySelector('{CHAT} .bs-ask');
+      const text = (sel) => (card.querySelector(sel) || {{}}).textContent;
+      return [text('.bs-ask__who'), text('.bs-ask__path'), text('.bs-ask__route')];
+    }}""")
+    check('a passed-on question names the member that asked it and the way it came up',
+          card == ['Researcher asks you', 'Researcher › Builder › Lead › You',
+                   'Your answer goes to Researcher word for word.'], card)
+    check('the message box names the lead', page.get_attribute(COMPOSER, 'placeholder') == 'Message Lead…',
+          page.get_attribute(COMPOSER, 'placeholder'))
+    bar = page.inner_text('#crew-bar-text')
+    check('the crew bar says who asks the reader', '1 asks you' in bar, bar)
+
+    page.tap('#crew-bar')
+    page.wait_for_selector('#crew-tree .tree-row')
+    rows = tree_rows(page)
+    check('Crew hangs each member under the member that ordered it, at any depth',
+          rows == [['Lead', 'needs you', None], ['Reviewer', 'done', 'Lead'], ['Builder', 'waiting', 'Lead'],
+                   ['Researcher', 'asks you', 'Builder']], rows)
+    flow = page.eval_on_selector_all('#flow-list .flow-row', 'rows => rows.map(r => r.dataset.kind)')
+    check('Flow lists every order, report and question, newest first',
+          flow == ['question', 'ask', 'ask', 'order', 'report', 'order', 'order', 'order'], flow)
+    page.tap('#flow-chips [data-flow="report"]')
+    reports = page.eval_on_selector_all('#flow-list .flow-row', 'rows => rows.map(r => r.dataset.kind)')
+    check('the Reports chip shows only reports', reports == ['report'], reports)
+    page.tap('#flow-chips [data-flow="all"]')
+
+    page.tap(f'#crew-tree .tree-row[data-member="{CHAIN_RESEARCHER}"]')
+    page.wait_for_selector(MEMBER, state='visible')
+    head = page.evaluate("""() => [document.querySelector('#member-title').textContent,
+      document.querySelector('#member-sub').textContent, document.querySelector('#member-foot-text').textContent,
+      document.querySelector('#btn-ask-lead').textContent]""")
+    check('a grandchild\'s screen names its path and the parent it takes orders from',
+          head[0] == 'Researcher' and head[1].startswith('Lead › Builder › Researcher')
+          and head[2] == 'Researcher takes orders from Builder. To change its work, tell Lead.'
+          and head[3] == 'Ask Lead', head)
+    labels = page.eval_on_selector_all(f'{MEMBER_THREAD} .bs-msg', """els => els.map(m => [
+      m.querySelector('.bs-msg__head').firstChild.textContent, (m.querySelector('.bs-msg__to') || {}).textContent])""")
+    check('a member\'s thread shows the order it received and the question it asked its parent',
+          labels == [['Builder', 'order'], ['Researcher', 'asked Builder']], labels)
+    page.tap('#btn-ask-lead')
+    page.wait_for_selector(MEMBER, state='hidden')
+    check('Ask Lead opens Chat with the member named in the message box',
+          page.get_attribute(VIEW, 'data-view') == 'chat' and page.input_value(COMPOSER) == 'About Researcher: ',
+          page.input_value(COMPOSER))
+
+    page.tap('#view-tabs [data-view="crew"]')
+    page.tap(f'#crew-tree .tree-row[data-member="{CHAIN_BUILDER}"]')
+    page.wait_for_selector(MEMBER, state='visible')
+    crew = page.eval_on_selector_all('#member-crew .bs-order', """rows => rows.map(r => [
+      r.querySelector('.bs-order__name').textContent, r.querySelector('.bs-status').textContent])""")
+    check('a member\'s screen lists the crew it ordered', crew == [['Researcher', 'asks you']], crew)
+    page.go_back()
+    page.wait_for_selector(MEMBER, state='hidden')
+    page.tap(f'#crew-tree .tree-row[data-member="{CHAIN}"]')
+    check('the lead\'s node opens its Log', until(page, f"() => document.querySelector('{VIEW}').dataset.view === 'log'"))
+    page.context.close()
+
+    page = new_page(browser, errors, size=(1280, 800), touch=False, view='chat')
+    page.goto(f'{BASE}/#s={quote(CHAIN)}')
+    page.wait_for_selector('#crew-tree .tree-row')
+    shown_now = page.evaluate("""() => ['crew-view', 'tasks-view', 'files-view', 'chat-view']
+      .map(id => document.getElementById(id).checkVisibility())""")
+    check('from 900px Crew stands beside Chat in its own column', shown_now == [True, False, False, True], shown_now)
+    page.click('.side-switch [data-side="tasks"]')
+    shown_now = page.evaluate("""() => ['crew-view', 'tasks-view', 'files-view']
+      .map(id => document.getElementById(id).checkVisibility())""")
+    check('the column\'s chips switch it to Tasks', shown_now == [False, True, False], shown_now)
     page.context.close()
 
 
@@ -1393,11 +1426,10 @@ def check_leaving_clears_the_view(browser, errors):
         route.abort()
     page.unroute('**/fork')
 
-    open_session(page, CHILD)
-    page.wait_for_selector('#watch-banner', state='visible')
-    hidden = page.evaluate("""() => ['input-row', 'row-permission', 'row-persona', 'row-fork', 'row-clear', 'btn-interrupt', 'row-stop']
-      .map(id => document.getElementById(id).hidden)""")
-    check('a watch-only child has no chat box and no controls in its sheet', all(hidden), hidden)
+    page.tap(WATCH_CHILD)
+    page.wait_for_selector(MEMBER, state='visible')
+    page.go_back()
+    page.wait_for_selector(MEMBER, state='hidden')
     page.tap(MORE)
     page.wait_for_selector(SHEET, state='visible')
     page.go_back()
@@ -1409,7 +1441,7 @@ def check_leaving_clears_the_view(browser, errors):
         text: ['view-node', 'view-dir', 'view-id-copy', 'view-sheet-meta', 'view-waiting', 'view-permission', 'view-fork', 'view-clear']
           .map(id => $(id).textContent).join(''),
         waiting: $('view-waiting').hidden,
-        footer: [$('input-row').hidden, $('watch-banner').hidden],
+        footer: [$('input-row').hidden, $('member-view').hidden],
         rows: ['row-permission', 'row-persona', 'row-fork', 'row-clear', 'row-stop'].map(id => $(id).hidden),
         permission: $('btn-permission').textContent,
         dot: $('view-state-dot').className,
@@ -1990,8 +2022,8 @@ def check_following(browser, errors):
 
 
 def check_ask_records(browser, errors):
-    # The panel's frames keep their own ask record: the session's question
-    # still takes its own answered copy after a child's question is drawn.
+    # A member's Log keeps its own ask record: the session's question still
+    # takes its own answered copy after a child's question is drawn.
     page = new_page(browser, errors)
     release = staged_stream(page, EMPTY,
                             [message_frame('assistant', ask_block('Session question?', child_id=CHILD), 1)],
@@ -2001,11 +2033,15 @@ def check_ask_records(browser, errors):
     open_from_list(page, EMPTY_ROW)
     page.wait_for_selector(ASK_BOX)
     page.tap(f'{ASK_BOX} .child-watch')
-    page.wait_for_selector('#child-transcript .ask')
+    page.wait_for_selector(MEMBER, state='visible')
+    page.tap(MEMBER_LOG)
+    page.wait_for_selector('#member-log .ask')
     release()
-    page.wait_for_selector(f'{ASK_BOX} {ASK_ANSWER}')
+    # The member's screen covers the session's transcript, so the answer lands
+    # out of sight.
+    page.wait_for_selector(f'{ASK_BOX} {ASK_ANSWER}', state='attached')
     boxes = page.eval_on_selector_all(ASK_BOX, 'els => els.map(e => e.querySelectorAll(".answer").length)')
-    check('a child\'s question in the panel leaves the session\'s question to take its own answer', boxes == [1], boxes)
+    check('a child\'s question in its Log leaves the session\'s question to take its own answer', boxes == [1], boxes)
     page.context.close()
 
     # A page read back draws with an ask record of its own: the session's
@@ -2159,8 +2195,8 @@ CHECKS = [
     check_list,
     check_stamps,
     check_kinds,
-    check_panel,
-    check_panel_frames,
+    check_member,
+    check_chain,
     check_addresses,
     check_leaving_clears_the_view,
     check_composer,
