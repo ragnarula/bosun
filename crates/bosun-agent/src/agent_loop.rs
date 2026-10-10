@@ -1859,7 +1859,7 @@ async fn run_turn_inner(
                 ask_recipient,
             })?;
 
-            let (text, reasoning, tool_calls, stopped, stop_reason) = match collect_stream(
+            let (mut text, reasoning, tool_calls, stopped, stop_reason) = match collect_stream(
                 &mut stream,
                 deps,
                 session_id,
@@ -1911,6 +1911,16 @@ async fn run_turn_inner(
                 .await?;
             }
 
+            // DeepSeek and some other providers emit tool calls as XML in the
+            // text stream instead of using the native tool_calls array. Scan
+            // the text for <invoke> blocks and extract them as calls before
+            // recording, so the stored text is clean.
+            let xml_calls = if !text.is_empty() {
+                parse_xml_tool_calls(&mut text, session_id)
+            } else {
+                Vec::new()
+            };
+
             if !text.is_empty() {
                 record_in_wake(
                     deps,
@@ -1921,7 +1931,8 @@ async fn run_turn_inner(
                 )
                 .await?;
             }
-            let calls: Vec<Call> = parse_tool_calls(tool_calls, session_id);
+            let mut calls: Vec<Call> = parse_tool_calls(tool_calls, session_id);
+            calls.extend(xml_calls);
 
             if calls.is_empty() {
                 if text.is_empty() {
@@ -3151,6 +3162,119 @@ fn parse_tool_calls(
             }
         })
         .collect()
+}
+
+/// Scans the assistant text for `<invoke name="...">...</invoke>` blocks, which
+/// some providers (DeepSeek) emit as text instead of native tool calls. Each
+/// block is parsed into a `Call`, its arguments built from the `<parameter>`
+/// elements, and removed from the text. A parameter with `string="true"` is kept
+/// as a string; one with `string="false"` or no `string` attribute is parsed as
+/// JSON when it looks like one, or kept as a string otherwise.
+fn parse_xml_tool_calls(text: &mut String, session_id: &str) -> Vec<Call> {
+    let mut calls = Vec::new();
+    let mut call_index = 0u64;
+    // The marker the loop looks for. A stray `<invoke` that is not a tool
+    // opening is left alone: only an `<invoke name="...">` that finds its
+    // closing `</invoke>` is extracted.
+    const OPEN: &str = "<invoke name=\"";
+    const CLOSE: &str = "</invoke>";
+
+    loop {
+        let start = match text.find(OPEN) {
+            Some(pos) => pos,
+            None => break,
+        };
+        let name_start = start + OPEN.len();
+        let name_end = match text[name_start..].find("\">") {
+            Some(pos) => name_start + pos,
+            None => break,
+        };
+        let name = text[name_start..name_end].to_string();
+        let body_start = name_end + 2; // skip `">`
+        let end = match text[body_start..].find(CLOSE) {
+            Some(pos) => body_start + pos,
+            None => break,
+        };
+        let body = &text[body_start..end];
+
+        let mut args = serde_json::Map::new();
+        let mut param_pos = 0usize;
+        while param_pos < body.len() {
+            let tag_start = match body[param_pos..].find("<parameter name=\"") {
+                Some(pos) => param_pos + pos,
+                None => break,
+            };
+            let pn_start = tag_start + "<parameter name=\"".len();
+            let pn_end = match body[pn_start..].find('\"') {
+                Some(pos) => pn_start + pos,
+                None => break,
+            };
+            let param_name = body[pn_start..pn_end].to_string();
+            let after_name = &body[pn_end + 1..];
+            // The string attribute, when present, says whether to keep the
+            // value as a string: `<parameter name="x" string="true">`.
+            let (is_string, value_start) = if after_name.starts_with(" string=\"true\"") {
+                (true, pn_end + 1 + " string=\"true\">".len())
+            } else if after_name.starts_with(" string=\"false\"") {
+                (false, pn_end + 1 + " string=\"false\">".len())
+            } else if after_name.starts_with('>') {
+                (false, pn_end + 2) // `">`
+            } else {
+                break;
+            };
+            let value_end = match body[value_start..].find("</parameter>") {
+                Some(pos) => value_start + pos,
+                None => break,
+            };
+            let raw_value = &body[value_start..value_end];
+            let value = if is_string {
+                Value::String(raw_value.to_string())
+            } else {
+                serde_json::from_str(raw_value).unwrap_or(Value::String(raw_value.to_string()))
+            };
+            args.insert(param_name, value);
+            param_pos = value_end + "</parameter>".len();
+        }
+
+        // Remove the whole block from the text, newlines and all.
+        let block_end = end + CLOSE.len();
+        let mut after = text.split_off(start);
+        let _block = after.split_off(block_end - start);
+        text.push_str(&after);
+
+        let id = format!("xml-{session_id}-{}", call_index);
+        call_index += 1;
+        calls.push(Call {
+            id,
+            name,
+            args: Value::Object(args),
+            recorded: false,
+        });
+    }
+
+    // Trim whitespace left by removed blocks. A run of empty lines between
+    // prose and a block collapses to one blank line; a block at the very
+    // start or very end leaves no trailing gap.
+    *text = text
+        .lines()
+        .fold((Vec::new(), 0usize), |(mut lines, blanks), line| {
+            if line.trim().is_empty() {
+                if blanks == 0 && !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                (lines, blanks + 1)
+            } else {
+                lines.push(line.to_string());
+                (lines, 0)
+            }
+        })
+        .0
+        .join("\n");
+    if text.ends_with('\n') {
+        text.pop();
+    }
+
+    calls
 }
 
 /// One tool call a turn runs: the id the provider gave it, the tool's name, its
@@ -20585,5 +20709,70 @@ mod tests {
             system.contains("checkout (github.com/owner/acme/tools/skills/checkout)"),
             "the store's advertised packages survive a node that cannot answer: {system}"
         );
+    }
+
+    #[test]
+    fn parse_xml_tool_calls_extracts_invoke_blocks() {
+        let mut text = concat!(
+            "I will run the tests now.\n",
+            "<invoke name=\"shell\">\n",
+            "<parameter name=\"command\" string=\"true\">cargo test</parameter>\n",
+            "<parameter name=\"timeout_secs\" string=\"false\">120</parameter>\n",
+            "</invoke>\n",
+            "Let me check the results.\n",
+        )
+        .to_string();
+        let calls = parse_xml_tool_calls(&mut text, "s-test");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args["command"], "cargo test");
+        assert_eq!(calls[0].args["timeout_secs"], 120);
+        assert_eq!(text.trim(), "I will run the tests now.\n\nLet me check the results.");
+    }
+
+    #[test]
+    fn parse_xml_tool_calls_leaves_text_without_invoke_untouched() {
+        let mut text = "Just some text, no tools here.".to_string();
+        let calls = parse_xml_tool_calls(&mut text, "s-test");
+        assert!(calls.is_empty());
+        assert_eq!(text, "Just some text, no tools here.");
+    }
+
+    #[test]
+    fn parse_xml_tool_calls_handles_multiple_invoke_blocks() {
+        let mut text = concat!(
+            "First:\n",
+            "<invoke name=\"shell\">\n",
+            "<parameter name=\"command\" string=\"true\">ls</parameter>\n",
+            "</invoke>\n",
+            "Then:\n",
+            "<invoke name=\"file_read\">\n",
+            "<parameter name=\"path\" string=\"true\">src/main.rs</parameter>\n",
+            "</invoke>\n",
+        )
+        .to_string();
+        let calls = parse_xml_tool_calls(&mut text, "s-test");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args["command"], "ls");
+        assert_eq!(calls[1].name, "file_read");
+        assert_eq!(calls[1].args["path"], "src/main.rs");
+        assert_eq!(text.trim(), "First:\n\nThen:");
+    }
+
+    #[test]
+    fn parse_xml_tool_calls_parameter_without_string_attr_parses_json() {
+        let mut text = concat!(
+            "<invoke name=\"todowrite\">\n",
+            "<parameter name=\"items\">[{\"id\":\"1\",\"content\":\"do it\",\"status\":\"todo\"}]</parameter>\n",
+            "</invoke>\n",
+        )
+        .to_string();
+        let calls = parse_xml_tool_calls(&mut text, "s-test");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "todowrite");
+        assert!(calls[0].args["items"].is_array());
+        assert_eq!(calls[0].args["items"][0]["id"], "1");
+        assert!(text.trim().is_empty());
     }
 }
