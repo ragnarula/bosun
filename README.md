@@ -95,6 +95,32 @@ The current sprint and the planned roadmap are tracked in
   `skill` tool beside the working copy's own skills. Versions are commit SHAs;
   an update re-resolves the tracked ref and replaces the packages.
 
+## The crew
+
+A session and the sessions it spawns are a crew. The root session is the lead.
+You give the lead its instructions, and the lead gives orders to the agents it
+spawns. Each of those agents can spawn its own. Every agent reports to the
+agent that spawned it. A question climbs the chain to you, and your answer goes
+straight back to the agent that asked it.
+
+![The pane on a phone: Chat with the lead, the Crew view, and one crew member's screen](docs/images/crew.png)
+
+- **Chat** is your conversation with the lead. It shows the lead's orders as
+  cards, with one row for each agent and its state, and each report from an
+  agent as one line. A question that came up the chain names the agent that
+  asked it and the path to you. The message box sends to the lead only.
+- **Crew** shows the chain of command as a tree. Each agent has its avatar,
+  its persona, its state and what it is doing now. Below the tree, Flow lists
+  every order, report, question and answer between the agents, newest first.
+- **A crew member's screen** opens from the tree, an order row or Flow. It
+  shows that agent's own thread and its Log. It has no message box: to change
+  an agent's work, tell the lead. **Ask Lead** opens Chat with the agent's name
+  in the message box.
+
+`bosun open` has the same views. Alt+1 to Alt+4, or F1 to F4, switch between
+Chat, Crew, Tasks and Files. In Crew, ↑ and ↓ pick an agent, Enter opens its
+thread, Alt+5 or F5 opens its Log, and Esc returns to Crew.
+
 ## Requirements
 
 - [Rust](https://rustup.rs/) stable, with edition 2024 support, to build from
