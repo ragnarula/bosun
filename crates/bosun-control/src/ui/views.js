@@ -10,7 +10,7 @@ import { closeMember } from './history.js';
 
 export { VIEWS, currentView, setView };
 
-const VIEWS = ['chat', 'crew', 'tasks', 'files', 'log'];
+const VIEWS = ['sessions', 'chat', 'crew', 'tasks', 'files', 'log'];
 const VIEW_KEY = 'bosun.view';
 const SIDES = ['crew', 'tasks', 'files'];
 const SIDE_KEY = 'bosun.side';
@@ -38,6 +38,11 @@ function currentView() {
 
 function setView(name) {
   if (!VIEWS.includes(name)) return;
+  // The sessions tab navigates back; it is not a view to persist.
+  if (name === 'sessions') {
+    history.back();
+    return;
+  }
   markView(name);
   if (name === 'log') follow();
 }
@@ -69,6 +74,10 @@ function setSide(name) {
 // A view picked while a member's screen covers the session leaves the screen.
 for (const control of view.querySelectorAll('button[data-view]')) {
   control.addEventListener('click', () => {
+    if (control.dataset.view === 'sessions') {
+      history.back();
+      return;
+    }
     if (view.dataset.member) closeMember();
     setView(control.dataset.view);
   });
